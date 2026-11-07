@@ -8,7 +8,7 @@ sprinkling of ``QShortcut``s:
 * **Window-owned ``QAction``s, never ``QShortcut``s.** A ``QShortcut`` parented
   to whichever widget happened to be handy is invisible — it cannot appear in a
   menu, so the only way to learn it is to be told. Every row here becomes a
-  ``QAction`` the window owns, and (bar one deliberate exception, ``Esc``) each
+  ``QAction`` the window owns, and (bar ``Esc`` and ``F11``) each
   one is placed in a menu, where it advertises its own key.
 * **One table, read three ways.** The same rows build the actions, annotate the
   tooltips of the controls they drive, and fill the cheat-sheet dialog. A
@@ -232,7 +232,7 @@ SHORTCUTS: tuple[Shortcut, ...] = (
         section="Navigation",
         handler="_shortcut_escape",
         keys=("Esc",),
-        # The ONE row with no menu entry, deliberately: what Escape does depends
+        # No menu entry, deliberately: what Escape does depends
         # entirely on what is in front of you, so a menu item promising one of
         # its three behaviours would be wrong two-thirds of the time. It is in
         # the cheat-sheet, which can say all three.
@@ -292,6 +292,14 @@ SHORTCUTS: tuple[Shortcut, ...] = (
         keys=("Ctrl+D",),
         existing_action="_details_visible_action",
         tooltip_host="_details_visible_action",
+    ),
+    Shortcut(
+        id="toggle_fullscreen",
+        label="Full screen on or off",
+        section="Panels",
+        handler="_toggle_fullscreen",
+        keys=("F11",),
+        menu=None,
     ),
     Shortcut(
         id="cheat_sheet",

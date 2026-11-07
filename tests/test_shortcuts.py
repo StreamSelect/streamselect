@@ -244,6 +244,16 @@ class TestInstall:
         assert win._shortcut_actions["toggle_sidebar"] is win._sidebar_visible_action
         assert win._shortcut_actions["toggle_details"] is win._details_visible_action
 
+    def test_f11_goes_full_screen_and_back_keeping_maximized(self, win):
+        win.setWindowState(Qt.WindowState.WindowMaximized)
+        action = win._shortcut_actions["toggle_fullscreen"]
+        assert [seq.toString() for seq in action.shortcuts()] == ["F11"]
+        action.trigger()
+        assert win.windowState() & Qt.WindowState.WindowFullScreen
+        action.trigger()
+        assert not win.windowState() & Qt.WindowState.WindowFullScreen
+        assert win.windowState() & Qt.WindowState.WindowMaximized
+
     def test_each_row_lands_in_the_menu_it_names(self, win):
         for spec in SHORTCUTS:
             if spec.menu is None or spec.existing_action is not None:

@@ -584,6 +584,11 @@ class _MenuActionsMixin:
         """Collapse or restore the details pane from the Layout menu."""
         self._toggle_main_panel(self._DETAILS_PANEL, self._details_visible_action)
 
+    def _toggle_fullscreen(self) -> None:
+        """Enter or leave full screen. Only that flag flips, so a maximized window
+        comes back maximized."""
+        self.setWindowState(self.windowState() ^ Qt.WindowState.WindowFullScreen)
+
     def _toggle_main_panel(self, index: int, action) -> None:
         """Toggle one ``main_splitter`` panel and re-sync *action* from reality.
 
