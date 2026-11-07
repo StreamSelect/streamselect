@@ -14,40 +14,50 @@ It never hides anything on its own. It suggests and sorts, and you decide what t
 
 ## What it does
 
-**Compares your sources.** Each source has an Analytics tab that helps you decide whether it's worth keeping:
+StreamSelect reads every name once and splits it into title, year, language, region and quality, groups copies of the same title together, and adds posters, plots and cast. Everything below works on that organized library. Add as many sources as you like; their catalogs are merged into one.
+
+### Finding things
+
+- **One search box** for titles, alternate titles, actors, directors and the languages spoken in a stream. Results are grouped by what matched, and can be shown as posters.
+- **Filters** for genre, language, region, quality, decade, collection, streaming platform and subtitle language. Save a combination you use often (a "recipe") and it stays on the Discover page as a row of matching titles that updates as your catalog changes.
+- **Global exclusions** hide anything you never want to see, such as a language you don't speak, everywhere in the app.
+- **New content is never hidden silently.** When a source adds new categories, regions or languages, StreamSelect shows you what's new after the refresh and lets you include or exclude each one.
+- **You can see what your filters are hiding.** When filters hold results back, the app says how many and lets you show them, so you don't miss something because you filtered too aggressively.
+- **Copies of the same title are combined.** The same movie in five languages across three sources shows once in recommendations and suggestions, with the other versions listed under it.
+- **Recommendations** come from what you like and dislike, matched on genres, cast, directors and plot keywords. Each one shows why it was picked, and you can mute any genre, person or keyword.
+
+### Keeping track
+
+- A watch list of shows and keywords, with alerts when something matching is on now or coming up.
+- Alerts when a series you follow has new episodes, checked on a schedule you choose.
+- A list of what you plan to watch next, favorites, history, and resume positions for movies and episodes.
+- A TV guide from your provider's program listings, including very large ones: what's on now, the full schedule with columns you can sort, and upcoming live events.
+
+### Playing things
+
+- **Everything plays in mpv** on every platform, so mpv's features work on your streams. The window is plain, so you can leave it in a corner while you work or make it full screen (F11 in the app).
+- **Watch more than one thing at once.** Each source gets its own player window, so a game from one source and a show from another can play side by side. Starting the second doesn't cut off the first, which matters when each source only allows one connection.
+- **Even out the volume.** Normalize volume brings quiet dialogue up without making explosions louder, so you stop riding the volume. You can also mix 5.1 surround down to stereo or mono, which helps on laptop speakers and headphones where voices in the center channel get lost.
+- **Change things while it plays.** Click the buffer and speed figures at the top of the window to switch audio language or subtitles, change the sound settings above, or skip to another item in what's playing next.
+
+### Staying connected
+
+- **Every server address is used.** Providers often give several addresses, and one being slow or down is a common reason streams fail. StreamSelect keeps track of how each address performs, tries the most reliable and fastest first, and moves on to the next when one fails, so you aren't swapping addresses by hand.
+- **Stream diagnosis** in the Tools menu measures how fast a stream arrives against what the video needs and runs a speed test of your own connection to compare. It tells you in plain words whether the problem is the provider or your internet, suggests a buffer setting that would help, and can switch to it for you.
+- **Connection problems are explained.** When a source won't connect, the app says why and what to try: a wrong username or password, an expired subscription, an address that isn't an Xtream server, a provider refusing you (often because of a VPN), a temporary lockout after failed logins, or nothing answering at all.
+
+### Comparing your sources
+
+Each source has an Analytics tab that helps you decide whether it's worth keeping:
 
 - What only that source carries, and how much of it your other sources also have
 - Movie, series and live counts, guide coverage, titles by region, and days left on the account
 - How often plays start, what time of day they fail, and which server addresses work
 - What you actually watch there, and how much of its connection limit you use
 
-**Lets you combine filters and save them.** Pick any mix of genre, region, language, decade, collection, quality, streaming platform and subtitle language, and you see every matching title and how many there are. Save a combination you like and it stays on the Discover page as a row of matching titles, which updates as your sources change.
+### Details
 
-**Handles several sources and several addresses per source.** Add as many sources as you have and their catalogs are blended into one library. A source can have more than one server address: StreamSelect tries them in order of how reliably and quickly each one has answered, and keeps using the ones that work.
-
-**Combines copies of the same title.** The same movie in five languages across three sources shows once in recommendations and suggestions, with the other versions listed under it.
-
-**Tracks what you want to watch:**
-
-- A watch list of shows and keywords, with alerts when something matching is on now or coming up
-- Alerts when a series you follow gets new episodes
-- A list of what you plan to watch next, favorites, history, and resume positions for movies and episodes
-
-**Searches across everything.** One search box covers titles, alternate titles, cast, directors and the languages spoken in a stream. Results are grouped by what matched, and can be shown as posters. Filters cover language, region, quality, streaming platform and category, and you can hide anything you never want to see, everywhere in the app.
-
-**Shows the TV guide.** Reads your provider's program guide, including very large ones: what's on right now, the full schedule with columns you can sort, and upcoming live events.
-
-**Recommends.** Likes and dislikes feed a recommendation list based on genres, cast, directors and plot keywords. It shows why something was recommended, and you can mute any genre, person or keyword.
-
-**Lets you adjust a stream while it plays.** Click the buffer and speed figures at the top of the window to change the audio language or subtitles, even out quiet dialogue and loud effects, mix surround sound down to stereo or mono, or skip to another item in what's playing next. You can also watch two sources at once in separate windows.
-
-**Helps you work out why something isn't working.**
-
-- When a stream won't play or keeps stalling, choose Stream diagnosis from the Tools menu. It measures how fast the stream arrives against what the video needs, runs a speed test of your own connection to compare, and tells you in plain words whether the problem is the provider or your internet. It suggests a buffer setting that would help, and can switch to it for you.
-- When a source won't connect, the app says why and what to try: a wrong username or password, an expired subscription, an address that isn't an Xtream server, a provider that's refusing you (often because of a VPN), a temporary lockout after failed logins, or nothing answering at all.
-- Each source's Analytics tab shows how often its streams start and what time of day they tend to fail.
-
-**Pulls in details.** Posters, plots, cast and ratings come from your provider. Add your own free TMDb or OMDb API key in Settings for more.
+Posters, plots, cast and ratings come from your provider. Add your own free TMDb or OMDb API key in Settings for more.
 
 ## Download
 
@@ -77,6 +87,7 @@ Double-click anything to play it. Right-click for everything else. Press `?` for
 
 ## Current limits
 
+- Recording and downloading are built but hidden while they're tested.
 - Xtream accounts only. An Xtream M3U link works, but a plain M3U playlist file or a non-Xtream M3U URL doesn't.
 - The app checks for new versions and takes you to the download, but it doesn't install them itself.
 
