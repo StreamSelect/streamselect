@@ -22,10 +22,9 @@ where the hand already goes (R6). An early mockup had it in both places.
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal as _pyqtSignal
-from PyQt6.QtGui import QMouseEvent, QPixmap
+from PyQt6.QtGui import QMouseEvent
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QWidget
 
-from streamselect.core.runtime_env import bundle_resource_path
 from streamselect.gui import cursor_affordance
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
@@ -191,20 +190,6 @@ class _AppHeaderMixin:
         layout = QHBoxLayout(header)
         layout.setContentsMargins(12, 6, 12, 6)
         layout.setSpacing(10)
-
-        # The same 256px file the window icon uses, which every build ships.
-        mark_file = bundle_resource_path("packaging/icon/streamselect-256.png")
-        if mark_file.exists():
-            ratio = header.devicePixelRatioF()
-            pixmap = QPixmap(str(mark_file)).scaled(
-                round(24 * ratio), round(24 * ratio),
-                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            pixmap.setDevicePixelRatio(ratio)
-            mark = self._brand_mark = QLabel()
-            mark.setPixmap(pixmap)
-            mark.setFixedSize(24, 24)
-            mark.setToolTip("StreamSelect")
-            layout.addWidget(mark)
 
         brand = self._brand_label = QLabel("StreamSelect")
         _theme.style_fn(brand, _brand_sheet)

@@ -75,29 +75,3 @@ def test_the_spec_no_longer_hardcodes_no_icon():
         "the PNG is not in `datas`, so bundle_resource_path will not find it "
         "inside the frozen app — the icon would work in a checkout only"
     )
-
-
-def test_the_header_paints_the_mark_at_its_size_left_of_the_name(qtbot):
-    """A missing file or a dropped pixmap would leave only the wordmark."""
-    from unittest.mock import MagicMock
-
-    from PyQt6.QtWidgets import QWidget
-
-    from streamselect.gui.app_header import _AppHeaderMixin
-
-    class Host(_AppHeaderMixin, QWidget):
-        def __getattr__(self, name):
-            return MagicMock()
-
-    host = Host()
-    qtbot.addWidget(host)
-    header = host._create_header()
-    qtbot.addWidget(header)
-    header.resize(1400, 48)
-    header.show()
-    qtbot.waitExposed(header)
-    mark, brand = host.__dict__["_brand_mark"], host.__dict__["_brand_label"]
-    assert not mark.pixmap().isNull()
-    assert mark.width() == 24 and mark.height() == 24
-    assert mark.geometry().right() < brand.geometry().left()
-    assert brand.width() >= brand.fontMetrics().horizontalAdvance("StreamSelect")
