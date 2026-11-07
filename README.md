@@ -1,6 +1,6 @@
 # StreamSelect
 
-A desktop app that turns the huge, messy catalog of an IPTV subscription into a library you can actually browse. Channel and movie names like `EN| 4K - The Matrix (1999) MULTI-SUB` are read once and split into title, year, language, region and quality, copies of the same title are grouped together, and posters, plots and cast are added, so you can search, filter and find what you want instead of scrolling a list of hundreds of thousands of rows.
+A desktop app that turns the huge, messy catalog of an IPTV subscription into a library you can actually browse. The raw channel and movie names, with their language codes, quality tags and other clutter, are read once and split into title, year, language, region and quality, copies of the same title are grouped together, and posters, plots and cast are added, so you can search, filter and find what you want instead of scrolling a list of hundreds of thousands of rows.
 
 Runs on Linux, macOS and Windows. Plays through mpv. Free and open source under GPLv3.
 
