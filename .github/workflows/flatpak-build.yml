@@ -13,8 +13,19 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:kde-6.11
-      options: --privileged
+      # The host's preinstalled toolchains are mounted so they can be cleared:
+      # building mpv and ffmpeg with no cache fills the runner's disk otherwise.
+      options: >-
+        --privileged
+        -v /usr/local/lib/android:/host/android
+        -v /usr/share/dotnet:/host/dotnet
+        -v /opt/hostedtoolcache:/host/toolcache
     steps:
+      - name: Free disk space
+        run: |
+          rm -rf /host/android/* /host/dotnet/* /host/toolcache/*
+          df -h /
+
       - name: Checkout
         uses: actions/checkout@v4
 

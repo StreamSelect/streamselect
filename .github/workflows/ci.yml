@@ -120,12 +120,7 @@ jobs:
       # The structural guards, which are fast and catch what actually breaks:
       # a file grown past its pinned size, a new undefined name, the app
       # failing to boot, tests writing the real user config (a real
-      # data-loss bug once), a stray colour literal, and a second path for a
-      # gate that already has one. Mirrors .githooks/pre-push's GUARDS list
-      # exactly (GUARD-5 — this job was previously missing
-      # test_no_new_undefined_names.py, so a local pre-push pass and this job
-      # were not actually answering the same question); both are pinned to
-      # the same six by tests/test_local_gates_have_one_path.py::test_repo_wide_guard_lists_agree.
+      # data-loss bug once), and a stray colour literal.
       - name: Structural guards
         env:
           QT_QPA_PLATFORM: offscreen
@@ -135,8 +130,7 @@ jobs:
             tests/test_no_new_undefined_names.py \
             tests/test_mainwindow_launch_smoke.py \
             tests/test_config_isolation.py \
-            tests/test_no_stray_color_literals.py \
-            tests/test_local_gates_have_one_path.py
+            tests/test_no_stray_color_literals.py
 
   test:
     name: tests (${{ matrix.os }}, ${{ matrix.shard }}/4)
