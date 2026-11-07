@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=StreamSelect
+GenericName=IPTV Player
+Comment=Browse and watch your IPTV sources
+Exec=streamselect
+Icon=io.github.streamselect.StreamSelect
+Terminal=false
+Categories=AudioVideo;Video;Player;TV;
+Keywords=iptv;tv;xtream;epg;
+StartupWMClass=StreamSelect

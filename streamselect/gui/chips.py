@@ -1,0 +1,415 @@
+"""Chip and dropdown controls shared across filter/nav surfaces.
+
+Extracted from ``filter_bar.py`` (audit slice 4): ``FilterBar`` itself was
+never instantiated in production and was deleted, but ``ToggleChip``, ``FilterChip``
+and ``FilterDropdown`` here are live — the nav header's view chips, the watch-rule
+editor's match-mode chips, and the global content-filter chip all build on
+``ToggleChip``.
+"""
+
+from typing import Dict, List
+
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QCursor
+from PyQt6.QtWidgets import (
+    QCheckBox,
+    QFrame,
+    QHBoxLayout,
+    QMenu,
+    QPushButton,
+    QScrollArea,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+    QWidgetAction,
+)
+
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+
+
+class ToggleChip(QPushButton):
+    """Toggle chip button for simple on/off filtering"""
+
+    toggled_changed = pyqtSignal(bool)
+
+    #: Corner radius of the segmented track. The chips at each end round their
+    #: OUTER corners to match it, because Qt does not clip a child widget to its
+    #: parent's border-radius — a square chip inside a rounded track bleeds
+    #: through the curve.
+    SEGMENT_RADIUS: int = 7
+
+    def __init__(self, label: str, enabled: bool = True,
+                 vector_role: str | None = None,
+                 segment: str | None = None):
+        super().__init__()
+        self.label = label
+        self._enabled = enabled
+        self._count = None
+        # A semantic icon role (streamselect.gui.icons.VECTOR_KEYS). When set, the chip
+        # carries a monochrome vector icon instead of an emoji baked into its
+        # label — an emoji cannot take a colour, so it ignored the palette and
+        # rendered differently on every platform.
+        self._vector_role = vector_role
+        # Position in a segmented track: "first" | "middle" | "last", or None
+        # for a free-standing pill (the original — still used, e.g. the
+        # watch-rule editor's "Whole words only" chip).
+        # A segmented chip fills its whole cell when selected instead of
+        # floating as a pill, which is what makes the active view read as the
+        # active view rather than as one more button.
+        self._segment = segment
+        if segment is not None:
+            # Fill the track vertically. Without this the chip keeps its
+            # sizeHint height and the layout centres it, leaving it floating
+            # 31px tall inside a 40px track with the track's own fill showing
+            # above and below — a pill in a box, which is the look the
+            # segmented track exists to replace.
+            self.setSizePolicy(QSizePolicy.Policy.Preferred,
+                               QSizePolicy.Policy.Expanding)
+        self.setCheckable(True)
+        self.setChecked(enabled)
+        self.update_appearance()
+        self.clicked.connect(self.on_clicked)
+
+    def _geometry_css(self) -> str:
+        """Corner radii and separator for this chip's place in the track.
+
+        One helper feeding both the selected and unselected builders, so the
+        two states cannot drift apart on shape — only on colour.
+        """
+        if self._segment is None:
+            return "border-radius: 12px; padding: 6px 14px;"
+
+        r = self.SEGMENT_RADIUS
+        corners = {
+            "first": f"border-top-left-radius: {r}px; border-bottom-left-radius: {r}px;",
+            "last": f"border-top-right-radius: {r}px; border-bottom-right-radius: {r}px;",
+        }.get(self._segment, "")
+        # Every chip but the leftmost carries the hairline that divides it from
+        # its neighbour, so the track shows exactly one rule per boundary.
+        # A TRANSPARENT border in every resting state, recoloured on hover.
+        # The hover outline a user asked for cannot be added on :hover
+        # alone — a border that appears only on hover adds 1px to the box and
+        # nudges the label as the pointer crosses it. Reserving the ring here
+        # means hover changes colour and nothing else.
+        rule = (f"border-left-color: {_theme.COLOR_LINE};"
+                if self._segment != "first" else "")
+        return (f"border: 1px solid transparent; border-radius: 0px; "
+                f"{corners} {rule} padding: 6px 15px;")
+
+    def on_clicked(self):
+        self._enabled = self.isChecked()
+        self.update_appearance()
+        self.toggled_changed.emit(self._enabled)
+
+    def setChecked(self, checked: bool) -> None:  # noqa: N802 - Qt override
+        """Keep the painted state in step with the checked state.
+
+        This chip carries TWO notions of "on": Qt's ``isChecked()`` and its own
+        ``_enabled``, which is the one :meth:`update_appearance` paints from.
+        ``on_clicked`` synced them, so a chip the user clicked looked right —
+        but a chip set programmatically did not, because plain ``setChecked``
+        touched neither ``_enabled`` nor the paint.
+
+        That is a real defect wherever one chip in a group deselects another.
+        In the Sports lane tabs the handler sets the new lane and clears the
+        rest with ``setChecked(False)``; the cleared chip never repainted, so
+        two lanes looked selected at once and the highlight no longer told you
+        which lane you were in (user report: *"you can see the state of
+        the button didn't change, it looks selected either way"*).
+
+        Overriding here rather than fixing the one caller: any future group of
+        these hits the same trap otherwise.
+
+        Args:
+            checked: The new checked state.
+        """
+        super().setChecked(checked)
+        if self._enabled != checked:
+            self._enabled = checked
+            self.update_appearance()
+
+    def set_count(self, count: int):
+        self._count = count if count > 0 else None
+        self.update_appearance()
+
+
+    def _tinted(self, on: bool, sheet: str) -> str:
+        """Re-tint the vector icon, then hand back *sheet* unchanged.
+
+        Called from inside the ``style_fn`` builder on purpose. That builder is
+        what ``theme._reapply_registered_styles()`` re-invokes on a palette
+        switch, so putting the re-tint here is what makes the icon follow the
+        theme; the same call placed in ``update_appearance`` runs once at
+        construction and never again.
+        """
+        if self._vector_role:
+            from PyQt6.QtCore import QSize
+            colour = _theme.COLOR_ON_ACCENT if on else _theme.COLOR_TEXT
+            _icon_utils.set_button_icon(self, self._vector_role, color=colour)
+            self.setIconSize(QSize(14, 14))
+        return sheet
+
+    def update_appearance(self):
+        """Repaint the chip for its current state.
+
+        Both states used to be measurably unreadable, in every dark palette
+        (an earlier change user report — "the primary views chip colour for search, epg,
+        etc are wrong when selected"):
+
+        - SELECTED filled with ``COLOR_ACCENT_BLUE`` and wrote ``color: white``
+          on it. That token is ``indigo.12`` — a NEAR-WHITE lavender in the dark
+          palettes — so white-on-it measured **1.31:1**. The literal is also the
+          bug's cause: a hardcoded colour cannot track a palette, which is
+          exactly what the no-literals rule exists to prevent. The fill is now
+          ``COLOR_ACCENT`` with ``COLOR_ON_ACCENT``, the token whose entire job
+          is "legible on a solid accent" (6.75:1 in Midnight).
+        - UNSELECTED filled with ``COLOR_SURFACE_LIGHT_2``, one of the
+          deliberately-fixed-LIGHT "highlight chip" surfaces that stay light in
+          every palette by design, and wrote ``COLOR_MUTED_2`` on it — 2.30:1,
+          a pale slab in a dark app. An unselected view chip is a control at
+          rest, so it gets the surface token named for that.
+
+        Registered via ``theme.style_fn`` rather than ``setStyleSheet`` so a
+        live theme switch re-reads the tokens instead of keeping Qt's cached
+        render of the old ones.
+        """
+        label_text = self.label
+        if self._count is not None:
+            label_text = f"{self.label} ({self._count})"
+
+        segmented = self._segment is not None
+        if self._enabled:
+            # A segmented cell shows its state by filling edge to edge — a
+            # shape cue, not a colour one — so it does not also need the dot
+            # the free-standing pill uses.
+            self.setText(label_text)
+            if not segmented and not self._vector_role:
+                _icon_utils.set_button_icon(self, "status_dot", trailing=True)
+            _theme.style_fn(self, lambda: self._tinted(True, f"""
+                QPushButton {{
+                    background-color: {_theme.COLOR_ACCENT};
+                    color: {_theme.COLOR_ON_ACCENT};
+                    {self._geometry_css()}
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{ background-color: {_theme.COLOR_ACCENT_HOVER}; }}
+            """))
+        else:
+            self.setText(label_text)
+            if not segmented and not self._vector_role:
+                _icon_utils.set_button_icon(self, "inactive_dot", trailing=True)
+            # Both token reads happen INSIDE the builder. Hoisting them here
+            # would bake the current palette's hex into the closure, and the
+            # re-invocation on a theme switch would hand back the old colours —
+            # the precise staleness style_fn exists to stop.
+            _theme.style_fn(self, lambda: self._tinted(False, f"""
+                QPushButton {{
+                    background-color: {
+                        "transparent" if segmented else _theme.COLOR_BG_CARD};
+                    color: {_theme.COLOR_TEXT};
+                    {self._geometry_css()}
+                    {"" if segmented
+                     else f"border-color: {_theme.COLOR_BORDER};"}
+                }}
+                QPushButton:hover {{
+                    background-color: {_theme.OVERLAY_SELECTION};
+                    color: {_theme.COLOR_TEXT_HI};
+                    border-color: {_theme.COLOR_ACCENT};
+                }}
+            """))
+
+    def is_enabled(self) -> bool:
+        return self._enabled
+
+    def set_enabled(self, enabled: bool):
+        self._enabled = enabled
+        self.blockSignals(True)
+        self.setChecked(enabled)
+        self.blockSignals(False)
+        self.update_appearance()
+
+
+class FilterChip(ToggleChip):
+    """Three-state chip for the global content filter.
+
+    States:
+      no-filter  — gray ○, click opens dialog
+      active     — teal ●, click pauses, right-click opens dialog
+      paused     — amber ●, click resumes, right-click opens dialog
+
+    toggled_changed(bool):
+      True  = filter should be active (resume)
+      False = filter should be paused
+    open_dialog_requested = right-click or click-when-no-filters
+    """
+
+    open_dialog_requested = pyqtSignal()
+
+    def __init__(self, label: str):
+        super().__init__(label, enabled=False)
+        # Disable checkable state: ToggleChip sets setCheckable(True), but on Linux/Wayland
+        # Qt's native checkable-button renderer splits the hit-test region so the text area
+        # registers no clicks. FilterChip manages all visual state via setStyleSheet and
+        # never reads isChecked(), so removing checkable has no functional effect.
+        self.setCheckable(False)
+        self._paused = False
+        self._has_filters = False
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(
+            lambda _: self.open_dialog_requested.emit()
+        )
+        self.setToolTip("Content category filters — click to configure")
+
+    def set_filter_state(self, has_filters: bool, paused: bool) -> None:
+        self._has_filters = has_filters
+        self._paused = paused
+        self.blockSignals(True)
+        self.set_enabled(has_filters)
+        self.blockSignals(False)
+        if has_filters and paused:
+            self.setText(self.label)
+            _icon_utils.set_button_icon(self, "status_dot", trailing=True)
+            _theme.style(self, "EXCL_CHIP_PAUSED")
+            self.setToolTip("Filters paused — click to resume · right-click to edit")
+        elif has_filters:
+            self.setText(self.label)
+            _icon_utils.set_button_icon(self, "status_dot", trailing=True)
+            _theme.style(self, "EXCL_CHIP_ACTIVE")
+            self.setToolTip("Filters active — click to pause · right-click to edit")
+        else:
+            self.update_appearance()   # standard gray ○
+            self.setToolTip("Content category filters — click to configure")
+
+    def on_clicked(self) -> None:
+        if self._has_filters:
+            # Toggle pause/resume — keep chip lit, don't flip _enabled
+            self.blockSignals(True)
+            self.set_enabled(True)
+            self.blockSignals(False)
+            # True = resume (un-pause), False = pause
+            self.toggled_changed.emit(self._paused)
+        else:
+            # No filters configured — open dialog
+            self.open_dialog_requested.emit()
+
+
+#: The two footer buttons every multi-select dropdown menu carries.
+#:
+#: Named constants rather than an inline literal: a second dropdown class
+#: once sat side-by-side with this one on the (now-retired) Sports filter bar
+#: and had drifted to "Clear All" while this one said "Clear" — one bar
+#: offering two different words for the same button. Kept named so a future
+#: sibling dropdown cannot repeat that drift.
+DROPDOWN_SELECT_ALL_LABEL = "Select All"
+DROPDOWN_CLEAR_LABEL = "Clear"
+
+
+class FilterDropdown(QPushButton):
+    """Dropdown button with multi-select checkboxes"""
+
+    filter_changed = pyqtSignal()
+
+    def __init__(self, label: str, groups: Dict[str, int], all_selected: bool = True):
+        super().__init__()
+        self.label = label
+        self.groups = groups
+        self.selected_groups: set = set(groups.keys()) if all_selected else set()
+
+        self.setText(label)
+        _theme.style(self, "FILTER_CONTROL_BTN")
+        _icon_utils.set_button_icon(self, "dropdown_caret", trailing=True)
+
+        self.menu = QMenu(self)
+        self.checkboxes = {}
+        self.setup_menu()
+        self.clicked.connect(self.show_menu)
+
+    def setup_menu(self):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setMinimumWidth(300)
+        scroll.setMaximumHeight(400)
+
+        container = QWidget()
+        layout = QVBoxLayout(container)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(8)
+
+        for group_name in sorted(self.groups.keys()):
+            count = self.groups[group_name]
+            checkbox = QCheckBox(f"{group_name} ({count:,})")
+            checkbox.setChecked(group_name in self.selected_groups)
+            checkbox.stateChanged.connect(
+                lambda state, name=group_name: self.on_checkbox_changed(name, state)
+            )
+            self.checkboxes[group_name] = checkbox
+            layout.addWidget(checkbox)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator)
+
+        button_layout = QHBoxLayout()
+        select_all_btn = QPushButton(DROPDOWN_SELECT_ALL_LABEL)
+        select_all_btn.clicked.connect(self.select_all)
+        button_layout.addWidget(select_all_btn)
+        clear_btn = QPushButton(DROPDOWN_CLEAR_LABEL)
+        clear_btn.clicked.connect(self.clear_all)
+        button_layout.addWidget(clear_btn)
+        layout.addLayout(button_layout)
+
+        scroll.setWidget(container)
+        widget_action = QWidgetAction(self.menu)
+        widget_action.setDefaultWidget(scroll)
+        self.menu.addAction(widget_action)
+
+    def show_menu(self):
+        self.menu.exec(QCursor.pos())
+
+    def on_checkbox_changed(self, group_name: str, state: int):
+        if state == Qt.CheckState.Checked.value:
+            self.selected_groups.add(group_name)
+        else:
+            self.selected_groups.discard(group_name)
+        self.update_button_label()
+        self.filter_changed.emit()
+
+    def select_all(self):
+        self.selected_groups = set(self.groups.keys())
+        for cb in self.checkboxes.values():
+            cb.blockSignals(True)
+            cb.setChecked(True)
+            cb.blockSignals(False)
+        self.update_button_label()
+        self.filter_changed.emit()
+
+    def clear_all(self):
+        self.selected_groups.clear()
+        for cb in self.checkboxes.values():
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.blockSignals(False)
+        self.update_button_label()
+        self.filter_changed.emit()
+
+    def update_button_label(self):
+        total = len(self.groups)
+        selected = len(self.selected_groups)
+        if selected == total:
+            self.setText(self.label)
+        elif selected == 0:
+            self.setText(f"{self.label} (None)")
+        else:
+            self.setText(f"{self.label} ({selected}/{total})")
+
+    def get_selected(self) -> List[str]:
+        return list(self.selected_groups)
+
+    def update_groups(self, groups: Dict[str, int]):
+        self.groups = groups
+        self.menu.clear()
+        self.checkboxes.clear()
+        self.setup_menu()
+        self.update_button_label()

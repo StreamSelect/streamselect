@@ -1,0 +1,193 @@
+"""Surface mpv's own stderr into our log — it was silently discarded.
+
+PLAY-10: both mpv launch sites in ``mpv.py`` ran with
+``stderr=subprocess.DEVNULL``, so none of mpv's own diagnostics — the exact
+"HTTP error 500", "Will reconnect at 0 in Ns" lines ffmpeg emits during the
+same-provider-switch retry backoff this slice fixes — ever reached the app
+log. A user report ("it's just hanging") had a complete picture sitting in a
+process nobody was reading.
+
+:func:`start_log_tap` is the one place a launched mpv process's stderr is
+piped and read; both Popen sites in ``mpv.py`` call it right after launch,
+each passing ``--msg-level=all=warn`` on the command line first so the volume
+stays small — see the option's exact choice in the PR body.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+import threading
+import time
+from typing import NamedTuple
+
+from loguru import logger
+
+
+class ExitRecord(NamedTuple):
+    """How an mpv process ended — the evidence the playback watchdog lacked.
+
+    An mpv that exits while still OPENING (loaded a path, never got demuxer
+    data) looks exactly like a user closing a just-loaded window unless the
+    reason is known: mpv prints ``Exiting... (Quit)`` for a user close and
+    ``Exiting... (End of file)`` / ``(Errors when loading file)`` for a stream
+    that gave it nothing — at ``cplayer=info``, which is why the launch sites
+    raise that one domain above ``all=warn``. A user log: a
+    cold play on a one-connection source died this way inside 30 s with no
+    warning line, no report, and no retry.
+    """
+    reason: str | None
+    returncode: int | None
+    elapsed_s: float
+
+
+#: ``Exiting... (End of file)`` → ``End of file``.
+_EXIT_RE = re.compile(r"Exiting\.\.\. \((?P<reason>[^)]*)\)")
+
+#: ``[ffmpeg] http: HTTP error 509`` → ``509``. This is ffmpeg's own line for
+#: any non-2xx HTTP response on the stream's own connection — 509 in
+#: particular is an Xtream provider refusing because the account is already
+#: at its connection limit (PLAY-21), but the pattern matches any status.
+_HTTP_ERR_RE = re.compile(r"HTTP error (?P<code>\d{3})")
+
+#: Reasons that mean the STREAM ended the process, not the user.
+STREAM_EXIT_REASONS: frozenset[str] = frozenset({
+    "End of file", "Errors when loading file", "Some errors happened",
+})
+
+_exits: dict[str, ExitRecord] = {}
+#: Last HTTP status code ffmpeg reported for *key*, with the monotonic time it
+#: was tapped — the timestamp is what lets a reader tell "this play's own
+#: error" from "a previous file's error in the same long-lived mpv instance".
+_http_errors: dict[str, tuple[int, float]] = {}
+_exits_lock = threading.Lock()   # one lock for the tap's shared state
+
+
+def last_exit(key: str) -> "ExitRecord | None":
+    """The recorded end of the last process launched under *key*, if any."""
+    with _exits_lock:
+        return _exits.get(key)
+
+
+def last_http_error(key: str, since: float) -> "int | None":
+    """The most recent HTTP status ffmpeg reported for *key*, if recent enough.
+
+    Returns the code only when its tapped timestamp is ``>= since``; otherwise
+    (including when no HTTP error line has been tapped for this key at all)
+    returns None. The timestamp filter is what keeps a previous file's 509 in
+    the same long-lived mpv instance from being blamed on this play.
+    """
+    with _exits_lock:
+        rec = _http_errors.get(key)
+    if rec is None:
+        return None
+    code, ts = rec
+    return code if ts >= since else None
+
+
+def clear_exit(key: str) -> None:
+    """Forget *key*'s previous exit — called by the launch sites before Popen."""
+    with _exits_lock:
+        _exits.pop(key, None)
+        _http_errors.pop(key, None)
+
+#: Substrings (case-insensitive) that escalate a tapped line to WARNING —
+#: mpv/ffmpeg's own trouble signals, not routine playback chatter. Deliberately
+#: overlapping ("error" already covers "HTTP error"): each is named because the
+#: PR that added this enumerated them, not because they're mutually exclusive.
+_WARNING_MARKERS = (
+    "http error", "failed to open", "connection refused", "reconnect", "error",
+)
+
+
+def _exit_code(proc: "subprocess.Popen") -> int | None:
+    """The process's return code, waiting briefly rather than racing EOF.
+
+    PLAY-12: ``proc.poll()`` right at EOF used to race the child's own exit —
+    the pipe closes a beat before the OS finishes reaping it, so ``poll()``
+    still read ``None`` and every exit logged ``rc=None``. ``proc.wait(timeout=5)``
+    blocks (briefly: EOF means the process is already gone or seconds from it)
+    for the real code instead, so ``rc=None`` in the log now means "still
+    running after 5s", not "we didn't wait". A double with no ``.wait`` (some
+    test stand-ins) falls back to ``.poll()`` unchanged.
+    """
+    wait = getattr(proc, "wait", None)
+    if callable(wait):
+        try:
+            rc = wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.debug("mpv still running 5s after its output closed; rc unknown")
+            rc = None
+    else:
+        poll = getattr(proc, "poll", None)
+        rc = poll() if callable(poll) else None
+    return rc if isinstance(rc, int) else None
+
+
+def start_log_tap(proc: "subprocess.Popen", key: str) -> threading.Thread:
+    """Start a daemon thread that logs *proc*'s output, tagged with *key*.
+
+    Never joined by the caller: shutdown must not wait on a stream that may
+    still be reconnecting. The thread exits on its own once the stream hits
+    EOF (the process died or closed the pipe).
+
+    Args:
+        proc: The launched mpv process. Reads ``proc.stdout`` when present,
+            else ``proc.stderr`` — both launch sites now merge stderr into
+            stdout (PLAY-12: mpv's own ``Exiting... (reason)`` line prints at
+            ``cplayer=info``, which mpv writes to stdout, not stderr; the old
+            stderr-only tap could never see it). Either must be a readable
+            byte stream (a real pipe, or a test double such as
+            ``io.BytesIO``) — anything whose ``readline()`` doesn't yield
+            ``bytes`` (e.g. an unconfigured ``MagicMock`` process double in a
+            test) ends the pump immediately rather than spinning: a real
+            pipe's EOF sentinel (``b""``) is itself ``bytes``, so this never
+            fires against genuine mpv output.
+        key: Instance key this process belongs to — or, for the standalone
+            no-IPC launch that has no instance key, the play's title. Included
+            in every log line so a multi-window session's mpv chatter is
+            traceable to the process that produced it.
+
+    Returns:
+        The started daemon thread.
+    """
+    started = time.monotonic()
+    reason: str | None = None
+
+    def _record_exit() -> None:
+        rec = ExitRecord(reason, _exit_code(proc), round(time.monotonic() - started, 1))
+        with _exits_lock:
+            _exits[key] = rec
+        logger.info("mpv[{}] exited rc={} after {}s ({})", key, rec.returncode,
+                    rec.elapsed_s, reason or "no exit reason seen")
+
+    def _pump() -> None:
+        nonlocal reason
+        try:
+            stream = proc.stdout if proc.stdout is not None else proc.stderr
+            if stream is None:
+                return
+            for raw_line in iter(stream.readline, b""):
+                if not isinstance(raw_line, (bytes, bytearray)):
+                    break   # not a real byte stream — see Args note above
+                line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                if not line:
+                    continue
+                m = _EXIT_RE.search(line)
+                if m:
+                    reason = m.group("reason")
+                http_m = _HTTP_ERR_RE.search(line)
+                if http_m:
+                    with _exits_lock:
+                        _http_errors[key] = (int(http_m.group("code")), time.monotonic())
+                if any(marker in line.lower() for marker in _WARNING_MARKERS):
+                    logger.warning("mpv[{}] {}", key, line)
+                else:
+                    logger.debug("mpv[{}] {}", key, line)
+            _record_exit()
+        except Exception:
+            logger.exception("mpv log tap for [{}] crashed", key)
+
+    thread = threading.Thread(target=_pump, name=f"mpv-log-tap-{key}", daemon=True)
+    thread.start()
+    return thread

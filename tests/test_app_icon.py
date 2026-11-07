@@ -1,0 +1,103 @@
+"""The app ships an icon, and the app actually sets it.
+
+There was none earlier. ``packaging/streamselect.spec:153`` read
+``icon=None,  # placeholder omitted for the MVP; add packaging/streamselect.icns
+later``, nothing called ``setWindowIcon``, and a ``feat/app-icon`` branch
+existed with zero commits — so every surface fell back to the window manager's
+generic square. User report: "what ever happened to the app icon? Shouldn't that be
+displaying?"
+
+These assert the two halves that were missing: the files exist, and the startup
+path reads them. A rendered icon nobody sets is the state we just left.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import re
+
+import pytest
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+ICON_DIR = REPO_ROOT / "packaging" / "icon"
+
+# 16 is the size that decides an icon — dock, taskbar, alt-tab. 1024 is what
+# the macOS iconset needs for its 512@2x slot.
+REQUIRED = (16, 32, 64, 128, 256, 512, 1024)
+
+
+@pytest.mark.parametrize("size", REQUIRED)
+def test_every_required_size_is_present(size):
+    """A missing size silently degrades to a scaled neighbour, or to nothing."""
+    png = ICON_DIR / f"streamselect-{size}.png"
+    assert png.exists(), f"{png.name} is missing"
+    assert png.stat().st_size > 100, f"{png.name} is suspiciously small"
+
+
+def test_the_source_svg_is_committed():
+    """PNGs regenerated from nothing are unmaintainable."""
+    assert (ICON_DIR / "streamselect.svg").exists()
+
+
+def test_the_pngs_are_the_size_they_claim():
+    """A 16px file that is really 512 scaled down defeats the point of the set."""
+    from PyQt6.QtGui import QImage
+
+    for size in REQUIRED:
+        img = QImage(str(ICON_DIR / f"streamselect-{size}.png"))
+        assert (img.width(), img.height()) == (size, size), (
+            f"streamselect-{size}.png is {img.width()}x{img.height()}"
+        )
+
+
+def test_startup_sets_the_window_icon():
+    """Rendering an icon nobody sets is exactly the state this replaced."""
+    src = (REPO_ROOT / "streamselect" / "__main__.py").read_text()
+
+    assert "setWindowIcon" in src, (
+        "__main__ never calls setWindowIcon, so the window and the task "
+        "switcher keep the system default however many PNGs are committed"
+    )
+    assert "bundle_resource_path" in src, (
+        "the icon path must resolve through bundle_resource_path, or it will "
+        "be found in a checkout and missing inside the packaged app"
+    )
+
+
+def test_the_spec_no_longer_hardcodes_no_icon():
+    """`icon=None` was the original defect, in one line."""
+    spec = (REPO_ROOT / "packaging" / "streamselect.spec").read_text()
+
+    assert not re.search(r"^\s*icon=None,\s*$", spec, re.M), (
+        "packaging/streamselect.spec still passes icon=None"
+    )
+    assert "streamselect-256.png" in spec, (
+        "the PNG is not in `datas`, so bundle_resource_path will not find it "
+        "inside the frozen app — the icon would work in a checkout only"
+    )
+
+
+def test_the_header_paints_the_mark_at_its_size_left_of_the_name(qtbot):
+    """A missing file or a dropped pixmap would leave only the wordmark."""
+    from unittest.mock import MagicMock
+
+    from PyQt6.QtWidgets import QWidget
+
+    from streamselect.gui.app_header import _AppHeaderMixin
+
+    class Host(_AppHeaderMixin, QWidget):
+        def __getattr__(self, name):
+            return MagicMock()
+
+    host = Host()
+    qtbot.addWidget(host)
+    header = host._create_header()
+    qtbot.addWidget(header)
+    header.resize(1400, 48)
+    header.show()
+    qtbot.waitExposed(header)
+    mark, brand = host.__dict__["_brand_mark"], host.__dict__["_brand_label"]
+    assert not mark.pixmap().isNull()
+    assert mark.width() == 24 and mark.height() == 24
+    assert mark.geometry().right() < brand.geometry().left()
+    assert brand.width() >= brand.fontMetrics().horizontalAdvance("StreamSelect")

@@ -1,0 +1,455 @@
+"""Tests for B7-5 — sidebar sections refresh off-thread.
+
+Pins three invariants per section (Favorites, History, WatchQueue):
+
+1. ``refresh()`` submits work to an executor — it does NOT block the caller.
+2. ``_bg_refresh()`` returns plain DTO / dataclass data (no live ORM session) and
+   emits ``None`` on failure so the section can render an error row.
+3. ``_on_data_ready()`` populates the section list correctly on the main thread —
+   the sort / continue-vs-never split, the media-icon mapping, the episode-code
+   rendering, AND the failure path (``None`` → a visible error row, never a silent
+   blank). This is the half that actually regresses, so it is tested directly.
+
+``_bg_refresh`` is tested with a mock db (no Qt). ``_on_data_ready`` is tested with a
+real ``QListWidget`` under a module ``QApplication`` — the section instances are built
+via ``__new__`` so no full Qt widget tree is needed.
+
+RecommendedSection is already off-thread and is not re-tested here.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from streamselect.core.repositories.dtos import FavoriteDTO, HistoryDTO
+from tests.conftest import sidebar_config
+
+
+# ---------------------------------------------------------------------------
+# Fixtures / helpers
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def qapp():
+    """A process-wide QApplication so QListWidget can be instantiated headless."""
+    from PyQt6.QtWidgets import QApplication
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
+def _icon_config():
+    """Every field a sidebar section reads — see conftest.sidebar_config."""
+    return sidebar_config()
+
+
+def _mock_db():
+    """A fake db whose session_scope() yields a throwaway session."""
+    mock_session = MagicMock()
+    cm = MagicMock()
+    cm.__enter__ = MagicMock(return_value=mock_session)
+    cm.__exit__ = MagicMock(return_value=False)
+    db = MagicMock()
+    db.session_scope.return_value = cm
+    return db
+
+
+def _texts(list_widget):
+    """Each row as it READS — a plain item's text, or a heading's label+count."""
+    from tests.conftest import sidebar_item_text
+
+    return [sidebar_item_text(list_widget, list_widget.item(i))
+            for i in range(list_widget.count())]
+
+
+def _chip_icon_role(list_widget, i):
+    """The media-type ICON role painted on row ``i`` (or None if plain).
+
+    The type is a glyph again — it was briefly the WORD ("Movie · 1985"), which
+    is the repetition the icon column exists to prevent. These tests still
+    assert each row is told apart by its media type; they now read the pixmap
+    it is painted with rather than text that is no longer there.
+    """
+    from PyQt6.QtWidgets import QLabel
+    w = list_widget.itemWidget(list_widget.item(i))
+    if w is None:
+        return None
+    marks = [
+        lbl for lbl in w.findChildren(QLabel)
+        if lbl.pixmap() is not None and not lbl.pixmap().isNull()
+    ]
+    return marks[0].pixmap().cacheKey() if marks else None
+
+
+def _icon_role_key(role):
+    """The cacheKey a row icon for *role* would paint with, for comparison."""
+    from streamselect.gui import icon_utils as _icon_utils
+    from streamselect.gui import icons as _icons
+    from streamselect.gui import theme as _theme
+    from streamselect.gui.chip_row import ICON_PX
+    return _icon_utils.vector_pixmap(
+        _icons.vector_key(role), _theme.COLOR_TEXT, ICON_PX
+    ).cacheKey()
+
+
+def _chip_title(list_widget, i):
+    """Title text of the chip row at row ``i`` (or None if it is a plain item)."""
+    from streamselect.gui.chip_row import row_title_label
+    w = list_widget.itemWidget(list_widget.item(i))
+    if w is None:
+        return None
+    lbl = row_title_label(w)
+    return lbl.text() if lbl else None
+
+
+def _row_positions(list_widget):
+    """Indices of CHANNEL rows, skipping any group heading.
+
+    History renders time-group headings ("Today", "Older") as real widgets, so
+    a row is no longer at the index its position in the DTO list suggests —
+    every index shifts by the headings above it.
+    """
+    from PyQt6.QtCore import Qt
+
+    role_bucket = Qt.ItemDataRole.UserRole + 8
+    return [i for i in range(list_widget.count())
+            if list_widget.item(i).data(role_bucket) is None]
+
+
+def _ids(list_widget):
+    """UserRole ids for non-header rows (headers carry no UserRole data).
+
+    Queue rows carry a dict payload (Wave 2 Slice 2B:
+    ``{"grain": ..., "channel_id"/"episode_id": ...}``); favorites rows still
+    carry a bare id string. Normalize to the row's primary id either way.
+    """
+    from PyQt6.QtCore import Qt
+    out = []
+    for i in range(list_widget.count()):
+        data = list_widget.item(i).data(Qt.ItemDataRole.UserRole)
+        if data is None:
+            continue
+        if isinstance(data, dict):
+            data = data.get("episode_id") or data.get("channel_id")
+        out.append(data)
+    return out
+
+
+# ===========================================================================
+# FavoritesSection
+# ===========================================================================
+
+def test_favorites_bg_refresh_returns_favorite_dtos():
+    """_bg_refresh must read via get_favorites_dto and emit the DTO list."""
+    from streamselect.gui.sidebar.favorites import FavoritesSection
+
+    dtos = [
+        FavoriteDTO(id="c1", name="Channel 1", media_type="movie", last_played=datetime.now()),
+        FavoriteDTO(id="c2", name="Channel 2", media_type="live", last_played=None),
+    ]
+
+    def fake_repos_factory(session):
+        repos = MagicMock()
+        repos.channels.get_favorites_dto.return_value = dtos
+        # Wave 2 Slice 2B: _load_rows also fetches favorited EPISODES — none here.
+        repos.episodes.get_favorites_dto.return_value = []
+        return repos
+
+    with patch("streamselect.gui.sidebar.favorites.RepositoryFactory", fake_repos_factory):
+        obj = FavoritesSection.__new__(FavoritesSection)
+        obj.db = _mock_db()
+        obj.config = _icon_config()
+        obj._data_ready = MagicMock()
+        obj._bg_refresh()
+
+    obj._data_ready.emit.assert_called_once_with((dtos, []))
+
+
+def test_favorites_bg_refresh_emits_none_on_error():
+    """_bg_refresh must emit None when the DB read fails so the section can render an error."""
+    from streamselect.gui.sidebar.favorites import FavoritesSection
+
+    db = MagicMock()
+    db.session_scope.side_effect = RuntimeError("db locked")
+
+    obj = FavoritesSection.__new__(FavoritesSection)
+    obj.db = db
+    obj.config = _icon_config()
+    obj._data_ready = MagicMock()
+    obj._bg_refresh()
+
+    obj._data_ready.emit.assert_called_once_with(None)
+
+
+def test_favorites_on_data_ready_splits_sorts_and_maps_icons(qapp):
+    """_on_data_ready must split continue/never, sort each, and map media icons."""
+    from PyQt6.QtWidgets import QListWidget
+    from streamselect.gui.sidebar.favorites import FavoritesSection
+
+    obj = FavoritesSection.__new__(FavoritesSection)
+    obj.favorites_list = QListWidget()
+    obj.config = _icon_config()
+    obj.set_empty = lambda *_: None
+
+    dtos = [
+        FavoriteDTO(id="c1", name="Alpha", media_type="movie", last_played=None),
+        FavoriteDTO(id="c2", name="Beta", media_type="series", last_played=datetime(2024, 1, 2)),
+        FavoriteDTO(id="c3", name="Gamma", media_type="live", last_played=datetime(2024, 1, 5)),
+    ]
+    # (channel_dtos, episode_dtos) — Wave 2 Slice 2B; no favorited episodes here.
+    obj._on_data_ready((dtos, []))
+
+    # Headers are GroupHeading widgets; content rows are chip rows.
+    texts = _texts(obj.favorites_list)
+    # continue-watching sorted by last_played desc (c3 then c2), then never-watched (c1)
+    assert _ids(obj.favorites_list) == ["c3", "c2", "c1"]
+    assert "Continue Watching" in texts[0]
+    assert _chip_icon_role(obj.favorites_list, 1) == _icon_role_key("live")   # c3 live
+    assert _chip_title(obj.favorites_list, 1) == "Gamma"
+    assert _chip_icon_role(obj.favorites_list, 2) == _icon_role_key("series")   # c2 series
+    assert "Never Watched" in texts[3]
+    assert _chip_icon_role(obj.favorites_list, 4) == _icon_role_key("movie")   # c1 movie
+    assert _chip_title(obj.favorites_list, 4) == "Alpha"
+
+
+def test_favorites_on_data_ready_empty_shows_hint(qapp):
+    from PyQt6.QtWidgets import QListWidget
+    from streamselect.gui.sidebar.favorites import FavoritesSection
+
+    obj = FavoritesSection.__new__(FavoritesSection)
+    obj.favorites_list = QListWidget()
+    obj.config = _icon_config()
+    obj.set_empty = lambda *_: None
+
+    obj._on_data_ready(([], []))
+    assert _texts(obj.favorites_list) == [
+        "No favorites yet",
+        "Right-click any channel to add to favorites",
+    ]
+
+
+def test_favorites_on_data_ready_none_shows_error_row(qapp):
+    """A failed load (None) must render a distinct error row, never a silent blank."""
+    from PyQt6.QtWidgets import QListWidget
+    from streamselect.gui.sidebar.favorites import FavoritesSection
+
+    obj = FavoritesSection.__new__(FavoritesSection)
+    obj.favorites_list = QListWidget()
+    obj.config = _icon_config()
+    obj.set_empty = lambda *_: None
+
+    obj._on_data_ready(None)
+    texts = _texts(obj.favorites_list)
+    assert len(texts) == 1
+    assert not obj.favorites_list.item(0).icon().isNull(), "the error row carries the warning icon"
+    assert "Couldn't load favorites" in texts[0]
+
+
+# ===========================================================================
+# HistorySection
+# ===========================================================================
+
+def test_history_bg_refresh_uses_build_history_dtos():
+    """_bg_refresh must call build_history_dtos and emit the result."""
+    from streamselect.gui.sidebar.history import HistorySection
+
+    dtos = [
+        HistoryDTO(id="c1", name="My Show", media_type="series", episode_code="S01E03"),
+        HistoryDTO(id="c2", name="Action Movie", media_type="movie", episode_code=None),
+    ]
+
+    def fake_build(repos, limit, adult_mode):
+        return dtos
+
+    # build_history_dtos is imported inside _bg_refresh from streamselect.core.repositories.dtos,
+    # so patch it at its definition site.
+    with patch("streamselect.gui.sidebar.history.RepositoryFactory", lambda s: MagicMock()), \
+         patch("streamselect.core.repositories.dtos.build_history_dtos", fake_build):
+        obj = HistorySection.__new__(HistorySection)
+        obj.db = _mock_db()
+        obj.config = _icon_config()
+        obj._data_ready = MagicMock()
+        obj._bg_refresh()
+
+    obj._data_ready.emit.assert_called_once_with(dtos)
+
+
+def test_history_bg_refresh_emits_none_on_error():
+    """_bg_refresh must emit None when the DB read fails."""
+    from streamselect.gui.sidebar.history import HistorySection
+
+    db = MagicMock()
+    db.session_scope.side_effect = RuntimeError("db locked")
+
+    obj = HistorySection.__new__(HistorySection)
+    obj.db = db
+    obj.config = _icon_config()
+    obj._data_ready = MagicMock()
+    obj._bg_refresh()
+
+    obj._data_ready.emit.assert_called_once_with(None)
+
+
+def test_history_on_data_ready_renders_episode_code_and_icons(qapp):
+    """Series rows carry the episode code on the meta line; movies have none."""
+    from PyQt6.QtWidgets import QListWidget
+    from streamselect.gui.sidebar.history import HistorySection
+
+    obj = HistorySection.__new__(HistorySection)
+    obj.history_list = QListWidget()
+    obj.config = _icon_config()
+    obj.set_empty = lambda *_: None
+
+    dtos = [
+        HistoryDTO(id="c1", name="My Show", media_type="series", episode_code="S01E03"),
+        HistoryDTO(id="c2", name="A Film", media_type="movie", episode_code=None),
+    ]
+    obj._on_data_ready(dtos)
+
+    assert _ids(obj.history_list) == ["c1", "c2"]   # history preserves order, no split
+    # Addressed by ROW rather than by list index: these two sit under a time
+    # heading now, so index 0 is "Older", not "My Show".
+    rows = _row_positions(obj.history_list)
+    assert len(rows) == 2, f"expected two rows, got {len(rows)}"
+    # V3: the episode code moved OFF the title and onto the meta line, where it is
+    # always fully visible instead of competing with the title for width.
+    assert _chip_title(obj.history_list, rows[0]) == "My Show"
+    assert _chip_icon_role(obj.history_list, rows[0]) == _icon_role_key("series")
+    assert _chip_title(obj.history_list, rows[1]) == "A Film"
+    # Nothing to say on a second line (no episode, no year, never played) — so the
+    # row does not grow one. A blank meta line would be a row of wasted height.
+    assert _chip_icon_role(obj.history_list, rows[1]) == _icon_role_key("movie")
+
+
+def test_history_on_data_ready_none_shows_error_row(qapp):
+    from PyQt6.QtWidgets import QListWidget
+    from streamselect.gui.sidebar.history import HistorySection
+
+    obj = HistorySection.__new__(HistorySection)
+    obj.history_list = QListWidget()
+    obj.config = _icon_config()
+    obj.set_empty = lambda *_: None
+
+    obj._on_data_ready(None)
+    texts = _texts(obj.history_list)
+    assert len(texts) == 1
+    assert not obj.history_list.item(0).icon().isNull(), "the error row carries the warning icon"
+    assert "Couldn't load history" in texts[0]
+
+
+# ===========================================================================
+# WatchQueueSection
+# ===========================================================================
+
+def test_queue_bg_refresh_returns_queue_entries():
+    """_bg_refresh must read via repos.queue.get_all() and emit the entries."""
+    from streamselect.gui.sidebar.queue import WatchQueueSection
+    from streamselect.core.repositories.queue import QueueEntry
+
+    entries = [
+        QueueEntry(queue_id=1, channel_id="c1", channel_name="Film A",
+                   media_type="movie", last_played=None, channel=None),
+        QueueEntry(queue_id=2, channel_id="c2", channel_name="My Show",
+                   media_type="series", last_played=datetime.now(), channel=None),
+    ]
+
+    def fake_repos_factory(session):
+        repos = MagicMock()
+        repos.queue.get_all.return_value = entries
+        return repos
+
+    with patch("streamselect.gui.sidebar.queue.RepositoryFactory", fake_repos_factory):
+        obj = WatchQueueSection.__new__(WatchQueueSection)
+        obj.db = _mock_db()
+        obj.config = _icon_config()
+        obj._data_ready = MagicMock()
+        obj._bg_refresh()
+
+    obj._data_ready.emit.assert_called_once_with(entries)
+
+
+def test_queue_bg_refresh_emits_none_on_error():
+    """_bg_refresh must emit None when the DB read fails."""
+    from streamselect.gui.sidebar.queue import WatchQueueSection
+
+    db = MagicMock()
+    db.session_scope.side_effect = RuntimeError("db locked")
+
+    obj = WatchQueueSection.__new__(WatchQueueSection)
+    obj.db = db
+    obj.config = _icon_config()
+    obj._data_ready = MagicMock()
+    obj._bg_refresh()
+
+    obj._data_ready.emit.assert_called_once_with(None)
+
+
+def test_queue_on_data_ready_splits_and_maps_icons(qapp):
+    from PyQt6.QtWidgets import QListWidget
+    from streamselect.gui.sidebar.queue import WatchQueueSection
+    from streamselect.core.repositories.queue import QueueEntry
+    from tests.conftest import wire_watch_queue_filter
+
+    obj = WatchQueueSection.__new__(WatchQueueSection)
+    obj._list = QListWidget()
+    obj.config = _icon_config()
+    obj.set_empty = lambda *_: None
+    wire_watch_queue_filter(obj)
+
+    entries = [
+        QueueEntry(queue_id=1, channel_id="q1", channel_name="Film A",
+                   media_type="movie", last_played=None, channel=None),
+        QueueEntry(queue_id=2, channel_id="q2", channel_name="My Show",
+                   media_type="series", last_played=datetime(2024, 1, 2), channel=None),
+    ]
+    obj._on_data_ready(entries)
+
+    texts = _texts(obj._list)
+    assert _ids(obj._list) == ["q2", "q1"]   # continue-watching (q2) before never-watched (q1)
+    assert "Continue Watching" in texts[0]
+    assert _chip_icon_role(obj._list, 1) == _icon_role_key("series")   # q2 series
+    assert _chip_title(obj._list, 1) == "My Show"
+    assert "Never Watched" in texts[2]
+    assert _chip_icon_role(obj._list, 3) == _icon_role_key("movie")   # q1 movie
+    assert _chip_title(obj._list, 3) == "Film A"
+
+
+def test_queue_on_data_ready_none_shows_error_row(qapp):
+    from PyQt6.QtWidgets import QListWidget
+    from streamselect.gui.sidebar.queue import WatchQueueSection
+
+    obj = WatchQueueSection.__new__(WatchQueueSection)
+    obj._list = QListWidget()
+    obj.config = _icon_config()
+    obj.set_empty = lambda *_: None
+
+    obj._on_data_ready(None)
+    texts = _texts(obj._list)
+    assert len(texts) == 1
+    assert not obj._list.item(0).icon().isNull(), "the error row carries the warning icon"
+    assert "Couldn't load watch queue" in texts[0]
+
+
+# ===========================================================================
+# Pattern / thread-leak guards
+# ===========================================================================
+
+def test_sections_have_bg_refresh_pattern():
+    """Each off-thread section must implement _bg_refresh and own a _data_ready signal.
+
+    RecommendedSection uses _rec_data_ready (its name predates this band); the three
+    new sections use _data_ready for consistency. Owning an executor is what the
+    closeEvent cleanup loop keys on (hasattr(section, "_executor")).
+    """
+    from streamselect.gui.sidebar.favorites import FavoritesSection
+    from streamselect.gui.sidebar.history import HistorySection
+    from streamselect.gui.sidebar.queue import WatchQueueSection
+    from streamselect.gui.sidebar.recommended import RecommendedSection
+
+    for cls in (FavoritesSection, HistorySection, WatchQueueSection, RecommendedSection):
+        assert hasattr(cls, "_bg_refresh"), f"{cls.__name__} is missing _bg_refresh"
+
+    for cls in (FavoritesSection, HistorySection, WatchQueueSection):
+        assert hasattr(cls, "_data_ready"), f"{cls.__name__} is missing _data_ready signal"

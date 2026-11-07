@@ -1,0 +1,339 @@
+"""Notification system for background operations"""
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Optional, Callable
+from uuid import uuid4
+
+try:
+    from PyQt6.QtCore import QTimer
+    QT_AVAILABLE = True
+except ImportError:
+    QT_AVAILABLE = False
+
+
+#: Longest an error message may be before it is cut. Generous for a sentence,
+#: far under anything that turns a toast into a wall.
+_MAX_ERROR_CHARS = 240
+
+
+def condense_error(text: str) -> str:
+    """Reduce an exception's text to the one line a person can act on.
+
+    A failed provider refresh put the WHOLE SQLAlchemy error in a toast —
+    including the statement — so the notification was several thousand
+    characters of ``(?, ?, ?, …)`` with the actual cause, "database is locked",
+    scrolled off the top. The screenshot of it is unreadable in every sense.
+
+    SQLAlchemy formats errors as ``(sqlite3.OperationalError) database is
+    locked\n[SQL: …]\n[parameters: …]``, so the first line IS the cause and
+    everything after it is diagnostic detail that belongs in the log — where it
+    already is, in full, at the same moment.
+
+    Args:
+        text: The raw exception text.
+
+    Returns:
+        A single line, at most ``_MAX_ERROR_CHARS`` characters, ellipsised if
+        it had to be cut.
+    """
+    first = (text or "").strip().split("\n", 1)[0].strip()
+    # Some drivers put the statement on the SAME line as the message.
+    for marker in ("[SQL:", "[parameters:"):
+        if marker in first:
+            first = first.split(marker, 1)[0].strip()
+    if len(first) > _MAX_ERROR_CHARS:
+        first = first[:_MAX_ERROR_CHARS - 1].rstrip() + "…"
+    return first or "Unknown error"
+
+
+class NotificationType(Enum):
+    """Type of notification"""
+    INFO = "info"
+    SUCCESS = "success"
+    WARNING = "warning"
+    ERROR = "error"
+    PROGRESS = "progress"
+
+
+class NotificationPriority(Enum):
+    """Notification priority"""
+    LOW = 1
+    NORMAL = 2
+    HIGH = 3
+
+
+class StepStatus(Enum):
+    """Status of a single step in a stepped notification."""
+    PENDING = "pending"
+    ACTIVE  = "active"
+    DONE    = "done"
+
+
+@dataclass
+class Notification:
+    """Notification data"""
+
+    id: str = field(default_factory=lambda: str(uuid4()))
+    title: str = ""
+    message: str = ""
+    type: NotificationType = NotificationType.INFO
+    priority: NotificationPriority = NotificationPriority.NORMAL
+
+    # Progress-specific
+    progress: Optional[float] = None  # 0.0 to 1.0
+    progress_current: Optional[int] = None
+    progress_total: Optional[int] = None
+    estimated_time_remaining: Optional[int] = None  # seconds
+
+    # Steps checklist — optional list of (label, StepStatus).
+    # When present the card renders a per-step row instead of a raw progress bar.
+    # Notifications without steps render exactly as before (backward-compatible).
+    steps: Optional[list] = None  # list[tuple[str, StepStatus]]
+
+    # When False the progress bar is suppressed entirely even for PROGRESS type.
+    # Use for queue-overview notifications where the steps ARE the progress indicator
+    # and an always-0% bar would be misleading (total=None → indeterminate → useless).
+    show_progress_bar: bool = True
+
+    # Actions
+    # list[(label, callback)] or [(label, callback, keep_open)] — keep_open
+    # (default False) skips the automatic dismiss-on-click for an action that
+    # must not close a persistent card, e.g. "Watch" on the Catch, Keep,
+    # Record recording notice, where "Stop" (the default, dismissing) is the
+    # one that actually ends what the card is about.
+    actions: list = field(default_factory=list)
+    dismissible: bool = True
+    auto_dismiss_seconds: Optional[int] = None
+
+    # Grouping
+    group_id: Optional[str] = None  # For grouping related notifications
+
+    # State
+    created_at: datetime = field(default_factory=datetime.now)
+    is_collapsed: bool = False
+    is_dismissed: bool = False
+
+
+class NotificationManager:
+    """Manages application notifications"""
+
+    def __init__(self, max_visible: int = 3):
+        self.notifications: list[Notification] = []
+        self.max_visible = max_visible
+        self.listeners: list[Callable] = []
+        self.auto_dismiss_timers: dict = {}  # notification_id -> QTimer
+
+    def add_listener(self, callback: Callable):
+        """Add notification change listener"""
+        self.listeners.append(callback)
+
+    def remove_listener(self, callback: Callable):
+        """Remove notification change listener"""
+        if callback in self.listeners:
+            self.listeners.remove(callback)
+
+    def _notify_listeners(self):
+        """Notify all listeners of changes"""
+        for callback in self.listeners:
+            callback(self.get_visible_notifications())
+
+    def _setup_auto_dismiss(self, notification_id: str, seconds: int):
+        """Set up auto-dismiss timer for a notification"""
+        if not QT_AVAILABLE:
+            return
+
+        from loguru import logger
+
+        # Cancel existing timer if any
+        if notification_id in self.auto_dismiss_timers:
+            self.auto_dismiss_timers[notification_id].stop()
+            del self.auto_dismiss_timers[notification_id]
+
+        # Create new timer
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda: self._auto_dismiss_callback(notification_id))
+        timer.start(int(seconds * 1000))
+        self.auto_dismiss_timers[notification_id] = timer
+
+        logger.debug(f"Auto-dismiss timer created for {notification_id}: {seconds}s")
+
+    def _auto_dismiss_callback(self, notification_id: str):
+        """Callback when auto-dismiss timer fires"""
+        from loguru import logger
+        logger.debug(f"Auto-dismiss timer fired for {notification_id}")
+        self.dismiss(notification_id)
+
+    def show(self, notification: Notification = None, **kwargs) -> str:
+        """Show a notification
+
+        Args:
+            notification: Notification object OR
+            **kwargs: title, message, type, auto_dismiss_ms, etc.
+
+        Returns:
+            notification_id
+        """
+        if notification is None:
+            # Create notification from kwargs
+            notif_type = kwargs.get('type', 'info')
+            if isinstance(notif_type, str):
+                notif_type = NotificationType(notif_type)
+
+            auto_dismiss_ms = kwargs.get('auto_dismiss_ms')
+            if 'auto_dismiss_seconds' in kwargs:
+                auto_dismiss_seconds = kwargs['auto_dismiss_seconds']
+            else:
+                auto_dismiss_seconds = auto_dismiss_ms / 1000 if auto_dismiss_ms else None
+
+            notification = Notification(
+                title=kwargs.get('title', ''),
+                message=kwargs.get('message', ''),
+                type=notif_type,
+                dismissible=kwargs.get('dismissible', True),
+                auto_dismiss_seconds=auto_dismiss_seconds,
+                actions=kwargs.get('actions', []),
+            )
+
+        self.notifications.append(notification)
+
+        # Set up auto-dismiss timer if specified
+        if notification.auto_dismiss_seconds and notification.auto_dismiss_seconds > 0:
+            self._setup_auto_dismiss(notification.id, notification.auto_dismiss_seconds)
+
+        self._notify_listeners()
+        return notification.id
+
+    def update(self, notification_id: str, **kwargs):
+        """Update an existing notification"""
+        for notif in self.notifications:
+            if notif.id == notification_id:
+                auto_dismiss_changed = 'auto_dismiss_seconds' in kwargs
+
+                # Convert string type to enum before setting attributes
+                if 'type' in kwargs and isinstance(kwargs['type'], str):
+                    kwargs['type'] = NotificationType(kwargs['type'])
+
+                for key, value in kwargs.items():
+                    if hasattr(notif, key):
+                        setattr(notif, key, value)
+
+                if auto_dismiss_changed:
+                    if notif.auto_dismiss_seconds and notif.auto_dismiss_seconds > 0:
+                        self._setup_auto_dismiss(notif.id, notif.auto_dismiss_seconds)
+                    elif notification_id in self.auto_dismiss_timers:
+                        # Switching to persistent — cancel the existing timer
+                        self.auto_dismiss_timers[notification_id].stop()
+                        del self.auto_dismiss_timers[notification_id]
+
+                self._notify_listeners()
+                break
+
+    def dismiss(self, notification_id: str):
+        """Dismiss a notification"""
+        from loguru import logger
+        logger.debug(f"Dismissing notification {notification_id}")
+
+        # Cancel auto-dismiss timer if exists
+        if notification_id in self.auto_dismiss_timers:
+            self.auto_dismiss_timers[notification_id].stop()
+            del self.auto_dismiss_timers[notification_id]
+            logger.debug(f"Cleaned up timer for {notification_id}")
+
+        self.update(notification_id, is_dismissed=True)
+        # Remove from list
+        self.notifications = [n for n in self.notifications if n.id != notification_id]
+        self._notify_listeners()
+
+    def get_visible_notifications(self) -> list[Notification]:
+        """Get currently visible notifications"""
+        active = [n for n in self.notifications if not n.is_dismissed]
+
+        # Sort by priority and time
+        active.sort(key=lambda n: (n.priority.value, n.created_at), reverse=True)
+
+        return active[:self.max_visible]
+
+    def clear_all(self):
+        """Clear all notifications"""
+        # Stop all auto-dismiss timers
+        for timer in self.auto_dismiss_timers.values():
+            timer.stop()
+        self.auto_dismiss_timers.clear()
+
+        self.notifications.clear()
+        self._notify_listeners()
+
+    def show_progress(self, title: str, total: Optional[int] = None,
+                     group_id: Optional[str] = None,
+                     steps: Optional[list] = None,
+                     show_bar: bool = True) -> str:
+        """Show a progress notification.
+
+        Args:
+            title:    Toast header text.
+            total:    Optional raw progress total (used when *steps* is None).
+            group_id: Optional grouping key.
+            steps:    Optional list of ``(label, StepStatus)`` tuples.  When
+                      provided the card shows a per-step checklist instead of
+                      a raw progress bar.  The caller owns updating the list
+                      via :meth:`set_steps`.
+            show_bar: When ``False`` the progress bar is suppressed.  Use for
+                      queue-overview toasts where the steps list is the progress
+                      indicator and a permanently-0% bar would be misleading.
+
+        Returns:
+            notification_id for subsequent updates.
+        """
+        notif = Notification(
+            title=title,
+            type=NotificationType.PROGRESS,
+            progress=0.0,
+            progress_current=0,
+            progress_total=total,
+            dismissible=False,
+            group_id=group_id,
+            steps=steps,
+            show_progress_bar=show_bar,
+        )
+        return self.show(notif)
+
+    def set_steps(self, notification_id: str, steps: list) -> None:
+        """Replace the step list on an existing notification and notify listeners.
+
+        Args:
+            notification_id: Target notification.
+            steps:           New ``list[tuple[str, StepStatus]]``.  The caller
+                             is responsible for constructing a consistent list;
+                             this method only stores and broadcasts it.
+        """
+        self.update(notification_id, steps=steps)
+
+    def update_progress(self, notification_id: str, current: int,
+                       total: Optional[int] = None, message: Optional[str] = None):
+        """Update progress notification"""
+        updates = {
+            'progress_current': current,
+        }
+
+        if total is not None:
+            updates['progress_total'] = total
+            updates['progress'] = current / total if total > 0 else 0.0
+
+        if message:
+            updates['message'] = message
+
+        self.update(notification_id, **updates)
+
+    def complete_progress(self, notification_id: str, message: str = "Complete"):
+        """Mark progress as complete"""
+        self.update(
+            notification_id,
+            type=NotificationType.SUCCESS,
+            progress=1.0,
+            message=message,
+            dismissible=True,
+            auto_dismiss_seconds=5
+        )

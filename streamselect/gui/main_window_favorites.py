@@ -1,0 +1,1093 @@
+"""Favorites / queue / history / rating mixin for MainWindow.
+
+Extracted from MainWindow; mixed in via:
+    class MainWindow(_FavoritesMixin, ..., QMainWindow): ...
+
+All methods access state set in MainWindow.__init__ via ``self.*``.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+
+from loguru import logger
+from PyQt6.QtCore import Qt, QTimer
+
+from streamselect.core.repositories import RepositoryFactory
+from streamselect.gui import deferred_config_save as _cfgsave
+
+
+class _FavoritesMixin:
+    """Mixin: favorites, queue, history, ratings, and sidebar alert helpers."""
+
+    def _on_channel_state_echo(self, channel_id: str, delta: dict) -> None:
+        """ChannelStateBus tier-1 subscriber: instant optimistic channel-list echo.
+
+        Applies only the per-channel-row fields the model already knows how to
+        update in place; the bus's tier-2 authoritative re-read (already wired
+        by the constructor) corrects anything this echo gets wrong. Both model
+        setters no-op on an id that isn't in the current list.
+        """
+        if "rating" in delta and hasattr(self, "channel_model"):
+            self.channel_model.update_rating(channel_id, delta["rating"])
+        if "is_favorite" in delta and hasattr(self, "channel_model"):
+            self.channel_model.update_favorite(channel_id, delta["is_favorite"])
+
+    def _write_failed(self, what: str) -> None:
+        """DEBT-3 async write raised: say so instead of leaving stale state."""
+        logger.warning(f"Async write failed: {what}")
+        self.status(f"Could not save {what} — nothing changed", ms=0, level="error")
+
+    def _toggle_rating(self, channel_id: str, rating: int) -> None:
+        """Toggle a like/dislike; clicking the active rating clears it.
+
+        DEBT-3: write runs off the UI thread via ``_run_query``; publish fires
+        only once it lands.
+        """
+        def _write(repos):
+            current = repos.ratings.get(channel_id)
+            if current == rating:
+                repos.ratings.clear(channel_id)
+                return 0
+            repos.ratings.set(channel_id, rating)
+            # A like/dislike is mutually exclusive with "not interested" —
+            # clear any suppression so the sentiment buttons stay consistent.
+            repos.channels.set_rec_suppressed(channel_id, False)
+            return rating
+        def _on_result(new_rating):
+            if self.view_mode == "preferences":
+                self.preferences_view.refresh()
+            self._refresh_recommended_section()
+            self.channel_state_bus.publish(channel_id, rating=new_rating)
+        self._run_query(_write, _on_result, commit=True, on_error=lambda e: self._write_failed("your rating"))
+
+    def _toggle_favorite_by_id(self, channel_id: str, make_favorite: bool) -> None:
+        """Set favorite status explicitly (context-menu path). DEBT-3: async write."""
+        def _write(repos):
+            channel = repos.channels.get_by_id(channel_id)
+            if not channel:
+                return None
+            channel.is_favorite = make_favorite
+            return True
+        def _on_result(result):
+            if result is None:
+                return
+            # Un-favoriting removes one row; favoriting needs the full render.
+            if make_favorite:
+                self.load_favorites()
+            else:
+                self._remove_sidebar_row("favorites", channel_id)
+            self.channel_state_bus.publish(channel_id, is_favorite=make_favorite)
+        self._run_query(_write, _on_result, commit=True, on_error=lambda e: self._write_failed("favorite"))
+
+    def _hide_channel_from_alerts(self, channel_id: str) -> None:
+        """Hide a channel from Watch Alerts. DEBT-3: async write."""
+        def _write(repos):
+            repos.channels.set_hidden(channel_id, True)
+            return True
+        def _on_result(_result):
+            self._refresh_watch_alerts()
+            self.load_history()
+            self.load_channels()
+            self.channel_state_bus.publish(channel_id, is_hidden=True)
+        self._run_query(_write, _on_result, commit=True, on_error=lambda e: self._write_failed("hiding this channel"))
+
+    def _not_interested(self, channel_id: str, suppressed: bool = True) -> None:
+        """Suppress (or un-suppress) channel from recommendations only.
+
+        Turning suppression on is mutually exclusive with a like/dislike — the
+        rating is cleared so the sentiment buttons stay consistent.
+        """
+        from streamselect.core.database import UserRatingDB
+        with self.db.session_scope() as session:
+            RepositoryFactory(session).channels.set_rec_suppressed(channel_id, suppressed)
+            if suppressed:
+                current = session.get(UserRatingDB, channel_id)
+                if current:
+                    session.delete(current)
+        if suppressed and hasattr(self, "channel_model"):
+            self.channel_model.update_rating(channel_id, 0)
+        self.preferences_view.refresh()
+        if suppressed:
+            # "Not interested" takes this one title off the rail. The other 19
+            # recommendations' scores are unchanged, so re-running the engine to
+            # drop one row is work with nothing to show for it.
+            self._remove_sidebar_row("recommended", channel_id)
+        else:
+            self._refresh_recommended_section()
+        self.channel_state_bus.publish(channel_id, is_suppressed=suppressed)
+
+    def _on_suppression_requested(self, channel_id: str, suppressed: bool) -> None:
+        self._not_interested(channel_id, suppressed)
+
+    def _on_hide_from_details_pane(self, channel_id: str) -> None:
+        self._hide_channel_from_recommendations(channel_id)
+
+    # --- VOD Mark-as-Watched helpers (channel list / history / favorites) ---
+
+    def _mark_channel_watched(self, channel_id: str) -> None:
+        """Mark a movie or series channel as watched and update the row in place.
+
+        When the "Hide watched" filter is ON, the row is removed from the model
+        immediately (no full reload).  When the filter is OFF, the row's watch
+        indicator updates in place via ``update_watch_completed``.
+        """
+        with self.db.session_scope() as session:
+            RepositoryFactory(session).channels.mark_watched(channel_id, watched=True)
+        self._apply_mark_watched_ui([channel_id], watched=True)
+
+    def _mark_channel_unwatched(self, channel_id: str) -> None:
+        """Mark a movie or series channel as unwatched and update the row in place."""
+        with self.db.session_scope() as session:
+            RepositoryFactory(session).channels.mark_watched(channel_id, watched=False)
+        self._apply_mark_watched_ui([channel_id], watched=False)
+
+    def _on_details_watched_toggled(self, channel_id: str, watched: bool) -> None:
+        """Details-pane Watched toggle — route through the shared mark-watched chokepoint.
+
+        Reuses the same per-channel mark/unmark path the context-menu "Mark as
+        Watched" action uses, so persistence + in-place row updates stay identical.
+
+        Args:
+            channel_id: The channel whose watched state changed.
+            watched: True to mark watched, False to mark unwatched.
+        """
+        if watched:
+            self._mark_channel_watched(channel_id)
+        else:
+            self._mark_channel_unwatched(channel_id)
+
+    def _bulk_mark_watched(self, channel_ids: list[str]) -> None:
+        """Toggle the watched state for multiple channels atomically, then update rows in place.
+
+        If ALL selected channels are already watched, unmarks them all; otherwise
+        marks them all as watched.  The decision is always re-derived from the DB
+        (not from the menu context) so stale context data can never mis-toggle.
+
+        Args:
+            channel_ids: IDs of the channels whose watched state should be toggled.
+        """
+        from streamselect.core.database import ChannelDB
+        with self.db.session_scope(commit=False) as session:
+            watched_count = (
+                session.query(ChannelDB)
+                .filter(
+                    ChannelDB.id.in_(channel_ids),
+                    ChannelDB.watch_completed == True,  # noqa: E712
+                )
+                .count()
+            )
+        all_watched = len(channel_ids) > 0 and watched_count == len(channel_ids)
+        target_watched = not all_watched  # all watched → unmark; otherwise mark
+
+        with self.db.session_scope() as session:
+            RepositoryFactory(session).channels.mark_watched_bulk(channel_ids, watched=target_watched)
+        self._apply_mark_watched_ui(channel_ids, watched=target_watched)
+
+    def _apply_mark_watched_ui(self, channel_ids: list[str], watched: bool) -> None:
+        """Update the channel model after a mark-watched DB write — no full reload.
+
+        If "Hide watched" is ON and we're marking as watched: remove the affected
+        rows from the model and decrement the watched-hidden count so the stats
+        label stays accurate.  Otherwise just refresh the watch indicator in place.
+
+        Args:
+            channel_ids: The channels whose watch state changed.
+            watched: True if marking watched, False if marking unwatched.
+        """
+        hide_watched = bool(getattr(self, '_stats_hide_watched', False))
+        for cid in channel_ids:   # D60: the details pane re-reads (resume, watched badge)
+            self.channel_state_bus.publish(cid, watch_completed=watched)
+        if not hasattr(self, 'channel_model'):
+            self.load_channels()  # model not set up yet
+            return
+
+        if hide_watched and watched:
+            # Filter is ON and item just became watched → remove rows from model.
+            for cid in channel_ids:
+                self.channel_model.remove_channel(cid)
+            # Increment the watched hidden count in the stats (no DB round-trip needed).
+            current_hidden = getattr(self, '_stats_watched_hidden', 0)
+            self._stats_watched_hidden = current_hidden + len(channel_ids)
+            self._refresh_channel_stats_label()
+        else:
+            # Filter is OFF (or unmarking watched) → update the watch indicator in place.
+            for cid in channel_ids:
+                self.channel_model.update_watch_completed(
+                    cid,
+                    watch_completed=watched,
+                    watch_percent=100 if watched else 0,
+                    watch_progress=0,
+                )
+
+    def _bulk_add_to_favorites(self, channel_ids: list[str]) -> None:
+        """Add multiple channels to Favorites, then refresh. BUS-2 (see
+        channel_state_bus.py): DEBT-3 async write; each found channel
+        publishes once the batch commits; load_favorites() stays one call."""
+        def _write(repos):
+            favorited = []
+            for cid in channel_ids:
+                ch = repos.channels.get_by_id(cid)
+                if ch:
+                    ch.is_favorite = True
+                    favorited.append(cid)
+            return favorited
+        def _on_result(favorited):
+            self.load_favorites()
+            for cid in favorited:
+                self.channel_state_bus.publish(cid, is_favorite=True)
+        self._run_query(_write, _on_result, commit=True, on_error=lambda e: self._write_failed("favoriting these channels"))
+
+    def _bulk_add_to_queue(self, channel_ids: list[str]) -> None:
+        """Add multiple channels to the Watch Queue, then refresh. BUS-2 (see
+        channel_state_bus.py): DEBT-3 async write; each channel publishes
+        in_queue=True once the batch commits (queue.add no-ops if already
+        queued); the two section refreshes stay one call each."""
+        from streamselect.core.database import ChannelDB
+        def _write(repos):
+            for cid in channel_ids:
+                ch = repos.session.get(ChannelDB, cid)
+                repos.queue.add(
+                    cid, channel_name=ch.name if ch else "",
+                    media_type=ch.media_type if ch else "", source_id=ch.source_id if ch else "",
+                )
+            return list(channel_ids)
+        def _on_result(ids):
+            self._refresh_queue_section()
+            self._refresh_recommended_section()
+            for cid in ids:
+                self.channel_state_bus.publish(cid, in_queue=True)
+        self._run_query(_write, _on_result, commit=True, on_error=lambda e: self._write_failed("adding these channels to the queue"))
+
+    # --- Watch Queue helpers ---
+
+    def _add_to_queue(self, channel_id: str) -> None:
+        from streamselect.core.database import ChannelDB
+        with self.db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            ch = session.get(ChannelDB, channel_id)
+            repos.queue.add(
+                channel_id,
+                channel_name=ch.name if ch else "",
+                media_type=ch.media_type if ch else "",
+                source_id=ch.source_id if ch else "",
+            )
+        self._refresh_queue_section()
+        self._refresh_recommended_section()
+        self.channel_state_bus.publish(channel_id, in_queue=True)
+
+    def _remove_from_queue(self, channel_id: str) -> None:
+        with self.db.session_scope() as session:
+            RepositoryFactory(session).queue.remove(channel_id)
+        # One row left the queue — take that row out, don't rebuild 600.
+        self._remove_sidebar_row("queue", channel_id)
+        self._refresh_recommended_section()
+        self.channel_state_bus.publish(channel_id, in_queue=False)
+
+    def _sidebar_shows_channel(self, section_key: str, channel_id: str) -> bool:
+        """True when *section_key* currently renders a row for *channel_id*.
+
+        The cheap question to ask before an expensive rebuild. A section that
+        does not exist yet, is not loaded, or does not hold the channel needs no
+        refresh — and rebuilding it anyway is what made playback rebuild every
+        row of Favorites and the Watch Queue on every track change.
+
+        Conservative on the unknown: a section without ``has_row`` (a test
+        double, a section that keeps no list) answers False rather than
+        triggering a rebuild, because the callers here refresh only for a
+        channel the section is already showing.
+
+        Args:
+            section_key: Sidebar section id, e.g. ``"queue"``.
+            channel_id: The channel that just changed.
+
+        Returns:
+            True if that section is showing that channel right now.
+        """
+        try:
+            section = self.sidebar_sections.get(section_key)
+            has_row = getattr(section, "has_row", None)
+            if not callable(has_row):
+                return False
+            return bool(has_row(channel_id))
+        except RuntimeError:  # silent: a half-built host (MainWindow.__new__ in
+            # a test double) raises this from PyQt rather than AttributeError.
+            # Answering "not shown" makes the caller do the full refresh it
+            # would have done anyway; there is nothing to report.
+            return False
+        except Exception:
+            logger.exception(
+                "sidebar: could not test {} for {}", section_key, channel_id
+            )
+            return False
+
+    def _refresh_queue_section(self) -> None:
+        section = self.sidebar_sections.get("queue")
+        if section:
+            section.refresh()
+
+    def _remove_sidebar_row(self, section_key: str, key: str) -> None:
+        """Take ONE row out of a sidebar section instead of rebuilding it.
+
+        User report: "the entire watch queue still refreshes when a single line is
+        removed." Every mutation funnelled into ``section.refresh()``, which
+        re-reads the table off-thread and rebuilds every row widget — 600 chip
+        rows destroyed and rebuilt to delete one.
+
+        The one seam for it, so no caller hand-rolls a second: when the row is
+        not rendered here (``remove_row`` returns False — section never loaded,
+        or the row is not in view) it falls back to the full refresh rather than
+        leaving the sidebar disagreeing with the database.
+        """
+        section = self.sidebar_sections.get(section_key)
+        if section is None:
+            return
+        if not section.remove_row(key):
+            section.refresh()
+
+    def _refresh_alerts_retry_section(self) -> None:
+        section = self.sidebar_sections.get("alerts")
+        if section and hasattr(section, "refresh_retry"):
+            # Display path includes recovered "online" rows (green icon, "Back online!" tooltip) so they stay
+            # visible until the user removes them — get_all_pending() (checker-only) would drop them the instant
+            # they recover. See StreamRetryRepository.get_all_display.
+            entries = self.stream_retry_manager.get_all_display()
+            section.refresh_retry(entries)
+
+    def _on_retry_play_requested(self, channel_id: str, stream_url: str, channel_name: str) -> None:
+        """Double-click on a Stream Monitoring item — try launching the stream again."""
+        channel = None
+        with self.db.session_scope() as session:
+            channel = RepositoryFactory(session).channels.get_playable_dto(channel_id)
+        if channel:
+            self.play_media(channel)
+        else:
+            # Episode path — no ChannelDB entry; validate and play directly
+            self.launch_player_for_episode(stream_url, channel_name or stream_url, [])
+
+    def _on_retry_context_menu_requested(self, entry_id: str, channel_id: str, x: int, y: int) -> None:
+        """Thin wrapper → unified channel menu (retry surface)."""
+        ids = [channel_id] if channel_id else []
+        self._show_channel_menu(ids, "retry", x, y, entry_id=entry_id)
+
+    def _on_stream_back_online(self, channel_id: str, channel_name: str, stream_url: str = "") -> None:
+        """A previously-failed stream is back online — toast with a Play action.
+
+        Wired to ``StreamRetryManager.stream_online``. The Play action routes
+        through the existing retry-play seam (``_on_retry_play_requested`` —
+        the same handler double-clicking the Stream Monitoring row uses) so
+        it resolves the ChannelDB row when there is one, or falls back to the
+        episode-launch path otherwise.
+        """
+        self.notification_manager.show(
+            title="Stream Available",
+            message=f"{channel_name} is back online.",
+            type="success",
+            dismissible=True,
+            auto_dismiss_seconds=30,
+            actions=[(
+                "Play",
+                lambda _cid=channel_id, _url=stream_url, _name=channel_name:
+                    self._on_retry_play_requested(_cid, _url, _name)
+            )],
+        )
+        self._refresh_alerts_retry_section()
+
+    def search_for_title(self, title: str) -> None:
+        """Activate the Search view and pre-fill the search box with *title*.
+
+        Called when the user double-clicks an unavailable queue or favorites entry
+        to find a replacement on an active source.
+        """
+        # Ensure the Search chip is active and the channel-list view is actually shown (the user may be in
+        # EPG/Discover) — mirrors on_search_view_toggle, which switches the view via switch_to_list_view().
+        # Without this the query would run but the results stay hidden behind the current view.
+        if not self.search_chip.is_enabled():
+            self.search_chip.blockSignals(True)
+            self.search_chip.set_enabled(True)
+            self.search_chip.blockSignals(False)
+        self.switch_to_list_view()
+        self.search_input.setText(title)
+
+    def _clear_unavailable_queue(self, section) -> None:
+        """Confirm then remove all unavailable entries from the watch queue."""
+        from PyQt6.QtWidgets import QMessageBox
+        # Count without modifying; get hidden ids on a read-only pass.
+        count = 0
+        hidden: set[str] = set()
+        with self.db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            hidden = set(repos.providers.get_hidden_provider_ids())
+            entries = repos.queue.get_all(hidden_provider_ids=hidden)
+            count = sum(1 for e in entries if not e.available)
+
+        if count == 0:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Clear Unavailable",
+            f"Remove {count} unavailable item{'s' if count != 1 else ''} from your watch queue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        with self.db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            hidden = set(repos.providers.get_hidden_provider_ids())
+            repos.queue.clear_unavailable(hidden)
+
+        section.refresh()
+        self.status(
+            f"Removed {count} unavailable item{'s' if count != 1 else ''} from watch queue", ms=0
+        )
+
+    def _clear_unavailable_favorites(self, section) -> None:
+        """Confirm then un-favorite all channels on unavailable sources."""
+        from PyQt6.QtWidgets import QMessageBox
+        count = 0
+        hidden: set[str] = set()
+        with self.db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            hidden = set(repos.providers.get_hidden_provider_ids())
+            dtos = repos.channels.get_favorites_dto(hidden_provider_ids=hidden)
+            count = sum(1 for d in dtos if not d.available)
+
+        if count == 0:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "Clear Unavailable",
+            f"Remove {count} unavailable item{'s' if count != 1 else ''} from your favorites?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        with self.db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            hidden = set(repos.providers.get_hidden_provider_ids())
+            repos.channels.clear_unavailable_favorites(hidden)
+
+        section.refresh()
+        self.status(
+            f"Removed {count} unavailable item{'s' if count != 1 else ''} from favorites", ms=0
+        )
+
+    def _clear_queue(self) -> None:
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, "Clear Queue",
+            "Are you sure you want to clear the watch queue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            with self.db.session_scope() as session:
+                RepositoryFactory(session).queue.clear()
+            self._refresh_queue_section()
+
+    def _clear_watched_queue(self) -> None:
+        # Confirms, like its two siblings did and this one did not. It is behind the ⋯ so it already takes two
+        # clicks, but it deletes without asking and the other clears do not — an inconsistency nobody would
+        # predict from the menu.
+        from PyQt6.QtWidgets import QMessageBox
+
+        reply = QMessageBox.question(
+            self,
+            "Clear Watched",
+            "Remove every finished item from the watch queue?\n\n"
+            "Partially watched titles stay.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        count = 0
+        with self.db.session_scope() as session:
+            count = RepositoryFactory(session).queue.clear_watched()
+        self._refresh_queue_section()
+        if count:
+            self.status(f"Removed {count} watched item(s) from queue", ms=0)
+
+    def play_queue_item_id(self, channel_id: str) -> None:
+        """Play a queue item — series opens the season view, others play directly."""
+        from streamselect.core.models import MediaType
+        channel = None
+        with self.db.session_scope() as session:
+            channel = RepositoryFactory(session).channels.get_playable_dto(channel_id)
+        if not channel:
+            return
+        if channel.media_type == MediaType.SERIES:
+            self.drill_into_series(channel)
+        else:
+            self.play_media(channel)
+
+    def _on_details_queue_toggle(self, channel_id: str) -> None:
+        """Handle queue toggle from the details pane button."""
+        from streamselect.core.database import ChannelDB
+        removed = False
+        with self.db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            if repos.queue.is_queued(channel_id):
+                repos.queue.remove(channel_id)
+                removed = True
+            else:
+                ch = session.get(ChannelDB, channel_id)
+                repos.queue.add(
+                    channel_id,
+                    channel_name=ch.name if ch else "",
+                    media_type=ch.media_type if ch else "",
+                    source_id=ch.source_id if ch else "",
+                )
+        # Removing is one row leaving; ADDING has to place the row in the right
+        # group in the right order, which is the full render's job.
+        if removed:
+            self._remove_sidebar_row("queue", channel_id)
+        else:
+            self._refresh_queue_section()
+        self.channel_state_bus.publish(channel_id, in_queue=not removed)
+
+    def _on_details_episode_queue_toggle(self, episode_id: str) -> None:
+        """Handle queue toggle from the details pane button in EPISODE mode (Slice 2B).
+
+        Targets the single episode shown in the pane, not its parent series — the
+        channel-grain mirror of _on_details_queue_toggle above, keyed by episode_id.
+        Denormalizes the series/episode identity onto the WatchQueueDB row so the
+        entry survives an orphaned episode (same rationale as channel_name on
+        channel-grain rows — see WatchQueueDB's docstring).
+        """
+        from streamselect.core.database import EpisodeDB
+        removed = False
+        with self.db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            if repos.queue.is_episode_queued(episode_id):
+                repos.queue.remove_episode(episode_id)
+                removed = True
+            else:
+                ep = session.get(EpisodeDB, episode_id)
+                if ep is not None:
+                    series = repos.channels.get_by_source_id(
+                        provider_id=ep.provider_id, source_id=ep.series_id
+                    )
+                    repos.queue.add_episode(
+                        episode_id,
+                        channel_id=series.id if series else ep.series_id,
+                        channel_name=(series.name if series else ep.series_name) or "",
+                        season_num=ep.season_num,
+                        episode_num=ep.episode_num,
+                        episode_title=ep.title or "",
+                        source_id=series.source_id if series else "",
+                    )
+        # Episode-grain rows key on episode_id (see WatchQueueSection._row_matches).
+        if removed:
+            self._remove_sidebar_row("queue", episode_id)
+        else:
+            self._refresh_queue_section()
+        self.details_pane.refresh_episode_state([episode_id])   # D60
+
+    def _on_details_episode_favorite_toggle(self, episode_id: str) -> None:
+        """Toggle favorite for the single EPISODE shown in the details pane (episode mode).
+
+        The new status is read back INSIDE the session block, so no ORM object
+        crosses the boundary (mirrors _toggle_favorite_by_id for channels).
+        """
+        from streamselect.core.database import EpisodeDB
+        new_status = None
+        title = ""
+        with self.db.session_scope() as session:
+            ep = session.get(EpisodeDB, episode_id)
+            if ep is None:
+                return
+            ep.is_favorite = not bool(ep.is_favorite)
+            new_status = ep.is_favorite
+            title = ep.title or "Episode"
+        self.status(f"{title} {'added to' if new_status else 'removed from'} favorites", ms=0)
+        self.load_favorites()
+        self.refresh_episode_watch_state([episode_id])   # D60: tree menu + the pane
+
+    def _on_queue_channel_context_menu(self, channel_id: str, gx: int, gy: int) -> None:
+        """Thin wrapper → unified channel menu (queue surface)."""
+        self._show_channel_menu([channel_id], "queue", gx, gy)
+
+    def _on_rec_channel_context_menu(self, channel_id: str, gx: int, gy: int) -> None:
+        """Thin wrapper → unified channel menu (recommended surface)."""
+        self._show_channel_menu([channel_id], "recommended", gx, gy)
+
+    def _on_alert_channel_context_menu(self, channel_id: str, gx: int, gy: int) -> None:
+        """Thin wrapper → unified channel menu (alerts surface)."""
+        self._show_channel_menu([channel_id], "alerts", gx, gy)
+
+    def _on_alert_clicked(self, channel_db_id: str) -> None:
+        """Play the channel immediately when a sidebar watch alert is double-clicked."""
+        if channel_db_id:
+            self.play_channel_by_id(channel_db_id)
+
+    def _on_alert_channel_details(self, channel_db_id: str) -> None:
+        """Show channel details when a watch alert row is single-clicked.
+
+        VERS-1: an alert row can point at a dead source, so this routes
+        through show_channel_details_by_id() (redirects to a live sibling
+        via resolve_live_copy()), also fixing a latent main-thread DB read.
+        """
+        if channel_db_id:
+            self.show_channel_details_by_id(channel_db_id)
+
+    def load_favorites(self):
+        """Load favorites into sidebar"""
+        if "favorites" in self.sidebar_sections:
+            self.sidebar_sections["favorites"].refresh()
+
+    def _hide_channel_from_history(self, channel_id: str) -> None:
+        with self.db.session_scope() as session:
+            RepositoryFactory(session).channels.set_hidden(channel_id, True)
+        self.load_history()
+        self.load_channels()
+        self.channel_state_bus.publish(channel_id, is_hidden=True)
+
+    def play_from_history_id(self, channel_id: str, episode_id: str = ""):
+        """Play what a History row is about.
+
+        A series row NAMES an episode — the one you last watched, rendered as
+        the ``S..E..`` on its meta line — and when it does, that is what a
+        double-click plays. Routed through ``play_episode_by_id``, the existing
+        chokepoint for surfaces that know only an episode id, so History does
+        not grow a play path of its own.
+
+        Without the id this fell through to the smart-resume ladder below, and
+        for a completed episode with nothing after it that ladder returns no
+        target at all — so a double-click opened the series browser rather than
+        playing anything. User report: "double clicking a watched episode in history
+        doesn't play the episode (it should play on double click) it instead
+        opens the browse the series."
+
+        The ladder stays for everything else: a series row with no episode ever
+        played, and the ">>" button, which deliberately asks for the NEXT one.
+
+        Args:
+            channel_id: The history row's channel.
+            episode_id: The episode the row names, or "" when it names none —
+                a movie, a live channel, or a series not yet started.
+        """
+        from streamselect.core.models import MediaType
+        if episode_id:
+            self.play_episode_by_id(episode_id)
+            return
+        channel = None
+        with self.db.session_scope() as session:
+            channel = RepositoryFactory(session).channels.get_playable_dto(channel_id)
+        if not channel:
+            return
+        if channel.media_type == MediaType.SERIES:
+            resume_ep = None
+            with self.db.session_scope() as session:
+                resume_ep = RepositoryFactory(session).episodes.get_resume_dto(
+                    series_id=channel.source_id,
+                    provider_id=channel.provider_id,
+                )
+            if resume_ep:
+                logger.info(f"Smart-resuming series from: {resume_ep.title}")
+                self.play_episode(resume_ep)
+            else:
+                logger.info("No resume target found, opening series view")
+                self.drill_into_series(channel)
+        else:
+            self.play_media(channel)
+
+    def remove_from_history(self, channel_id: str):
+        """Remove a single channel from history"""
+        channel_name = None
+        with self.db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            channel = repos.channels.get_by_id(channel_id)
+            if channel:
+                channel_name = channel.name
+                repos.channels.remove_from_history(channel_id)
+        if channel_name:
+            self.status(f"Removed {channel_name} from history", ms=0)
+            logger.info(f"Removed {channel_name} from history")
+            self.load_history()
+
+    def show_favorites_context_menu(self, position, list_widget=None):
+        if list_widget is None:
+            if hasattr(self, 'favorites_list'):
+                list_widget = self.favorites_list
+            else:
+                return
+        item = list_widget.itemAt(position)
+        if not item or not item.data(Qt.ItemDataRole.UserRole):
+            return
+        from streamselect.gui.sidebar.favorites import _ROLE_GRAIN
+        if item.data(_ROLE_GRAIN) == "episode":
+            # Favorited-episode rows (Wave 2 Slice 2B) have no channel context menu
+            # yet — channel_menu.py's registry is ChannelDB-only; Favorite/Unfavorite
+            # for an episode lives in the series-tree row's own right-click menu.
+            return
+        channel_id = item.data(Qt.ItemDataRole.UserRole)
+        gp = list_widget.mapToGlobal(position)
+        self._show_context_menu_for(channel_id, gp.x(), gp.y(), "favorites")
+
+    def show_channel_context_menu(self, position):
+        # QListView uses indexAt() instead of itemAt()
+        index = self.channels_list.indexAt(position)
+        if not index.isValid():
+            return
+        channel_id = index.data(Qt.ItemDataRole.UserRole)
+        if not channel_id:
+            return
+
+        # Collect all selected channel IDs (multi-select aware)
+        selected_ids = [
+            idx.data(Qt.ItemDataRole.UserRole)
+            for idx in self.channels_list.selectionModel().selectedIndexes()
+            if idx.data(Qt.ItemDataRole.UserRole)
+        ]
+        if not selected_ids:
+            selected_ids = [channel_id]
+
+        gp = self.channels_list.mapToGlobal(position)
+
+        if len(selected_ids) > 1:
+            # Multi-select context menu — only show bulk actions
+            self._show_multi_select_context_menu(selected_ids, gp)
+        else:
+            self._show_context_menu_for(channel_id, gp.x(), gp.y(), "channel")
+
+    def _quick_assign_category(
+        self,
+        channel_ids: list[str],
+        category: str,
+        mood: str | None,
+        exclude: bool,
+    ) -> None:
+        """Assign channel_ids to category immediately, no dialog."""
+        # Update config on main thread first so the signal-triggered reload sees the exclusion.
+        if exclude and category not in self.config.global_filter_excluded_user_categories:
+            self.config.global_filter_excluded_user_categories.append(category)
+            _cfgsave.save_soon(self)
+            self._update_filter_btn_state()
+
+        def _do_assign():
+            with self.db.session_scope() as session:
+                RepositoryFactory(session).channels.assign_user_category(channel_ids, category, mood)
+            self._category_assigned.emit(bool(exclude))
+
+        self.executor.submit(_do_assign)
+
+        n = len(channel_ids)
+        excl_note = " (added to Global Exclusions)" if exclude else ""
+        self.status(
+            f"{n:,} channel{'s' if n != 1 else ''} → \"{category}\"{excl_note}", ms=0
+        )
+
+        if hasattr(self, "discover_view"):
+            QTimer.singleShot(500, self.discover_view.reload)
+
+    def _on_category_assigned(self, membership_changed: bool) -> None:
+        """React to a completed user-category assignment.
+
+        Previously this was wired straight to ``load_channels``, so EVERY
+        assignment re-ran the query and reset the model — which scrolls the list
+        back to the top. Adding one item to "Watch Later" from row 400 threw the
+        user back to row 1, as punishment for a single action (user report).
+
+        A plain assignment writes ``user_category``/``category_mood`` and nothing
+        else. ``ChannelListDTO`` carries neither, so no row renders differently
+        and there is nothing to redraw, let alone requery.
+
+        The one case that genuinely needs a reload is an assignment that also
+        added the category to Global Exclusions: those rows must LEAVE the list,
+        and that is a membership change the model cannot infer.
+
+        Args:
+            membership_changed: True when the category was added to Global
+                Exclusions, so the visible set actually changed.
+        """
+        if membership_changed:
+            self.load_channels()
+
+    def _show_multi_select_context_menu(self, channel_ids: list[str], gp) -> None:
+        """Thin wrapper → unified channel menu (multi-select on channel surface)."""
+        self._show_channel_menu(channel_ids, "channel", gp.x(), gp.y())
+
+    def play_favorite_id(self, channel_id: str):
+        """Play a favorite channel by ID"""
+        from streamselect.core.models import MediaType
+        channel = None
+        with self.db.session_scope() as session:
+            channel = RepositoryFactory(session).channels.get_playable_dto(channel_id)
+        if not channel:
+            return
+        if channel.media_type == MediaType.SERIES:
+            self.drill_into_series(channel)
+        else:
+            self.play_media(channel)
+
+    def _apply_favorite_toggle(self, channel_id: str) -> None:
+        """Toggle favorite in DB, show status bar message, refresh sidebar.
+
+        DEBT-3: write runs off the UI thread via ``_run_query``, returning
+        plain data — the legacy get_session()/try-finally dance (working
+        around toggle_favorite()'s internal commit) is gone. ``toggle_favorite``'s
+        icon echo derives its value from what's on screen, not this return.
+        """
+        def _write(repos):
+            channel = repos.channels.get_by_id(channel_id)
+            if not channel:
+                return None
+            new_status = repos.channels.toggle_favorite(channel_id)
+            return channel.name, new_status
+        def _on_result(result):
+            if result is None:
+                return
+            name, new_status = result
+            status = "added to" if new_status else "removed from"
+            self.status(f"{name} {status} favorites", ms=0)
+            logger.info(f"Toggled favorite for {name}: {new_status}")
+            self.load_favorites()
+            self.channel_state_bus.publish(channel_id, is_favorite=new_status)
+        self._run_query(_write, _on_result, commit=True, on_error=lambda e: self._write_failed("favorite"))
+
+    def toggle_favorite(self, item):
+        """Toggle favorite status: an optimistic icon/cache echo, confirmed
+        once the async write (below) lands."""
+        channel_id = item.data(Qt.ItemDataRole.UserRole)
+        if not channel_id:
+            return
+
+        # The state comes from the cached DTO, not from a glyph in the row's
+        # text — the row paints its heart from FAV_GLYPH_ROLE (one icon set).
+        cached = next((ch for _t, ch in self.all_channels if ch.id == channel_id), None)
+        new_is_favorite = not (cached.is_favorite if cached is not None else False)
+
+        # Also update in all_channels cache for filtering. The cached entries are frozen ChannelListDTOs, so build a new one with
+        # the flipped flag rather than mutating in place (a frozen dataclass would raise on assignment).
+        for i, (_text, ch) in enumerate(self.all_channels):
+            if ch.id == channel_id:
+                new_ch = replace(ch, is_favorite=new_is_favorite)
+                display_text = new_ch.name
+                if new_ch.category:
+                    display_text += f" [{new_ch.category}]"
+                if new_ch.quality and new_ch.quality != "unknown":
+                    display_text += f" ({new_ch.quality})"
+                self.all_channels[i] = (display_text, new_ch)
+                break
+
+        self._apply_favorite_toggle(channel_id)
+
+    def play_channel_by_id(self, channel_id: str):
+        """Play channel by ID (for details pane Play button)"""
+        from streamselect.core.models import MediaType
+        channel = None
+        with self.db.session_scope() as session:
+            channel = RepositoryFactory(session).channels.get_playable_dto(channel_id)
+        if not channel:
+            return
+        if channel.media_type == MediaType.SERIES:
+            self.drill_into_series(channel)
+        else:
+            self.play_media(channel)
+
+    def play_channel_new_window_by_id(self, channel_id: str) -> None:
+        """Play channel by ID, forcing a separate per-source player window.
+
+        Mirrors ``play_channel_by_id`` but passes ``force_new_window=True`` so
+        the stream is keyed by ``provider_id`` regardless of the global
+        ``split_streams_by_source`` toggle.  For SERIES channels the normal
+        series drill-in is used — a series has no single stream to target.
+
+        Args:
+            channel_id: The channel's unique ID string.
+        """
+        from streamselect.core.models import MediaType
+        channel = None
+        with self.db.session_scope() as session:
+            channel = RepositoryFactory(session).channels.get_playable_dto(channel_id)
+        if not channel:
+            return
+        if channel.media_type == MediaType.SERIES:
+            self.drill_into_series(channel)
+        else:
+            self.play_media(channel, force_new_window=True)
+
+    def play_channel_open_ended_buffer_by_id(self, channel_id: str) -> None:
+        """Play channel by ID with open-ended disk-backed buffering.
+
+        Mirrors ``play_channel_by_id`` but passes ``open_ended_buffer=True`` so
+        mpv uses a large disk-backed cache (up to 2 GiB, 3600 s readahead)
+        instead of the configured bounded buffer profile.  For SERIES channels
+        the normal series drill-in is used — a series has no single stream to
+        buffer ahead on.
+
+        Args:
+            channel_id: The channel's unique ID string.
+        """
+        from streamselect.core.models import MediaType
+        channel = None
+        with self.db.session_scope() as session:
+            channel = RepositoryFactory(session).channels.get_playable_dto(channel_id)
+        if not channel:
+            return
+        if channel.media_type == MediaType.SERIES:
+            self.drill_into_series(channel)
+        else:
+            self.play_media(channel, open_ended_buffer=True)
+
+    def play_channel_deep_cache_by_id(self, channel_id: str) -> None:
+        """Play channel by ID with deep-cache ("Buffer without limit") mode.
+
+        Mirrors ``play_channel_open_ended_buffer_by_id`` but passes
+        ``deep_buffer=True`` so mpv also records the raw stream to disk (a
+        scratch ``.ts`` file, purged when this instance stops/relaunches) on
+        top of the open-ended disk-backed cache. VOD-only — the
+        ``play_deep_cache`` menu action is gated to movie/series in
+        ``channel_menu.py``, and for SERIES the normal drill-in is used (a
+        series has no single stream to deep-buffer).
+
+        Args:
+            channel_id: The channel's unique ID string.
+        """
+        from streamselect.core.models import MediaType
+        channel = None
+        with self.db.session_scope() as session:
+            channel = RepositoryFactory(session).channels.get_playable_dto(channel_id)
+        if not channel:
+            return
+        if channel.media_type == MediaType.SERIES:
+            self.drill_into_series(channel)
+        else:
+            self.play_media(channel, deep_buffer=True)
+
+    def play_channel_from_beginning_by_id(self, channel_id: str) -> None:
+        """Play channel by ID, forcing playback to start at position 0.
+
+        Overrides the ``config.playback_resume_mode`` setting and any saved resume
+        position for this one play — the resume position in the DB is unchanged.
+        For SERIES channels the normal drill-in is used.
+
+        Args:
+            channel_id: The channel's unique ID string.
+        """
+        from streamselect.core.models import MediaType
+        channel = None
+        with self.db.session_scope() as session:
+            channel = RepositoryFactory(session).channels.get_playable_dto(channel_id)
+        if not channel:
+            return
+        if channel.media_type == MediaType.SERIES:
+            self.drill_into_series(channel)
+        else:
+            self.play_media(channel, start_override=0)
+
+    def play_channel_resume_by_id(self, channel_id: str) -> None:
+        """Play channel by ID, forcing resume from the saved watch_progress position.
+
+        Overrides the ``config.playback_resume_mode`` setting — used when the user
+        explicitly chooses "Resume from M:SS" despite the global "Start from
+        beginning" default.  For SERIES channels the normal drill-in is used.
+
+        Args:
+            channel_id: The channel's unique ID string.
+        """
+        from streamselect.core.models import MediaType
+        channel = None
+        with self.db.session_scope() as session:
+            channel = RepositoryFactory(session).channels.get_playable_dto(channel_id)
+        if not channel:
+            return
+        if channel.media_type == MediaType.SERIES:
+            self.drill_into_series(channel)
+        else:
+            watch_progress = int(getattr(channel, "watch_progress", 0) or 0)
+            self.play_media(channel, start_override=watch_progress)
+
+    def _resolve_diagnostic_target(self, session, channel_id: str) -> tuple[str, str, str]:
+        """Resolve (stream_url, channel_name, episode_label) for the diagnostics dialog.
+
+        For a SERIES channel this returns a representative EPISODE's stream_url —
+        the series' own stored URL is synthetic and never streamed. Picks the
+        last-played episode if one exists, else the first by season/episode order.
+        Falls back to the channel URL if no episodes exist.
+
+        Args:
+            session: An active database session (from session_scope).
+            channel_id: The channel ID to resolve.
+
+        Returns:
+            A tuple (stream_url, channel_name, episode_label) as plain strings.
+            If the channel is not found, returns ("", "", "").
+        """
+        from streamselect.core.models import MediaType
+
+        channel = RepositoryFactory(session).channels.get_by_id(channel_id)
+        if not channel:
+            return "", "", ""
+
+        name = channel.name
+        stream_url = channel.stream_url
+        episode_label = ""
+
+        # For series channels, resolve a representative episode's stream URL
+        if channel.media_type == MediaType.SERIES:
+            repos = RepositoryFactory(session)
+
+            # Try last-played episode first
+            ep = repos.episodes.get_last_played(channel.source_id, channel.provider_id)
+
+            # Fall back to first episode if no last-played
+            if ep is None:
+                episodes = repos.episodes.get_by_series(channel.source_id, channel.provider_id)
+                ep = episodes[0] if episodes else None
+
+            # Use episode's stream URL and extract SxxExx code if found
+            if ep:
+                stream_url = ep.stream_url
+                episode_label = f"S{ep.season_num:02d}E{ep.episode_num:02d}"
+
+        return stream_url, name, episode_label
+
+    def diagnose_channel_by_id(self, channel_id: str) -> None:
+        """Open the stream-diagnostics dialog for a channel (bottom-nav Diagnose button).
+
+        Resolves the diagnostic target via the shared helper and hands the URL/name
+        to a modal dialog that runs the headless diagnostic off the main thread on
+        the shared executor.
+        """
+        from streamselect.gui.diagnostics_dialog import StreamDiagnosticsDialog
+
+        stream_url = None
+        name = ""
+        episode_label = ""
+        with self.db.session_scope() as session:
+            stream_url, name, episode_label = self._resolve_diagnostic_target(session, channel_id)
+
+        if not stream_url:
+            return
+
+        dialog = StreamDiagnosticsDialog(
+            channel_name=name,
+            stream_url=stream_url,
+            config=self.config,
+            executor=self.executor,
+            player_active=self.player_manager.is_running(),
+            query_player_props=self.player_manager.get_properties,
+            episode_label=episode_label,
+            parent=self,
+        )
+        dialog.exec()
+
+    def toggle_favorite_by_id(self, channel_id: str) -> None:
+        """Toggle favorite by ID (for details pane Favorite button).
+
+        The channel-list row and the details pane's favorite star both refresh
+        via ``ChannelStateBus`` — ``_apply_favorite_toggle`` publishes the new
+        state, tier 1 echoes the channel-list row in place, and tier 2's
+        authoritative re-read repaints the details pane's star even while the
+        lightbox has focus (now async; DEBT-3 — nothing follows synchronously).
+        """
+        self._apply_favorite_toggle(channel_id)

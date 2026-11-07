@@ -1,0 +1,53 @@
+What's New entry files
+======================
+
+Each user-facing change gets its own file here. Different PRs add different
+files, so parallel branches never conflict on the same list.
+
+Format
+------
+Filename: NNNN_slug.py  (zero-padded 4-digit id, e.g. 0016_my_feature.py)
+Content: a single top-level ENTRY variable:
+
+    from streamselect.whats_new import WhatsNewEntry
+
+    ENTRY = WhatsNewEntry(
+        id=16,
+        version="0.8.0",
+        date="2026-06-22",
+        title="My feature",
+        items=(
+            "First bullet point.",
+            "Second bullet point.",
+        ),
+    )
+
+test_steps (default — include them)
+-----------------------------------
+Every entry for a user-visible change (feature OR bug-fix) carries a non-empty
+``test_steps=(...)`` after ``items`` — the smoke test the tester/user steps
+through in the dev QA checklist.  Each step is one concise string: one action +
+the expected outcome, together covering the changed path end-to-end so there is
+always a concrete set of tasks to verify the change.  Example:
+
+    test_steps=(
+        "Open the Recipe chip → add a Genre tag → 'Now Plating' strip populates with matching cards.",
+        "Click the tag again → it toggles to ⊘ excluded → result count drops.",
+    ),
+
+Leave ``test_steps`` off (``test_steps=()`` / field absent) ONLY when there is
+nothing to test by hand — a pure internal refactor with no behavior change, or
+dev-only tooling like the checklist window itself; note why in the PR.  The
+dev-only Testing Checklist floating window (gated by STREAMSELECT_DEV env var) reads
+these steps and shows them only for entries that have at least one step and
+whose id exceeds the ``qa_verified_id`` config cursor.
+
+Rules
+-----
+- id must be the next integer after the current maximum (run `python -c
+  "from streamselect.whats_new import latest_id; print(latest_id() + 1)"` to
+  confirm).
+- Never edit an existing entry file — changelog entries are immutable.
+- Never append to a shared list — just add the new file.
+- The loader sorts by id, so file discovery order and merge order do not
+  matter.

@@ -1,0 +1,594 @@
+"""Behavioral tests for the Discover pin-implies-expand zone state machine.
+
+Guards the three core invariants:
+
+1. ``pin ⟹ (pinned zone, expanded, cards loaded)``
+   Pinning a collapsed (header-only) shelf puts it in the pinned zone AND
+   triggers a card fetch; the shelf is never left in the collapsed state.
+
+2. ``pinned ∧ collapsed`` is impossible
+   After ``_move_shelf(key, _ZONE_PINNED)``, the shelf widget's ``_collapsed``
+   flag must be False.
+
+3. ``_sanitize_zone_config`` enforces mutual exclusion
+   A key that appears in both ``pinned`` and ``collapsed`` config lists is
+   removed from the lower-priority list (collapsed), so the view and config
+   agree after sanitisation.
+
+4. Default expansion includes ``recently_added``, ``top_movies``, ``top_series``
+   on first launch.
+
+5. Manage-dialog ``_transfer`` to pinned removes the key from expanded/collapsed.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def qapp():
+    from PyQt6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture()
+def config(tmp_path):
+    """Isolated config that writes to tmp_path, not ~/.config/streamselect."""
+    from streamselect.core.config import Config
+    return Config(config_dir=tmp_path / "config", data_dir=tmp_path / "data")
+
+
+# ---------------------------------------------------------------------------
+# Helper — a minimal DiscoverView with no DB / image-cache wiring
+# ---------------------------------------------------------------------------
+
+def _build_view(qapp, config):
+    """Build a DiscoverView using __new__ to skip real DB / thread start."""
+    from streamselect.gui.discover_view import DiscoverView
+    view = DiscoverView.__new__(DiscoverView)
+    view._config = config
+    view._shelf_widgets = {}
+    view._shelf_zones   = {}
+    view._loaded_shelf_keys = set()
+    view._inflight_expand   = None
+    view._pending_collapsed = []
+    view._batch_timer       = None
+    view._more_expanded     = False  # needed by _update_more_btn
+    return view
+
+
+# ---------------------------------------------------------------------------
+# 1. pin ⟹ expand: card fetch is triggered when pinning a header-only shelf
+# ---------------------------------------------------------------------------
+
+class TestPinTriggersCardFetch:
+
+    def test_pin_collapsed_shelf_starts_card_fetch(self, qapp, config):
+        """_on_pin_requested must start _start_expand_fetch for an unloaded shelf."""
+        from streamselect.gui.discover_view import _ZONE_COLLAPSED, _ZONE_PINNED
+        from streamselect.gui.discover_shelf import _Shelf
+
+        view = _build_view(qapp, config)
+
+        # Build a header-only shelf in the collapsed zone.
+        image_cache = MagicMock()
+        shelf = _Shelf("Recently Added", "recently_added", [],
+                       image_cache, config, collapsed=True)
+        view._shelf_widgets["recently_added"] = shelf
+        view._shelf_zones["recently_added"]   = _ZONE_COLLAPSED
+
+        # Wire minimal zone containers so _move_shelf can call _add/_remove.
+        from PyQt6.QtWidgets import QVBoxLayout, QWidget
+        for attr in ("_pinned_zone", "_expanded_zone", "_collapsed_zone"):
+            w = QWidget()
+            setattr(view, attr, w)
+        for attr in ("_pinned_layout", "_expanded_layout", "_collapsed_layout"):
+            setattr(view, attr, QVBoxLayout())
+        view._more_btn = MagicMock()
+        view._config.discover_collapse_to_top = True
+
+        fetched: list[str] = []
+
+        def _fake_fetch(shelf_key):
+            fetched.append(shelf_key)
+
+        view._start_expand_fetch = _fake_fetch
+
+        view._on_pin_requested("recently_added")
+
+        # The shelf must now be in the pinned zone.
+        assert view._shelf_zones.get("recently_added") == _ZONE_PINNED, (
+            f"shelf must be in pinned zone, got {view._shelf_zones.get('recently_added')!r}"
+        )
+        # A card fetch must have been started.
+        assert "recently_added" in fetched, (
+            "_start_expand_fetch must be called when pinning an unloaded shelf"
+        )
+
+    def test_pin_loaded_shelf_no_double_fetch(self, qapp, config):
+        """Pinning an already-loaded shelf must NOT start a redundant card fetch."""
+        from streamselect.gui.discover_view import _ZONE_EXPANDED
+        from streamselect.gui.discover_shelf import _Shelf
+
+        view = _build_view(qapp, config)
+        image_cache = MagicMock()
+        shelf = _Shelf("Top Movies", "top_movies", [],
+                       image_cache, config, collapsed=False)
+        view._shelf_widgets["top_movies"] = shelf
+        view._shelf_zones["top_movies"]   = _ZONE_EXPANDED
+        # Mark as already loaded.
+        view._loaded_shelf_keys.add("top_movies")
+
+        from PyQt6.QtWidgets import QVBoxLayout, QWidget
+        for attr in ("_pinned_zone", "_expanded_zone", "_collapsed_zone"):
+            setattr(view, attr, QWidget())
+        for attr in ("_pinned_layout", "_expanded_layout", "_collapsed_layout"):
+            setattr(view, attr, QVBoxLayout())
+        view._more_btn = MagicMock()
+
+        fetched: list[str] = []
+        view._start_expand_fetch = lambda k: fetched.append(k)
+
+        view._on_pin_requested("top_movies")
+
+        assert fetched == [], (
+            "_start_expand_fetch must NOT be called when the shelf is already loaded"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 1b. _start_expand_fetch shows a loading row, then cards or an error row
+# ---------------------------------------------------------------------------
+
+def _seed_genre_channel(db, genre: str = "Test") -> None:
+    """Insert one provider + one ingested movie row with the given genre."""
+    import uuid
+    from streamselect.core.database import ChannelDB, ProviderDB
+    from streamselect.core.repositories import RepositoryFactory
+
+    session = db.get_session()
+    try:
+        session.add(ProviderDB(
+            id="p1", name="P", type="xtream", url="http://x.example.com", is_active=True,
+        ))
+        session.add(ChannelDB(
+            id=str(uuid.uuid4()), source_id="c1", provider_id="p1",
+            name=f"{genre} Movie", media_type="movie",
+            raw_data={"genre": genre, "rating": "7.0"},
+        ))
+        session.commit()
+    finally:
+        session.close()
+    with db.session_scope() as session:
+        RepositoryFactory(session).channels.update_detected_prefixes(provider_id=None)
+
+
+def _run_event_loop_until(signal, timeout_ms: int = 3000) -> None:
+    """Pump the Qt event loop until *signal* fires (or the timeout guard does)."""
+    from PyQt6.QtCore import QEventLoop, QTimer
+
+    loop = QEventLoop()
+    signal.connect(lambda *a: loop.quit())
+    guard = QTimer()
+    guard.setSingleShot(True)
+    guard.setInterval(timeout_ms)
+    guard.timeout.connect(loop.quit)
+    guard.start()
+    loop.exec()
+    guard.stop()
+
+
+class TestExpandFetchLoadingFeedback:
+    """User-reported perf bug: an expanding/pinning shelf used to sit empty
+    with zero feedback for however long the fetch took. ``_start_expand_fetch``
+    must show a loading row the instant the fetch is kicked off, replaced by
+    cards on success or a visible error row on failure — never silence.
+
+    Uses a REAL, fully-constructed ``DiscoverView`` (not the ``__new__``
+    shortcut other tests in this file use) because these paths emit real Qt
+    signals (``tmdbEnrichRequested``, the worker's ``ready``/``error``) that
+    need a properly-initialized QObject to fire safely.
+    """
+
+    def _build_real_view(self, tmp_path, config):
+        from streamselect.core.database import Database
+        from streamselect.gui.discover_view import DiscoverView, _ZONE_EXPANDED
+        from streamselect.gui.discover_shelf import _Shelf
+
+        db = Database(f"sqlite:///{tmp_path / 'expand_fetch.db'}")
+        db.create_tables()
+
+        view = DiscoverView(db, config, MagicMock())
+        image_cache = MagicMock()
+        image_cache.get_image_async = MagicMock()
+        shelf = _Shelf("Test Genre", "genre:Test", [], image_cache, config, collapsed=False)
+        view._shelf_widgets["genre:Test"] = shelf
+        view._shelf_zones["genre:Test"] = _ZONE_EXPANDED
+        return db, view, shelf
+
+    def test_start_expand_fetch_shows_loading_synchronously(self, qapp, config, tmp_path):
+        """set_loading() fires before the background thread starts — deterministic,
+        no timing dependency (checked before the event loop ever runs)."""
+        db, view, shelf = self._build_real_view(tmp_path, config)
+        _seed_genre_channel(db, "Test")
+        try:
+            view._start_expand_fetch("genre:Test")
+            assert shelf._placeholder_lbl is not None
+            assert "Loading" in shelf._placeholder_lbl.text()
+        finally:
+            view._stop_loader(view._expand_worker, view._expand_thread)
+            db.close()
+
+    def test_start_expand_fetch_success_replaces_loading_with_cards(self, qapp, config, tmp_path):
+        """On a successful fetch, the loading row is replaced by real cards."""
+        db, view, shelf = self._build_real_view(tmp_path, config)
+        _seed_genre_channel(db, "Test")
+        try:
+            view._start_expand_fetch("genre:Test")
+            assert shelf._placeholder_lbl is not None, "loading row must show first"
+
+            _run_event_loop_until(view._expand_worker.ready)
+
+            assert shelf._placeholder_lbl is None, "loading row must be cleared on success"
+            assert len(shelf._cards_widgets) == 1
+            assert "genre:Test" in view._loaded_shelf_keys
+        finally:
+            db.close()
+
+    def test_start_expand_fetch_failure_shows_error_row(self, qapp, config, tmp_path, monkeypatch):
+        """On a failed fetch, a visible error row replaces the loading row —
+        never a silently-empty shelf (the project rules async-background-DB-reads rule)."""
+        from streamselect.core import discovery_engine
+
+        db, view, shelf = self._build_real_view(tmp_path, config)
+        _seed_genre_channel(db, "Test")
+
+        def _boom(session):
+            raise RuntimeError("synthetic DB failure")
+
+        monkeypatch.setattr(discovery_engine, "build_status_sets", _boom)
+
+        try:
+            view._start_expand_fetch("genre:Test")
+            worker = view._expand_worker
+            _run_event_loop_until(worker.error)
+
+            assert shelf._placeholder_lbl is not None, "error row must be shown"
+            assert shelf._cards_widgets == [], "must not look like a legitimate empty shelf"
+            assert "genre:Test" not in view._loaded_shelf_keys, (
+                "a failed fetch must not be marked loaded — the next expand/pin retries"
+            )
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# 2. pinned ∧ collapsed is impossible after _move_shelf
+# ---------------------------------------------------------------------------
+
+class TestMoveShelfPinImpliesExpanded:
+
+    def test_move_to_pinned_uncollapses_shelf(self, qapp, config):
+        """_move_shelf(key, PINNED) must set set_collapsed(False) on the widget."""
+        from streamselect.gui.discover_view import _ZONE_COLLAPSED, _ZONE_PINNED
+        from streamselect.gui.discover_shelf import _Shelf
+
+        view = _build_view(qapp, config)
+        image_cache = MagicMock()
+        shelf = _Shelf("Genre", "genre:Action", [],
+                       image_cache, config, collapsed=True)
+        view._shelf_widgets["genre:Action"] = shelf
+        view._shelf_zones["genre:Action"]   = _ZONE_COLLAPSED
+
+        from PyQt6.QtWidgets import QVBoxLayout, QWidget
+        for attr in ("_pinned_zone", "_expanded_zone", "_collapsed_zone"):
+            w = QWidget()
+            setattr(view, attr, w)
+        for attr in ("_pinned_layout", "_expanded_layout", "_collapsed_layout"):
+            setattr(view, attr, QVBoxLayout())
+        view._more_btn = MagicMock()
+
+        # Before: collapsed.
+        assert shelf._collapsed is True
+
+        view._move_shelf("genre:Action", _ZONE_PINNED)
+
+        # After: not collapsed (pin ⟹ expand).
+        assert shelf._collapsed is False, (
+            "A shelf moved to the pinned zone must not be collapsed"
+        )
+        assert shelf._pinned is True, (
+            "A shelf moved to the pinned zone must have _pinned=True"
+        )
+
+    def test_move_to_collapsed_sets_collapsed_true(self, qapp, config):
+        """_move_shelf(key, COLLAPSED) sets collapsed=True on the widget."""
+        from streamselect.gui.discover_view import _ZONE_EXPANDED, _ZONE_COLLAPSED
+        from streamselect.gui.discover_shelf import _Shelf
+
+        view = _build_view(qapp, config)
+        image_cache = MagicMock()
+        shelf = _Shelf("Genre", "genre:Drama", [],
+                       image_cache, config, collapsed=False)
+        view._shelf_widgets["genre:Drama"] = shelf
+        view._shelf_zones["genre:Drama"]   = _ZONE_EXPANDED
+
+        from PyQt6.QtWidgets import QVBoxLayout, QWidget
+        for attr in ("_pinned_zone", "_expanded_zone", "_collapsed_zone"):
+            setattr(view, attr, QWidget())
+        for attr in ("_pinned_layout", "_expanded_layout", "_collapsed_layout"):
+            setattr(view, attr, QVBoxLayout())
+        view._more_btn = MagicMock()
+
+        assert shelf._collapsed is False
+        view._move_shelf("genre:Drama", _ZONE_COLLAPSED)
+        assert shelf._collapsed is True
+
+
+# ---------------------------------------------------------------------------
+# 3. _sanitize_zone_config enforces mutual exclusion
+# ---------------------------------------------------------------------------
+
+class TestSanitizeZoneConfig:
+
+    def test_a_pinned_key_is_not_also_collapsed(self, config):
+        """The invariant is unchanged; what enforces it is.
+
+        This used to assert that sanitisation REMOVED a key from the stored
+        collapsed list. Collapsed is no longer stored — it is the zone every
+        unlisted key falls through to — so the exclusion is now structural
+        rather than enforced: a pinned key cannot also be collapsed because
+        there is no collapsed list for it to be in.
+
+        The assertion is therefore on the outcome (``determine_zone`` says
+        pinned) rather than on the mechanism, which is what it should have
+        been asserting all along.
+        """
+        from streamselect.gui.discover_view import DiscoverView
+        from streamselect.gui.discover_workers import determine_zone
+
+        config.discover_pinned_shelves    = ["recently_added", "top_movies"]
+        config.discover_expanded_shelves  = []
+        config.discover_hidden_shelves    = []
+
+        view = DiscoverView.__new__(DiscoverView)
+        view._config = config
+        view._sanitize_zone_config()
+
+        assert "recently_added" in config.discover_pinned_shelves
+        assert "top_movies" in config.discover_pinned_shelves
+        assert determine_zone(
+            "recently_added", pinned=frozenset(config.discover_pinned_shelves),
+            expanded=frozenset(), collapsed=frozenset(), hidden=frozenset(),
+            default_expanded=frozenset(), first_launch=False) == "pinned"
+        # And an unlisted key still lands in the default zone.
+        assert determine_zone(
+            "genre:Action", pinned=frozenset(config.discover_pinned_shelves),
+            expanded=frozenset(), collapsed=frozenset(), hidden=frozenset(),
+            default_expanded=frozenset(), first_launch=False) == "collapsed"
+
+    def test_key_in_pinned_and_expanded_removed_from_expanded(self, config):
+        """A key in both pinned and expanded is removed from expanded."""
+        from streamselect.gui.discover_view import DiscoverView
+
+        config.discover_pinned_shelves    = ["top_movies"]
+        config.discover_expanded_shelves  = ["top_movies", "recently_added"]
+        config.discover_collapsed_shelves = []
+        config.discover_hidden_shelves    = []
+
+        view = DiscoverView.__new__(DiscoverView)
+        view._config = config
+        view._sanitize_zone_config()
+
+        assert "top_movies" not in config.discover_expanded_shelves, (
+            "A key in pinned must be removed from expanded after sanitisation"
+        )
+        assert "recently_added" in config.discover_expanded_shelves
+
+    def test_an_expanded_key_is_not_also_collapsed(self, config):
+        """Same change of mechanism as above: structural, not enforced.
+
+        An expanded key resolves to expanded, and a key nobody listed resolves
+        to collapsed — which is the whole reason collapsed no longer needs
+        storing.
+        """
+        from streamselect.gui.discover_view import DiscoverView
+        from streamselect.gui.discover_workers import determine_zone
+
+        config.discover_pinned_shelves    = []
+        config.discover_expanded_shelves  = ["genre:Action"]
+        config.discover_hidden_shelves    = []
+
+        view = DiscoverView.__new__(DiscoverView)
+        view._config = config
+        view._sanitize_zone_config()
+
+        expanded = frozenset(config.discover_expanded_shelves)
+        assert determine_zone("genre:Action", pinned=frozenset(), expanded=expanded,
+                              collapsed=frozenset(), hidden=frozenset(),
+                              default_expanded=frozenset(),
+                              first_launch=False) == "expanded"
+        assert determine_zone("genre:Drama", pinned=frozenset(), expanded=expanded,
+                              collapsed=frozenset(), hidden=frozenset(),
+                              default_expanded=frozenset(),
+                              first_launch=False) == "collapsed"
+
+    def test_duplicate_entries_deduped(self, config):
+        """Duplicate keys within a single list are removed."""
+        from streamselect.gui.discover_view import DiscoverView
+
+        config.discover_pinned_shelves    = ["top_movies", "top_movies", "recently_added"]
+        config.discover_expanded_shelves  = []
+        config.discover_collapsed_shelves = []
+        config.discover_hidden_shelves    = []
+
+        view = DiscoverView.__new__(DiscoverView)
+        view._config = config
+        view._sanitize_zone_config()
+
+        assert config.discover_pinned_shelves.count("top_movies") == 1, (
+            "Duplicate entries must be deduplicated within the pinned list"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 4. Default expanded set includes recently_added, top_movies, top_series
+# ---------------------------------------------------------------------------
+
+class TestDefaultExpandedSet:
+
+    def test_default_expanded_includes_key_shelves(self):
+        """_DEFAULT_EXPANDED must include recently_added, top_movies, top_series."""
+        from streamselect.gui.discover_view import _DEFAULT_EXPANDED
+
+        for key in ("recently_added", "top_movies", "top_series"):
+            assert key in _DEFAULT_EXPANDED, (
+                f"'{key}' must be in _DEFAULT_EXPANDED for sensible first-run defaults"
+            )
+
+    def test_first_launch_defaults_top_series_expanded(self):
+        """On first launch, top_series maps to the expanded zone."""
+        from streamselect.gui.discover_workers import determine_zone, _ZONE_EXPANDED
+        from streamselect.gui.discover_view import _DEFAULT_EXPANDED
+
+        zone = determine_zone(
+            "top_series",
+            pinned=frozenset(),
+            expanded=frozenset(),
+            collapsed=frozenset(),
+            hidden=frozenset(),
+            default_expanded=_DEFAULT_EXPANDED,
+            first_launch=True,
+        )
+        assert zone == _ZONE_EXPANDED, (
+            f"top_series must map to expanded on first launch, got {zone!r}"
+        )
+
+    def test_first_launch_genre_still_collapsed(self):
+        """On first launch, genre shelves default to the collapsed zone."""
+        from streamselect.gui.discover_workers import determine_zone, _ZONE_COLLAPSED
+        from streamselect.gui.discover_view import _DEFAULT_EXPANDED
+
+        zone = determine_zone(
+            "genre:Action",
+            pinned=frozenset(),
+            expanded=frozenset(),
+            collapsed=frozenset(),
+            hidden=frozenset(),
+            default_expanded=_DEFAULT_EXPANDED,
+            first_launch=True,
+        )
+        assert zone == _ZONE_COLLAPSED, (
+            f"genre:Action must map to collapsed on first launch, got {zone!r}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 5. Manage-dialog _transfer to pinned cleans other lists
+# ---------------------------------------------------------------------------
+
+class TestManageDialogTransferToPinned:
+    """The real dialog, its real sections, its real rows.
+
+    This used to be ``DiscoverManageDialog.__new__`` plus nine hand-listed
+    attributes and a pair of throwaway container widgets — the project rules's
+    stale-copy shape, which went stale the moment the dialog grew
+    ``_folded_families``. The factory in ``tests/conftest.py`` runs the real
+    ``__init__``, so the rows, the sections and the family headings under test
+    are the ones the user gets.
+    """
+
+    def _build_dialog(self, config, owned_widgets):
+        from tests.conftest import make_discover_manage_dialog
+        return owned_widgets.own(make_discover_manage_dialog(config))
+
+    def test_transfer_collapsed_to_pinned_removes_from_collapsed(
+            self, qapp, config, owned_widgets):
+        """Transferring a shelf from collapsed to pinned removes it from collapsed."""
+        config.discover_pinned_shelves    = []
+        config.discover_expanded_shelves  = []
+        config.discover_hidden_shelves    = []
+
+        # Collapsed is derived from the zone map, never stored (F47).
+        from tests.conftest import make_discover_manage_dialog
+        dlg = owned_widgets.own(make_discover_manage_dialog(config, zones={"genre:Action": "collapsed"}))
+        assert config.discover_collapsed_shelves == [], "opening the dialog stores nothing"
+
+        dlg._transfer(
+            "genre:Action",
+            dlg._collapsed, dlg._collapsed_list,
+            dlg._pinned,    dlg._pinned_list,
+            dlg._build_pinned_row,
+        )
+
+        assert "genre:Action" in dlg._pinned, "key must be in pinned after transfer"
+        assert "genre:Action" not in dlg._collapsed, (
+            "key must be removed from collapsed after transfer to pinned"
+        )
+
+    def test_transfer_pinned_deduped_from_expanded(
+            self, qapp, config, owned_widgets):
+        """Pinning an expanded key removes it from Expanded (and never leaves it in
+        Collapsed). Collapsed is derived since F47, so the old "in expanded AND
+        collapsed" config state can no longer be built."""
+        config.discover_pinned_shelves    = []
+        config.discover_expanded_shelves  = ["recently_added"]
+        config.discover_hidden_shelves    = []
+
+        dlg = self._build_dialog(config, owned_widgets)
+
+        # The row widget the dialog is tracking is the collapsed one (built
+        # last); the expanded section still holds a stale one for the same key.
+        dlg._transfer(
+            "recently_added",
+            dlg._expanded, dlg._expanded_list,
+            dlg._pinned,   dlg._pinned_list,
+            dlg._build_pinned_row,
+        )
+
+        assert "recently_added" in dlg._pinned
+        assert "recently_added" not in dlg._expanded
+        assert "recently_added" not in dlg._collapsed, (
+            "pin transfer must also remove key from collapsed (mutual-exclusion guard)"
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6. un-pinning returns to EXPANDED, not COLLAPSED
+# ---------------------------------------------------------------------------
+
+class TestUnpinReturnsToExpanded:
+
+    def test_unpin_moves_to_expanded_zone(self, qapp, config):
+        """_on_unpin_requested must move the shelf to _ZONE_EXPANDED, not COLLAPSED."""
+        from streamselect.gui.discover_view import _ZONE_PINNED, _ZONE_EXPANDED
+        from streamselect.gui.discover_shelf import _Shelf
+
+        view = _build_view(qapp, config)
+        image_cache = MagicMock()
+        shelf = _Shelf("Recently Added", "recently_added", [],
+                       image_cache, config, pinned=True, collapsed=False)
+        view._shelf_widgets["recently_added"] = shelf
+        view._shelf_zones["recently_added"]   = _ZONE_PINNED
+
+        from PyQt6.QtWidgets import QVBoxLayout, QWidget
+        for attr in ("_pinned_zone", "_expanded_zone", "_collapsed_zone"):
+            setattr(view, attr, QWidget())
+        for attr in ("_pinned_layout", "_expanded_layout", "_collapsed_layout"):
+            setattr(view, attr, QVBoxLayout())
+        view._more_btn = MagicMock()
+
+        view._on_unpin_requested("recently_added")
+
+        assert view._shelf_zones.get("recently_added") == _ZONE_EXPANDED, (
+            "Un-pinning must move the shelf to the expanded zone"
+        )
+        assert shelf._pinned is False
+        assert shelf._collapsed is False, "Un-pinned shelf must not be collapsed"

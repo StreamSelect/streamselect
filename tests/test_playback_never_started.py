@@ -1,0 +1,979 @@
+"""A stream that never starts must not read as a successful play.
+
+User report: *"the stream didn't start, it's just hanging"* — and the log
+above that report is a complete success path. ``_send_ipc_command`` returns True
+on any reply at all, so a ``loadfile`` mpv accepted and then did nothing with
+produced: "Playing: <name>" in the status bar on a 2s timer, ``mark_played``
+with ``count: 3``, and the notification auto-dismissed. Nothing anywhere asked
+whether video had arrived.
+
+The signal already existed and was being read as a different fact. The
+playback-health probe treats an empty ``path`` as "idle — the user closed the
+player". Immediately after a launch that same reading means the file never
+loaded. One bit of memory — *has this play ever had a loaded file?* — separates
+them, and that bit is what these tests pin.
+
+The most important test here is the NEGATIVE one: a play that started and then
+went idle must stay silent. A detector that cries wolf every time someone closes
+the player would be worse than the silence it replaces.
+"""
+
+from __future__ import annotations
+
+import io
+import pathlib
+from datetime import datetime, timedelta
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from streamselect.core.players import mpv_log_tap
+from streamselect.core.stream_access import RECONNECT_DELAY_MAX_S
+from streamselect.core.time_display import clock_text
+from streamselect.gui import playback_start_watch as watch
+from streamselect.gui.playback_start_watch import (
+    FAILED_AFTER_TICKS,
+    OPENING_AFTER_TICKS,
+    POLL_MS,
+    STALLED_AFTER_TICKS,
+    STOP_POLLING_AFTER_TICKS,
+    PlayAttempt,
+    ffmpeg_retry_window_s,
+)
+
+
+ATTEMPT = PlayAttempt("p_123", "MLB 04 | Mariners x Red Sox", "http://x/1.ts")
+
+
+def _host():
+    """A duck-typed host — the module takes ``host`` and touches only these.
+
+    Deliberately not a ``MainWindow.__new__``: this module's contract IS the
+    small attribute surface below, so a real window would test Qt rather than
+    the rule. Anything it reaches for that is missing raises here rather than
+    being silently absorbed. ``_provider_display_name`` backs the PLAY-12
+    waiting line; unused (and un-asserted) by every test whose PlayAttempt
+    carries no ``provider_id``.
+    """
+    from tests.conftest import wire_status_method
+
+    host = SimpleNamespace(
+        status_bar=MagicMock(),
+        notification_manager=MagicMock(),
+        stream_retry_manager=MagicMock(),
+        _provider_display_name=MagicMock(return_value="Test Source"),
+    )
+    # STATUS-1: the module's showMessage calls now go through host.status(...);
+    # bound here rather than widening the docstring's "small attribute surface"
+    # claim into something host.status_bar.showMessage-only tests would miss.
+    wire_status_method(host)
+    return host
+
+
+# ── the bit of memory ────────────────────────────────────────────────────────
+
+def test_arm_clears_the_previous_play(host=None):
+    host = _host()
+    host._health_ever_played = True
+    host._health_idle_ticks = 99
+    watch.arm(host, ATTEMPT)
+    assert host._health_ever_played is False
+    assert host._health_idle_ticks == 0
+    assert host._health_attempt is ATTEMPT
+
+
+def test_on_playing_is_true_only_the_first_time():
+    """This is what lets "Playing:" be announced once, when it is TRUE —
+    rather than on a timer that fired whether or not anything played."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    assert watch.on_playing(host) is True
+    assert watch.on_playing(host) is False
+    assert watch.on_playing(host) is False
+
+
+def test_a_loaded_file_clears_the_idle_count():
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    watch.on_idle_tick(host)
+    watch.on_idle_tick(host)
+    watch.on_playing(host)
+    assert host._health_idle_ticks == 0
+
+
+# ── the failure it exists to catch ───────────────────────────────────────────
+
+def test_a_play_that_never_starts_is_reported():
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    for _ in range(FAILED_AFTER_TICKS):
+        watch.on_idle_tick(host)
+
+    host.status_bar.showMessage.assert_called_once()
+    assert ATTEMPT.channel_name in host.status_bar.showMessage.call_args[0][0]
+    host.notification_manager.show.assert_called_once()
+    host.stream_retry_manager.add_failure.assert_called_once_with(
+        ATTEMPT.channel_id, ATTEMPT.channel_name, ATTEMPT.stream_url,
+        "playback never started")
+
+
+def test_it_is_reported_exactly_once_however_long_the_window_sits_there():
+    """A report every 2s for as long as mpv idles would be its own bug."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    for _ in range(STOP_POLLING_AFTER_TICKS * 3):
+        watch.on_idle_tick(host)
+    assert host.notification_manager.show.call_count == 1
+    assert host.stream_retry_manager.add_failure.call_count == 1
+
+
+def test_nothing_is_reported_before_the_threshold():
+    """One probe that raced the launch must not condemn a working stream."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    for _ in range(FAILED_AFTER_TICKS - 1):
+        watch.on_idle_tick(host)
+    host.notification_manager.show.assert_not_called()
+    host.stream_retry_manager.add_failure.assert_not_called()
+
+
+# ── the false positive that would make this worse than silence ───────────────
+
+def test_closing_a_player_that_WAS_playing_reports_nothing():
+    """The whole point of the memory bit.
+
+    Same empty ``path``, opposite meaning. Without ``_health_ever_played`` this
+    fires every single time the user closes mpv, which is the most common event
+    in the app.
+    """
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    watch.on_playing(host)                      # video arrived
+    for _ in range(STOP_POLLING_AFTER_TICKS * 2):
+        watch.on_idle_tick(host)                # then the user closed it
+    host.notification_manager.show.assert_not_called()
+    host.stream_retry_manager.add_failure.assert_not_called()
+    host.status_bar.showMessage.assert_not_called()
+
+
+def test_a_play_with_no_identity_still_tells_the_user_but_logs_no_failure():
+    """Episode playback arms without a PlayAttempt. It must not crash, must
+    still say something, and must not invent a channel id for the ledger."""
+    host = _host()
+    watch.arm(host, None)
+    for _ in range(FAILED_AFTER_TICKS):
+        watch.on_idle_tick(host)
+    host.notification_manager.show.assert_called_once()
+    host.stream_retry_manager.add_failure.assert_not_called()
+
+
+def test_polling_stops_only_after_the_longer_threshold():
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    results = [watch.on_idle_tick(host) for _ in range(STOP_POLLING_AFTER_TICKS)]
+    assert results[-1] is True
+    assert not any(results[:-1]), "polling stopped early"
+    assert FAILED_AFTER_TICKS < STOP_POLLING_AFTER_TICKS, (
+        "the failure must be reported before polling gives up, or it never is")
+
+
+def test_a_broken_notification_does_not_take_out_the_poll():
+    """A stream that failed must not also kill the loop that noticed."""
+    host = _host()
+    host.notification_manager.show.side_effect = RuntimeError("boom")
+    watch.arm(host, ATTEMPT)
+    for _ in range(FAILED_AFTER_TICKS):
+        watch.on_idle_tick(host)
+    host.stream_retry_manager.add_failure.assert_called_once()
+
+
+# ── the wiring, because a rule nobody calls is not a rule ────────────────────
+
+HOST_SRC = (pathlib.Path(__file__).resolve().parent.parent
+            / "streamselect" / "gui" / "main_window_streaming.py").read_text()
+
+
+def test_the_unconditional_playing_claim_is_gone():
+    """It announced "Playing:" on a 2s timer regardless of what mpv did — the
+    single line that made a hung stream look like a successful one."""
+    assert 'showMessage(f"Playing: {channel_name}")' not in HOST_SRC, (
+        "the 2s unconditional \"Playing:\" timer is back")
+
+
+@pytest.mark.parametrize("call", [
+    "_startwatch.on_idle_tick(self)",
+    "_startwatch.on_playing(self)",
+    "_startwatch.start_polling(self, attempt)",
+])
+def test_the_host_actually_calls_the_watch(call):
+    assert call in HOST_SRC, f"main_window_streaming no longer calls {call}"
+
+
+def test_the_play_path_names_what_it_launched():
+    """Without the PlayAttempt the failure can be shown but never recorded."""
+    assert "_startwatch.PlayAttempt(" in HOST_SRC
+    assert "channel_id, channel_name, final_url" in HOST_SRC
+
+
+# ── the read that must not explode ───────────────────────────────────────────
+
+def test_every_read_survives_a_half_built_qobject_host():
+    """``getattr(host, name, default)`` is unusable here, and silently so.
+
+    The host is often a ``MainWindow.__new__`` double. Touching a missing
+    attribute on a half-built QObject raises **RuntimeError**, not
+    AttributeError — so the default is never reached and the read that was meant
+    to be safe is the thing that explodes. This exact shape has now cost four
+    separate batches; it caught this module too, in
+    ``test_playback_health``, after the unit tests above were green.
+
+    Written against the REAL class rather than a stand-in, because the whole
+    behaviour belongs to Qt's ``__getattr__`` and a plain object cannot
+    reproduce it.
+    """
+    from streamselect.gui.main_window import MainWindow
+
+    host = MainWindow.__new__(MainWindow)
+    host.status_bar = MagicMock()
+    host.notification_manager = MagicMock()
+    host.stream_retry_manager = MagicMock()
+
+    # Never armed: every counter is absent. Each of these must answer, not raise.
+    assert watch.on_playing(host) is True
+    assert watch.on_idle_tick(host) is False
+
+    watch.arm(host, ATTEMPT)
+    for _ in range(FAILED_AFTER_TICKS):
+        watch.on_idle_tick(host)
+    host.stream_retry_manager.add_failure.assert_called_once()
+
+
+# ── the other shape: the player EXITED without playing ───────────────────────
+#
+# an earlier change detects "still running, nothing loaded". It cannot see the case where mpv
+# is GONE: the app runs it with --idle=once when the user has asked it to close
+# when finished, so a file that ends immediately takes the whole process with
+# it. There is then no instance to probe, the health poll stops, and nothing was
+# ever reported.
+#
+# Reproduced locally against a range-capable server with the app's
+# exact flags: `loadfile … start=90` on a 60-second file ends the file at once
+# and mpv is gone within a second. A resume position past the real end does
+# that, and playback carries one on every part-watched title. The slow-server
+# theory was tested at the same time and ruled OUT — with
+# --cache-pause-initial=yes --cache-pause-wait=10 a 20 KB/s stream starts inside
+# three seconds.
+
+def test_the_player_vanishing_before_anything_played_is_reported():
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    assert watch.on_player_gone(host) is True
+    host.notification_manager.show.assert_called_once()
+    host.stream_retry_manager.add_failure.assert_called_once()
+
+
+def test_closing_a_player_that_WAS_playing_is_silent():
+    """The most common event in the app. It must stay silent, exactly as the
+    idle path does."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    watch.on_playing(host)
+    assert watch.on_player_gone(host) is False
+    host.notification_manager.show.assert_not_called()
+
+
+def test_the_two_failure_paths_report_at_most_once_between_them():
+    """Both can fire for one failed play — idle probes, then the process dies.
+    Two toasts for one click is its own bug."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    for _ in range(FAILED_AFTER_TICKS):
+        watch.on_idle_tick(host)
+    watch.on_player_gone(host)
+    assert host.notification_manager.show.call_count == 1
+    assert host.stream_retry_manager.add_failure.call_count == 1
+
+
+def test_arming_a_new_play_allows_the_next_failure_to_report():
+    """The once-only latch is per PLAY, not per session."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    watch.on_player_gone(host)
+    watch.arm(host, ATTEMPT)
+    assert watch.on_player_gone(host) is True
+    assert host.notification_manager.show.call_count == 2
+
+
+def test_a_resume_position_is_named_in_the_message():
+    """The one cause of this the USER can act on: a saved position past the end
+    of the file ends it instantly, and playing from the start works."""
+    host = _host()
+    watch.arm(host, PlayAttempt("p", "TRON Legacy", "http://x/1.mp4", 5657))
+    watch.on_player_gone(host)
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    assert "94m17s" in msg, msg
+    assert "from the start" in msg
+
+
+def test_no_resume_means_no_resume_advice():
+    """A live channel has no position; telling them to play from the start
+    would be nonsense."""
+    host = _host()
+    watch.arm(host, PlayAttempt("p", "Sky Sports", "http://x/1.ts", 0))
+    watch.on_player_gone(host)
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    assert "from the start" not in msg
+    assert "busy or the stream dead" in msg
+
+
+def test_the_health_tick_calls_it_when_no_player_is_left():
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "streamselect" / "gui" / "main_window_streaming.py").read_text()
+    body = src[src.index("def _playback_health_tick"):]
+    body = body[:body.index("\n    def ", 1)]
+    assert "_startwatch.on_player_gone(self" in body, (
+        "a player that exits without playing is silent again")
+    # Before the poll stops, or it never runs.
+    assert (body.index("_startwatch.on_player_gone(self")
+            < body.index("_playback_health_timer.stop()"))
+
+
+def test_the_play_path_carries_the_resume_offset():
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "streamselect" / "gui" / "main_window_streaming.py").read_text()
+    assert "final_url, start_seconds," in src, (
+        "PlayAttempt no longer carries the resume offset, so the message "
+        "cannot name it")
+
+
+def test_the_play_path_carries_the_event_start_time():
+    """Without it the pre-start message (SPORT-6) has nothing to name."""
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "streamselect" / "gui" / "main_window_streaming.py").read_text()
+    assert 'data.get("event_start_time")' in src
+
+
+# ── the third shape: loaded but frozen ──────────────────────────────────────
+
+def test_stalled_start_reports_once():
+    """A file that loaded but never advanced is reported once — the failure
+    verdict is still the LAST status-bar line, on top of the per-tick waiting
+    lines PLAY-12 adds (see the OPENING/FROZEN waiting-line tests below)."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    for _ in range(STALLED_AFTER_TICKS):
+        watch.on_loaded_tick(host, 0.0, False)
+
+    calls = [c.args[0] for c in host.status_bar.showMessage.call_args_list]
+    assert "Nothing is playing" in calls[-1]
+    host.notification_manager.show.assert_called_once()
+    host.stream_retry_manager.add_failure.assert_called_once_with(
+        ATTEMPT.channel_id, ATTEMPT.channel_name, ATTEMPT.stream_url,
+        "playback never started")
+
+    # Further ticks do nothing further — the report latch stops the waiting
+    # line too, not just the notification.
+    calls_before = len(host.status_bar.showMessage.call_args_list)
+    for _ in range(5):
+        watch.on_loaded_tick(host, 0.0, False)
+    assert host.notification_manager.show.call_count == 1
+    assert len(host.status_bar.showMessage.call_args_list) == calls_before
+
+
+def test_progress_disarms_the_stall_watch():
+    """Once time-pos advances by the epsilon, no stall is reported — and the
+    waiting line (never shown here — progress lands on tick 2, before the
+    2nd-tick floor) is cleared rather than left standing."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    watch.on_loaded_tick(host, 1.0, False)
+    watch.on_loaded_tick(host, 3.0, False)  # +2.0, well above epsilon
+    for _ in range(20):
+        watch.on_loaded_tick(host, 3.0, False)
+    host.notification_manager.show.assert_not_called()
+    host.stream_retry_manager.add_failure.assert_not_called()
+    host.status_bar.showMessage.assert_not_called()
+    host.status_bar.clearMessage.assert_called_once()
+
+
+def test_first_frozen_reading_is_not_progress():
+    """A single 0.0 reading (decoded garbage frame) is not progress."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    for _ in range(STALLED_AFTER_TICKS):
+        watch.on_loaded_tick(host, 0.0, False)
+    host.notification_manager.show.assert_called_once()
+
+
+def test_user_pause_holds_the_counter():
+    """Paused position does not count toward the stall threshold."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    # 4 unpaused frozen ticks
+    for _ in range(4):
+        watch.on_loaded_tick(host, 0.0, False)
+    # 10 paused frozen ticks (doesn't count)
+    for _ in range(10):
+        watch.on_loaded_tick(host, 0.0, True)
+    # Should still be at 4, not stalled
+    host.notification_manager.show.assert_not_called()
+    # 4 more unpaused ticks crosses the threshold
+    for _ in range(4):
+        watch.on_loaded_tick(host, 0.0, False)
+    host.notification_manager.show.assert_called_once()
+
+
+def test_progress_just_before_threshold_stays_silent():
+    """A small advance just before stalling should prevent the report."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    for _ in range(STALLED_AFTER_TICKS - 1):
+        watch.on_loaded_tick(host, 0.0, False)
+    # Progress at the last tick before threshold
+    watch.on_loaded_tick(host, 2.0, False)
+    watch.on_loaded_tick(host, 4.5, False)
+    # No stall report even after many frozen ticks
+    for _ in range(20):
+        watch.on_loaded_tick(host, 4.5, False)
+    host.notification_manager.show.assert_not_called()
+
+
+def test_stalled_then_player_gone_reports_once_total():
+    """A stall report and a gone report must total only one."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    # Drive a stalled report
+    for _ in range(STALLED_AFTER_TICKS):
+        watch.on_loaded_tick(host, 0.0, False)
+    # Set _health_ever_played to False to allow on_player_gone to report
+    host._health_ever_played = False
+    # Call on_player_gone
+    watch.on_player_gone(host)
+    # Total notifications should be 1
+    assert host.notification_manager.show.call_count == 1
+    assert host.stream_retry_manager.add_failure.call_count == 1
+
+
+# ── the fifth shape: loaded but still OPENING (PLAY-10) ─────────────────────
+#
+# A same-provider switch on a one-connection source retries the open on
+# ffmpeg's own schedule — +0,+0,+1,+4,+11,+26,+57s (PLAY-14, measured
+#) — while mpv reports a loaded ``path`` but NO demuxer data at
+# all — no time-pos, no cache-duration. Before this shape existed that read
+# exactly like FROZEN and reported at 16s, mid retry. OPENING gets its own,
+# longer counter, itself shorter than mpv's own 57s reconnect window on
+# purpose (the verdict tells the user while mpv keeps trying underneath it).
+
+def test_opening_reports_nothing_at_the_frozen_threshold():
+    """No demuxer data at all for 8 ticks (~16s) must stay silent — that's
+    comfortably inside the retry schedule this slice widened."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    for _ in range(STALLED_AFTER_TICKS):
+        watch.on_loaded_tick(host, None, False, cache_duration=None)
+    host.notification_manager.show.assert_not_called()
+
+
+def test_opening_reports_at_its_own_longer_threshold():
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    for _ in range(OPENING_AFTER_TICKS):
+        watch.on_loaded_tick(host, None, False, cache_duration=None)
+    host.notification_manager.show.assert_called_once()
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    assert "busy or the stream dead" in msg
+
+
+def test_opening_report_names_the_same_provider_switch_cause():
+    """When the watchdog knows this play was a same-provider switch
+    (``stream_switch.switch_context``, set on the host by ``play_media``),
+    the OPENING report names the actual cause instead of the generic guess."""
+    host = _host()
+    host._switch_same_provider = True
+    watch.arm(host, ATTEMPT)
+    for _ in range(OPENING_AFTER_TICKS):
+        watch.on_loaded_tick(host, None, False, cache_duration=None)
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    assert "still counting the previous stream" in msg
+    assert "busy or the stream dead" not in msg
+
+
+def test_data_arriving_mid_opening_then_advancing_never_reports():
+    """cache_duration arriving (but no time-pos yet) is neither OPENING nor
+    FROZEN; once time-pos then advances, nothing is ever reported."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    for _ in range(10):
+        watch.on_loaded_tick(host, None, False, cache_duration=None)
+    for _ in range(15):
+        watch.on_loaded_tick(host, None, False, cache_duration=3.5)
+    watch.on_loaded_tick(host, 1.0, False)
+    watch.on_loaded_tick(host, 3.0, False)
+    for _ in range(30):
+        watch.on_loaded_tick(host, 3.0, False)
+    host.notification_manager.show.assert_not_called()
+
+
+def test_frozen_numeric_time_pos_still_reports_at_the_old_threshold():
+    """FROZEN (a numeric time-pos that never advances) is unchanged by the
+    OPENING split — same counter, same 8-tick threshold as before."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    for _ in range(STALLED_AFTER_TICKS):
+        watch.on_loaded_tick(host, 0.0, False, cache_duration=None)
+    host.notification_manager.show.assert_called_once()
+
+
+# ── PLAY-12: a silent OPENING/FROZEN wait now counts and names the source ───
+#
+# User report: "streams not starting, then eventually starting... it
+# does eventually start but the delay is weird" — a same-provider switch that
+# used to fail fast (PLAY-10's probe skip) now sits on a held connection with
+# no explanation at all. From the 2nd tick (4s) on, every OPENING/FROZEN tick
+# pushes a status-bar line naming what it's waiting on; the 40s/16s reports
+# above are unchanged — this only fills the silent gap before them.
+
+def test_opening_tick_one_shows_nothing():
+    """A fast-opening stream must never flash a line it didn't need."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    watch.on_loaded_tick(host, None, False, cache_duration=None)
+    host.status_bar.showMessage.assert_not_called()
+
+
+def test_opening_tick_two_names_the_source_and_the_elapsed_wait():
+    host = _host()
+    watch.arm(host, PlayAttempt("p", "Some Channel", "http://x/1.ts", provider_id="prov-1"))
+    watch.on_loaded_tick(host, None, False, cache_duration=None)   # tick 1 — silent
+    watch.on_loaded_tick(host, None, False, cache_duration=None)   # tick 2 — 4s
+    msg = host.status_bar.showMessage.call_args[0][0]
+    assert "Waiting for Test Source to answer" in msg and "4s" in msg
+    host._provider_display_name.assert_called_once_with("prov-1")
+
+
+def test_opening_waiting_line_names_a_held_same_provider_switch():
+    """The exact cause from the diagnosis: the panel is still holding a
+    connection for the previous stream, not a dead/unreachable source."""
+    host = _host()
+    host._switch_same_provider = True
+    watch.arm(host, PlayAttempt("p", "Some Channel", "http://x/1.ts", provider_id="prov-1"))
+    for _ in range(2):
+        watch.on_loaded_tick(host, None, False, cache_duration=None)
+    msg = host.status_bar.showMessage.call_args[0][0]
+    assert "Waiting for Test Source to free the previous stream" in msg
+
+
+def test_frozen_waiting_line_uses_the_same_wording_as_opening():
+    host = _host()
+    watch.arm(host, PlayAttempt("p", "Some Channel", "http://x/1.ts", provider_id="prov-1"))
+    for _ in range(2):
+        watch.on_loaded_tick(host, 0.0, False)
+    msg = host.status_bar.showMessage.call_args[0][0]
+    assert "Waiting for Test Source to answer" in msg
+
+
+def test_waiting_line_falls_back_to_a_generic_source_with_no_provider_id():
+    """Episode playback arms with no provider_id at all — must not crash."""
+    host = _host()
+    watch.arm(host, ATTEMPT)   # ATTEMPT carries no provider_id
+    for _ in range(2):
+        watch.on_loaded_tick(host, None, False, cache_duration=None)
+    msg = host.status_bar.showMessage.call_args[0][0]
+    assert "Waiting for the source to answer" in msg
+    host._provider_display_name.assert_not_called()
+
+
+def test_a_progress_tick_stops_the_countdown():
+    """The waiting line disarms the moment real progress lands — same latch
+    as the failure report, so it doesn't keep counting on top of a healthy
+    stream that simply took a few ticks to get going."""
+    host = _host()
+    watch.arm(host, PlayAttempt("p", "Some Channel", "http://x/1.ts", provider_id="prov-1"))
+    for _ in range(4):
+        watch.on_loaded_tick(host, 0.0, False)   # FROZEN — waiting line shown from tick 2
+    shown_before = host.status_bar.showMessage.call_count
+    assert shown_before > 0
+    watch.on_loaded_tick(host, 5.0, False)        # real progress
+    host.status_bar.clearMessage.assert_called_once()
+    assert host.status_bar.showMessage.call_count == shown_before   # no further waiting line
+
+
+# ── the fourth shape: a fixture played before it started (SPORT-6) ──────────
+#
+# The app already stores every fixture's event_start_time. Playing one before
+# kickoff used to get the same "may be busy or dead" guess as a genuinely
+# broken stream — the one case the app can actually EXPLAIN instead.
+
+_NOW = datetime(2026, 9, 2, 18, 0, 0)   # UTC-naive, matches EPG storage format
+
+
+def _prestart_host(monkeypatch):
+    """A duck-typed host with the clock pinned to _NOW (injected-clock rule)."""
+    monkeypatch.setattr(watch.epg_utils, "now_utc", lambda: _NOW)
+    return _host()
+
+
+def test_prestart_fixture_names_its_start_time(monkeypatch):
+    host = _prestart_host(monkeypatch)
+    start = _NOW + timedelta(hours=1)
+    watch.arm(host, PlayAttempt("p", "Mariners x Red Sox", "http://x/1.ts", 0, start))
+    watch.on_player_gone(host)
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    assert "hasn't started" in msg
+    assert clock_text(watch.epg_utils.to_local(start)) in msg
+    assert "busy or the stream dead" not in msg
+
+
+def test_past_start_keeps_the_generic_detail(monkeypatch):
+    """An event that already started is not "pre-start" — the old guess stands."""
+    host = _prestart_host(monkeypatch)
+    start = _NOW - timedelta(hours=2)
+    watch.arm(host, PlayAttempt("p", "Old Game", "http://x/1.ts", 0, start))
+    watch.on_player_gone(host)
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    assert "hasn't started" not in msg
+    assert "busy or the stream dead" in msg
+
+
+def test_prestart_beats_resume_detail(monkeypatch):
+    """A future start AND a resume offset both apply — the pre-start line wins."""
+    host = _prestart_host(monkeypatch)
+    start = _NOW + timedelta(hours=1)
+    watch.arm(host, PlayAttempt("p", "Fixture", "http://x/1.mp4", 5657, start))
+    watch.on_player_gone(host)
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    assert "hasn't started" in msg
+    assert "from the start" not in msg
+
+
+# ──: the exit REASON decides whether a loaded-but-unplayed exit is silent ──
+#
+# A user log 10:11: a cold play on a one-connection source loaded its path,
+# never received demuxer data, and mpv (``--idle=once``) exited inside 30 s
+# with no warning line. ``on_player_gone`` read "loaded" as "played" and said
+# nothing; a second click 32 s later played. mpv's own ``Exiting... (reason)``
+# line (captured by core/players/mpv_log_tap.py) is what tells a user close
+# ("Quit") from a stream that ended the process ("End of file").
+
+def _loaded_but_never_progressed():
+    host = _host()
+    watch.arm(host, watch.PlayAttempt("ch-1", "Some Title", "http://x/1.mkv"))
+    watch.on_playing(host)                      # a path loaded …
+    watch.on_loaded_tick(host, None, False, cache_duration=None)   # … but OPENING
+    return host
+
+
+def test_a_loaded_file_whose_stream_ended_the_process_is_reported():
+    host = _loaded_but_never_progressed()
+    assert watch.on_player_gone(host, exit_reason="End of file") is True
+    host.notification_manager.show.assert_called_once()
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    assert "exited while still opening" in msg
+    assert "retry" not in msg.lower(), "playback must never promise an automatic retry"
+    host.stream_retry_manager.add_failure.assert_called_once()
+
+
+def test_a_loaded_file_the_user_closed_stays_silent():
+    host = _loaded_but_never_progressed()
+    assert watch.on_player_gone(host, exit_reason="Quit") is False
+    host.notification_manager.show.assert_not_called()
+
+
+def test_a_loaded_file_with_no_known_reason_stays_silent_as_before():
+    host = _loaded_but_never_progressed()
+    assert watch.on_player_gone(host) is False
+    host.notification_manager.show.assert_not_called()
+
+
+def test_a_play_that_progressed_is_silent_whatever_the_reason():
+    host = _loaded_but_never_progressed()
+    watch.on_loaded_tick(host, 1.0, False, cache_duration=3.0)
+    watch.on_loaded_tick(host, 2.0, False, cache_duration=3.0)   # real progress
+    assert watch.on_player_gone(host, exit_reason="End of file") is False
+    host.notification_manager.show.assert_not_called()
+
+
+def test_arming_over_an_unplayed_attempt_is_logged_not_toasted(caplog):
+    from loguru import logger as _loguru
+    host = _loaded_but_never_progressed()
+    lines: list[str] = []
+    hid = _loguru.add(lambda m: lines.append(str(m)), level="INFO", format="{message}")
+    try:
+        watch.arm(host, watch.PlayAttempt("ch-2", "Next Title", "http://x/2.mkv"))
+    finally:
+        _loguru.remove(hid)
+    assert any("previous play 'Some Title' never progressed" in ln for ln in lines)
+    host.notification_manager.show.assert_not_called()
+
+
+# ── PLAY-17, then PLAY-19: a drop mid-play is reported, never replayed ──────
+#
+# A user's log: mpv played a movie from 04:03:35, the
+# origin closed the connection at 04:04:01, ffmpeg's reconnects were all
+# refused for 60s, the buffer ran dry, and mpv exited on EOF 157s in — read
+# by the app exactly like the film ending. No report, window gone. PLAY-17
+# fixed that by reporting AND replaying automatically from a few seconds
+# before the cut. User report, after that shipped: *"these new playback
+# features are fucking dumb. if a channel fails to play, it shouldn't be
+# automatically started again, you're just making more problems."* PLAY-19
+# removes the replay; the report (and the position already on record via the
+# watch-capture path, PLAY-9/RESUME-1, for the details pane's own Resume)
+# stays.
+
+def _dropped_host():
+    """A play that genuinely progressed (real video arrived), then a source
+    drop far short of its own known duration."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    watch.on_playing(host)
+    watch.on_loaded_tick(host, 0.0, False, duration=5400)
+    watch.on_loaded_tick(host, 10.0, False, duration=5400)
+    watch.on_loaded_tick(host, 272.0, False, duration=5400)
+    return host
+
+
+def test_a_mid_play_drop_is_reported_and_nothing_is_replayed():
+    host = _dropped_host()
+    host.play_media = MagicMock()
+    host._run_query = MagicMock()
+
+    with patch("streamselect.gui.playback_start_watch.QTimer.singleShot") as shot:
+        assert watch.on_player_gone(host, "End of file") is True
+    shot.assert_not_called()
+
+    msg = host.status_bar.showMessage.call_args[0][0]
+    assert "dropped at 4:27" in msg and "Resume" in msg
+    host.notification_manager.show.assert_called_once()
+    assert host.notification_manager.show.call_args.kwargs["title"] == "Stream dropped"
+    host.play_media.assert_not_called()
+    host._run_query.assert_not_called()
+
+
+def test_a_film_that_ends_is_not_a_drop():
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    watch.on_playing(host)
+    watch.on_loaded_tick(host, 0.0, False, duration=5400)
+    watch.on_loaded_tick(host, 5350.0, False, duration=5400)   # 50s short — within margin
+
+    with patch("streamselect.gui.playback_start_watch.QTimer.singleShot") as shot:
+        assert watch.on_player_gone(host, "End of file") is False
+    shot.assert_not_called()
+    host.status_bar.showMessage.assert_not_called()
+
+
+def test_a_live_stream_has_no_duration_and_is_not_resumed_here():
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    watch.on_playing(host)
+    watch.on_loaded_tick(host, 0.0, False)          # no duration — live channel
+    watch.on_loaded_tick(host, 30.0, False)
+
+    with patch("streamselect.gui.playback_start_watch.QTimer.singleShot") as shot:
+        assert watch.on_player_gone(host, "End of file") is False
+    shot.assert_not_called()
+
+
+def test_the_user_closing_the_window_is_not_a_drop():
+    host = _dropped_host()
+
+    with patch("streamselect.gui.playback_start_watch.QTimer.singleShot") as shot:
+        assert watch.on_player_gone(host, "Quit") is False
+    shot.assert_not_called()
+
+
+def test_dropped_mid_stream_is_the_one_predicate():
+    assert watch.dropped_mid_stream(300, 5400) is True            # numeric + numeric + past margin
+    assert watch.dropped_mid_stream(300, None) is False           # live — no duration
+    assert watch.dropped_mid_stream(None, 5400) is False          # no last position
+    assert watch.dropped_mid_stream(5350, 5400) is False          # within margin — genuine finish
+
+
+# ── PLAY-16: the verdict waits out mpv's own retry window ───────────────────
+# A user's log: the OPENING verdict used to fire at 40s
+# (20 ticks) — INSIDE PLAY-14's 57s mpv reconnect window — and reported
+# "never started" for a stream that then played at 03:47:11. The threshold
+# now derives from mpv's own schedule instead of a bare literal.
+
+def test_the_opening_verdict_lands_after_mpv_has_stopped_trying():
+    """Floor + the property that would break: the old 20-tick/40s threshold
+    sat INSIDE mpv's 57s reconnect window and fails this; the derived value
+    covers mpv's whole scheduled backoff plus one more socket timeout."""
+    mpv_window_s = ffmpeg_retry_window_s(RECONNECT_DELAY_MAX_S)
+    assert OPENING_AFTER_TICKS * (POLL_MS // 1000) > mpv_window_s
+
+
+def test_progress_clears_the_channel_s_failure_record():
+    """A stream that PLAYED is stronger evidence than any probe's "back
+    online" — it must not sit flagged/degraded/dead in the retry ledger."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    watch.on_loaded_tick(host, 0.0, False, 3.0)
+    host.stream_retry_manager.remove_by_channel.assert_not_called()
+    watch.on_loaded_tick(host, 1.0, False, 3.0)
+    host.stream_retry_manager.remove_by_channel.assert_called_once_with(ATTEMPT.channel_id)
+
+
+def test_no_progress_clears_nothing():
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    for _ in range(20):
+        watch.on_loaded_tick(host, None, False, cache_duration=None)
+    host.stream_retry_manager.remove_by_channel.assert_not_called()
+
+
+def test_a_failing_ledger_clear_does_not_take_out_the_poll():
+    """Bookkeeping must never cost the user the progress the poll just found."""
+    host = _host()
+    watch.arm(host, ATTEMPT)
+    host.stream_retry_manager.remove_by_channel.side_effect = RuntimeError("boom")
+
+    watch.on_loaded_tick(host, 0.0, False, 3.0)
+    watch.on_loaded_tick(host, 1.0, False, 3.0)   # must not raise
+
+    assert host._health_ever_progressed is True
+
+
+# ── PLAY-19: playback is never restarted automatically ──────────────────────
+#
+# User report: *"these new playback features are fucking dumb. if a
+# channel fails to play, it shouldn't be automatically started again, you're
+# just making more problems."* Both automatic-replay mechanisms (the
+# never-started retry and the mid-play drop resume) are gone; every report
+# path stays, and nothing this module does ever calls back into playback.
+
+def test_a_never_started_exit_is_reported_and_nothing_is_replayed():
+    host = _loaded_but_never_progressed()   # loaded, but never got past OPENING
+    host.play_media = MagicMock()
+    host._run_query = MagicMock()
+
+    with patch("streamselect.gui.playback_start_watch.QTimer.singleShot") as shot:
+        assert watch.on_player_gone(host, exit_reason="End of file") is True
+    shot.assert_not_called()
+
+    host.notification_manager.show.assert_called_once()
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    status = host.status_bar.showMessage.call_args[0][0]
+    assert "retry" not in msg.lower() and "retry" not in status.lower()
+    host.play_media.assert_not_called()
+    host._run_query.assert_not_called()
+
+
+def test_no_replay_machinery_remains():
+    """The guard that keeps this from growing back."""
+    for name in ("schedule_retry", "replay", "retry_candidate",
+                 "resume_after_drop", "RETRY_AFTER_EXIT_MS", "MAX_DROP_RESUMES"):
+        assert not hasattr(watch, name), f"playback_start_watch.{name} should be gone"
+    assert "retry" not in PlayAttempt._fields
+    assert "drop_resumes" not in PlayAttempt._fields
+
+
+# ── PLAY-21: the real cause (mpv's own HTTP status) names itself, and an
+# episode's failure report no longer poisons the channel-keyed retry ledger ──
+#
+# a user's log: "[ffmpeg] http: HTTP error 509" — the IPTV source refusing
+# because the account is already at its connection limit — sat in mpv's own
+# tapped output (core/players/mpv_log_tap.py) the whole time, while the toast
+# said only "the source may be busy or the stream dead."
+
+def _tap_http_error(key: str, code: int) -> None:
+    """Feed a synthetic HTTP error line through the REAL tap so *key* picks up
+    a genuine, monotonic-timestamped recorded error — exercises the real
+    since-filter in mpv_log_tap.last_http_error rather than poking private
+    module state directly."""
+    proc = MagicMock()
+    proc.stdout = io.BytesIO(f"[ffmpeg] http: HTTP error {code} \n".encode())
+    proc.stderr = None
+    proc.wait.return_value = 0
+    thread = mpv_log_tap.start_log_tap(proc, key)
+    thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("code", [509, 458])
+def test_a_limit_refusal_recorded_after_arm_names_the_connection_limit(code):
+    """458 is another panel's spelling of 509: same message.
+
+    With StreamSelect itself holding another stream from the source, so the refusal
+    is reported rather than waited out (Q7, tests/test_connection_wait.py)."""
+    key = f"prov-{code}-key"
+    host = _host()
+    host.player_manager = MagicMock()
+    host.player_manager.resolve_key.return_value = key
+    host.player_manager.connection_accountant.holders.return_value = [
+        SimpleNamespace(holder_id="another-window")]
+    mpv_log_tap.clear_exit(key)
+    attempt = PlayAttempt("p1", "Mariners at Red Sox", "http://x/1.ts",
+                           provider_id=key)
+    watch.arm(host, attempt)
+    _tap_http_error(key, code)   # recorded AFTER arm — this play's own error
+
+    assert watch.on_player_gone(host) is True
+
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    status = host.status_bar.showMessage.call_args[0][0]
+    assert f"HTTP {code}" in msg
+    assert "all of its connections" in msg
+    assert "connection limit" in status
+    mpv_log_tap.clear_exit(key)
+
+
+def test_a_stale_509_recorded_before_arm_is_ignored():
+    """A 509 tapped from the PREVIOUS file in the same long-lived mpv
+    instance must not be blamed on this play — the old generic detail
+    stands, exactly as if nothing had been tapped at all."""
+    host = _host()
+    host.player_manager = MagicMock()
+    host.player_manager.resolve_key.return_value = "prov-509-stale"
+    mpv_log_tap.clear_exit("prov-509-stale")
+    _tap_http_error("prov-509-stale", 509)   # recorded BEFORE arm — stale
+
+    attempt = PlayAttempt("p1", "Some Channel", "http://x/1.ts",
+                           provider_id="prov-509-stale")
+    watch.arm(host, attempt)
+    assert watch.on_player_gone(host) is True
+
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    status = host.status_bar.showMessage.call_args[0][0]
+    assert "HTTP 509" not in msg
+    assert "busy or the stream dead" in msg
+    assert "connection limit" not in status
+    mpv_log_tap.clear_exit("prov-509-stale")
+
+
+def test_no_509_leaves_the_old_message_unchanged():
+    host = _host()
+    host.player_manager = MagicMock()
+    host.player_manager.resolve_key.return_value = "prov-clean"
+    mpv_log_tap.clear_exit("prov-clean")
+    attempt = PlayAttempt("p1", "Some Channel", "http://x/1.ts", provider_id="prov-clean")
+    watch.arm(host, attempt)
+
+    assert watch.on_player_gone(host) is True
+
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    status = host.status_bar.showMessage.call_args[0][0]
+    assert "HTTP" not in msg
+    assert "connection limit" not in status
+    assert "busy or the stream dead" in msg
+
+
+def test_record_failure_false_skips_the_retry_ledger_but_still_reports():
+    """Episode playback's attempt (record_failure=False, since episode_id is
+    not a channel id): the report still fires, but nothing is added to the
+    channel-keyed retry ledger."""
+    host = _host()
+    attempt = PlayAttempt("ep-1", "Show S01E01", "http://x/1.ts", record_failure=False)
+    watch.arm(host, attempt)
+    for _ in range(FAILED_AFTER_TICKS):
+        watch.on_idle_tick(host)
+    host.notification_manager.show.assert_called_once()
+    msg = host.notification_manager.show.call_args.kwargs["message"]
+    assert "Show S01E01" in msg
+    host.stream_retry_manager.add_failure.assert_not_called()
+
+
+def test_record_failure_defaults_true_for_backward_compatibility():
+    """Every existing PlayAttempt() call site (positional args, no
+    record_failure kwarg) must keep recording into the ledger."""
+    assert PlayAttempt("p", "n", "u").record_failure is True

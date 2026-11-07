@@ -1,0 +1,1000 @@
+"""Faceted filter panel — resizable vertical sidebar inside the channel list area.
+
+Sections (Language OR Region OR Platform grows the pool; Quality filters it):
+  Media     — Live / Movies / Series
+  Language  — language groups + locale sub-groups
+  Region    — geographic hierarchy: group → individual prefix codes
+  Platform  — individual streaming brands
+  Quality   — resolution/encoding tiers  (AND/restrictive)
+  Genre     — canonical genre names (Movies / Series only)
+  Unknown   — channels with no detectable region/language or quality tag
+
+All sections persist their collapsed/expanded state and selection state to config.
+Panel width persists via the QSplitter in main_window.
+"""
+
+from __future__ import annotations
+
+import functools
+
+from PyQt6.QtCore import QPoint, Qt, pyqtSignal
+from PyQt6.QtWidgets import (
+    QCheckBox, QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QScrollArea,
+    QSizePolicy, QVBoxLayout, QWidget,
+)
+from loguru import logger
+
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+from streamselect.gui import filter_panel_sections as _fp_sections
+from streamselect.gui.chunked_construction import build_chunked
+from streamselect.gui.filter_panel_chip_seam import _ChipSeamMixin
+from streamselect.gui.filter_group_row import _Section, UNTAGGED_LABELS
+from streamselect.gui import deferred_config_save as _cfgsave
+
+# ── Main FilterPanel ───────────────────────────────────────────────────────────
+
+class FilterPanel(_ChipSeamMixin, QWidget):
+    """Vertical faceted filter panel — lives in a QSplitter left of the channel list."""
+
+    filter_changed = pyqtSignal()
+    _pending_restore_reload = False  # set True just before the restore-only emit below
+
+    # Section keys in display order.
+    # "category" (live-channel kind: Sports/News/Kids…) sits between quality and
+    # genre — both are content descriptors; category is the live-channel variant.
+    # subtitle/dub/format sit after genre — audio presentation axis.
+    _SECTION_KEYS = ["media", "language", "region", "platform",
+                     "quality", "category", "genre", "subtitle", "dub",
+                     "format"]
+
+    # Human-facing facet titles for the new-values opt-out popup.  Iteration order
+    # also drives the popup's section order.
+    _FACET_TITLES = {
+        "language": "Language",
+        "region":   "Region",
+        "platform": "Platform",
+        "quality":  "Quality",
+        "category": "Category",
+        "genre":    "Genre",
+        "subtitle": "Subtitle Language",
+        "dub":      "Dub Language",
+        "format":   "Audio Format",
+    }
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self._restoring = False
+        # Set True at the END of the first update_data() call.  Until then, dynamic
+        # sections (Language, Region, Platform, Quality, Genre) have no items, so
+        # save_state() must NOT overwrite their persisted config values with an empty
+        # list.  Static sections (Media, Untagged) are populated in __init__ and are
+        # always safe to save.
+        self._stats_loaded = False
+        # Live handle on the in-flight chunked update_data() build, if any
+        # (PERF-17) — a superseding call cancels this before starting its own.
+        self._update_handle = None
+
+        self.setMinimumWidth(160)
+        self.setMaximumWidth(400)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+
+        _theme.style_fn(self, lambda: f"background: {_theme.COLOR_BG_SECTION};")
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Panel header
+        # COLOR_LINE_DARK, not COLOR_BG_DEEP: this header pairs its background
+        # with COLOR_TEXT (themed) below, and COLOR_BG_DEEP is a fixed-dark
+        # token reserved for the lightbox/trail-map "cinema" family (see
+        # theme_palettes.py) — pairing it with a themed foreground would go
+        # illegible once a light palette (Daylight) makes COLOR_TEXT dark.
+        self._header_bar = QWidget()
+        self._header_bar.setFixedHeight(36)
+        _theme.style_fn(self._header_bar, lambda: f"background: {_theme.COLOR_LINE_DARK};")
+        phl = QHBoxLayout(self._header_bar)
+        phl.setContentsMargins(10, 0, 8, 0)
+        self._includes_lbl = QLabel("Includes:")
+        _theme.style_fn(self._includes_lbl, lambda: f"font-size: {_theme.FONT_XL}; font-weight: bold; color: {_theme.COLOR_TEXT};")
+        phl.addWidget(self._includes_lbl)
+        phl.addStretch()
+
+        self._all_btn = QPushButton("All")
+        self._all_btn.setFixedHeight(22)
+        self._all_btn.setToolTip("Select all — show everything, no filter active")
+        _theme.style(self._all_btn, "PANEL_BTN")
+        self._all_btn.clicked.connect(self.select_all_sections)
+        phl.addWidget(self._all_btn)
+
+        self._clear_btn = QPushButton("Clear")
+        self._clear_btn.setFixedHeight(22)
+        self._clear_btn.setToolTip("Clear all — uncheck everything, then pick exactly what to include")
+        _theme.style(self._clear_btn, "PANEL_BTN")
+        self._clear_btn.clicked.connect(self.clear_all)
+        phl.addWidget(self._clear_btn)
+
+        outer.addWidget(self._header_bar)
+
+        # "Hide watched" toggle — compact row between header and scrollable sections.
+        # OFF by default (watched channels are visible); turning it ON hides them.
+        self._hide_watched_row = QWidget()
+        self._hide_watched_row.setFixedHeight(30)
+        _theme.style_fn(self._hide_watched_row, lambda: f"background: {_theme.COLOR_LINE_DARK};")
+        hw_rl = QHBoxLayout(self._hide_watched_row)
+        hw_rl.setContentsMargins(10, 0, 8, 0)
+        hw_rl.setSpacing(6)
+        self._hide_watched_cb = QCheckBox("Hide watched")
+        self._hide_watched_cb.setIcon(_icon_utils.role_icon("hide_watched_filter", _theme.COLOR_MUTED))
+        self._hide_watched_cb.setToolTip(
+            "When checked, movies and series you have marked as watched are hidden from the list."
+        )
+        _theme.style_fn(self._hide_watched_cb, lambda: f"color: {_theme.COLOR_TEXT}; font-size: {_theme.FONT_SM};")
+        self._hide_watched_cb.setChecked(getattr(self.config, 'filter_hide_watched', False))
+        self._hide_watched_cb.stateChanged.connect(self._on_hide_watched_changed)
+        hw_rl.addWidget(self._hide_watched_cb)
+        hw_rl.addStretch()
+        outer.addWidget(self._hide_watched_row)
+
+        # Scrollable sections
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        _theme.style_fn(self._scroll, lambda: f"""
+            QScrollArea {{ border:none; background:{_theme.COLOR_BG_SECTION}; }}
+            QScrollBar:vertical {{ background:{_theme.COLOR_BG_BAR}; width:6px; border-radius:3px; }}
+            QScrollBar::handle:vertical {{ background:{_theme.COLOR_BORDER}; border-radius:3px; }}
+        """)
+
+        self._section_container = QWidget()
+        _theme.style_fn(self._section_container, lambda: f"background:{_theme.COLOR_BG_SECTION};")
+        self._sl = QVBoxLayout(self._section_container)
+        self._sl.setContentsMargins(0, 0, 0, 0)
+        self._sl.setSpacing(0)
+
+        # Read saved collapse states
+        saved_states: dict = getattr(self.config, 'filter_section_states', {})
+
+        def _expanded(key: str, default: bool) -> bool:
+            return saved_states.get(key, default)
+
+        # Build sections
+        self._media_sec = _Section(
+            "media", "Media",
+            initially_expanded=_expanded("media", True),
+            info_text="Filter by content type. Uncheck a type to hide all channels of that kind.",
+            config=self.config)
+        self._media_sec.set_flat_items([
+            ("live",   "Live",   0),
+            ("movie",  "Movies", 0),
+            ("series", "Series", 0),
+        ])
+        self._media_sec.changed.connect(self._on_changed)
+        self._sl.addWidget(self._media_sec)
+        self._add_divider()
+
+        self._lang_sec = _Section(
+            "language", "Language",
+            initially_expanded=_expanded("language", False),
+            info_text=(
+                "Show channels by language or locale prefix (e.g. EN, FR, DE).\n"
+                "Language, Region, and Platform work as a union — "
+                "checking more always expands results, never shrinks them."
+            ),
+            config=self.config)
+        self._lang_sec.changed.connect(self._on_changed)
+        self._sl.addWidget(self._lang_sec)
+        self._add_divider()
+
+        self._region_sec = _Section(
+            "region", "Region",
+            initially_expanded=_expanded("region", False),
+            info_text=(
+                "Show channels by geographic region code (e.g. US, CA, MX).\n"
+                "Works together with Language and Platform as a union — "
+                "checking more always adds to results."
+            ),
+            config=self.config)
+        self._region_sec.changed.connect(self._on_changed)
+        self._sl.addWidget(self._region_sec)
+        self._add_divider()
+
+        self._platform_sec = _Section(
+            "platform", "Platform",
+            initially_expanded=_expanded("platform", False),
+            info_text=(
+                "Show channels from specific streaming platforms (e.g. Netflix, EAR, Disney+).\n"
+                "Works together with Language and Region as a union — "
+                "checking more always adds to results."
+            ),
+            config=self.config)
+        self._platform_sec.changed.connect(self._on_changed)
+        self._sl.addWidget(self._platform_sec)
+        self._add_divider()
+
+        self._quality_sec = _Section(
+            "quality", "Quality", and_axis=True,
+            initially_expanded=_expanded("quality", False),
+            info_text=(
+                "Filter by video quality tier.\n\n"
+                "Unlike other sections, this works differently: unchecking a tier "
+                "hides channels explicitly tagged with that quality. "
+                "Channels with no quality information are always shown."
+            ),
+            config=self.config)
+        self._quality_sec.changed.connect(self._on_changed)
+        self._sl.addWidget(self._quality_sec)
+        self._add_divider()
+
+        self._category_sec = _Section(
+            "category", "Category",
+            initially_expanded=_expanded("category", False),
+            info_text=(
+                "Filter live channels by programming kind (e.g. Sports, News, Kids).\n\n"
+                "Check kinds to include — live channels of any checked kind are shown. "
+                "Live channels with no category data are always included.\n"
+                "Only applies to Live channels; movies and series are unaffected."
+            ),
+            config=self.config)
+        self._category_sec.changed.connect(self._on_changed)
+        self._sl.addWidget(self._category_sec)
+        self._add_divider()
+
+        self._genre_sec = _Section(
+            "genre", "Genre",
+            initially_expanded=_expanded("genre", False),
+            info_text=(
+                "Filter movies and series by genre.\n\n"
+                "Check genres to include — channels of any checked genre are shown. "
+                "Channels with no genre data are always included.\n"
+                "Only applies to Movies and Series; live channels are unaffected."
+            ),
+            config=self.config)
+        self._genre_sec.changed.connect(self._on_changed)
+        self._sl.addWidget(self._genre_sec)
+        self._add_divider()
+
+        self._subtitle_sec = _Section(
+            "subtitle", "Subtitle Language",
+            initially_expanded=_expanded("subtitle", False),
+            info_text=(
+                "Filter by subtitle language detected in the channel name.\n\n"
+                "Multi = channel offers subtitles in multiple languages."
+            ),
+            config=self.config)
+        self._subtitle_sec.changed.connect(self._on_changed)
+        self._sl.addWidget(self._subtitle_sec)
+        self._add_divider()
+
+        self._dub_sec = _Section(
+            "dub", "Dub Language",
+            initially_expanded=_expanded("dub", False),
+            info_text=(
+                "Filter by dub (dubbed audio) language detected in the channel name."
+            ),
+            config=self.config)
+        self._dub_sec.changed.connect(self._on_changed)
+        self._sl.addWidget(self._dub_sec)
+        self._add_divider()
+
+        self._format_sec = _Section(
+            "format", "Audio Format",
+            initially_expanded=_expanded("format", False),
+            info_text=(
+                "Filter by audio presentation format detected in the channel name.\n\n"
+                "Dub = dubbed audio track. Original = original-language audio with "
+                "subtitles. Multi = multiple subtitle languages. Dual = two audio tracks."
+            ),
+            config=self.config)
+        self._format_sec.changed.connect(self._on_changed)
+        self._sl.addWidget(self._format_sec)
+        self._add_divider()
+
+        # NOTE: the old "Unknown" section lived here. It offered two toggles
+        # (no_prefix / no_quality), covered 2 of 9 facets, and displayed a
+        # hardcoded count of 0 for both. Every facet section now carries its own
+        # "Untagged — N" footer row with a live count, generated from
+        # _facet_sections() so coverage cannot drift again.
+        self._sl.addStretch()
+        self._scroll.setWidget(self._section_container)
+        outer.addWidget(self._scroll, 1)
+
+        # Wire right-click and "Only" button signals from all sections
+        for sec in self._all_sections():
+            sec.item_right_clicked.connect(self._on_item_right_clicked)
+            sec.item_only_requested.connect(self._on_item_only_requested)
+            # collapse_toggled saves state but does NOT emit filter_changed
+            sec.collapse_toggled.connect(self._on_collapse_toggled)
+
+        self.restore_state()
+
+    # ── public API ──────────────────────────────────────────────────────────
+
+    def update_data(self, tag_counts: dict[str, dict[str, int]],
+                    untagged_counts: dict[str, int] | None = None):
+        """Populate dynamic sections from ``TagRepository.get_facet_value_counts()``.
+
+        ``tag_counts`` is a nested dict ``{facet_type: {value: channel_count}}``
+        returned by the tag-facet stats query.  Recognised facet types:
+        ``language``, ``region``, ``platform``, ``quality``, ``genre``.
+
+        Restore follows the **opt-out model** (the design notes): each facet
+        goes through :meth:`_restore_facet_opt_out`, keyed off a persisted
+        ``filter_known_*`` set that distinguishes a NEW/unseen value (default
+        INCLUDED) from one the user deliberately deselected (stays excluded).  On the
+        feature's first run for a facet (``filter_known_* is None``) the baseline
+        INCLUDES every present value — a one-time un-hide of any content a stale
+        saved selection was hiding — and records the baseline.
+
+        The very first call (startup) emits ``filter_changed`` so
+        ``MainWindow.on_filter_changed`` re-runs ``load_channels()`` with the
+        restored filters.  A later call (source refresh/import) does not blindly
+        re-emit, but if it surfaced NEW facet values it shows the opt-out popup
+        (:meth:`_show_new_values_popup`) and reloads once the user decides.
+
+        The nine dynamic facet sections used to rebuild in one synchronous pass —
+        measured a 2,037ms main-thread stall at launch. Each section's full
+        rebuild (items assembly + ``set_flat_items``/``set_grouped_items`` +
+        its opt-out ``restore`` call — see ``filter_panel_sections.py``) is now
+        one unit of ``build_chunked`` work, built one per event-loop turn
+        (PERF-17) so build+restore stay atomic and ordered within a section. A
+        call superseding one still in flight (e.g. a fast source refresh)
+        cancels it first — see ``self._update_handle``.
+        """
+        if self._update_handle is not None:
+            self._update_handle.cancel()
+
+        # Capture whether this is the first call BEFORE any state is modified.
+        was_first = not self._stats_loaded
+
+        # (included_attr, known_attr) per section — single source of truth for the
+        # opt-out restore below; see _known_section_attrs().
+        _attr_map = {
+            sec: (inc_attr, known_attr)
+            for inc_attr, known_attr, sec in self._known_section_attrs()
+        }
+        # Newly-seen facet values collected across sections → drives the opt-out
+        # popup after a source refresh (section_key → set of new values).
+        new_by_facet: dict[str, set[str]] = {}
+
+        def _restore(sec: object, prev: set[str]) -> None:
+            """Opt-out restore for one dynamic facet section.
+
+            New/unseen values default INCLUDED; genuinely deselected values (known
+            but not in the saved/live selection) stay unchecked.  ``prev`` is the
+            in-memory selection captured *before* the section's items were rebuilt.
+            Full contract: :meth:`_restore_facet_opt_out`.
+            """
+            inc_attr, known_attr = _attr_map[sec]
+            self._restore_facet_opt_out(
+                sec, inc_attr, known_attr, set(prev), was_first, new_by_facet)
+
+        # ── Media — static items (no change needed)
+
+        # One chunked unit per dynamic facet, in display order — see
+        # filter_panel_sections.py for each section's moved-out rebuild body.
+        section_fns = [
+            functools.partial(_fp_sections.build_language, self, tag_counts, _restore),
+            functools.partial(_fp_sections.build_region, self, tag_counts, _restore),
+            functools.partial(_fp_sections.build_platform, self, tag_counts, _restore),
+            functools.partial(_fp_sections.build_quality, self, tag_counts, _restore),
+            functools.partial(_fp_sections.build_category, self, tag_counts, _restore),
+            functools.partial(_fp_sections.build_genre, self, tag_counts, _restore),
+            functools.partial(_fp_sections.build_subtitle, self, tag_counts, _restore),
+            functools.partial(_fp_sections.build_dub, self, tag_counts, _restore),
+            functools.partial(_fp_sections.build_format, self, tag_counts, _restore),
+        ]
+
+        def _finish() -> None:
+            """Runs once, after the LAST section — never for a cancelled/superseded run."""
+            # Dynamic sections are now populated — safe for save_state() to persist them.
+            self._stats_loaded = True
+
+            # Persist the opt-out baseline / accumulated known sets and the restored
+            # selections.  _restore_facet_opt_out() set config.filter_known_* in memory;
+            # save_state() writes filter_included_* (guarded by _stats_loaded) and calls
+            # config.save(), which flushes the known sets to disk too.
+            self.save_state()
+
+            logger.debug(
+                "FilterPanel updated (tag model): " + ", ".join(
+                    f"{len(sec.get_all_keys())} {facet}"
+                    for facet, sec in self._facet_sections().items()
+                )
+            )
+
+            # First call: the list loaded before dynamic sections populated
+            # (restore_search_state fires load_channels while they're still
+            # empty) — re-run it, but only if the restored filters constrain
+            # anything.  A later call (refresh/import) only reloads if it
+            # surfaced NEW facet values, via the opt-out popup below.
+            if was_first and self._restore_constrains_the_query():
+                self._pending_restore_reload = True  # keep rows: not a user click
+                self.filter_changed.emit()
+            elif new_by_facet:
+                self._show_new_values_popup(new_by_facet)
+
+            self._apply_untagged_rows(untagged_counts)
+
+        self._update_handle = build_chunked(
+            section_fns, lambda f: f(), batch_size=1, parent=self, on_done=_finish,
+        )
+
+    def _facet_sections(self) -> dict[str, object]:
+        """Facet type -> the section that shows it. One place, so the untagged
+        footer rows and the tag_includes builder can never cover different sets."""
+        return {
+            "language": self._lang_sec,
+            "region":   self._region_sec,
+            "platform": self._platform_sec,
+            "quality":  self._quality_sec,
+            "category": self._category_sec,
+            "genre":    self._genre_sec,
+            "subtitle": self._subtitle_sec,
+            "dub":      self._dub_sec,
+            "format":   self._format_sec,
+        }
+
+    def _apply_untagged_rows(self, untagged_counts: dict[str, int] | None) -> None:
+        """Give every facet section its "Untagged — N" footer row.
+
+        Replaces the old single "Unknown" section, which covered 2 of 9 facets
+        (both of them legacy column axes, neither a tag facet) and displayed a
+        hardcoded count of 0 for both. A separate section has to be extended by
+        hand for every facet; a footer row is generated from the same map the
+        filter itself uses, so the two cannot drift apart.
+
+        Checked state is restored from ``filter_facets_hiding_untagged`` — the
+        set of facets the user has explicitly switched OFF. Absent = checked,
+        so the default is inclusive and a facet added later starts inclusive too.
+        """
+        hidden = set(getattr(self.config, "filter_facets_hiding_untagged", None) or [])
+        counts = untagged_counts or {}
+        for facet, section in self._facet_sections().items():
+            section.set_untagged_row(int(counts.get(facet, 0)), checked=facet not in hidden,
+                                     label=UNTAGGED_LABELS.get(facet, "Untagged"))
+
+    def _restore_constrains_the_query(self) -> bool:
+        """True when the just-restored facet selections would narrow the query.
+
+        The first ``load_channels`` runs while these sections are still empty, so
+        it applies NO facet constraint at all. If the restore leaves every facet
+        unconstrained, re-running it produces exactly the same rows — and the
+        user watches the list blank and repopulate seconds after launch for
+        nothing. User report: *"the results load, then something else
+        happens, and the results are refreshed all within a matter of seconds
+        without any interaction with the app"*, and separately *"I can confirm
+        the reload changed nothing"*. Their log shows it plainly: 1 row at
+        gen=2, 0 rows at gen=3, 1 row again at gen=4.
+
+        "Unconstrained" is :meth:`get_filter_state`'s own definition — all
+        selected, or no items — so this cannot drift from what the query
+        actually does. The untagged footers count too: hiding one constrains the
+        query without deselecting any value.
+
+        Returns:
+            True if a reload is warranted.
+        """
+        for section in self._facet_sections().values():
+            try:
+                if not section.is_all_selected() and section.get_all_keys():
+                    return True
+                if section.has_untagged_row() and not section.untagged_included():
+                    return True
+            except Exception:
+                # Cannot tell → reload. The wasted query is cheap; showing the
+                # user a list their saved filters should have narrowed is not.
+                logger.exception("filter_panel: could not test a facet section")
+                return True
+        return False
+
+    def get_filter_state(self) -> dict:
+        """Return resolved filter state for main_window.load_channels().
+
+        Tag-model (Slice B): sections are now driven by tag facet values.  The
+        resolved state includes a ``tag_includes`` dict — one entry per constrained
+        facet — that ``_query_channels`` passes directly to
+        ``ChannelRepository.get_all(tag_includes=…)``.
+
+        A facet is *unconstrained* (= show all values) when its section is
+        all-selected or has no items.  Unconstrained facets are omitted from
+        ``tag_includes`` so the EXISTS subquery is not generated and no channels
+        are excluded on that axis.
+
+        Cross-axis expansion is no longer needed: each facet is an independent
+        AND axis — selecting Language=English AND Platform=Disney+ returns only
+        channels that carry *both* tags (intersection), which is the correct
+        behaviour.  The old expansion was required to work around the OR-pool
+        identity model; it is deleted here.
+        """
+        media_sel = set(self._media_sec.get_selected_keys())
+        media_all = {"live", "movie", "series"}
+        media_types = list(media_sel) if media_sel != media_all else list(media_all)
+
+        # Facets whose "Untagged" footer the user switched OFF.
+        facets_hiding_untagged = {
+            facet for facet, section in self._facet_sections().items()
+            if section.has_untagged_row() and not section.untagged_included()
+        }
+        # The legacy column axes the retired "Unknown" section used to drive.
+        # Nothing sets them False any more: the language/region and quality
+        # facets now own that question through their own footer rows.
+        include_untagged = True
+        include_untagged_quality = True
+
+        # ── Build tag_includes: {facet_type: set(selected_values)} ──────────────
+        # Facet is constrained only when NOT all items are selected AND the section
+        # has items (empty section = no data for that facet → no constraint).
+        tag_includes: dict[str, set[str]] = {}
+
+        # Language facet
+        if not self._lang_sec.is_all_selected() and self._lang_sec.get_all_keys():
+            selected = set(self._lang_sec.get_selected_keys())
+            if selected:
+                tag_includes["language"] = selected
+
+        # Region facet — selected keys are individual ISO codes (leaf-level)
+        if not self._region_sec.is_all_selected() and self._region_sec.get_all_keys():
+            selected = set(self._region_sec.get_selected_keys())
+            if selected:
+                tag_includes["region"] = selected
+
+        # Platform facet
+        if not self._platform_sec.is_all_selected() and self._platform_sec.get_all_keys():
+            selected = set(self._platform_sec.get_selected_keys())
+            if selected:
+                tag_includes["platform"] = selected
+
+        # Quality facet
+        if not self._quality_sec.is_all_selected() and self._quality_sec.get_all_keys():
+            selected = set(self._quality_sec.get_selected_keys())
+            if selected:
+                tag_includes["quality"] = selected
+
+        # Category facet (live-channel kinds: Sports, News, Kids…)
+        if not self._category_sec.is_all_selected() and self._category_sec.get_all_keys():
+            selected = set(self._category_sec.get_selected_keys())
+            if selected:
+                tag_includes["category"] = selected
+
+        # Genre facet
+        genre_all = self._genre_sec.is_all_selected()
+        genre_filters = None if genre_all else self._genre_sec.get_selected_keys()
+        if not genre_all and self._genre_sec.get_all_keys():
+            selected = set(self._genre_sec.get_selected_keys())
+            if selected:
+                tag_includes["genre"] = selected
+
+        # Subtitle language facet
+        if not self._subtitle_sec.is_all_selected() and self._subtitle_sec.get_all_keys():
+            selected = set(self._subtitle_sec.get_selected_keys())
+            if selected:
+                tag_includes["subtitle"] = selected
+
+        # Dub language facet
+        if not self._dub_sec.is_all_selected() and self._dub_sec.get_all_keys():
+            selected = set(self._dub_sec.get_selected_keys())
+            if selected:
+                tag_includes["dub"] = selected
+
+        # Audio format facet
+        if not self._format_sec.is_all_selected() and self._format_sec.get_all_keys():
+            selected = set(self._format_sec.get_selected_keys())
+            if selected:
+                tag_includes["format"] = selected
+
+        # A facet whose untagged row is OFF must become an ACTIVE constraint even
+        # when every VALUE is ticked — otherwise "hide untagged" would silently
+        # do nothing, because tag_includes is only populated for partially-
+        # selected sections.
+        for facet in facets_hiding_untagged:
+            if facet not in tag_includes:
+                section = self._facet_sections()[facet]
+                selected = set(section.get_selected_keys())
+                if selected:
+                    tag_includes[facet] = selected
+
+        return {
+            'media_types':        media_types,
+            'language_groups':    self._lang_sec.get_selected_keys(),
+            'region_groups':      self._region_sec.get_selected_keys(),
+            'quality_groups':     self._quality_sec.get_selected_keys(),
+            'platform_groups':    self._platform_sec.get_selected_keys(),
+            'category_filters':   self._category_sec.get_selected_keys(),
+            'genre_filters':      self._genre_sec.get_selected_keys(),
+            'subtitle_filters':   self._subtitle_sec.get_selected_keys(),
+            'dub_filters':        self._dub_sec.get_selected_keys(),
+            'format_filters':     self._format_sec.get_selected_keys(),
+            'include_untagged':          include_untagged,
+            'include_untagged_quality':  include_untagged_quality,
+            'adult_mode':         getattr(self.config, 'filter_adult_mode', 'hide'),
+            'hide_watched':       self._hide_watched_cb.isChecked(),
+            'excluded_provider_ids': [],
+            # Tag-facet includes — used by _query_channels → get_all(tag_includes=…).
+            # None means no tag filter active (all channels pass on this axis).
+            'tag_includes': tag_includes or None,
+            # Facets where untagged content must NOT pass (footer row unticked).
+            'facets_hiding_untagged': facets_hiding_untagged or None,
+            # Legacy prefix fields — kept so the old fallback path in load_channels
+            # (no filter_panel) still has these keys; they are now always None when
+            # routing through the tag model.
+            '_language_prefixes': None,
+            '_region_prefixes':   None,
+            '_platform_prefixes': None,
+            '_quality_prefixes':  None,
+            '_genre_filters':     genre_filters,
+        }
+
+    def select_all_sections(self):
+        """Check everything — show all content, no active filter."""
+        self._restoring = True
+        try:
+            for sec in self._all_sections():
+                sec.select_all()
+        finally:
+            self._restoring = False
+        self.save_state(unseen="include")
+        self.filter_changed.emit()
+
+    def clear_all(self):
+        """Uncheck everything — start from scratch to select exactly what to include."""
+        self._restoring = True
+        try:
+            for sec in self._all_sections():
+                sec.select_none()
+        finally:
+            self._restoring = False
+        self.save_state(unseen="exclude")
+        self.filter_changed.emit()
+
+    def select_only_group(self, item_key: str, section_key: str) -> None:
+        """Panel-wide "Only" action — clear all sections, then select one group.
+
+        Clears every group in EVERY facet section (calls select_none on all),
+        then selects only the target group in its section, then emits
+        filter_changed exactly once.  This is the back-end of the per-row
+        "Only" button added in filter_group_row.py.
+        """
+        self._restoring = True
+        try:
+            for sec in self._all_sections():
+                sec.select_none()
+            for sec in self._all_sections():
+                if sec.section_key() == section_key:
+                    sec.select_only_group(item_key)
+                    break
+        finally:
+            self._restoring = False
+        self.save_state()
+        self.filter_changed.emit()
+
+    def save_state(self, *, unseen: str = "keep"):
+        """Persist the panel's selections.
+
+        Args:
+            unseen: What happens to a value the panel is not showing right now
+                (its titles are globally excluded, or on a disabled source).
+                ``"keep"`` leaves its saved state alone; ``"include"`` (the All
+                button) saves no filter at all; ``"exclude"`` (Clear) saves
+                exactly the ticked values.
+        """
+        try:
+            state = self.get_filter_state()
+
+            # Dynamic sections (Language/Region/Quality/Platform/Genre) have no items
+            # between __init__ and the first update_data() call.  Writing empty lists
+            # to config here would clobber a persisted subset before update_data() can
+            # restore it — the exact bug this guard prevents.  Static sections (Media,
+            # Untagged) are always safe to save because they are populated in __init__.
+            if self._stats_loaded:
+                # Named one by one, not setattr in a loop: GUARD-4 finds a
+                # stored field's readers by its literal name.
+                sel = {inc: self._persisted_selection(sec, inc, known, unseen)
+                       for inc, known, sec in self._known_section_attrs()}
+                cfg = self.config
+                cfg.filter_included_languages = sel['filter_included_languages']
+                cfg.filter_included_regions = sel['filter_included_regions']
+                cfg.filter_included_qualities = sel['filter_included_qualities']
+                cfg.filter_included_platforms = sel['filter_included_platforms']
+                cfg.filter_included_categories = sel['filter_included_categories']
+                cfg.filter_included_genres = sel['filter_included_genres']
+                cfg.filter_included_subtitles = sel['filter_included_subtitles']
+                cfg.filter_included_dubs = sel['filter_included_dubs']
+                cfg.filter_included_formats = sel['filter_included_formats']
+            self.config.filter_adult_mode = state['adult_mode']
+
+            # Save per-section collapse states
+            self.config.filter_section_states = {
+                sec.section_key(): sec.is_expanded()
+                for sec in self._all_sections()
+            }
+            # Save media selection and untagged toggles
+            self.config.filter_enabled_media_types = state['media_types']
+            # Only once the footer rows EXIST. save_state() can fire from
+            # _on_changed before update_data() has built them (MainWindow's
+            # restore_search_state does exactly that), and computing the
+            # exception set from zero rows writes [] over the user's saved
+            # choices — the same clobber the dynamic sections are guarded
+            # against just above, and the one this file's own regression tests
+            # were written for.
+            if any(sec.has_untagged_row() for sec in self._facet_sections().values()):
+                self.config.filter_facets_hiding_untagged = sorted(
+                    facet for facet, sec in self._facet_sections().items()
+                    if sec.has_untagged_row() and not sec.untagged_included()
+                )
+            _cfgsave.save_soon(self)
+        except Exception as e:
+            logger.warning(f"Could not save filter panel state: {e}")
+
+    def _persisted_selection(self, sec, included_attr: str, known_attr: str,
+                             unseen: str) -> "list[str] | None":
+        """The ``filter_included_*`` value to save for one facet section.
+
+        The section only holds the values present in the current counts, which
+        are scoped by Global Exclusions and active sources. Saving just its
+        ticked keys silently dropped every value not on screen — still in
+        ``filter_known_*``, so when it came back (an exclusion lifted, a source
+        re-enabled) the opt-out restore read it as deliberately unticked: a
+        filter the user never set, constraining every search after it.
+        """
+        selected = list(sec.get_selected_keys())
+        if unseen == "include":
+            return None  # "never configured" → every value, present or not
+        if unseen == "exclude":
+            return selected
+        present = set(sec.get_all_keys())
+        saved = getattr(self.config, included_attr, None)
+        prior = saved if saved is not None else (getattr(self.config, known_attr, None) or [])
+        return selected + sorted(set(prior) - present - set(selected))
+
+    def restore_state(self):
+        self._restoring = True
+        try:
+            for attr, sec in self._persisted_section_attrs():
+                saved = getattr(self.config, attr, None)
+                # None = never configured → skip (leave at all-selected default).
+                # [] = explicitly none → restore_selection(set()) unchecks all.
+                if saved is not None:
+                    sec.restore_selection(set(saved))
+
+            # Restore media chips
+            enabled = getattr(self.config, 'filter_enabled_media_types',
+                              ['live', 'movie', 'series']) or ['live', 'movie', 'series']
+            self._media_sec.restore_selection(set(enabled))
+
+        except Exception as e:
+            logger.warning(f"Could not restore filter panel state: {e}")
+        finally:
+            self._restoring = False
+
+    # ── private ─────────────────────────────────────────────────────────────
+
+    def _all_sections(self) -> list[_Section]:
+        return [self._media_sec, self._lang_sec, self._region_sec,
+                self._platform_sec, self._quality_sec, self._category_sec,
+                self._genre_sec, self._subtitle_sec, self._dub_sec,
+                self._format_sec]
+
+    def _known_section_attrs(self) -> list[tuple[str, str, object]]:
+        """Return (included_attr, known_attr, section) triples for the 9 dynamic facets.
+
+        Single source of truth for the config-key ↔ section mapping used by the
+        opt-out restore in :meth:`update_data`.  ``_persisted_section_attrs`` is
+        derived from this so the two mappings never drift.
+        """
+        return [
+            ('filter_included_languages',  'filter_known_languages',  self._lang_sec),
+            ('filter_included_regions',    'filter_known_regions',    self._region_sec),
+            ('filter_included_qualities',  'filter_known_qualities',  self._quality_sec),
+            ('filter_included_platforms',  'filter_known_platforms',  self._platform_sec),
+            ('filter_included_categories', 'filter_known_categories', self._category_sec),
+            ('filter_included_genres',     'filter_known_genres',     self._genre_sec),
+            ('filter_included_subtitles',  'filter_known_subtitles',  self._subtitle_sec),
+            ('filter_included_dubs',       'filter_known_dubs',       self._dub_sec),
+            ('filter_included_formats',    'filter_known_formats',    self._format_sec),
+        ]
+
+    def _persisted_section_attrs(self) -> list[tuple[str, object]]:
+        """Return (config_attr_name, section) pairs for all dynamic sections.
+
+        Single source of truth for the config-key → section mapping, shared by
+        ``restore_state`` (startup) and ``update_data``.  Derived from
+        ``_known_section_attrs`` so the include-attr mapping has one definition.
+        """
+        return [(inc_attr, sec) for inc_attr, _known_attr, sec in self._known_section_attrs()]
+
+    def _section_by_key(self, section_key: str):
+        """Return the _Section whose key matches, or None."""
+        for sec in self._all_sections():
+            if sec.section_key() == section_key:
+                return sec
+        return None
+
+    def _restore_facet_opt_out(self, sec, included_attr: str, known_attr: str,
+                               prev: set[str], was_first: bool,
+                               new_out: dict[str, set[str]]) -> None:
+        """Restore one facet's selection under the opt-out model.
+
+        ``current`` = every value currently present/renderable in the section
+        (``sec.get_all_keys()``).  ``known`` = the accumulated set of values already
+        surfaced to the user (``config.<known_attr>``).
+
+        * ``known`` is None → the opt-out baseline has never run for this facet:
+          INCLUDE every present value (un-hide the user's currently-hidden content,
+          overriding any prior Tier-1 deselection) and record the baseline.  No
+          popup — the un-hide is silent.
+        * otherwise → ``new = current − known``.  The effective selection is
+          ``base ∪ new`` where ``base`` is the live in-memory selection (``prev``)
+          or, when empty, the persisted ``included_attr`` (None persisted → all
+          present).  New values stay CHECKED (opt-out); a value in ``known`` but not
+          in ``base`` was genuinely deselected and stays unchecked.  ``known`` grows
+          to ``known ∪ current`` and never shrinks, so a value that disappears and
+          later reappears is not re-flagged as new.
+
+        Newly-seen values are recorded in ``new_out[section_key]`` for the popup,
+        but only on non-first calls (``was_first`` False — i.e. a source refresh).
+        """
+        current = set(sec.get_all_keys())
+        known_raw = getattr(self.config, known_attr, None)
+
+        if known_raw is None:
+            # Feature's first run for this facet → establish the opt-out baseline.
+            sec.restore_selection(current)
+            setattr(self.config, known_attr, sorted(current))
+            return
+
+        known = set(known_raw)
+        new = current - known
+        if prev:
+            base = set(prev)
+        else:
+            saved = getattr(self.config, included_attr, None)
+            base = set(saved) if saved is not None else set(current)
+        sec.restore_selection(base | new)
+        setattr(self.config, known_attr, sorted(known | current))
+        if new and not was_first:
+            new_out[sec.section_key()] = new
+
+    def _show_new_values_popup(self, new_by_facet: dict[str, set[str]]) -> None:
+        """Show the opt-out popup for newly-seen facet values, then apply + reload.
+
+        Every new value is already CHECKED (included).  On confirm, unchecked values
+        are removed from their section's selection (excluded); on cancel, all stay
+        included.  Either way the channel list is reloaded so it reflects the final
+        selection and the newly-surfaced content.
+        """
+        from PyQt6.QtWidgets import QDialog
+
+        from streamselect.gui.new_facet_values_dialog import NewFacetValuesDialog
+
+        labels: dict[str, dict[str, str]] = {}
+        if 'region' in new_by_facet:
+            labels['region'] = {
+                code: self._region_label(code) for code in new_by_facet['region']
+            }
+        dlg = NewFacetValuesDialog(
+            new_by_facet, self._FACET_TITLES, labels, parent=self.window())
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            excluded = dlg.excluded()
+            if excluded:
+                self._apply_new_value_exclusions(excluded)
+        self.save_state()
+        self.filter_changed.emit()
+
+    def _apply_new_value_exclusions(self, excluded: dict[str, set[str]]) -> None:
+        """Uncheck the given values in each section (opt them out of the filter)."""
+        self._restoring = True
+        try:
+            for section_key, values in excluded.items():
+                sec = self._section_by_key(section_key)
+                if sec is None:
+                    continue
+                remaining = set(sec.get_selected_keys()) - set(values)
+                sec.restore_selection(remaining)
+        finally:
+            self._restoring = False
+
+    def _add_divider(self):
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFixedHeight(1)
+        _theme.style_fn(line, lambda: f"background:{_theme.COLOR_LINE_DARK}; border:none;")
+        self._sl.addWidget(line)
+
+    def _on_item_only_requested(self, item_key: str, section_key: str) -> None:
+        """Slot for the per-row 'Only' button — delegates to select_only_group."""
+        self.select_only_group(item_key, section_key)
+
+    def _on_collapse_toggled(self):
+        """Save collapse state when a section header is toggled — no filter reload."""
+        if not self._restoring:
+            self.save_state()
+
+    def _on_changed(self):
+        if not self._restoring:
+            self.save_state()
+        self.filter_changed.emit()
+
+    def _on_hide_watched_changed(self, _state: int) -> None:
+        """Handle toggling the 'Hide watched' checkbox — persist and reload."""
+        if not self._restoring:
+            self.config.filter_hide_watched = self._hide_watched_cb.isChecked()
+            _cfgsave.save_soon(self)
+        self.filter_changed.emit()
+
+    def _region_label(self, code: str) -> str:
+        from streamselect.core.region_codes import REGION_FULL_NAMES
+        return REGION_FULL_NAMES.get(code, code)
+
+    # ── Right-click context menu ────────────────────────────────────────────────
+
+    # Sections where "Exclude globally" makes sense — maps section key to the
+    # config lookup that resolves a display key to its prefix codes.
+    _GLOBALLY_EXCLUDABLE = {"language", "region", "platform", "subtitle", "dub", "format"}
+
+    def _on_item_right_clicked(self, item_key: str, section_key: str, pos: QPoint):
+        menu = QMenu(self)
+        _theme.style_fn(menu, lambda: f"QMenu {{ background:{_theme.COLOR_LINE_DARK}; color:{_theme.COLOR_TEXT}; border:1px solid {_theme.COLOR_BORDER}; }}"
+            f"QMenu::item:selected {{ background:{_theme.COLOR_BORDER}; }}")
+
+        only_act = menu.addAction(f"Only '{item_key}'")
+        only_act.setToolTip("Show only this group — clears all other filters")
+        only_act.triggered.connect(lambda: self.select_only_group(item_key, section_key))
+
+        solo_act = menu.addAction(f"Check only '{item_key}'")
+        solo_act.triggered.connect(lambda: self._check_only(item_key, section_key))
+
+        if section_key in self._GLOBALLY_EXCLUDABLE:
+            menu.addSeparator()
+            excl_act = menu.addAction(f"Exclude '{item_key}' globally…")
+            excl_act.triggered.connect(
+                lambda: self._exclude_globally(item_key, section_key)
+            )
+
+        menu.exec(pos)
+
+    def _check_only(self, item_key: str, section_key: str):
+        for sec in self._all_sections():
+            if sec.section_key() == section_key:
+                sec.check_only(item_key)
+                self.save_state()
+                break
+
+    def _exclude_globally(self, item_key: str, section_key: str):
+        """Add the item's prefix codes to global_filter_excluded_prefixes."""
+        # Resolve display key → list of raw prefix codes
+        if section_key == "language":
+            prefixes = self.config.filter_language_groups.get(item_key, [item_key])
+        elif section_key == "region":
+            prefixes = [item_key]
+        elif section_key == "platform":
+            prefixes = self.config.filter_platform_groups.get(item_key, [item_key])
+        else:
+            return
+
+        excluded: list[str] = list(getattr(self.config, 'global_filter_excluded_prefixes', []))
+        added = False
+        for p in prefixes:
+            if p not in excluded:
+                excluded.append(p)
+                added = True
+        if not added:
+            return
+
+        self.config.global_filter_excluded_prefixes = excluded
+        _cfgsave.save_soon(self)
+        logger.info(f"Globally excluded {prefixes} via filter panel (key={item_key!r})")
+
+        # Also uncheck the item locally so the UI is consistent
+        for sec in self._all_sections():
+            if sec.section_key() == section_key:
+                for r in sec._rows:
+                    if r.key() == item_key:
+                        r.set_checked(False, block=False)
+                        break
+                sec._update_ui()
+                break
+        self.save_state()
+        self.filter_changed.emit()

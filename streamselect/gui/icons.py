@@ -1,0 +1,788 @@
+"""Central icon registry for StreamSelect UI.
+
+All glyphs, emoji, and symbols used in the UI must be defined here.
+Import and reference by name — never use a literal glyph in widget code
+(``tests/test_no_stray_glyph_literals.py`` fails the suite on one).
+
+An ICON-ONLY BUTTON is not built from these constants directly: passing a
+glyph as a button's text draws a colour emoji at the host font size inside a
+fixed-size button, which crops. Go through the one factory instead, which
+resolves a vector glyph where :data:`VECTOR_KEYS` has one and repaints on a
+theme switch::
+
+    from streamselect.gui import icon_utils
+    btn = icon_utils.icon_button("close", "Clear filter")
+    icon_utils.set_button_icon(btn, "collapse")   # a toggle swaps its ICON
+
+A glyph read stays right for text: ``QLabel(icons.bullet_icon)``, or a label
+that is words plus a glyph (``f"{icons.play_icon} Play"``).
+
+To add a new icon, add it here first, then reference it.
+"""
+
+# Media type indicators
+live_icon: str = "📡"
+movie_icon: str = "🎬"
+series_icon: str = "📺"
+season_icon: str = "📁"
+episode_icon: str = "▶"
+unknown_icon: str = "❓"
+
+# Favorite / rating
+favorite_icon: str = "★"
+unfavorite_icon: str = "☆"
+rating_star_icon: str = "★"
+like_icon: str = "👍"
+dislike_icon: str = "👎"
+not_interested_icon: str = "🙅"
+curious_icon: str = "❓"
+# "No mood set" state in the mood-picker button row (category_picker_dialog) —
+# was a bare "—" literal at the call site, coincidentally the same codepoint
+# as group_mark_icon (a different, unrelated role: the nested group-heading
+# marker). Its own name so the two never collide again.
+mood_none_icon: str = "—"
+watched_icon: str = "✓"
+# Channel-list playback-state separator — the fixed "·" slot between the leading
+# icons/tags and the title becomes a 3-state indicator (see playback_state_glyph).
+# SHAPE carries the meaning (dot vs play-triangle vs check); colour (applied by the
+# row delegate from theme tokens) is reinforcement only, so it is colourblind-safe.
+playback_neutral_icon: str = "·"        # U+00B7 MIDDLE DOT — not started (neutral separator)
+playback_in_progress_icon: str = "▶"    # U+25B6 BLACK RIGHT-POINTING TRIANGLE — in progress / resumable
+partial_watched_icon: str = "◐"      # U+25D0 CIRCLE WITH LEFT HALF BLACK — ~half watched (~37–62%)
+partial_watched_q1_icon: str = "◔"   # U+25D4 CIRCLE WITH UPPER RIGHT QUADRANT BLACK — ~quarter watched (<37%)
+partial_watched_q3_icon: str = "◕"   # U+25D5 CIRCLE WITH ALL BUT UPPER LEFT QUADRANT BLACK — ~three-quarter (62–99%)
+
+# Actions
+add_icon: str = "+"  # Add / create new item
+play_icon: str = "▶"
+open_ended_buffer_icon: str = "∞"  # U+221E INFINITY — open-ended disk-backed buffer (monochrome, "buffer without end")
+record_icon: str = "⏺"     # U+23FA BLACK CIRCLE FOR RECORD — record a live channel
+# Catch, Keep, Record (Feature 3, settled): guide-row Rec column state.
+# Same filled dot as record_icon (the state is COLOUR, COLOR_ERR-family, applied
+# by the caller) — the affordance itself does not change shape, only its tint
+# and tooltip, once it is actively taking the connection.
+# A distinct, non-solid shape for "scheduled but not yet recording" — reuses the
+# partial-circle family already established by partial_watched_*_icon above
+# rather than a clock glyph, which is Emoji_Presentation by default on most
+# platforms and would render in colour regardless of theme.
+diagnose_icon: str = "∿"    # stream-diagnostics action (U+223F SINE WAVE — monochrome signal waveform)
+                            # Monochrome by codepoint, unlike 🔧/🛠 which render as
+                            # colour emoji on most platforms and would ignore the palette.
+close_icon: str = "×"
+delete_icon: str = "🗑"
+refresh_icon: str = "⟳"
+settings_icon: str = "⚙"
+search_icon: str = "🔍"
+                            # (📋 is the Watch Queue; ⧉ is the split-streams toggle)
+versions_icon: str = "🗐"   # U+1F5D0 PAGES — channel-menu "Show N versions" (collapsed-row variant picker)
+filter_icon: str = "⚡"
+show_all_icon: str = "⋯"    # U+22EF MIDLINE HORIZONTAL ELLIPSIS — "show all / expand" affordance
+overflow_icon: str = "⋯"    # U+22EF MIDLINE HORIZONTAL ELLIPSIS — "More…" overflow-menu button (demoted actions)
+hide_icon: str = "🚫"
+pin_icon: str = "📌"
+visibility_toggle_icon: str = "👁"
+
+# Navigation / collapse
+expand_icon: str = ">"
+collapse_icon: str = "⌄"
+move_up_icon: str = "▲"
+move_down_icon: str = "▼"
+# channel_list_section_band's own PAINTED caret pair (QPainter.drawText, no
+# QIcon involved) — visually its own small-triangle shape, deliberately
+# distinct from expand_icon/collapse_icon's chevrons. search_band_caret_shut
+# shares its codepoint with qa_goto_icon on purpose (same shape, unrelated
+# meaning) but keeps its own name so the two contexts never collide under one.
+search_band_caret_open_icon: str = "▾"   # U+25BE BLACK DOWN-POINTING SMALL TRIANGLE
+search_band_caret_shut_icon: str = "▸"   # U+25B8 BLACK RIGHT-POINTING SMALL TRIANGLE
+# The "this control opens a menu" caret on a chip/dropdown button (chips.py's
+# FilterDropdown). Same codepoint as move_down_icon, different meaning — a
+# reorder arrow and a menu affordance must be free to diverge, and typing "▼"
+# inline in two places is exactly the drift tests/test_no_stray_glyph_literals.py
+# now fails the suite on.
+prev_icon: str = "◀"
+next_icon: str = "▶"
+# Carousel / single-axis navigation (monochrome single chevrons — no colour bleed)
+nav_prev_icon: str = "‹"   # U+2039 SINGLE LEFT-POINTING ANGLE QUOTATION MARK — "newer / forward"
+nav_next_icon: str = "›"   # U+203A SINGLE RIGHT-POINTING ANGLE QUOTATION MARK — "older / back"
+
+# State
+loading_icon: str = "⟳"
+epg_indicator_icon: str = "▦"   # EPG/guide status square; colored by freshness state
+live_indicator_icon: str = "🟢"
+stream_retry_pending_icon: str = "🔴"
+stream_retry_online_icon: str = "🟢"
+status_dot_icon: str = "●"      # filled status dot; colored by state (ok/err) at the call site
+watchlist_on_icon: str = "🔔"
+watchlist_off_icon: str = "🔕"
+preferred_version_icon: str = "🎯"
+# "Clear EPG link" — unlink a channel's wrong/mismatched guide data and block it
+# from future auto-matching (channel menu + details-pane rail, live channels only).
+
+# Alerts (siren — used for the Alerts sidebar section AND the new-episode alert action;
+# not 📡, which is live/provider/events, nor ⚠, which stays for warnings)
+alert_icon: str = "🚨"          # the alert affordance — Alerts section header + "alert me to new episodes"
+# "New monitored-content match" marker — the colourblind-safe non-colour cue that
+# ALWAYS pairs with the new-match GREEN across every surface (sidebar badge, details
+# Alert button, channel-list rows, Watch Queue line).  Deliberately the same siren
+# as ``alert_icon`` (it IS an alert) but kept DISTINCT in name/meaning from ✨
+# (``discover_icon`` — "new ingested content"); the two must never collide.
+new_match_icon: str = "🚨"
+manage_icon: str = "⚙"          # manage/organize affordance (e.g. Manage alerts)
+
+# Section / navigation labels
+history_icon: str = "🕒"
+provider_icon: str = "📡"
+watch_alerts_icon: str = "⚠"
+info_icon: str = "ℹ"
+#: Tools ▸ "Open config folder". A FOLDER rather than a document, because the
+#: action reveals the directory — config.yaml sits beside the logs, and a user
+#: sent to fetch one usually needs the other.
+config_folder_icon: str = "📂"  # U+1F4C2 OPEN FILE FOLDER
+#: Tools ▸ "Log viewer". A SCROLL rather than a document or a magnifier: the
+#: window shows a running stream of lines, not a file to open or a search.
+#: Tools ▸ "Clear log" and the viewer's own clear button — the same broom the
+#: EPG link-clearing action uses, because it is the same kind of act.
+#: The viewer's save-to-file action.
+watchlist_icon: str = "⏰"
+calendar_icon: str = "📅"
+#: The mark a NESTED group heading puts in the reserved play-slot column.
+#:
+#: An em-dash, deliberately NOT a caret. The section headers have had no caret
+#: since an earlier change — the heading itself is the control, and a caret beside a
+#: clickable title is a second affordance for one action. A caret also carries
+#: STATE (down open, right shut), so it would have to flip, and then it is a
+#: control competing with the heading it sits on. This is a mark: it fills the
+#: column, breaks the run of titles, and says nothing it cannot back up.
+group_mark_icon: str = "—"
+discover_icon: str = "✨"
+preferences_icon: str = "🎯"
+queue_icon: str = "📋"
+events_icon: str = "📡"         # EPG Events tab (platform-event / scheduled feeds)
+
+# Discover zoom slider
+
+# Poster lightbox
+zoom_poster_icon: str = "⤢"   # U+2922 — diagonal arrow; "click to enlarge" affordance
+
+# Similar-titles lightbox — "preview / open in the lightbox" affordance on a Similar
+# row and on each similar-strip card.  U+2922 diagonal arrow (same glyph family as
+# zoom_poster_icon).  DELIBERATELY DISTINCT in name/meaning from ``expand_icon`` (the
+# collapsible caret ">"): this opens the preview overlay, it does not expand a section.
+lightbox_icon: str = "⤢"
+
+# Explore trail-map (cascading-columns adjacency browser opened from the lightbox).
+# Compass = "lateral exploration / walk the adjacency trail" — DELIBERATELY DISTINCT
+# from ``discover_icon`` (✨ = the global browse) and ``lightbox_icon`` (⤢ = preview).
+# The sidebar section header's Explore affordance. Same U+2922 glyph family as
+# ``zoom_poster_icon``/``lightbox_icon`` — all three mean "open this out into a
+# bigger surface" — and specifically the glyph that opened the cascading columns
+# from a Similar row before click-to-preview replaced it there, so it is already
+# the learned affordance for exactly this action. NOT ``expand_icon`` (">"): the
+# section's own collapse toggle sits in the same header and renders that pair.
+explore_columns_icon: str = "⤢"   # U+2922 — "open the cascading columns"
+# Trail-map row chevron — "expand this stop into the next column". Reuses the single
+# right-angle-quote family (nav_next), NOT the collapsible ">" caret (expand_icon).
+trail_expand_icon: str = "›"   # U+203A SINGLE RIGHT-POINTING ANGLE QUOTATION MARK
+
+# What's New
+bullet_icon: str = "•"       # U+2022 BULLET — used in What's New item lists
+
+# View toggles
+list_view_icon: str = "☰"
+grid_view_icon: str = "⊞"
+
+# Notification type indicators
+notification_progress_icon: str = "⟳"
+notification_success_icon: str = "✓"
+notification_error_icon: str = "✗"
+notification_warning_icon: str = "⚠"
+notification_info_icon: str = ""
+
+# Migration progress indicators
+migration_pending_icon: str = "◻"   # U+25FB WHITE MEDIUM SQUARE — task not yet done
+migration_done_icon: str = "✓"      # U+2713 CHECK MARK — task complete
+
+# Taste markers on a details-pane person chip (Cast section): you have liked /
+# disliked work by this person. Their own keys, not move_up/move_down — a
+# reorder arrow and a taste marker must be free to diverge.
+# A measured fact (PLAYED-1): the stream itself confirmed it, e.g. the quality
+# badge on a copy chip whose resolution was read off the stream.
+verified_icon: str = "✓"            # U+2713 CHECK MARK
+
+# Tag cloud — state mark prefixes (WeightedTagCloud)
+tag_include_icon: str = "✓"   # U+2713 CHECK MARK — "this facet value is included in filter"
+
+# Tag cloud — sort / filter controls
+
+# Content variant count badge (dedup Slice 2 — shown on collapsed cards with >1 variant)
+variant_count_icon: str = "×"    # U+00D7 MULTIPLICATION SIGN — "×N" variant count badge prefix
+
+# Recipe builder (task an earlier change)
+recipe_icon: str = "✦"          # U+2726 BLACK FOUR POINTED STAR — Recipe chip (same as whats_new star)
+recipe_check_icon: str = "✓"    # U+2713 CHECK MARK — included ingredient indicator (alias of tag_include_icon)
+
+# Dev-only QA Testing Checklist
+qa_stale_icon: str = "⚠"           # Newer build available — re-test hint
+qa_goto_icon: str = "▸"            # U+25B8 BLACK RIGHT-POINTING SMALL TRIANGLE — "Go" deep-link to view/content under test
+
+# Background metadata enrichment queue (Tools menu + progress view). Start/Resume
+# reuse play_icon (▶) — same "go" affordance, no need for a third glyph.
+
+# Provider icon palette — colored-circle glyphs offered when picking a source icon
+provider_icon_palette: list[str] = [
+    "🔴", "🟠", "🟡", "🟢", "🔵", "🟣", "🟤", "⚫", "⚪", "🔶", "🔷", "🔸", "🔹",
+]
+
+
+def pick_next_icon(used_icons: list[str]) -> str:
+    """Return the first palette icon not already in use; cycle if palette exhausted."""
+    for icon in provider_icon_palette:
+        if icon not in used_icons:
+            return icon
+    return provider_icon_palette[len(used_icons) % len(provider_icon_palette)]
+
+
+def effective_watch_pct(watch_percent: int, watch_progress: int) -> int:
+    """Return the effective watch percentage for glyph selection.
+
+    When ``watch_percent`` is 0 but ``watch_progress`` is nonzero, the item has
+    started but no explicit % was captured (e.g. very short progress).  Promote
+    it to 1 so the partial glyph shows rather than leaving the row blank.
+
+    Args:
+        watch_percent: 0–100 stored percentage.
+        watch_progress: Resume position in seconds (0 = unwatched or completed).
+
+    Returns:
+        int: Effective percentage for ``watch_progress_glyph()``.
+    """
+    return watch_percent or (1 if watch_progress > 0 else 0)
+
+
+def watch_progress_glyph(
+    watch_percent: int,
+    watch_completed: bool,
+    partial_threshold_pct: int = 10,
+) -> str:
+    """Map a stored ``watch_percent`` to the appropriate graduated progress glyph.
+
+    Thresholds (percent):
+        - 100 / watch_completed → ✓ (``watched_icon``)
+        - ≥ partial_threshold_pct and < 37 → ◔ (``partial_watched_q1_icon``, ~quarter)
+        - ≥ 37 and < 63                    → ◐ (``partial_watched_icon``,    ~half)
+        - ≥ 63 and < complete              → ◕ (``partial_watched_q3_icon``, ~three-quarter)
+        - below partial_threshold_pct       → "" (untouched / no glyph)
+
+    Args:
+        watch_percent: 0–100 stored percentage (0 = unwatched or duration unknown).
+        watch_completed: Sticky completion flag; overrides percent when True.
+        partial_threshold_pct: Lower bound (int, 0–100) below which no glyph is shown.
+            Corresponds to ``Config.watch_partial_threshold * 100``.
+
+    Returns:
+        One of the four watch-state glyphs, or ``""`` when the item is untouched.
+    """
+    if watch_completed:
+        return watched_icon
+    if watch_percent >= 63:
+        return partial_watched_q3_icon
+    if watch_percent >= 37:
+        return partial_watched_icon
+    if watch_percent >= partial_threshold_pct:
+        return partial_watched_q1_icon
+    return ""
+
+
+def playback_state_glyph(watch_progress: int, watch_completed: bool) -> str:
+    """Map a row's playback state to the single 3-state separator glyph.
+
+    The channel-list "·" separator is a fixed-position playback indicator whose
+    three mutually-exclusive states are distinguished by SHAPE (colourblind-safe;
+    the row delegate adds colour as reinforcement only):
+
+        - ``watch_completed``                       → ✓  (``watched_icon``, green)
+        - ``watch_progress > 0`` and not completed  → ▶  (``playback_in_progress_icon``, orange)
+        - otherwise (not started)                   → ·  (``playback_neutral_icon``, neutral)
+
+    Unlike :func:`watch_progress_glyph`, this is a binary started/not-started
+    distinction (no graduated quarter/half thresholds) — the list answers "can I
+    resume this?", not "how far in am I?".
+
+    Args:
+        watch_progress: Resume position in seconds (0 = unwatched or completed).
+        watch_completed: Sticky completion flag.
+
+    Returns:
+        One of ``watched_icon`` / ``playback_in_progress_icon`` / ``playback_neutral_icon``.
+    """
+    if watch_completed:
+        return watched_icon
+    if watch_progress > 0:
+        return playback_in_progress_icon
+    return playback_neutral_icon
+
+
+#: playback_state_glyph's two drawn states → their icon roles. The neutral "·"
+#: is typography and has no role.
+PLAYBACK_GLYPH_ROLES: dict[str, str] = {
+    watched_icon: "watched",
+    playback_in_progress_icon: "playback_in_progress",
+}
+
+
+# ---------------------------------------------------------------------------
+# Watch-indicator icon helpers (QIcon cache, lazily built on the main thread)
+# ---------------------------------------------------------------------------
+# The small set of watch state x provenance combinations (~8 entries) is cached
+# so QPixmap/QIcon construction happens once per glyph x muted pair.  QPixmap is a
+# GUI object and MUST be created on the main thread -- these helpers are only ever
+# called from the model's data() method which runs on the main thread.
+
+_WATCH_ICON_CACHE: dict[tuple[str, bool], object] = {}  # (glyph, muted) -> QIcon
+
+
+# ---------------------------------------------------------------------------
+# General glyph → QIcon helper (menu action icons)
+# ---------------------------------------------------------------------------
+# Renders any text glyph to a *monochrome* QIcon for use with QAction.setIcon().
+# Cached by (glyph, colour) — construction is deferred to first use so the module
+# can be imported before a QApplication exists.
+
+_GLYPH_ICON_CACHE: dict[tuple[str, str], object] = {}  # (glyph, colour) -> QIcon
+
+
+def glyph_icon(glyph: str, color: str | None = None) -> object:
+    """Return a QIcon rendering *glyph* monochrome in *color* for QAction.setIcon().
+
+    The glyph is painted and then recoloured via a ``SourceIn`` composite, so the
+    result is a single solid colour regardless of whether *glyph* is a plain text
+    symbol or a colour-emoji codepoint: line glyphs keep their stroke detail while
+    colour emoji collapse to a clean silhouette.  This is what lets the channel
+    context menu read as one monotone palette with the single orange resume accent
+    (the menu passes ``COLOR_PLAYBACK_IN_PROGRESS`` only for the resume affordance).
+
+    MUST be called on the main thread — builds a QPixmap on first use.
+
+    Args:
+        glyph: Text glyph (emoji or symbol) to render.
+        color: A theme colour token (e.g. ``theme.COLOR_PLAYBACK_IN_PROGRESS``).
+            ``None`` → the muted/gray menu default (``theme.COLOR_MUTED``).
+
+    Returns:
+        A cached ``QIcon`` instance keyed by (glyph, resolved colour).
+    """
+    from streamselect.gui import theme as _theme  # local import to avoid circular at load
+
+    color_str = color or _theme.COLOR_MUTED
+    cache_key = (glyph, color_str)
+    if cache_key in _GLYPH_ICON_CACHE:
+        return _GLYPH_ICON_CACHE[cache_key]
+
+    from PyQt6.QtCore import QRect, Qt
+    from PyQt6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
+    from PyQt6.QtWidgets import QApplication
+
+    size = 16
+    screen = QApplication.primaryScreen()
+    dpr = screen.devicePixelRatio() if screen is not None else 1.0
+    phys = int(size * dpr)
+    pixmap = QPixmap(phys, phys)
+    pixmap.setDevicePixelRatio(dpr)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    font = QFont()
+    font.setPixelSize(int(_theme.FONT_LG.replace("px", "")))
+    painter.setFont(font)
+    painter.drawText(QRect(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, glyph)
+    # Recolour: keep the rendered glyph's alpha shape, replace its RGB with the
+    # target colour.  Collapses colour emoji to a single-colour silhouette so the
+    # menu stays monotone; the painter works in logical coords (DPR set), so fill
+    # the logical rect, not pixmap.rect() (the device rect).
+    painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+    painter.fillRect(QRect(0, 0, size, size), QColor(color_str))
+    painter.end()
+
+    icon = QIcon(pixmap)
+    _GLYPH_ICON_CACHE[cache_key] = icon
+    return icon
+
+
+def _clear_glyph_icon_cache() -> None:
+    """Discard all cached QIcon entries from :func:`glyph_icon`.
+
+    Called after ``QApplication`` teardown (e.g. between tests) so stale
+    QIcon objects from a previous ``QApplication`` instance are never reused.
+    """
+    _GLYPH_ICON_CACHE.clear()
+
+
+def _clear_watch_icon_cache() -> None:
+    """Discard all cached QIcon entries.
+
+    Called after ``QApplication`` teardown (e.g. between tests) so stale
+    QIcon objects from a previous ``QApplication`` instance are never reused.
+    """
+    _WATCH_ICON_CACHE.clear()
+
+
+def watch_icon(glyph: str, muted: bool) -> object:
+    """Return the mdi6 QIcon for watch-state *glyph*, in solid or muted color.
+
+    MUST be called on the main thread -- builds a QPixmap on first use.
+
+    The color is taken from ``theme.COLOR_TEXT`` (solid, deliberate watch) or
+    ``theme.COLOR_MUTED`` (muted, auto-advanced via queue).  Both come from
+    design tokens -- no inline hex literals.
+
+    Args:
+        glyph: One of the watch-progress glyphs (checkmark and circle variants).
+        muted: True -> muted/gray (queue-watched); False -> solid (manually-watched).
+
+    Returns:
+        A cached ``QIcon`` instance.
+    """
+    from streamselect.gui import theme as _theme  # local import to avoid circular at module load
+
+    cache_key = (glyph, muted)
+    if cache_key in _WATCH_ICON_CACHE:
+        return _WATCH_ICON_CACHE[cache_key]
+
+    # Drawn from the one icon set: each watch glyph maps to its mdi6 role.
+    from streamselect.gui import icon_utils as _icon_utils  # local: icon_utils imports this module
+    role = {watched_icon: "watched", partial_watched_q1_icon: "partial_watched_q1",
+            partial_watched_icon: "partial_watched", partial_watched_q3_icon: "partial_watched_q3",
+            episode_icon: "episode"}.get(glyph, "episode")
+    icon = _icon_utils.role_icon(role, _theme.COLOR_MUTED if muted else _theme.COLOR_TEXT)
+    _WATCH_ICON_CACHE[cache_key] = icon
+    return icon
+
+
+def watch_icon_for_channel(
+    glyph: str | None,
+    last_played_via: str | None,
+) -> object | None:
+    """Return a QIcon for a channel's watch state, or None if unwatched.
+
+    Wraps ``watch_icon`` with the provenance mapping:
+    - ``last_played_via == "queue"`` -> muted/gray icon (auto-advanced, passive).
+    - anything else (manual, alert, None with a glyph) -> solid icon.
+    - ``glyph`` is empty or None -> None (no icon; slot stays blank for unwatched rows).
+
+    MUST be called on the main thread.
+
+    Args:
+        glyph: Result of ``watch_progress_glyph(...)``; empty-string or None = unwatched.
+        last_played_via: Provenance string from the DTO (manual / queue / None).
+
+    Returns:
+        A ``QIcon`` or ``None``.
+    """
+    if not glyph:
+        return None
+    muted = (last_played_via == "queue")
+    return watch_icon(glyph, muted)
+
+
+# ---------------------------------------------------------------------------
+# Vector icon keys — the monochrome, themeable counterpart to the glyphs above
+# ---------------------------------------------------------------------------
+# The emoji constants above cannot take a colour: they render in whatever the
+# font supplies, so they ignore the palette entirely and look different on every
+# platform. ``mdi6`` (Material Design Icons, already shipped via the qtawesome
+# dependency) is monochrome and colour-controlled, so an icon finally tracks the
+# theme like any other foreground.
+#
+# One map, keyed by the SAME semantic role the glyph constants use, so a caller
+# reads either representation from one place. Resolution goes through
+# ``icon_utils.resolve_icon``, which owns the fallback chain — this module never
+# imports qtawesome itself.
+VECTOR_KEYS: dict[str, str] = {
+    # media kind — chosen by rendering candidates at row size, not by name:
+    # a "television" glyph beats "play-box" for series because the latter's play
+    # triangle reads as a play BUTTON next to an actual one, and "access-point"
+    # beats "satellite-variant" for live, which collapses into noise at 15px.
+    "live": "mdi6.access-point",
+    "movie": "mdi6.movie-open-outline",
+    # A user's pick (P1). "television-classic" and the movie clapper
+    # are both small boxes at the 13px sidebar size and were near
+    # indistinguishable side by side; the plain television reads as its own
+    # shape against the clapper's diagonal.
+    "series": "mdi6.television",
+    "season": "mdi6.folder-outline",
+    "episode": "mdi6.play-circle-outline",
+    # judgement / state
+    # A heart, not a star (user report): the details pane shows ratings
+    # as stars, and one shape cannot mean both "rated" and "favourite".
+    "favorite": "mdi6.heart",
+    "unfavorite": "mdi6.heart-outline",
+    "like": "mdi6.thumb-up-outline",
+    "dislike": "mdi6.thumb-down-outline",
+    "not_interested": "mdi6.cancel",
+    "watched": "mdi6.check",
+    "unwatched": "mdi6.circle-outline",
+    # The sidebar header's "something new here" marker — in practice new
+    # Watch Alerts. The bell with a dot (a user's pick); the role is
+    # named "news" but the app has no news.
+    "news": "mdi6.bell-badge-outline",
+    # The row-level "new" mark. A small spark, not a dot: the status dot
+    # (source on/off) is a filled dot too, and the two differed only by colour.
+    "new_dot": "mdi6.star-four-points-small",
+    "monitor": "mdi6.bell-outline",
+    "monitor_off": "mdi6.bell-off-outline",
+    "hide": "mdi6.eye-off-outline",
+    "queue": "mdi6.playlist-plus",
+    # channel-menu "Show N versions separately" (recommendation-engine dedup
+    # override) — distinct from "versions" would-be role: not registered
+    # because show_versions has never needed a vector counterpart either.
+    "show_separately": "mdi6.not-equal-variant",
+    # "Saved for later" is a list, not a time: a bookmark, not a clock beside
+    # the scheduled-recording clock (user report). The eye read as a football.
+    "watch_later": "mdi6.bookmark-outline",
+    # navigation / chrome
+    "search": "mdi6.magnify",
+    "epg": "mdi6.calendar-month-outline",
+    "recommended": "mdi6.star-check-outline",
+    "discover": "mdi6.shimmer",
+    "recipe": "mdi6.tune-variant",
+    # A whistle, not a ball: the view holds hockey, F1, UFC and tennis, and
+    # any one sport's ball would say the other three are somewhere else.
+    "sports": "mdi6.whistle",
+    # A ticket, not a calendar: the view is what you can BUY OR TUNE INTO at a
+    # time, and "calendar" is already the EPG's glyph.
+    "events": "mdi6.ticket-confirmation-outline",
+    # "Manage these alerts" — the three-slider glyph. Its own role rather than
+    # reusing "recipe" (also sliders): two different meanings sharing one glyph
+    # is how an icon stops meaning anything.
+    "manage": "mdi6.tune",
+    "explore": "mdi6.arrow-right",
+    "columns": "mdi6.arrow-expand",
+    "settings": "mdi6.cog-outline",
+    "tools": "mdi6.wrench-outline",
+    "split": "mdi6.view-split-vertical",
+    # Universal disclosure convention: closed shows a RIGHT chevron, open shows
+    # a DOWN chevron — the same direction the plain-text carets above
+    # (``expand_icon``/``collapse_icon`` = ">"/"⌄") already use. These two were
+    # swapped (CHV-2): "expand" — the role every call site passes for a CLOSED
+    # section, naming the action available — resolved to chevron-DOWN, and
+    # "collapse" (OPEN section) resolved to chevron-RIGHT, so every
+    # vector-rendered disclosure chevron in the app pointed backwards.
+    "expand": "mdi6.chevron-right",
+    "collapse": "mdi6.chevron-down",
+    # "this programme is on several sources" — NOT the expand/collapse chevron.
+    # A chevron at 14px is very nearly a play triangle, and on the EPG
+    # programme row the two sat in the same column: user report, "carot and play
+    # buttons look way too similar". Two stacked boxes says "a list of
+    # sources", which is what opening the row actually shows. Outline closed,
+    # filled open — one shape, two states.
+    "sources_closed": "mdi6.view-agenda-outline",
+    "sources_open": "mdi6.view-agenda",
+    "more": "mdi6.dots-horizontal",
+    "close": "mdi6.close",
+    # QA checklist (dev) — the pass/fail toggle and the jump arrow (ledger F42).
+    "qa_pass": "mdi6.check-bold",   # not "watched"'s plain check
+    "qa_fail": "mdi6.close-thick",
+    "qa_jump": "mdi6.arrow-up",
+    "add": "mdi6.plus",
+    # Remove the selected row from a list the user is building (e.g. a
+    # provider's URL list) — the opposite of "add", not a delete/trash action.
+    "remove": "mdi6.minus",
+    "refresh": "mdi6.refresh",
+    # Destructive section action ("Clear History"). Registered because a
+    # single-action section shows its action DIRECTLY in the header rather
+    # than behind a ⋯, and a header button needs a vector glyph.
+    "clear_all": "mdi6.delete-outline",
+    "warning": "mdi6.alert-outline",
+    "history": "mdi6.history",
+    "sources": "mdi6.package-variant-closed",
+    "play": "mdi6.play",
+    # "Play the next episode" — the transport control for skipping AHEAD, not
+    # ">>", which is the fast-forward glyph and means "speed up".
+    "next_episode": "mdi6.skip-next",
+    # History's per-group "forget these" control. A VECTOR, not the delete_icon
+    # emoji: a colour emoji set as a button's TEXT is drawn at the font size and
+    # gets clipped in a 20x20 button (ledger F13).
+    "delete": "mdi6.trash-can-outline",
+    "as_grid": "mdi6.view-grid-outline",
+    "as_list": "mdi6.view-list-outline",
+    # Save a VOD to disk PERMANENTLY — the tray, not a cloud: nothing here
+    # comes from a service, and the file lands on the local library dir.
+    "download": "mdi6.tray-arrow-down",
+    # The Downloads section's "reveal in file manager" action, and the same
+    # action in a row's context menu. An OPEN folder: the button reveals a
+    # location rather than describing one, which is the distinction
+    # config_folder_icon already draws for Tools > Open config folder.
+    "folder_open": "mdi6.folder-open-outline",
+    # record-rec is the unambiguous REC mark; a plain ring would sit beside
+    # "unwatched" and the status dots at row size.
+    "record": "mdi6.record-rec",
+    # Catch, Keep, Record (Feature 3): Watch Alerts' record-slot STATE, beside
+    # "record" above (the idle affordance). A plain filled dot for "taking the
+    # connection right now" — no "REC" lettering, so it reads as a state next
+    # to the idle button rather than a second copy of the same label — and a
+    # clock for "scheduled, not yet due".
+    "recording_active": "mdi6.record",
+    "recording_scheduled": "mdi6.clock-outline",
+    # ── sports, keyed by the stored ``sport_type`` value ──────────────────
+    # The nav chip for the whole view keeps its whistle ("any one sport's ball
+    # would say the other three are somewhere else"). That reasoning is right
+    # for a view and inverted for a facet: here the glyph names exactly one
+    # sport, which is the whole point — the filter strip and the row gutter
+    # share this vocabulary, so pressing a ball leaves the rows wearing it.
+    #
+    # Every key below was verified present in the bundled font before being
+    # written down, not assumed from its name.
+    "sport_soccer": "mdi6.soccer",
+    "sport_tennis": "mdi6.tennis",
+    "sport_basketball": "mdi6.basketball",
+    "sport_baseball": "mdi6.baseball",
+    "sport_hockey": "mdi6.hockey-puck",
+    "sport_field_hockey": "mdi6.hockey-sticks",
+    "sport_american_football": "mdi6.football",
+    "sport_rugby": "mdi6.rugby",
+    "sport_cricket": "mdi6.cricket",
+    "sport_golf": "mdi6.golf",
+    "sport_boxing": "mdi6.boxing-glove",
+    # mma and wrestling are distinct glyphs on purpose: they are separate
+    # stored sport_types (many and 451 rows), and sharing mdi6.karate would
+    # make the filter strip show one facet twice. kabaddi is a grappling
+    # silhouette — the closest true shape to wrestling in this font.
+    #
+    # "mdi6.judo" and "mdi6.wrestling" do NOT exist, whatever their names
+    # suggest. A first probe reported both present because it ran WITHOUT a
+    # QApplication, which makes qtawesome answer for a font it has not loaded.
+    # Any icon-existence check has to construct one first.
+    "sport_mma": "mdi6.mixed-martial-arts",
+    "sport_wrestling": "mdi6.kabaddi",
+    "sport_racing": "mdi6.racing-helmet",
+    "sport_cycling": "mdi6.bike",
+    # Added with the FloSports vertical keywords — volleyball,
+    # swimming and track are new stored sport_types. Verified present in the
+    # bundled font and non-colliding with every glyph above before being
+    # written down here, same as the rest of this block.
+    "sport_volleyball": "mdi6.volleyball",
+    "sport_swimming": "mdi6.swim",
+    "sport_track": "mdi6.run-fast",
+    # The many multi-sport networks — Fox Sports 1, Sky Sports News, beIN.
+    # "General", not "Unclassified": a rack carries many sports, so having no
+    # single sport_type is correct rather than a classification failure.
+    #
+    # A stadium, NOT the whistle: the whistle is the nav chip for the whole
+    # Sports view, and the registry guard is right that two roles rendering the
+    # same glyph are indistinguishable to the user — the view chip and the
+    # General facet would have been pixel-identical. A venue that hosts many
+    # sports is also the better shape for "carries several of these".
+    "sport_general": "mdi6.stadium-variant",
+    # "show only this group" in a filter group row (was the ◎ glyph).
+    "filter_only": "mdi6.filter-check-outline",
+    # ── Every remaining role (icon plan: one icon set, mdi6) ──
+    # Picked against the rendered table in the "Icon Conversion Plan" artifact
+    # and checked pixel-for-pixel by tests/test_vector_icon_registry.py. Roles
+    # that mean the same as an existing one reuse it rather than duplicate it:
+    # overflow→more, next→next_episode, watchlist_off→monitor_off, notification_info→info, config_folder→folder_open, calendar→epg, explore_columns→columns, notification_warning→warning.
+    "unknown": "mdi6.help-circle-outline",
+    # Ratings (user report): the details pane draws five stars, one half
+    # per rating point; list rows keep the number with a full star beside it.
+    "rating_star": "mdi6.star",
+    "rating_half": "mdi6.star-half-full",
+    "rating_empty": "mdi6.star-outline",
+    "curious": "mdi6.head-question-outline",
+    "playback_in_progress": "mdi6.play-outline",
+    "partial_watched_q1": "mdi6.circle-slice-2",
+    "partial_watched": "mdi6.circle-slice-4",
+    "partial_watched_q3": "mdi6.circle-slice-6",
+    "browse": "mdi6.folder-play-outline",
+    "play_all": "mdi6.playlist-play",
+    "open_ended_buffer": "mdi6.infinity",
+    "record_window": "mdi6.timer-outline",
+    "deep_cache": "mdi6.harddisk",
+    "play_from_beginning": "mdi6.replay",
+    "resume_from": "mdi6.step-forward",
+    "diagnose": "mdi6.stethoscope",
+    "new_window": "mdi6.open-in-new",
+    "back": "mdi6.arrow-left",
+    "undo": "mdi6.undo",
+    "keyboard": "mdi6.keyboard-outline",
+    "copy": "mdi6.content-copy",
+    "versions": "mdi6.layers-outline",
+    "global_exclusion": "mdi6.lock-outline",
+    "search_filter": "mdi6.filter-outline",
+    "dead_stream": "mdi6.lan-disconnect",
+    "keyword_exclusion": "mdi6.format-letter-case",
+    "adult_filter": "mdi6.account-cancel-outline",
+    "show_all": "mdi6.unfold-more-horizontal",
+    "see_all_arrow": "mdi6.chevron-double-right",
+    "redirect": "mdi6.arrow-u-right-top",
+    "hide_watched_filter": "mdi6.eye-check-outline",
+    "visibility_toggle": "mdi6.eye",
+    "analyze": "mdi6.chart-bar",
+    "edit": "mdi6.pencil-outline",
+    "move_up": "mdi6.arrow-up-bold-outline",
+    "move_down": "mdi6.arrow-down-bold-outline",
+    "dropdown_caret": "mdi6.menu-down",
+    "try_first": "mdi6.format-vertical-align-top",
+    "prev": "mdi6.skip-previous",
+    "nav_prev": "mdi6.page-previous-outline",
+    "nav_next": "mdi6.page-next-outline",
+    "loading": "mdi6.loading",
+    "stream_retry_pending": "mdi6.sync-alert",
+    "stream_retry_online": "mdi6.access-point-check",
+    "status_dot": "mdi6.circle",
+    "inactive_dot": "mdi6.circle-off-outline",
+    "watchlist_on": "mdi6.bell-ring-outline",
+    "clear_epg_link": "mdi6.link-variant-off",
+    "new_episodes": "mdi6.new-box",
+    "alert": "mdi6.bell-alert-outline",
+    "new_match": "mdi6.bell-plus-outline",
+    "provider": "mdi6.server-network",
+    "info": "mdi6.information-outline",
+    "missing_data": "mdi6.database-off-outline",
+    "reconnect": "mdi6.power-plug-outline",
+    "log_viewer": "mdi6.text-box-outline",
+    "clear_log": "mdi6.delete-sweep-outline",
+    "save_log": "mdi6.content-save-outline",
+    "watchlist": "mdi6.alarm",
+    "preferences": "mdi6.account-heart-outline",
+    "category": "mdi6.shape-outline",
+    "zoom": "mdi6.magnify-plus-outline",
+    "zoom_poster": "mdi6.fullscreen",
+    "whats_new": "mdi6.bullhorn-outline",
+    "notification_success": "mdi6.check-circle-outline",
+    "notification_error": "mdi6.alert-circle-outline",
+    "migration_pending": "mdi6.progress-clock",
+    "verified": "mdi6.check-decagram-outline",
+    "pref_liked": "mdi6.trending-up",
+    "pref_disliked": "mdi6.trending-down",
+    "preferred_version": "mdi6.target",
+    "tag_include": "mdi6.plus-circle-outline",
+    "tag_exclude": "mdi6.minus-circle-outline",
+    "sort": "mdi6.swap-vertical",
+    "qa_checklist": "mdi6.flask-outline",
+    "qa_all_clear": "mdi6.party-popper",
+    "qa_purge": "mdi6.check-all",
+    "qa_archive": "mdi6.archive-outline",
+    "qa_unarchive": "mdi6.archive-arrow-up-outline",
+    "qa_attach": "mdi6.paperclip",
+    "qa_stale": "mdi6.update",
+    "qa_flag": "mdi6.flag-outline",
+    "qa_triaged": "mdi6.clipboard-check-outline",
+    "qa_retest": "mdi6.restart",
+    "qa_type_bug": "mdi6.bug-outline",
+    "qa_type_feature": "mdi6.lightbulb-outline",
+    "qa_type_note": "mdi6.note-text-outline",
+    "qa_addressed": "mdi6.sync",
+    "qa_goto": "mdi6.arrow-top-right",
+    "metadata_enrich": "mdi6.auto-fix",
+    "enrich_pause": "mdi6.pause",
+    "enrich_cancel": "mdi6.stop",
+}
+
+
+def vector_key(role: str) -> str:
+    """The ``mdi6`` key for a semantic *role*.
+
+    Raises:
+        KeyError: if *role* has no vector counterpart — deliberately loud, so a
+            typo surfaces at the call site instead of silently rendering nothing.
+    """
+    return VECTOR_KEYS[role]

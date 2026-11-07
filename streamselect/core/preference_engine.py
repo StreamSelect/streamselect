@@ -1,0 +1,958 @@
+"""Preference engine — attribute-weighted scoring from user ratings.
+
+Level 1: structured attributes (genre, director, cast) from MetadataDB.
+Level 2: TF-IDF plot keywords extracted from MetadataDB.plot.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import threading
+import time
+from collections import Counter
+from dataclasses import dataclass, field
+
+from loguru import logger
+
+from streamselect.core.filter_utils import normalize_genre
+from streamselect.core.idf_corpus import corpus_idf, extract_keywords
+from streamselect.core.preference_ranking import (
+    PEOPLE_DIVERSITY_DECAY,
+    _diversify_people,
+    _interleave_media_types,
+    _matched_mean,
+)
+from streamselect.core.media_mix import (
+    MEDIA_MIX_AUTOMATIC, mix_media_types, resolve_media_share,
+)
+
+
+# A single performer/director appearing in one liked title is noise, not taste:
+# an actor must show up across at least this many rated/favorited items before it
+# carries any weight, so the recommendations never become "all about" one face.
+ACTOR_MIN_SUPPORT: int = 2
+# Per-item actor contribution — deliberately small ("just an indication"): genre and
+# director are the load-bearing signals; a matched cast member only nudges.
+ACTOR_WEIGHT: float = 0.35
+
+
+# Per-field multipliers applied when a signal is accumulated (genre/director/actor)
+# or when a candidate's field is scored (keyword). Genre is the reference unit at
+# 1.0; a director match is worth more than a genre match, a cast match much less.
+GENRE_WEIGHT: float = 1.0
+DIRECTOR_WEIGHT: float = 1.5
+KEYWORD_WEIGHT: float = 0.4
+
+# Impression decay — every time an item is shown, its score is knocked down by
+# this fraction, never below IMPRESSION_DECAY_FLOOR of the original.
+IMPRESSION_DECAY: float = 0.04
+IMPRESSION_DECAY_FLOOR: float = 0.4
+
+# How many already-liked items may occupy the capped list; the rest of the slots
+# go to fresh discoveries.
+LIKED_CAP: int = 3
+
+
+@dataclass(frozen=True)
+class RecScoringSettings:
+    """User-tunable dials for the recommendation scorer.
+
+    Every field defaults to the module constant it steers, so the bare
+    ``RecScoringSettings()`` reproduces the shipped behavior exactly — the panel
+    is for steering, not required setup. Frozen and passed by parameter: there is
+    no global mutable scoring state.
+
+    Attributes:
+        genre_weight: Multiplier on genre affinity accumulated from a signal.
+        director_weight: Multiplier on director affinity.
+        actor_weight: Multiplier on cast affinity ("just an indication").
+        keyword_weight: Multiplier on the plot-keyword field when scoring.
+        actor_min_support: How many rated/favorited titles a performer must appear
+            in before carrying any weight (corroboration gate).
+        people_diversity_decay: Per prior appearance knock-down applied by the
+            within-generation people-diversity re-rank (1.0 = no spreading).
+        impression_decay: Score reduction per recorded impression.
+        liked_cap: Maximum already-liked items in the returned list.
+        media_mix: ``None`` (rank order stands — the bare-engine default), the
+            string ``"automatic"`` (√-damped share of the user's engagement), or
+            an explicit movie share in 0.0–1.0.
+    """
+
+    genre_weight:           float = GENRE_WEIGHT
+    director_weight:        float = DIRECTOR_WEIGHT
+    actor_weight:           float = ACTOR_WEIGHT
+    keyword_weight:         float = KEYWORD_WEIGHT
+    actor_min_support:      int   = ACTOR_MIN_SUPPORT
+    people_diversity_decay: float = PEOPLE_DIVERSITY_DECAY
+    impression_decay:       float = IMPRESSION_DECAY
+    liked_cap:              int   = LIKED_CAP
+    media_mix: str | float | None = None
+
+    @classmethod
+    def from_config(cls, config) -> "RecScoringSettings":
+        """Build settings from the user's config, falling back to the defaults.
+
+        Every ``rec_*`` config field is ``None`` until the user actually moves a
+        dial, so an untouched config yields the shipped defaults and a later
+        change to a default flows through automatically. The one inversion is the
+        media mix: ``rec_media_mix = None`` means **Automatic** (the app default),
+        while a float is the user's explicit movie share.
+        """
+        defaults = cls()
+
+        def _dial(name: str, default):
+            value = getattr(config, name, None)
+            return default if value is None else value
+
+        raw_mix = getattr(config, "rec_media_mix", None)
+        return cls(
+            genre_weight=float(_dial("rec_weight_genre", defaults.genre_weight)),
+            director_weight=float(_dial("rec_weight_director", defaults.director_weight)),
+            actor_weight=float(_dial("rec_weight_actor", defaults.actor_weight)),
+            keyword_weight=float(_dial("rec_weight_keyword", defaults.keyword_weight)),
+            actor_min_support=int(_dial("rec_actor_min_support", defaults.actor_min_support)),
+            people_diversity_decay=float(
+                _dial("rec_people_diversity_decay", defaults.people_diversity_decay)
+            ),
+            impression_decay=float(_dial("rec_impression_decay", defaults.impression_decay)),
+            liked_cap=int(_dial("rec_liked_cap", defaults.liked_cap)),
+            media_mix=MEDIA_MIX_AUTOMATIC if raw_mix is None else float(raw_mix),
+        )
+
+
+# The shipped dials — used whenever a caller passes no settings.
+DEFAULT_REC_SETTINGS: RecScoringSettings = RecScoringSettings()
+
+
+@dataclass
+class AttributeWeights:
+    """Accumulated preference signal from rated content."""
+    genres:    dict[str, float] = field(default_factory=dict)
+    directors: dict[str, float] = field(default_factory=dict)
+    actors:    dict[str, float] = field(default_factory=dict)
+    keywords:  dict[str, float] = field(default_factory=dict)
+    rated_count:    int = 0
+    liked_count:    int = 0
+    disliked_count: int = 0
+
+    def is_empty(self) -> bool:
+        return self.rated_count == 0
+
+    def top(self, attr: str, n: int = 10) -> list[tuple[str, float]]:
+        """Return top-n entries by absolute weight for the named attribute dict."""
+        d: dict[str, float] = getattr(self, attr, {})
+        return sorted(d.items(), key=lambda kv: abs(kv[1]), reverse=True)[:n]
+
+
+@dataclass
+class ScoredChannel:
+    """A candidate recommendation with its computed match score."""
+    channel_id:        str
+    channel_name:      str
+    media_type:        str
+    score:             float
+    matching_genres:   list[str]
+    matching_keywords: list[str]
+    director:          str | None
+    poster_url:        str | None
+    reason:            str          # e.g. "Action, Nolan, +heist"
+    already_liked:     bool = False  # user has given this a thumbs-up
+    metadata_rating:   float | None = None  # TMDb/OMDb score (0–10)
+    rec_shown_count:   int = 0       # total impression count (for tooltip + decay)
+    variant_count:     int = 0       # how many source/language copies collapsed into this entry
+    # Ingestion-computed display fields — read at render (never re-parse the name).
+    detected_title:    str = ""
+    detected_region:   str = ""
+    detected_quality:  str = ""
+    detected_year:     str = ""
+    detected_prefix:   str = ""  # honest audio-language token (e.g. "EN") — NOT the region
+    # Liked people (matched actors + director) driving this item's score — read by the
+    # within-generation people-diversity re-rank so the same face doesn't fill the list.
+    score_people:      tuple[str, ...] = ()
+
+    @property
+    def display_title(self) -> str:
+        """What a person should SEE — the cleaned title, raw name as fallback.
+
+        ``channel_name`` is the provider's raw string and 94.9% of rows differ
+        from their cleaned title. It is the obvious attribute, which is why the
+        Preferences dashboard rendered raw strings while the sidebar, scoring
+        the same objects from the same call, rendered "The Matrix". One
+        definition, on the object, shorter to type than the wrong form.
+        """
+        return self.detected_title or self.channel_name
+
+
+def version_score(channel, config) -> int:
+    """Score a channel against the user's version preferences (prefix/provider/quality).
+
+    Higher score = better match. Used to pick the preferred variant when multiple
+    language/region copies of the same production are candidates.
+    """
+    score = 0
+    if config.preferred_version_prefixes and channel.detected_prefix:
+        try:
+            idx = config.preferred_version_prefixes.index(channel.detected_prefix)
+            score += max(0, 10 - idx)
+        except ValueError:
+            pass
+    if config.preferred_version_provider_ids and channel.provider_id in config.preferred_version_provider_ids:
+        try:
+            idx = config.preferred_version_provider_ids.index(channel.provider_id)
+            score += max(0, 5 - idx)
+        except ValueError:
+            pass
+    if config.preferred_version_quality:
+        if config.preferred_version_quality.upper() in channel.name.upper():
+            score += 5
+    return score
+
+
+def _title_key(channel) -> str:
+    """Collapse key for one channel's title identity (the project rules 'Content identity').
+
+    Mirrors the canonical ``COALESCE(content_key, 'id:' || id)`` grouping used by
+    Browse/Discover/Other-Versions: variants that share a stored ``content_key``
+    are one title; a row without one stands alone.
+    """
+    from streamselect.core.content_identity import title_key
+    return title_key(getattr(channel, "content_key", None), channel.id)
+
+
+#: Weights computed for one taste state, shared by every surface that asks.
+#: Keyed by a signature of the inputs, so a changed rating is never served a
+#: stale answer — see :func:`_taste_signature`.
+_WEIGHTS_CACHE: "dict[tuple, tuple[float, AttributeWeights]]" = {}
+_WEIGHTS_LOCK = threading.Lock()
+
+#: Recompute at least this often even when the signature holds, so a corpus
+#: grown by background enrichment is eventually reflected. The signature covers
+#: taste; this covers what drifts underneath it.
+WEIGHTS_TTL_S: float = 600.0
+
+
+def _taste_signature(session, dials: "RecScoringSettings") -> tuple:
+    """A cheap fingerprint of the weights' inputs: 0.2 ms vs 2,077 ms to recompute.
+    **Must cover exactly what ``compute_weights`` READS**, and once got that
+    wrong both ways: it keyed on ``MAX(last_played)``, which the weights never
+    read (so every PLAY discarded a still-valid answer and the next selection
+    rebuilt a many-plot TF-IDF index on the UI thread — 2,118 ms), and it
+    omitted ``is_favorite``, which they do. Ratings carry a timestamp (counts
+    miss an edit in place); favorites, being boolean, do not. The plot corpus is
+    excluded on purpose — enrichment grows it continuously, so keying on it
+    restores the every-call miss ``WEIGHTS_TTL_S`` exists to backstop.
+    """
+    from sqlalchemy import text
+
+    ratings = session.execute(
+        text("SELECT COUNT(*), MAX(rated_at) FROM user_ratings")
+    ).first()
+    favorites = session.execute(
+        text("SELECT COUNT(*) FROM channels WHERE is_favorite = 1")
+    ).first()
+    return (tuple(ratings or ()), tuple(favorites or ()), dials)
+
+
+def _remember_weights(key, weights: AttributeWeights) -> AttributeWeights:
+    """Store *weights* under *key* and return them unchanged.
+
+    Returns the value so every exit reads ``return _remember_weights(...)`` —
+    an exit that forgets to store is then a visibly different line, not a silent
+    cache miss forever. ``key`` may be None when the signature could not be
+    taken, in which case nothing is stored and the answer still flows.
+    """
+    if key is not None:
+        with _WEIGHTS_LOCK:
+            _WEIGHTS_CACHE[key] = (time.monotonic(), weights)
+            # One taste state is live at a time; older keys are dead the moment
+            # a rating lands, so this never accumulates.
+            if len(_WEIGHTS_CACHE) > 8:
+                oldest = min(_WEIGHTS_CACHE, key=lambda k: _WEIGHTS_CACHE[k][0])
+                _WEIGHTS_CACHE.pop(oldest, None)
+    return weights
+
+
+def compute_weights(session, settings: RecScoringSettings | None = None) -> AttributeWeights:
+    """Load all ratings, join to MetadataDB, and accumulate attribute weights.
+
+    Level 1 — genre, director, cast (structured fields).
+    Level 2 — TF-IDF weighted keywords from plot text.
+
+    **Cached on a signature of its inputs.** This is a full TF-IDF rebuild over
+    every stored plot — measured at 3.9 s on a many-plot corpus — and six
+    surfaces call it independently: the Recommended sidebar, Discover's workers,
+    the details pane, the trail map, the preferences view and the discovery
+    engine. From a user's log, one startup ran it six times in thirty seconds
+    on identical inputs: ~23 s of CPU for the same answer six times, and a
+    plausible cause of "Couldn't load recommendations" on a slower machine where
+    those passes overlap.
+
+    Keyed, not timed, so rating something changes the signature and the next
+    call recomputes. The TTL is only a backstop for the plot corpus growing
+    under background enrichment, which no taste signal would notice.
+
+    Args:
+        session: Open SQLAlchemy session.
+        settings: User-tuned scoring dials (attribute weights + the actor
+            corroboration gate); ``None`` uses the shipped defaults.
+    """
+    from streamselect.core.database import UserRatingDB, ChannelDB, MetadataDB
+
+    dials = settings or DEFAULT_REC_SETTINGS
+
+    try:
+        # NOT `key`: this function already binds that name to a title key
+        # inside its loops, so a cache key called `key` is a different string
+        # by the time it reaches the return — cached under 'o', looked up under
+        # a tuple, and every call recomputed while looking cached.
+        cache_key = _taste_signature(session, dials)
+    except Exception:
+        # A signature we cannot take is not a reason to refuse the answer.
+        logger.exception("preference_engine: taste signature failed; recomputing")
+        cache_key = None
+    if cache_key is not None:
+        with _WEIGHTS_LOCK:
+            hit = _WEIGHTS_CACHE.get(cache_key)
+        if hit is not None and (time.monotonic() - hit[0]) < WEIGHTS_TTL_S:
+            return hit[1]
+
+    ratings = session.query(UserRatingDB).all()
+
+    # Include favorites as implicit +0.5 signals (they shaped the user's taste
+    # even if never explicitly rated).
+    rated_channel_ids = {r.channel_id for r in ratings}
+    # Batch-fetch rated channels in one IN query instead of per-row session.get()
+    rated_ids_list = list(rated_channel_ids)
+    rated_channel_map: dict[str, ChannelDB] = {}
+    if rated_ids_list:
+        for ch in session.query(ChannelDB).filter(ChannelDB.id.in_(rated_ids_list)).all():
+            rated_channel_map[ch.id] = ch
+
+    favorites = [
+        ch for ch in session.query(ChannelDB)
+        .filter(ChannelDB.is_favorite == True, ChannelDB.metadata_id.isnot(None)).all()  # noqa: E712
+        if ch.id not in rated_channel_ids
+    ]
+
+    if not ratings and not favorites:
+        # Cached too: "no taste yet" is an answer worth not recomputing, and it
+        # is the state a fresh install sits in while every surface asks.
+        return _remember_weights(cache_key, AttributeWeights())
+
+    # Collapse to one signal per TITLE (the project rules "Content identity" — group on the
+    # stored content_key, computed at ingestion, never re-keyed here). Rating or
+    # favoriting the same film in three language variants is one act of taste, not
+    # three: letting every variant through used to triple the genre weight and
+    # triple-fire the actor-corroboration counter. Precedence within a title group:
+    # an explicit rating always beats an implicit favorite (0.5); among explicit
+    # ratings the most recently rated one wins (tie-break on channel.id); among
+    # favorites-only groups the lowest channel.id wins (same determinism goal).
+    from datetime import datetime
+
+    _title_signals: dict[str, tuple] = {}  # title_key -> (channel, sig, rated_at, is_explicit)
+    for r in ratings:
+        ch = rated_channel_map.get(r.channel_id)
+        if not ch:
+            continue
+        key = _title_key(ch)
+        existing = _title_signals.get(key)
+        if existing is None:
+            _title_signals[key] = (ch, float(r.rating), r.rated_at, True)
+            continue
+        cur = (r.rated_at or datetime.min, ch.id)
+        prev = (existing[2] or datetime.min, existing[0].id)
+        if cur > prev:
+            _title_signals[key] = (ch, float(r.rating), r.rated_at, True)
+    for ch in favorites:
+        key = _title_key(ch)
+        existing = _title_signals.get(key)
+        if existing is None:
+            _title_signals[key] = (ch, 0.5, None, False)
+        elif not existing[3] and ch.id < existing[0].id:
+            _title_signals[key] = (ch, 0.5, None, False)
+        # else: an explicit rating already claims this title — it always wins.
+
+    signal_pairs: list[tuple] = [
+        (ch, sig) for ch, sig, _rated_at, _explicit in _title_signals.values()
+    ]
+    # Counts describe TITLES the user judged, not provider rows — derived from the
+    # collapsed explicit-rating entries only (favorites never count as "rated").
+    _explicit_signals = [v for v in _title_signals.values() if v[3]]
+
+    weights = AttributeWeights(
+        rated_count=len(_explicit_signals),
+        liked_count=sum(1 for _, sig, _, _ in _explicit_signals if sig > 0),
+        disliked_count=sum(1 for _, sig, _, _ in _explicit_signals if sig < 0),
+    )
+    # How many distinct rated/favorited items each actor appears in — used to prune
+    # single-appearance performers below (corroboration gate).
+    actor_support: Counter = Counter()
+
+    idf = corpus_idf(session)
+
+    # Batch-fetch all needed MetadataDB rows in one IN query instead of per-channel session.get()
+    all_metadata_ids = [ch.metadata_id for ch, _ in signal_pairs if ch and ch.metadata_id]
+    meta_map: dict[str, MetadataDB] = {}
+    if all_metadata_ids:
+        for meta in session.query(MetadataDB).filter(MetadataDB.id.in_(all_metadata_ids)).all():
+            meta_map[meta.id] = meta
+
+    from streamselect.core.credits import credits_for
+    credits = credits_for(session, [ch.id for ch, _ in signal_pairs if ch])
+
+    for channel, sig in signal_pairs:
+        if not channel or not channel.metadata_id:
+            continue
+        meta = meta_map.get(channel.metadata_id)
+        if not meta:
+            continue
+        people = credits.get(channel.id)
+
+        # Level 1 — structured attributes
+        for genre in _split_genres(_loads(meta.genres) or []):
+            weights.genres[genre] = weights.genres.get(genre, 0.0) + sig * dials.genre_weight
+
+        for director in people.directors if people else ():
+            weights.directors[director] = (
+                weights.directors.get(director, 0.0) + sig * dials.director_weight
+            )
+
+        for name in (people.cast_names() if people else [])[:10]:
+            if name:
+                weights.actors[name] = weights.actors.get(name, 0.0) + sig * dials.actor_weight
+                actor_support[name] += 1
+
+        # Level 2 — TF-IDF plot keywords
+        if meta.plot:
+            kws = extract_keywords(meta.plot)
+            kw_counts = Counter(kws)
+            total = len(kws) or 1
+            for word, cnt in kw_counts.items():
+                if word in idf:
+                    tf = cnt / total
+                    weights.keywords[word] = (
+                        weights.keywords.get(word, 0.0) + sig * tf * idf[word]
+                    )
+
+    # Corroboration gate: drop performers seen in only a single rated/favorited item.
+    # One film's worth of cast is noise; taste in an actor shows up across titles.
+    weights.actors = {
+        name: w for name, w in weights.actors.items()
+        if actor_support[name] >= dials.actor_min_support
+    }
+
+    return _remember_weights(cache_key, weights)
+
+
+def recommendation_scope(session, config) -> dict:
+    """Every exclusion axis ``score_candidates`` accepts, resolved from *config*.
+
+    THE chokepoint for "what may a recommendation contain". Four surfaces score
+    recommendations and each used to assemble these arguments itself; they had
+    already drifted, and ``score_candidates`` defaults ``adult_mode="all"``, so
+    a caller that omits it gets NO adult filtering rather than a safe default.
+    That is an earlier change surviving in surfaces the original fix did not reach. Counts,
+    and the guard that stops it recurring: tests/test_recommendation_scope.py.
+
+    Adding an axis here reaches every surface at once, which is the point.
+
+    Args:
+        session: An open session, used to resolve the adult-source id set.
+        config: The application ``Config``.
+
+    Returns:
+        Keyword arguments to splat into :func:`score_candidates`.
+    """
+    from streamselect.core.discovery_engine import build_adult_filter
+    from streamselect.core.filter_utils import (
+        get_active_category_filter, get_excluded_prefixes, global_exclusion_sets,
+        keyword_exclusion_list,
+    )
+    from streamselect.core.tag_exclusions import excluded_tag_content_types
+    from streamselect.core.repositories import RepositoryFactory
+    from streamselect.core.visibility_resolver import (
+        dead_signal_streak_floor as _dead_signal_streak_floor,
+    )
+
+    adult_mode, force_adult_ids = build_adult_filter(session, config)
+    # The prefix-CODE blacklist (get_active_category_filter — confusingly
+    # named for what it resolves, not for VisibilityScope's user-category
+    # axis below) and the per-prefix axis are UNIONED into the prefix
+    # exclusion — the existing convention, not something to re-invent per caller.
+    cat_excluded, include_uncategorized = get_active_category_filter(config)
+    excluded_prefixes = list(set(cat_excluded or []) | get_excluded_prefixes(config))
+    # excluded_categories: the human-assigned ChannelDB.user_category axis —
+    # a DIFFERENT config field (global_filter_excluded_user_categories) than
+    # the prefix-code blacklist above. This axis reached every Discover shelf
+    # only after an earlier change; before that it reached nowhere score_candidates
+    # touches either, so a category-excluded title could still be
+    # recommended even though the same exclusion hid it from the categories
+    # index. Sourced from global_exclusion_sets (paused-aware, like the
+    # other three axes it resolves) rather than a bespoke read.
+    _, excluded_categories, _, _ = global_exclusion_sets(config)
+
+    return {
+        "muted_attrs": getattr(config, "muted_attributes", None),
+        "dedupe_overrides": set(getattr(config, "rec_dedupe_overrides", [])),
+        "excluded_prefixes": excluded_prefixes,
+        "include_uncategorized": include_uncategorized,
+        "excluded_keywords": keyword_exclusion_list(config) or None,
+        "excluded_provider_ids": (
+            RepositoryFactory(session).providers.get_hidden_provider_ids() or None
+        ),
+        "excluded_categories": excluded_categories or None,
+        "excluded_content_types": excluded_tag_content_types(config) or None,
+        "adult_mode": adult_mode,
+        "force_adult_provider_ids": force_adult_ids or None,
+        "dead_signal_streak_floor": _dead_signal_streak_floor(config),  # VE-1
+    }
+
+
+def score_candidates(session, weights: AttributeWeights, limit: int = 30,
+                     muted_attrs: dict | None = None,
+                     dedupe_overrides: set[str] | None = None,
+                     excluded_prefixes: list[str] | None = None,
+                     include_uncategorized: bool = True,
+                     excluded_keywords: list[str] | None = None,
+                     excluded_provider_ids: list[str] | None = None,
+                     excluded_categories: set[str] | None = None,
+                     excluded_content_types: list[str] | None = None,
+                     adult_mode: str = "all",
+                     force_adult_provider_ids: list[str] | None = None,
+                     dead_signal_streak_floor: int | None = None,
+                     version_scorer=None,
+                     balance_media_types: bool = False,
+                     diversify_people: bool = False,
+                     media_mix: str | float | None = None,
+                     settings: RecScoringSettings | None = None) -> list[ScoredChannel]:
+    """Score movies/series by user preference weights.
+
+    Movie/series mix (``media_mix``, or ``settings.media_mix`` when the parameter
+    is omitted): ``None`` leaves the raw ranking alone, ``"automatic"`` derives a
+    √-damped share from the user's engagement, and a float is an explicit movie
+    share. It supersedes the legacy fixed 50/50 ``balance_media_types`` flag,
+    which still works when no mix is given.
+
+    Exclusion rules (applied via the single ``channel_visibility.apply()``
+    chokepoint — see ``streamselect/core/channel_visibility.py``):
+    - From an inactive/expired source (excluded_provider_ids) → excluded
+    - Matches a Global Exclusions prefix/category (excluded_prefixes) — the
+      canonical, region-aware predicate: a candidate WITH a detected_prefix is
+      judged on the prefix alone, one with NO prefix falls back to its
+      detected_region ("language wins over region") — or keyword
+      (excluded_keywords, case-insensitive substring on the title) → excluded
+    - In a globally-excluded user_category (excluded_categories) → excluded
+    - Disliked (rating < 0) → always excluded
+    - Hidden (is_hidden) → excluded
+    - Rec-suppressed (is_rec_suppressed) → excluded
+    - Already watched (last_played set) → excluded; recommendation served its purpose
+    - Currently in Watch Queue → excluded; user already queued it
+    - Currently in Favorites → excluded (capped at 5 liked-but-unwatched slots)
+    - Same production from another source (norm_title + media_type + year + director match)
+      → excluded unless channel.id is in dedupe_overrides
+    - Duplicate source/language variants → only highest-scoring copy surfaced
+
+    Returns a ranked list, highest score first.
+    """
+    from datetime import datetime
+    from streamselect.core import channel_visibility
+    from streamselect.core.database import ChannelDB, UserRatingDB, WatchQueueDB
+    from streamselect.core.preference_candidates import fetch_candidates
+
+    from streamselect.core.content_dedup import (
+        build_dedup_key, build_engaged_normalized, is_content_key_dedup,
+    )
+
+    if weights.is_empty():
+        return []
+
+    dials = settings or DEFAULT_REC_SETTINGS
+
+    disliked_ids: set[str] = {
+        r.channel_id for r in session.query(UserRatingDB)
+        .filter(UserRatingDB.rating < 0).all()
+    }
+    # NOTE: disliked_ids stays channel_id-keyed on purpose. A dislike already
+    # suppresses the whole title: disliked_ids feeds all_engaged_ids below, and
+    # build_engaged_normalized() records (_CK_TAG, content_key) for every engaged
+    # channel that has one, so the fingerprint check further down drops the
+    # siblings. Widening this set to those siblings would ALSO make them
+    # unrecommendable through dedupe_overrides -- and that override exists so a
+    # caller (e.g. "Other Versions") can deliberately surface the other copies.
+    # The direct check below is intentionally not override-gated; the fingerprint
+    # one is. Do not "fix" the asymmetry: it is the feature.
+    # Explicitly liked items (sort newer first)
+    liked_map: dict[str, datetime] = {
+        r.channel_id: r.rated_at for r in session.query(UserRatingDB)
+        .filter(UserRatingDB.rating > 0).all()
+    }
+    # Favorited items are excluded from the recommendations list — the user already
+    # has them; surfacing them again would be redundant.
+    # Column-only query: only need ids, not full ORM objects
+    favorite_ids: set[str] = {
+        cid for (cid,) in session.query(ChannelDB.id)
+        .filter(ChannelDB.is_favorite == True).all()  # noqa: E712
+    }
+    queued_ids: set[str] = {
+        row.channel_id for row in session.query(WatchQueueDB).all()
+    }
+
+    _overrides = dedupe_overrides or set()
+    all_engaged_ids = disliked_ids | favorite_ids | queued_ids | set(liked_map.keys())
+    engaged_normalized = build_engaged_normalized(session, all_engaged_ids, _overrides)
+
+    # For series, director is excluded from the dedup key (see content_dedup.py), so
+    # year is the only differentiator.  We build two sets to handle both null-year
+    # directions without suppressing genuine reboots (where both sides have a year):
+    #
+    #   engaged_series_with_year  → (norm, "series") for engaged entries that DO have
+    #     a year.  Suppresses null-year candidates: "EAR ★ Rick and Morty" (year=None)
+    #     when "EN - Rick And Morty (2013)" (year=2013) is queued.
+    #
+    #   engaged_series_null_year  → (norm, "series") for engaged entries that have NO
+    #     year.  Suppresses year-bearing candidates: "EN - BoJack Horseman (2014)"
+    #     (year=2014) when "EN ★ BoJack Horseman" (year=None) is favorited.
+    #
+    # Only one side needs year=None to trigger — if both sides have a year and they
+    # differ, neither set matches and the exact-key check handles them as separate
+    # productions (reboots).
+    engaged_series_with_year: set[tuple] = {
+        (k[0], k[1]) for k in engaged_normalized if k[1] == "series" and k[2] is not None
+    }
+    engaged_series_null_year: set[tuple] = {
+        (k[0], k[1]) for k in engaged_normalized if k[1] == "series" and k[2] is None
+    }
+
+    # Column-only candidate feed (PERF-21a — moved to preference_candidates.py):
+    # what used to be a full ChannelDB fetch (up to 786k rows on a user's
+    # library, `candidates_q.options(defer(ChannelDB.raw_data)).all()`) plus a
+    # second chunked MetadataDB IN(...) query is now ONE column-only statement
+    # joined 1:1 to metadata, returning plain Candidate rows — no ORM instance
+    # crosses the session boundary, and there is no per-candidate IN (...) list
+    # left to bind past SQLite's bound-parameter ceiling (the "too many SQL
+    # variables" crash tests/test_recommendations_scale.py guards). Every
+    # filter/join/visibility-axis this used to apply — incl. the fix for
+    # "Recommendations ignores global exclusions" (adult_mode reaching this
+    # query) — moved verbatim; see that module for the full rationale.
+    candidates = fetch_candidates(
+        session,
+        channel_visibility.VisibilityScope(
+            excluded_provider_ids=list(excluded_provider_ids or []),
+            excluded_prefixes=set(excluded_prefixes or []),
+            excluded_categories=set(excluded_categories or []),
+            excluded_content_types=set(excluded_content_types or []),
+            include_uncategorized=include_uncategorized,
+            excluded_keywords=set(excluded_keywords or []),
+            adult_mode=adult_mode,
+            force_adult_provider_ids=list(force_adult_provider_ids or []),
+            dead_signal_streak_floor=dead_signal_streak_floor,
+        ),
+    )
+
+    # Implicit prefix preference: count how often the user has positively engaged with
+    # each prefix (favorites, queued, liked, and watched).  Used as a tiebreaker when
+    # no explicit preferred_version_prefixes config entry matches — so that the
+    # recommended version is in the language/source the user actually watches.
+    # Column-only queries: only need detected_prefix, not full ORM objects.
+    _implicit_prefix: Counter = Counter()
+    _pos_ids = (favorite_ids | queued_ids | set(liked_map.keys())) - disliked_ids
+    if _pos_ids:
+        for (prefix,) in session.query(ChannelDB.detected_prefix).filter(
+            ChannelDB.id.in_(list(_pos_ids)),
+            ChannelDB.media_type.in_(["movie", "series"]),
+            ChannelDB.detected_prefix.isnot(None),
+        ).all():
+            _implicit_prefix[prefix] += 1
+    for (prefix,) in session.query(ChannelDB.detected_prefix).filter(
+        ChannelDB.last_played.isnot(None),
+        ChannelDB.media_type.in_(["movie", "series"]),
+        ChannelDB.detected_prefix.isnot(None),
+    ).all():
+        _implicit_prefix[prefix] += 2  # played = 2× engagement weight
+    _max_impl = max(_implicit_prefix.values(), default=1)
+
+    best_per_title: dict[tuple, ScoredChannel] = {}
+    variant_counts: dict[tuple, int] = {}
+    # (channel_id) → (explicit_vscore, implicit_vscore) for version tiebreaking.
+    # Tuple comparison is lexicographic: explicit config always dominates; implicit
+    # engagement frequency breaks ties when explicit scores are equal.
+    vscore_by_id: dict[str, tuple[int, float]] = {}
+    # (norm, mt) → first year-bearing dedup_key seen; used for null-year absorption
+    # within the recommendation list so the same show doesn't appear twice.
+    null_year_map: dict[tuple, tuple] = {}
+
+    for channel in candidates:
+        if channel.id in disliked_ids:
+            continue
+        if channel.id in favorite_ids:  # already in favorites — no need to surface again
+            continue
+        if channel.id in queued_ids:   # already in watch queue — user knows about it
+            continue
+        if channel.last_played:  # already watched — recommendation done
+            continue
+        # `channel` is a Candidate (PERF-21a): one column-only row already
+        # joined 1:1 to its MetadataDB fields, so `meta` is the same object —
+        # there is no per-row metadata dict lookup left to do.
+        meta = channel
+
+        dedup_key = build_dedup_key(channel, meta)
+        if channel.id not in _overrides and dedup_key in engaged_normalized:
+            continue
+
+        # The year/series fingerprint reconciliation below exists only to absorb the
+        # noisy-year problem in the runtime fingerprint. The stored content_key already
+        # collapses year/audio variants at ingestion, so for content_key keys we group
+        # on the key as-is and skip the (year-positional) fingerprint logic entirely.
+        ck_key = is_content_key_dedup(dedup_key)
+        if not ck_key:
+            # Bidirectional null-year suppression for series.
+            # Applied only when one side has year=None; both-year mismatches are reboots.
+            norm_mt = (dedup_key[0], dedup_key[1])
+            if channel.id not in _overrides and channel.media_type == "series":
+                if dedup_key[2] is None and norm_mt in engaged_series_with_year:
+                    continue  # null-year candidate, year-bearing engaged variant
+                if dedup_key[2] is not None and norm_mt in engaged_series_null_year:
+                    continue  # year-bearing candidate, null-year engaged variant
+
+            # Null-year absorption within the recommendation list:
+            # If a year-bearing entry for this (norm, mt) already exists, absorb this
+            # null-year variant into it so the same show doesn't appear twice.
+            if dedup_key[2] is None:
+                canonical = null_year_map.get(norm_mt)
+                if canonical is not None:
+                    dedup_key = canonical   # merge into the year-bearing entry
+            else:
+                existing = null_year_map.get(norm_mt)
+                if existing is None:
+                    null_year_map[norm_mt] = dedup_key
+                elif existing[2] is None:
+                    # Upgrade the null-year key to this year-bearing key
+                    if existing in best_per_title:
+                        best_per_title[dedup_key] = best_per_title.pop(existing)
+                        variant_counts[dedup_key] = variant_counts.pop(existing, 0)
+                    null_year_map[norm_mt] = dedup_key
+
+        genres = _split_genres(_loads(meta.genres) or [])
+        cast   = _loads(meta.cast)   or []
+        kws    = extract_keywords(meta.plot) if meta.plot else []
+
+        _muted       = muted_attrs or {}
+        # Normalised for the same reason the genres themselves are: a user who
+        # mutes "Drama" means the genre, not the English spelling of it.
+        muted_genres = {normalize_genre(g) for g in _muted.get("genres", [])}
+        muted_dirs   = set(_muted.get("directors", []))
+        muted_actors = set(_muted.get("actors",    []))
+        muted_kws    = set(_muted.get("keywords",  []))
+
+        # Per-field MEAN (not sum): a candidate's score in each field is the average
+        # strength of the affinities it actually has there, so a big cast or a long,
+        # keyword-dense plot can't inflate a field by sheer volume — which is exactly
+        # what let richer-metadata movies out-score thinner-metadata series. Fields
+        # still ADD across each other, so matching on genre+director+cast beats
+        # matching on genre alone (real corroboration), but no single field runs away.
+        genre_score   = _matched_mean(weights.genres.get(g, 0.0) for g in genres if g not in muted_genres)
+        dir_score     = _matched_mean(weights.directors.get(d, 0.0) for d in _split_directors(meta.director)
+                                      if d not in muted_dirs) if meta.director else 0.0
+        actor_score   = _matched_mean(
+            weights.actors.get(p.get("name", ""), 0.0)
+            for p in cast[:5]
+            if isinstance(p, dict) and p.get("name", "") not in muted_actors
+        )
+        keyword_score = _matched_mean(
+            weights.keywords.get(k, 0.0) for k in kws if k not in muted_kws
+        ) * dials.keyword_weight
+
+        total = genre_score + dir_score + actor_score + keyword_score
+        if total <= 0:
+            continue
+
+        shown = getattr(channel, 'rec_shown_count', 0) or 0
+        if shown > 0:
+            # Default: -4% per impression, floor at 40% of the original score.
+            total *= max(IMPRESSION_DECAY_FLOOR, 1.0 - shown * dials.impression_decay)
+
+        match_genres = [g for g in genres if weights.genres.get(g, 0.0) > 0]
+        match_kws = sorted(
+            (k for k in set(kws) if weights.keywords.get(k, 0.0) > 0.5),
+            key=lambda k: weights.keywords[k],
+            reverse=True,
+        )[:4]
+
+        parts: list[str] = match_genres[:2]
+        matched_dirs = [d for d in _split_directors(meta.director) if weights.directors.get(d, 0.0) > 0] if meta.director else []
+        if matched_dirs:
+            parts.append(matched_dirs[0].split()[-1])
+        if match_kws:
+            parts.append("+" + ", ".join(match_kws[:2]))
+
+        # Liked people actually driving this score (positive-weight actors + directors)
+        # — the set the within-generation diversity re-rank spreads out. Pure-genre
+        # matches carry no people, so they surface freely.
+        matched_actors = [
+            p.get("name", "") for p in cast[:5]
+            if isinstance(p, dict) and weights.actors.get(p.get("name", ""), 0.0) > 0
+        ]
+        score_people = tuple(matched_actors + matched_dirs)
+
+        sc = ScoredChannel(
+            channel_id=channel.id,
+            channel_name=channel.name,
+            media_type=channel.media_type,
+            score=total,
+            matching_genres=match_genres,
+            matching_keywords=match_kws,
+            director=meta.director,
+            poster_url=meta.poster_url,
+            reason=", ".join(parts) or "Attribute match",
+            already_liked=channel.id in liked_map,
+            metadata_rating=meta.rating,
+            rec_shown_count=getattr(channel, 'rec_shown_count', 0) or 0,
+            detected_title=channel.detected_title or channel.name,
+            detected_region=channel.detected_region or "",
+            detected_quality=channel.detected_quality or "",
+            detected_year=channel.detected_year or "",
+            detected_prefix=channel.detected_prefix or "",
+            score_people=score_people,
+        )
+        explicit_vs = version_scorer(channel) if version_scorer is not None else 0
+        impl_vs = _implicit_prefix.get(channel.detected_prefix or "", 0) / _max_impl
+        vscore_by_id[channel.id] = (explicit_vs, impl_vs)
+
+        variant_counts[dedup_key] = variant_counts.get(dedup_key, 0) + 1
+        existing = best_per_title.get(dedup_key)
+        if existing is None:
+            best_per_title[dedup_key] = sc
+        else:
+            # Version preference wins first (explicit config, then implicit engagement
+            # frequency); content score breaks remaining ties.
+            new_vs = vscore_by_id.get(channel.id, (0, 0.0))
+            old_vs = vscore_by_id.get(existing.channel_id, (0, 0.0))
+            if new_vs > old_vs or (new_vs == old_vs and total > existing.score):
+                best_per_title[dedup_key] = sc
+
+    for key, sc in best_per_title.items():
+        sc.variant_count = variant_counts.get(key, 1)
+
+    scored = list(best_per_title.values())
+    scored.sort(key=lambda s: s.score, reverse=True)
+
+    # Cap already-liked items at 5 slots (newest-liked first) so they don't crowd
+    # out new discoveries. Remaining slots go to fresh (unrated) content.
+    liked_results = sorted(
+        [sc for sc in scored if sc.already_liked],
+        key=lambda sc: liked_map.get(sc.channel_id, datetime.min),
+        reverse=True,
+    )
+    fresh_results = [sc for sc in scored if not sc.already_liked]
+    liked_cap = min(dials.liked_cap, len(liked_results))
+    fresh_slots = max(0, limit - liked_cap)
+    # 1) Spread repeated performers/directors across this generation so one liked face
+    #    can't fill the list (re-rank preserves per-type order for the interleave below).
+    if diversify_people:
+        fresh_results = _diversify_people(fresh_results, decay=dials.people_diversity_decay)
+    # 2) Guarantee a movie/series mix even when one type dominates the raw ranking
+    #    (more titles, or richer metadata). Discovery slots only — explicit likes above
+    #    are the user's own picks and stay as-is.
+    mix_spec = media_mix if media_mix is not None else dials.media_mix
+    movie_share = resolve_media_share(session, mix_spec)
+    if movie_share is not None:
+        fresh_selected = mix_media_types(fresh_results, fresh_slots, movie_share)
+    elif balance_media_types:
+        fresh_selected = _interleave_media_types(fresh_results, fresh_slots)
+    else:
+        fresh_selected = fresh_results[:fresh_slots]
+    merged = liked_results[:liked_cap] + fresh_selected
+    return merged[:limit]
+
+
+def record_impressions(session, channel_ids: list[str], cooldown_minutes: int = 60) -> None:
+    """Increment rec_shown_count for each channel, deduplicated within a cooldown window.
+
+    Channels already recorded within cooldown_minutes are skipped — prevents a single
+    browsing session from inflating counts on every list refresh.
+    """
+    from datetime import datetime, timedelta
+    from streamselect.core.database import ChannelDB
+
+    now = datetime.utcnow()
+    cutoff = now - timedelta(minutes=cooldown_minutes)
+    for cid in channel_ids:
+        ch = session.get(ChannelDB, cid)
+        if ch and (ch.rec_last_shown is None or ch.rec_last_shown < cutoff):
+            ch.rec_shown_count = (ch.rec_shown_count or 0) + 1
+            ch.rec_last_shown = now
+    session.commit()
+
+
+def _split_names(value: str) -> list[str]:
+    """Split a comma, slash, or ampersand-delimited string into individual names."""
+    return [v.strip() for v in re.split(r"[,/&]", value) if v.strip()]
+
+
+def _split_directors(director: str) -> list[str]:
+    return _split_names(director)
+
+
+def _split_genres(genre_value) -> list[str]:
+    """Split genres, then canonicalise each one to a single spelling.
+
+    Handles list-of-strings and slash/comma-delimited strings.
+
+    Why the normalisation is HERE
+    -----------------------------
+    Taste weights are a plain dict keyed on the genre string, so two spellings
+    of one genre are two unrelated preferences. A library assembled from
+    international providers carries five languages' worth of the same handful
+    of genres::
+
+        Drama    many mentions  <-  Drama many · دراما many · Drame many · Dramat many
+        Comedy   many mentions  <-  Comedy many · Comédie many · كوميديا many · Komödie many
+
+    Measured on a large library: 743 distinct genre strings collapse to 394,
+    and many of many genre mentions (28.6%) sit on a non-canonical key.
+    Every one of those scored a structural 0.0 against a preference learned in
+    English — the engine considered *Drame* unrelated to *Drama*.
+
+    This function is the one place both sides go through: the weight builder
+    (`build_*` / `compute_weights`) and `score_candidates`. Normalising here
+    means the write key and the read key cannot disagree, which is the property
+    that was actually missing — normalising at only one end would have made it
+    worse, not better.
+
+    ``normalize_genre`` is the project's existing canonical helper
+    (`filter_utils.py`); the tag layer has always routed through it. This is
+    that same chokepoint, finally shared.
+
+    Duplicates are collapsed after normalising, order preserved: a title tagged
+    both *Drama* and *Drame* is one Drama, not a double-weighted one.
+    """
+    if isinstance(genre_value, list):
+        result = []
+        for g in genre_value:
+            result.extend(_split_names(g) if isinstance(g, str) else [])
+    elif isinstance(genre_value, str):
+        result = _split_names(genre_value)
+    else:
+        return []
+
+    seen: set[str] = set()
+    canonical: list[str] = []
+    for genre in result:
+        name = normalize_genre(genre)
+        if name and name not in seen:
+            seen.add(name)
+            canonical.append(name)
+    return canonical
+
+
+def _loads(value) -> list | None:
+    """Safely deserialize a JSON string or return the value if already a list."""
+    if value is None:
+        return None
+    if isinstance(value, list):
+        return value
+    try:
+        return json.loads(value)
+    except (ValueError, TypeError):
+        return None

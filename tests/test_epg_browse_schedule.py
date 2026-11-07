@@ -1,0 +1,348 @@
+"""Behavioral tests for the EPG Browse tab's date/time schedule browser.
+
+Regression context
+------------------
+Browse is a date/time-driven schedule browser: choosing a day + time slot should
+list every programme in that window (``EpgRepository.get_schedule``); a text search
+*narrows* to matching upcoming programmes (``search_programs``).
+
+Commit ``dd576bf`` added an ``if not search: emit(placeholder); return`` gate to the
+``_EpgBrowseMixin._reload_browse`` trigger. That gate made ``_fetch_browse`` — and
+therefore the entire ``get_schedule`` branch — **unreachable whenever the search box
+is empty**, which is the default state. Result: the Browse tab showed only its
+"Search for a programme…" placeholder and the date/time/hide-filler controls did
+nothing — "the Browse interface doesn't work at all anymore." Only typing a search
+term produced any rows.
+
+These tests pin the fixed behavior:
+
+1. Data layer — ``get_schedule`` returns the day's programmes (the branch Browse
+   relies on for its primary, no-search mode).
+2. Trigger layer (the regressing half) — ``_reload_browse`` with an EMPTY search box
+   reaches ``_fetch_browse``/``get_schedule`` instead of short-circuiting to the
+   placeholder. This is the assertion that fails against the bug.
+3. Render layer — ``_render_browse`` shows the schedule rows when present and falls
+   back to the empty-state placeholder (not a bare empty tree) when there are none.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from streamselect.gui import theme as _theme_mod
+
+from streamselect.core.database import ChannelDB, Database, EpgProgramDB
+from streamselect.core.epg_utils import now_utc, to_local
+from streamselect.core.repositories.epg import EpgRepository
+from streamselect.gui.epg_browse_mixin import _EpgBrowseMixin
+
+
+# ---------------------------------------------------------------------------
+# Qt fixture
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="module")
+def qapp():
+    from PyQt6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+# ---------------------------------------------------------------------------
+# DB fixture — file-backed (NOT :memory:, whose pooled connections each get an
+# empty DB), seeded with one channel + one upcoming programme today.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def seeded_db(tmp_path):
+    db = Database(f"sqlite:///{tmp_path / 'epg_browse.db'}")
+    db.create_tables()
+    now = now_utc()
+    prog_start = now + timedelta(hours=1)
+    with db.session_scope() as session:
+        session.add(ChannelDB(id="c1", source_id="s1", provider_id="p1", name="ESPN HD"))
+        session.add(
+            EpgProgramDB(
+                provider_id="p1",
+                channel_epg_id="espn.us",
+                channel_db_id="c1",
+                channel_name="ESPN HD",
+                title="Premier League: Arsenal vs Chelsea",
+                description="Football match",
+                start_time=prog_start,
+                stop_time=now + timedelta(hours=3),
+                is_live=True,
+                is_new=False,
+            )
+        )
+    # Browse queries by the programme's LOCAL calendar day. Derive that day from the
+    # programme START — not from `now` — so the test is deterministic near local
+    # midnight: when the suite runs after ~23:00 local, `now + 1h` rolls into the
+    # NEXT local day, and `to_local(now).date()` would query the wrong day and find
+    # nothing (a wall-clock-dependent failure). Computed once here = single source.
+    return db, now, to_local(prog_start).date()
+
+
+# ---------------------------------------------------------------------------
+# 1. Data layer — get_schedule returns the day's programmes (no search).
+# ---------------------------------------------------------------------------
+
+def test_get_schedule_returns_day_programmes_without_search(seeded_db):
+    db, _, query_date = seeded_db
+    session = db.get_session()
+    try:
+        # query_date is the programme's LOCAL calendar day (see fixture) — get_schedule
+        # windows by local day (its contract; the project rules: never `.date()` UTC-anchored).
+        progs = EpgRepository(session).get_schedule(
+            target_date=query_date, provider_ids=["p1"]
+        )
+        assert len(progs) == 1
+        assert progs[0].title.startswith("Premier League")
+    finally:
+        session.close()
+
+
+def test_get_schedule_empty_provider_ids_returns_nothing(seeded_db):
+    """Guards the other half: an empty provider include-list yields no rows, which is
+    why ``_reload_browse`` must short-circuit only on empty providers — not on empty
+    search."""
+    db, _, _ = seeded_db
+    session = db.get_session()
+    try:
+        progs = EpgRepository(session).get_schedule(
+            target_date=now_utc().date(), provider_ids=[]
+        )
+        assert progs == []
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Trigger-layer host: a lightweight _EpgBrowseMixin instance whose executor and
+# data-signal are captured so we can see which path _reload_browse takes.
+# ---------------------------------------------------------------------------
+
+def _make_trigger_host(*, search_text: str, provider_ids, anchor=None):
+    host = _EpgBrowseMixin.__new__(_EpgBrowseMixin)
+    host._provider_ids = list(provider_ids)
+    host._filtered_provider_ids = lambda: host._provider_ids
+    # Search box + the forward start-anchor combo the trigger reads.
+    host.search_input = SimpleNamespace(text=lambda: search_text)
+    host.anchor_combo = SimpleNamespace(currentData=lambda: anchor)
+    host.hide_filler_btn = SimpleNamespace(isChecked=lambda: False)
+    # Capture executor submissions and emitted payloads.
+    host.submitted = []
+    host._executor = SimpleNamespace(
+        submit=lambda fn, *a: host.submitted.append((fn, a))
+    )
+    host.emitted = []
+    host._data_loaded = SimpleNamespace(emit=lambda payload: host.emitted.append(payload))
+    return host
+
+
+# ---------------------------------------------------------------------------
+# 2. Trigger layer — the regressing half.
+# ---------------------------------------------------------------------------
+
+def test_reload_browse_empty_search_fetches_schedule_not_placeholder():
+    """Empty search must still reach _fetch_browse (the forward schedule branch),
+    NOT short-circuit to a placeholder — Browse's primary, no-search mode."""
+    host = _make_trigger_host(search_text="", provider_ids=["p1"])
+    _EpgBrowseMixin._reload_browse(host)
+    # A forward fetch was submitted — Browse is alive with an empty search.
+    assert len(host.submitted) == 1, "empty search should still fetch the schedule"
+    fn, args = host.submitted[0]
+    assert fn == host._fetch_browse
+    # New forward signature: (provider_ids, anchor, search, hide_filler, after, append, gen)
+    provider_ids, anchor, search, hide_filler, after, append, gen = args
+    assert search == "", "search term forwarded as empty (schedule mode)"
+    assert provider_ids == ["p1"]
+    assert after is None, "a fresh reload starts at page 1 (no keyset cursor)"
+    assert append is False
+    # And crucially it did NOT emit the placeholder-only payload.
+    assert host.emitted == []
+
+
+def test_reload_browse_with_search_still_fetches():
+    """A non-empty search also fetches (search-narrowing mode) — unchanged."""
+    host = _make_trigger_host(search_text="Arsenal", provider_ids=["p1"])
+    _EpgBrowseMixin._reload_browse(host)
+    assert len(host.submitted) == 1
+    _, args = host.submitted[0]
+    assert args[2] == "Arsenal"  # search is the 3rd positional arg now
+    assert host.emitted == []
+
+
+def test_reload_browse_no_providers_emits_placeholder():
+    """With no EPG sources, short-circuit to the placeholder (the query could only
+    return empty) — and do NOT submit a doomed fetch."""
+    host = _make_trigger_host(search_text="", provider_ids=[])
+    _EpgBrowseMixin._reload_browse(host)
+    assert host.submitted == []
+    assert len(host.emitted) == 1
+    assert host.emitted[0]["tab"] == "browse"
+    assert host.emitted[0]["placeholder"] is True
+
+
+# ---------------------------------------------------------------------------
+# Render-layer host: real QTreeWidget + label stubs.
+# ---------------------------------------------------------------------------
+
+def _make_render_host(qapp, *, provider_ids, search_text, name_map, title_map=None):
+    from PyQt6.QtWidgets import QTreeWidget, QLabel
+
+    host = _EpgBrowseMixin.__new__(_EpgBrowseMixin)
+    host.config = SimpleNamespace(epg_watchlist_patterns=[])
+    host._channel_name_map = dict(name_map)
+    host._channel_title_map = dict(title_map or {})
+    host._channel_prefix_map = {}
+    host._channel_quality_map = {}
+    host._channel_provider_map = {}
+    host._provider_ids = list(provider_ids)
+    host._filtered_provider_ids = lambda: host._provider_ids
+    host.search_input = SimpleNamespace(text=lambda: search_text)
+    host.browse_list = QTreeWidget()
+    # 7 columns (REC-2 added "Rec")
+    host.browse_list.setColumnCount(7)
+    host.browse_list.setHeaderLabels(
+        ["Time", "Category", "Channel", "Quality", "Show", "Duration", "Rec"]
+    )
+    # Qt's raw default header sort indicator is (col 0, Descending) — leave it as-is
+    # so these behavior-pinning tests stay separator-free (Q3 coverage lives in its
+    # own test module and opts into ascending explicitly).
+    host.browse_placeholder = QLabel()
+    host.browse_stats = QLabel()
+    host.status_message = SimpleNamespace(emit=MagicMock())
+    # REC-2: no recording by default; a test overrides for the Rec column.
+    host.recording_manager = SimpleNamespace(progress=lambda: [])
+    host._recording_progress_rows = (
+        lambda: host.recording_manager.progress())
+    host._host = MagicMock(
+        return_value=SimpleNamespace(schedule_recording_from_programme=MagicMock())
+    )
+    return host
+
+
+# ---------------------------------------------------------------------------
+# 3. Render layer.
+# ---------------------------------------------------------------------------
+
+def test_render_browse_renders_schedule_rows(qapp, seeded_db):
+    db, _, query_date = seeded_db
+    # Fetch real (then-detached) programmes the way _fetch_browse does: a plain
+    # get_session() + close() (no commit/rollback), so loaded scalar columns stay
+    # readable on the main-thread render even after the session closes.
+    session = db.get_session()
+    progs = EpgRepository(session).get_schedule(
+        target_date=query_date, provider_ids=["p1"]
+    )
+    session.close()
+    host = _make_render_host(
+        qapp, provider_ids=["p1"], search_text="", name_map={"c1": "ESPN HD"}
+    )
+    _EpgBrowseMixin._render_browse(host, progs)
+    assert host.browse_list.topLevelItemCount() == 1
+    item = host.browse_list.topLevelItem(0)
+    assert item.text(2) == "ESPN HD"
+    assert "Premier League" in item.text(4)
+    assert host.browse_stats.text() == "1 programmes · times shown in your local time"
+
+
+def test_render_browse_rec_column_plain_glyph_by_default(qapp, seeded_db):
+    """REC-2: column 6 exists and carries the plain record glyph when nothing
+    is recording — the failing case pre-fix is either an IndexError (no
+    column 6) or stale data, never this glyph."""
+
+    db, _, query_date = seeded_db
+    session = db.get_session()
+    progs = EpgRepository(session).get_schedule(
+        target_date=query_date, provider_ids=["p1"])
+    session.close()
+    host = _make_render_host(
+        qapp, provider_ids=["p1"], search_text="", name_map={"c1": "ESPN HD"})
+
+    _EpgBrowseMixin._render_browse(host, progs)
+
+    item = host.browse_list.topLevelItem(0)
+    assert _rec_icon_is(item, 6, "record", _theme_mod.COLOR_TEXT)
+    assert item.toolTip(6) == (
+        "Record this programme — schedules its guide window with your padding"
+    )
+
+
+def test_render_browse_rec_column_shows_recording_when_overlapping(qapp, seeded_db):
+    """A fake progress() row overlapping this programme's window must flip
+    the Rec cell to the recording glyph, proven against a real populate."""
+    from streamselect.core.recording_manager import RecordingProgress
+
+    db, _, query_date = seeded_db
+    session = db.get_session()
+    progs = EpgRepository(session).get_schedule(
+        target_date=query_date, provider_ids=["p1"])
+    session.close()
+    prog = progs[0]
+
+    host = _make_render_host(
+        qapp, provider_ids=["p1"], search_text="", name_map={"c1": "ESPN HD"})
+    host.recording_manager = SimpleNamespace(progress=lambda: [RecordingProgress(
+        recording_id="r1", channel_id="c1", channel_name="ESPN HD",
+        programme_title=prog.title, state="recording",
+        starts_at=prog.start_time, ends_at=prog.stop_time,
+        recorded_bytes=0, dest_path="", error=None, waiting_for_slot=False,
+    )])
+
+    _EpgBrowseMixin._render_browse(host, progs)
+
+    item = host.browse_list.topLevelItem(0)
+    assert _rec_icon_is(item, 6, "recording_active", _theme_mod.COLOR_ERR)
+    assert "Recording" in item.toolTip(6)
+
+
+def test_clicking_the_browse_rec_cell_schedules_this_rows_exact_window(qapp, seeded_db):
+    db, _, query_date = seeded_db
+    session = db.get_session()
+    progs = EpgRepository(session).get_schedule(
+        target_date=query_date, provider_ids=["p1"])
+    session.close()
+    prog = progs[0]
+
+    host = _make_render_host(
+        qapp, provider_ids=["p1"], search_text="", name_map={"c1": "ESPN HD"})
+    _EpgBrowseMixin._render_browse(host, progs)
+
+    item = host.browse_list.topLevelItem(0)
+    _EpgBrowseMixin._browse_item_clicked(host, item, 6)
+
+    fake_host = host._host.return_value
+    fake_host.schedule_recording_from_programme.assert_called_once_with(
+        "c1", prog.start_time, prog.stop_time, prog.title
+    )
+
+
+def test_render_browse_empty_schedule_shows_placeholder(qapp):
+    """No programmes for the day → placeholder shown, not a bare empty tree."""
+    host = _make_render_host(
+        qapp, provider_ids=["p1"], search_text="", name_map={}
+    )
+    _EpgBrowseMixin._render_browse(host, [])
+    assert host.browse_placeholder.text() == "No upcoming programmes in the guide."
+    assert host.browse_stats.text() == ""
+    assert host.browse_list.topLevelItemCount() == 0
+
+
+def test_render_browse_empty_no_sources_message(qapp):
+    host = _make_render_host(
+        qapp, provider_ids=[], search_text="", name_map={}
+    )
+    _EpgBrowseMixin._render_browse(host, [])
+    assert "No EPG sources" in host.browse_placeholder.text()
+
+
+def _rec_icon_is(item, column: int, role: str, colour: str) -> bool:
+    """The Rec cell's icon is *role* painted in *colour* (pixel-compared)."""
+    from streamselect.gui import icon_utils
+    return (item.icon(column).pixmap(16, 16).toImage()
+            == icon_utils.role_icon(role, colour).pixmap(16, 16).toImage())

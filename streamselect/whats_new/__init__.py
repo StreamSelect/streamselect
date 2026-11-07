@@ -1,0 +1,131 @@
+"""What's New changelog — one file per entry, zero-conflict additions.
+
+Public API (unchanged from the old ``streamselect/whats_new.py``):
+
+    WhatsNewEntry  — frozen dataclass
+    WHATS_NEW      — list[WhatsNewEntry], sorted ascending by id
+    latest_id()    — int, highest id or 0
+    entries_since(last_seen_id) — list[WhatsNewEntry], sorted descending by id
+
+To add a new entry:  add a new file ``streamselect/whats_new/entries/NNNN_slug.py``
+where NNNN is the zero-padded id (see entries/README).  Never edit this file
+or any existing entry file — just add the new file.
+"""
+
+from __future__ import annotations
+
+import importlib
+import pkgutil
+from dataclasses import dataclass
+from typing import Union
+
+from loguru import logger
+
+# A single QA test step.  Two backward-compatible shapes:
+#   - ``str``                    — plain step text, no deep-link (today's form).
+#   - ``(text, target)`` 2-tuple — step text plus a navigation TARGET the QA
+#                                  checklist renders a "Go ▸" button for.
+# ``target`` vocabulary (resolved by ``MainWindow.navigate_to`` — the single seam):
+#   - ``"view:<name>"``     browse | discover | recipe | epg | preferences
+#   - ``"settings:<tab>"``  open the Settings dialog (optionally on a named tab)
+#   - ``"sample:<kind>"``   vod | live | partial | series — the app finds a
+#                           representative channel and opens Browse + details on it.
+TestStep = Union[str, "tuple[str, str]"]
+
+
+def step_text(step: "TestStep") -> str:
+    """Return the human-readable text of a test step.
+
+    Accepts either a plain ``str`` step or a ``(text, target)`` 2-tuple — the
+    single accessor every renderer/digest uses so the str-or-tuple shape lives
+    in exactly one place.
+    """
+    if isinstance(step, tuple):
+        return step[0]
+    return step
+
+
+def step_target(step: "TestStep") -> str | None:
+    """Return a test step's navigation target, or ``None`` for a plain-text step."""
+    if isinstance(step, tuple) and len(step) >= 2:
+        return step[1]
+    return None
+
+
+@dataclass(frozen=True)
+class WhatsNewEntry:
+    id: int                  # monotonic; the "seen" cursor. Each new entry = previous max + 1.
+    version: str             # display only, e.g. "0.1.0"
+    date: str                # ISO "YYYY-MM-DD"
+    title: str
+    items: tuple[str, ...]   # user-facing bullet points (frozen dataclass → tuple, not list)
+    # dev-only manual QA steps; omit when not applicable.  Each step is EITHER a
+    # plain ``str`` OR a ``(text, target)`` 2-tuple (see ``TestStep`` above).  Read
+    # via ``step_text`` / ``step_target`` — never index a step directly.
+    test_steps: tuple[TestStep, ...] = ()
+    addresses: tuple[str, ...] = ()
+    # Optional: references to prior items this entry's PR fixes.
+    # Format: "e{id}_s{idx}" for a specific test-step  (e.g. "e82_s4" = entry 82, step 4)
+    #      or "flagged:{uuid}" for a tester-flagged item (e.g. "flagged:abc123-...").
+    # When a referenced step or flagged item is FAILED/OPEN, the QA checklist shows an
+    # "↺ Addressed in PR #NNN — re-test" badge and marks it "resolved — pending re-test".
+    # The human must still re-test and manually mark it pass; nothing is auto-passed.
+    # Backward-compatible: omit from existing entries (defaults to empty tuple).
+
+    def __post_init__(self) -> None:
+        # ``items=("one bullet")`` is a STRING, not a 1-tuple, and the dialog
+        # then lists it one character per bullet (an earlier change shipped that way).
+        for name in ("items", "test_steps", "addresses"):
+            if isinstance(getattr(self, name), str):
+                raise TypeError(
+                    f"What's New #{self.id}: {name} is a string — a single "
+                    f"bullet needs a trailing comma: ({name}_text,)")
+
+
+def _load_entries() -> list[WhatsNewEntry]:
+    """Discover and load all entry modules from the ``entries`` sub-package.
+
+    Each module must expose a top-level ``ENTRY = WhatsNewEntry(...)`` attribute.
+    Modules that fail to load are skipped with a warning so a broken entry file
+    does not prevent the app from starting.
+
+    Returns entries sorted ascending by id (display / cursor arithmetic uses
+    this canonical ordering; the dialog caller re-sorts descending as needed).
+    """
+    from streamselect.whats_new import entries as _entries_pkg  # noqa: PLC0415
+
+    found: list[WhatsNewEntry] = []
+    for module_info in pkgutil.iter_modules(_entries_pkg.__path__):
+        if module_info.name.startswith("_"):
+            continue  # skip __init__ and private helpers
+        full_name = f"streamselect.whats_new.entries.{module_info.name}"
+        try:
+            mod = importlib.import_module(full_name)
+            entry = getattr(mod, "ENTRY", None)
+            if not isinstance(entry, WhatsNewEntry):
+                logger.warning(
+                    "whats_new entry module {} has no ENTRY attribute — skipped", full_name
+                )
+                continue
+            found.append(entry)
+        except Exception:  # noqa: BLE001
+            logger.warning("Failed to load whats_new entry module {} — skipped", full_name)
+
+    return sorted(found, key=lambda e: e.id)
+
+
+WHATS_NEW: list[WhatsNewEntry] = _load_entries()
+
+
+def latest_id() -> int:
+    """Return the highest entry id in the changelog, or 0 if empty."""
+    return max((e.id for e in WHATS_NEW), default=0)
+
+
+def entries_since(last_seen_id: int) -> list[WhatsNewEntry]:
+    """Return entries newer than last_seen_id, newest first."""
+    return sorted(
+        (e for e in WHATS_NEW if e.id > last_seen_id),
+        key=lambda e: e.id,
+        reverse=True,
+    )

@@ -1,0 +1,683 @@
+"""Details pane — the title block (DETAILS-3b).
+
+Title, byline (type · year · runtime · content rating, plus the Adult
+indicator), the genre-chip row, the rating/TMDb/IMDb row, the tagline, and the
+source + collection chip row that sits just above "Available in".
+
+Moved out of ``details_sections.py`` (pinned at its code-health ceiling) into
+its own cohesive module — the class name ``_MetadataSection`` is kept so the
+pane's one caller (``details_pane.py``) has an unchanged API: ``load_basic``,
+``load_metadata``, ``set_mode``, ``clear``, ``set_recommendation_reason``, the
+``genre_clicked`` signal, plus the new ``set_collection``,
+``collection_clicked`` and ``status_message``
+members this slice adds.
+
+Quality/region badges and the plain "Source:" label are gone from this block
+— quality now lives on the "Available in" copy chips (a parallel slice), and
+provenance is a clickable chip rather than static text.  The rating renders
+as five gold stars, one half-star per point, with the number in the tooltip
+(user report), via :func:`_rating_rich_text` / :func:`rating_tooltip`.
+"""
+from __future__ import annotations
+
+import html as _html
+
+import re
+
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtWidgets import (
+    QApplication, QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
+)
+
+from streamselect.core.filter_utils import normalize_genre
+from streamselect.core.tag_provenance import guess_reason, strongest_kind
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+from streamselect.gui.detail_chips import make_chip, make_flow
+from streamselect.gui.details_sections import _is_stale_polluted_title
+from streamselect.gui.flow_layout import FlowLayout, enable_height_for_width
+from streamselect.gui.qt_size_utils import no_width_force as _no_width_force
+from streamselect.gui.qt_text_utils import escape_mnemonic
+from streamselect.gui.source_label import source_label
+from streamselect.metadata_providers.base import MetadataResult
+
+
+#: Star edge in the rating row (px).
+RATING_STAR_PX = 15
+
+
+def rating_stars(rating: float) -> list[str]:
+    """The five star roles for a 0–10 *rating*: one half-star per point.
+
+    7.4 rounds to 7 halves → three full, one half, one empty. Most of a
+    typical library sits at 6–7 (measured: 65% of many ratings),
+    so half steps are what keeps the stars telling titles apart.
+    """
+    halves = max(0, min(10, round(rating)))
+    full, half = divmod(halves, 2)
+    return (["rating_star"] * full + ["rating_half"] * half
+            + ["rating_empty"] * (5 - full - half))
+
+
+def _rating_rich_text(rating: float) -> str:
+    """Five gold mdi6 stars (full / half / empty) for a 0–10 rating.
+
+    Colour is the ``COLOR_GOLD`` token read at call time; this is rich-text
+    content, rebuilt on every ``load_basic``/``load_metadata``, not a
+    stylesheet re-applied on a palette switch.
+    """
+    return "".join(
+        _icon_utils.role_html(role, color=_theme.COLOR_GOLD, px=RATING_STAR_PX)
+        for role in rating_stars(rating)
+    )
+
+
+def rating_tooltip(rating: float, votes: int | None = None) -> str:
+    """The number the stars stand for — shown on hover, not in the row."""
+    text = f"{rating:.1f} / 10"
+    return f"{text} · {votes:,} votes" if votes else text
+
+
+class _MetadataSection(QWidget):
+    """Title, byline, genre chips, rating/id chips, tagline, source/collection chips."""
+
+    genre_clicked = pyqtSignal(str)            # genre name — left-click a genre chip
+    collection_clicked = pyqtSignal(str)        # collection value — left-click the collection chip
+    # Right-click the collection chip: (provider_id, collection value).
+    collection_exclude_requested = pyqtSignal(str, str)
+    collection_include_requested = pyqtSignal(str, str)
+    manage_exclusions_requested = pyqtSignal()
+    status_message = pyqtSignal(str)            # one-line status text — id-chip copy feedback
+
+    def __init__(self, config, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self._byline_kind = ""
+        self._byline_year = ""
+        self._byline_runtime = ""
+        self._byline_content_rating = ""
+        self._is_live = False
+        self._episode_mode = False
+        self._metadata_genres: list[str] = []
+        self._tag_genre_items: list = []
+        self._tmdb_id: str | None = None
+        self._imdb_id: str | None = None
+        self._source_provider_id: str | None = None
+        self._source_channel_id: str | None = None
+        self._source_text: str = ""
+        self._source_name: str | None = None
+        self._collection_value: str | None = None
+        self._setup()
+
+    def _setup(self) -> None:
+        layout = QVBoxLayout(self)
+        # 8px bottom margin on the block: with the pane's own inter-section
+        # spacing this opens a clear gap before "Available in" (point 5).
+        layout.setContentsMargins(0, 0, 0, 8)
+        layout.setSpacing(4)
+
+        # Kicker ABOVE the title (user report): "MOVIE · 2024 · 2H 28M ·
+        # PG-13" in the episode eyebrow's small caps, plus the 🔞 Adult
+        # indicator and the source chips on the same row.
+        byline_row = QWidget()
+        byline_row_layout = QHBoxLayout(byline_row)
+        byline_row_layout.setContentsMargins(0, 0, 0, 0)
+        byline_row_layout.setSpacing(8)
+
+        self._byline_lbl = QLabel()
+        _theme.style(self._byline_lbl, "DETAIL_GROUP_HEADING")
+        _no_width_force(self._byline_lbl)
+        self._byline_lbl.hide()
+        byline_row_layout.addWidget(self._byline_lbl, 1)
+
+        self.adult_indicator = QLabel("🔞 Adult")
+        _theme.style(self.adult_indicator, "DETAIL_ADULT_BADGE")
+        self.adult_indicator.hide()
+        byline_row_layout.addWidget(self.adult_indicator)
+        layout.addWidget(byline_row)
+        self._byline_row_layout = byline_row_layout  # the source chips join it below
+
+        # Title bar — the title, and the rating at the right end of the same
+        # line (user report). An episode's block goes directly under it
+        # (place_under_title), so the series' genres follow the episode.
+        title_bar = QWidget()
+        title_bar_layout = QHBoxLayout(title_bar)
+        title_bar_layout.setContentsMargins(0, 0, 0, 0)
+        title_bar_layout.setSpacing(6)
+
+        self.title_label = QLabel()
+        self.title_label.setWordWrap(True)
+        _title_policy = QSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
+        _title_policy.setHeightForWidth(True)
+        self.title_label.setSizePolicy(_title_policy)
+        _theme.style(self.title_label, "DETAIL_TITLE")
+        title_bar_layout.addWidget(self.title_label, 1)
+        layout.addWidget(title_bar)
+        self._title_bar = title_bar
+
+        # Genres — metadata genres first, then tag genres (facet "genre") not
+        # already present; a guessed tag genre renders dashed.  A wrapping
+        # flow row of its own, flush left, so it never forces the pane wider.
+        self._genres_loading_lbl = QLabel()
+        _theme.style(self._genres_loading_lbl, "TEXT_MD")
+        self._genres_loading_lbl.hide()
+        layout.addWidget(self._genres_loading_lbl)
+
+        self._genres_container = QWidget()
+        self._genres_container.setSizePolicy(
+            QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum
+        )
+        self._genres_layout = FlowLayout(self._genres_container, h_spacing=4, v_spacing=4)
+        # Zero, as make_flow does: Qt's default layout margins indented the
+        # genre chips past every other row's left edge.
+        self._genres_layout.setContentsMargins(0, 0, 0, 0)
+        self._genres_container.hide()
+        layout.addWidget(self._genres_container)
+
+        # Rating row — "8.0 / 10" (no stars) + framed TMDb/IMDb chips, shown
+        # only when the id exists.  Left-click a chip copies its id and
+        # reports status; right-click offers Copy/Open on {TMDb,IMDb}.
+        self.rating_label = QLabel()
+        self.rating_label.setTextFormat(Qt.TextFormat.RichText)
+        self.rating_label.setFixedHeight(make_chip("x").sizeHint().height())
+        self.rating_label.hide()
+
+        self._tmdb_chip = make_chip("TMDb")
+        self._tmdb_chip.hide()
+        # Bound slots + a property, never a lambda over ``self``: a closure that
+        # captures the widget it is connected on is a reference cycle the
+        # top-level-widget leak guard (tests/conftest.py) rightly reports.
+        self._tmdb_chip.setProperty("id_kind", "tmdb")
+        self._tmdb_chip.clicked.connect(self._on_id_chip_sender_clicked)
+
+        self._imdb_chip = make_chip("IMDb")
+        self._imdb_chip.hide()
+        # Bound slots + a property, never a lambda over ``self``: a closure that
+        # captures the widget it is connected on is a reference cycle the
+        # top-level-widget leak guard (tests/conftest.py) rightly reports.
+        self._imdb_chip.setProperty("id_kind", "imdb")
+        self._imdb_chip.clicked.connect(self._on_id_chip_sender_clicked)
+
+        # One line when there is room (it shares the title's line), but still
+        # a flow, so a narrow pane wraps it instead of being forced wider.
+        self._rating_row_w = make_flow(
+            [self.rating_label, self._tmdb_chip, self._imdb_chip], prefer_one_line=True)
+        self._rating_row_w.hide()
+        title_bar_layout.addWidget(
+            self._rating_row_w, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        # Tagline — italic subtitle line, shown when metadata provides it.
+        self._tagline_lbl = QLabel()
+        self._tagline_lbl.setWordWrap(True)
+        _theme.style(self._tagline_lbl, "TEXT_MD_ITALIC")
+        _no_width_force(self._tagline_lbl)
+        self._tagline_lbl.hide()
+        layout.addWidget(self._tagline_lbl)
+
+        # Source chips — NO label, at the right end of the byline row (user
+        #): the source chip (provider icon+name, or "(source
+        # removed)") plus this copy's collection chip when one is known.  Left-click the source chip filters the list to that
+        # source; left-click the collection chip filters to that collection.
+        self._source_chip = make_chip("")
+        self._source_chip.clicked.connect(self._on_source_chip_clicked)
+
+        self._collection_chip = make_chip("", "COLOR_FACET_COLLECTION")
+        self._collection_chip.clicked.connect(self._on_collection_chip_clicked)
+        self._collection_chip.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._collection_chip.customContextMenuRequested.connect(self._on_collection_chip_menu)
+        # Set by the host: (provider_id, value) -> bool, so the menu offers the right row.
+        self.collection_excluded = lambda _pid, _value: False
+        self._collection_chip.hide()
+        self._genres_layout.addWidget(self._collection_chip)   # parented from the start
+
+        # The collection chip is NOT here: it is a grouping like a genre, so it
+        # ends the genre row in its own colour (user report); the source
+        # chip says where the copy comes from and stays on the kicker line.
+        self._source_row_w = make_flow([self._source_chip], prefer_one_line=True)
+        self._source_row_w.hide()
+        self._byline_row_layout.addWidget(
+            self._source_row_w, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        # Recommendation reason
+        self.rec_reason_label = QLabel()
+        _theme.style(self.rec_reason_label, "TEXT_MD_ITALIC")
+        self.rec_reason_label.setWordWrap(True)
+        _no_width_force(self.rec_reason_label)
+        self.rec_reason_label.hide()
+        layout.addWidget(self.rec_reason_label)
+        # The two shared rows hold wrapping flows; without height-for-width the
+        # pane sizes this block as if every flow were wrapped at its narrowest
+        # and the slack shows up as a gap under the genres.
+        # Never taller than it needs (sizeHint below): spare height in the pane
+        # belongs below the sections, not inside this block.
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        for _row in (self._byline_row_layout.parentWidget(), title_bar, self):
+            enable_height_for_width(_row)
+        # Any height beyond that goes below the block, never into its rows.
+        layout.addStretch(1)
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        """The block's REAL height at its current width.
+
+        Wrapped text and chip flows can only say how tall they are once they
+        know their width; their plain hints assume the worst (every chip on its
+        own line, the title in a narrow column) — 187 px for a block that needs
+        131. Given spare room, the pane grew the block toward that hint, and
+        the difference sat as a gap above "Available in".
+        """
+        hint = super().sizeHint()
+        if self.width() > 0:
+            hint.setHeight(self.heightForWidth(self.width()))
+        return hint
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        if event.oldSize().width() != event.size().width():
+            self.updateGeometry()   # the height that fits depends on the width
+
+    def set_mode(self, is_live: bool) -> None:
+        self._is_live = is_live
+        self._refresh_rating_row_visibility()
+        if is_live:
+            self._genres_loading_lbl.hide()
+            self._genres_container.hide()
+            self._tagline_lbl.hide()
+
+    def set_episode_mode(self, on: bool) -> None:
+        """An episode is the subject: the show's title steps down to the
+        episode-title size (the episode takes the big size) and the show's
+        rating hides, leaving only the episode's (user report)."""
+        self._episode_mode = on
+        _theme.style(self.title_label, "DETAIL_TITLE_SECOND" if on else "DETAIL_TITLE")
+        self._refresh_rating_row_visibility()
+
+    def place_under_title(self, widget: QWidget) -> None:
+        """Put *widget* (the pane's episode block) directly under the title,
+        above the genres, which belong to the show."""
+        layout = self.layout()
+        layout.insertWidget(layout.indexOf(self._title_bar) + 1, widget)
+
+    def _refresh_byline(self) -> None:
+        """Rebuild "Movie · 2024 · 2h 28m · PG-13" from whichever parts are known.
+
+        Called from both the tier-1 load and the metadata pass, because the
+        year can arrive in either and runtime/content rating only ever
+        arrive with metadata; rebuilding from the stored parts means a later
+        caller never has to know what an earlier one already wrote.
+        """
+        parts = [p for p in (
+            self._byline_kind, self._byline_year,
+            self._byline_runtime, self._byline_content_rating,
+        ) if p]
+        self._byline_lbl.setText(" · ".join(parts).upper())
+        self._byline_lbl.setVisible(bool(parts))
+
+    def _refresh_rating_row_visibility(self) -> None:
+        """Hide the rating row when it has nothing to show, or in live mode."""
+        has_content = (
+            not self.rating_label.isHidden()
+            or not self._tmdb_chip.isHidden()
+            or not self._imdb_chip.isHidden()
+        )
+        self._rating_row_w.setVisible(
+            has_content and not self._is_live and not self._episode_mode)
+
+    def load_basic(self, channel, provider_map: dict | None = None) -> None:
+        """Tier-1 display: channel attributes only, no metadata.
+
+        Reads stored detected_* fields written at ingestion time — never calls
+        parse_channel_name() here (ingestion-only rule, the project rules).
+        """
+        clean_title = getattr(channel, "detected_title", None) or channel.name
+        self._clean_display_title = clean_title  # fallback if metadata.title is a stale polluted copy
+        self.title_label.setText(clean_title)
+        self.title_label.setToolTip(channel.name)
+
+        # Byline — kind and year, in that order, on the line under the title.
+        self._byline_year = getattr(channel, "detected_year", None) or ""
+        self._byline_kind = (channel.media_type or "unknown").title()
+        self._refresh_byline()
+
+        # Source row — provider icon+name (or "(source removed)" for an
+        # orphaned provider_id); hidden entirely when the channel has none.
+        provider_id = getattr(channel, "provider_id", None)
+        self._source_provider_id = provider_id
+        self._source_channel_id = getattr(channel, "id", None)
+        if provider_id is not None:
+            provider_info = (provider_map or {}).get(provider_id)
+            if provider_info:
+                icon = provider_info.get("icon", "")
+                name = provider_info.get("name", "")
+                self._source_text = f"{icon} {name}".strip() if icon else name
+                self._source_name = name
+            else:
+                self._source_text = f"(source removed) [{provider_id}]"
+                self._source_name = None
+        else:
+            self._source_text = ""
+            self._source_name = None
+        self._rebuild_source_row()
+
+        if getattr(channel, "is_adult", False):
+            self.adult_indicator.show()
+        else:
+            self.adult_indicator.hide()
+
+        # Show rating from raw_data immediately (don't wait for metadata).
+        # A rating of 0 / "0" / "0.0" means "unrated" — hide it (don't show
+        # "0.0 / 10").
+        raw_rating = channel.raw_data.get("rating") if channel.raw_data else None
+        try:
+            rating_val = float(raw_rating) if raw_rating not in (None, "") else 0.0
+        except (ValueError, TypeError):
+            rating_val = 0.0
+        if rating_val > 0:
+            rating_val = min(10.0, rating_val)  # clamp upper bound
+            self.rating_label.setText(_rating_rich_text(rating_val))
+            self.rating_label.setToolTip(rating_tooltip(rating_val))
+            self.rating_label.show()
+        else:
+            self.rating_label.hide()
+        self._refresh_rating_row_visibility()
+
+        # Show loading indicator for categories (will be populated by load_metadata
+        # and/or set_genre_tags).  LIVE channels have no metadata genres — hide the
+        # area; the version chips (set_versions) handle their category display.
+        if getattr(channel, "media_type", None) == "live":
+            self._genres_loading_lbl.hide()
+            self._genres_container.hide()
+        else:
+            self._genres_container.hide()
+            self._genres_loading_lbl.setText(f"{_icon_utils.role_html('loading')}&nbsp;Loading categories...")
+            self._genres_loading_lbl.show()
+
+    def load_metadata(self, metadata: MetadataResult) -> None:
+        """Tier-2/3 display: enrich with metadata fields."""
+        if metadata.title:
+            # Display the metadata title verbatim — never re-parse it at render
+            # (ingestion-only rule, the project rules; see load_basic), except the one
+            # stale-polluted-title case _is_stale_polluted_title selects around.
+            _clean = getattr(self, "_clean_display_title", "")
+            if not _is_stale_polluted_title(_clean, metadata.title):
+                self.title_label.setText(metadata.title)
+
+        if metadata.tagline:
+            self._tagline_lbl.setText(metadata.tagline)
+            self._tagline_lbl.show()
+
+        if metadata.year:
+            # Metadata year wins over the one parsed out of the channel name:
+            # it comes from release_date, resolved at ingestion.
+            self._byline_year = str(metadata.year)
+            self._refresh_byline()
+
+        if metadata.runtime:
+            h, m = divmod(metadata.runtime, 60)
+            self._byline_runtime = f"{h}h {m}m" if h else f"{m}m"
+            self._refresh_byline()
+
+        if metadata.content_rating:
+            self._byline_content_rating = metadata.content_rating
+            self._refresh_byline()
+
+        if metadata.rating:
+            self.rating_label.setText(_rating_rich_text(metadata.rating))
+            self.rating_label.setToolTip(rating_tooltip(metadata.rating, metadata.rating_count))
+            self.rating_label.show()
+
+        if metadata.imdb_id:
+            self._imdb_id = metadata.imdb_id
+            self._imdb_chip.setToolTip(
+                f"IMDb {metadata.imdb_id} — click to copy the id, right-click to open on IMDb"
+            )
+            self._imdb_chip.show()
+
+        if metadata.tmdb_id:
+            self._tmdb_id = metadata.tmdb_id
+            self._tmdb_chip.setToolTip(
+                f"TMDb {metadata.tmdb_id} — click to copy the id, right-click to open on TMDb"
+            )
+            self._tmdb_chip.show()
+
+        self._refresh_rating_row_visibility()
+
+        if metadata.genres:
+            # Providers deliver genres as a list, a slash-joined or a
+            # comma-joined string; split on ',' and '/' (never '&' — "Sci-Fi &
+            # Fantasy" is one TMDB genre), de-dupe case-insensitively, and fold
+            # each leaf to its canonical key via normalize_genre — the same
+            # table ingestion and stats use, so this pane agrees with the
+            # row's detected_genre instead of showing the provider's raw
+            # wording.
+            genres: list[str] = []
+            seen: set[str] = set()
+            for g in metadata.genres:
+                parts = re.split(r"\s*[/,]\s*", g) if isinstance(g, str) else [g]
+                for p in parts:
+                    name = p.strip() if isinstance(p, str) else p
+                    if not name:
+                        continue
+                    if isinstance(name, str):
+                        name = normalize_genre(name)
+                    key = name.casefold() if isinstance(name, str) else name
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    genres.append(name)
+            self._metadata_genres = genres
+        else:
+            self._metadata_genres = []
+        self._rebuild_genre_row()
+
+    def set_genre_tags(self, tags) -> None:
+        """Merge tag-provenance genre facets into the genre row.
+
+        Called from ``DetailsPaneWidget.apply_channel_tags`` with the
+        facet_type == "genre" subset of the channel's tags (``ChannelTagDTO``).
+        A tag not already present among the metadata genres renders as its
+        own chip; one whose strongest feeder kind is "inference"
+        (``tag_provenance.strongest_kind``) renders dashed, with a "Guessed
+        ..." tooltip from ``tag_provenance.guess_reason``.
+        """
+        self._tag_genre_items = list(tags)
+        self._rebuild_genre_row()
+
+    def set_collection(self, value: str | None) -> None:
+        """Set this copy's collection-facet tag value (or None).
+
+        Called from ``DetailsPaneWidget.apply_channel_tags`` — the collection
+        value arrives with the channel's tags, async, after ``load_basic``
+        has already built the source row.
+        """
+        self._collection_value = value
+        self._rebuild_source_row()
+
+    def set_recommendation_reason(self, reason: str | None) -> None:
+        if reason:
+            self.rec_reason_label.setText(
+                f"{_icon_utils.role_html('preferences')}&nbsp;Recommended: {_html.escape(reason, quote=False)}")
+            self.rec_reason_label.show()
+        else:
+            self.rec_reason_label.hide()
+
+    def clear(self) -> None:
+        self.title_label.clear()
+        self._byline_kind = ""
+        self._byline_year = ""
+        self._byline_runtime = ""
+        self._byline_content_rating = ""
+        self._byline_lbl.hide()
+        self._tagline_lbl.hide()
+        self.rating_label.clear()
+        self.rating_label.hide()
+        self._tmdb_id = None
+        self._imdb_id = None
+        self._tmdb_chip.hide()
+        self._imdb_chip.hide()
+        self._refresh_rating_row_visibility()
+        self._genres_loading_lbl.hide()
+        self._metadata_genres = []
+        self._tag_genre_items = []
+        self._clear_genre_chips()
+        self._genres_container.hide()
+        self._source_provider_id = None
+        self._source_channel_id = None
+        self._source_text = ""
+        self._source_name = None
+        self._collection_value = None
+        self._source_row_w.hide()
+        self.adult_indicator.hide()
+        self.rec_reason_label.hide()
+
+    # ------------------------------------------------------------------ #
+    # Genre chips — private helpers                                        #
+    # ------------------------------------------------------------------ #
+
+    def _clear_genre_chips(self) -> None:
+        """Remove all genre chip buttons from the flow layout (the collection
+        chip, which shares the row, is kept and re-appended)."""
+        while self._genres_layout.count():
+            item = self._genres_layout.takeAt(0)
+            w = item.widget()
+            if w is not None and w is not self._collection_chip:
+                w.deleteLater()
+
+    def _sync_genre_row(self) -> None:
+        """Put the collection chip last on the genre row and show the row
+        while it holds anything visible."""
+        idx = self._genres_layout.indexOf(self._collection_chip)
+        if idx >= 0:
+            self._genres_layout.takeAt(idx)
+        self._genres_layout.addWidget(self._collection_chip)
+        shown = any(
+            not self._genres_layout.itemAt(i).widget().isHidden()
+            for i in range(self._genres_layout.count())
+        )
+        self._genres_container.updateGeometry()
+        self._genres_container.setVisible(shown)
+
+    def _populate_genre_chips(self, genres: list[str]) -> None:
+        """Replace the flow layout contents with one chip button per genre."""
+        self._clear_genre_chips()
+        for g in genres:
+            chip = make_chip(g, "COLOR_FACET_GENRE")
+            chip.setToolTip(f"Filter by genre: {g}")
+            chip.setProperty("genre", g)
+            chip.clicked.connect(self._on_genre_chip_clicked)
+            self._genres_layout.addWidget(chip)
+        self._sync_genre_row()
+
+    def _rebuild_genre_row(self) -> None:
+        """Rebuild the genre row from the metadata genres plus any tag genres.
+
+        Metadata genres render first (via ``_populate_genre_chips``, unchanged
+        logic); tag genres not already present are appended, dashed when
+        their strongest feeder kind is "inference".
+        """
+        if self._is_live:
+            self._genres_loading_lbl.hide()
+            self._clear_genre_chips()
+            self._sync_genre_row()   # a live channel can still have a collection
+            return
+        self._populate_genre_chips(self._metadata_genres)
+        seen = {g.casefold() for g in self._metadata_genres}
+        for tag in self._tag_genre_items:
+            if tag.value.casefold() in seen:
+                continue
+            seen.add(tag.value.casefold())
+            guessed = strongest_kind(tag.feeders) == "inference"
+            chip = make_chip(tag.value, "COLOR_FACET_GENRE", dashed=guessed)
+            tip = f"Filter by genre: {tag.value}"
+            if guessed:
+                tip = f"Guessed {guess_reason(tag.feeders, [])} — {tip}"
+            chip.setToolTip(tip)
+            chip.setProperty("genre", tag.value)
+            chip.clicked.connect(self._on_genre_chip_clicked)
+            self._genres_layout.addWidget(chip)
+        self._genres_loading_lbl.hide()
+        self._sync_genre_row()
+
+    # ------------------------------------------------------------------ #
+    # Source / collection row — private helpers                            #
+    # ------------------------------------------------------------------ #
+
+    def _rebuild_source_row(self) -> None:
+        if self._source_provider_id is None:
+            self._source_row_w.hide()
+            self._collection_chip.hide()
+            self._sync_genre_row()
+            return
+        self._source_chip.setText(escape_mnemonic(self._source_text))
+        self._source_chip.setToolTip("Click to copy this copy's channel id")
+        if self._collection_value:
+            self._collection_chip.setText(escape_mnemonic(self._collection_value))
+            self._collection_chip.setToolTip(
+                f"{source_label(self._source_name, sentence_start=True)} files this copy under "
+                f"{self._collection_value} — click to show the collection"
+            )
+            self._collection_chip.show()
+        else:
+            self._collection_chip.hide()
+        self._source_row_w.show()
+        self._sync_genre_row()
+
+    def _on_source_chip_clicked(self) -> None:
+        """Copy the channel id — what the source line always did. (DETAILS-3b
+        briefly made it filter the list to the whole source: never useful.)"""
+        if self._source_channel_id:
+            QApplication.clipboard().setText(self._source_channel_id)
+            self.status_message.emit(f"Copied channel id {self._source_channel_id} to clipboard")
+
+    def _on_collection_chip_clicked(self) -> None:
+        if self._collection_value:
+            self.collection_clicked.emit(self._collection_value)
+
+    def _on_collection_chip_menu(self, pos) -> None:
+        """Right-click the collection chip — the same grammar as the "Available
+        in" chips: a header, then the Global-Exclusion row, then Manage."""
+        from PyQt6.QtWidgets import QMenu
+
+        pid, value = self._source_provider_id, self._collection_value
+        if not pid or not value:
+            return
+        menu = QMenu(self)
+        header = menu.addAction(f"{value} ({self._source_name})" if self._source_name else value)
+        header.setEnabled(False)
+        menu.addSeparator()
+        excluded = self.collection_excluded(pid, value)
+        toggle = menu.addAction(f'Include the "{value}" collection again' if excluded
+                                else f'Exclude the "{value}" collection')
+        toggle.setToolTip("Every channel this source files under this collection, everywhere")
+        menu.addSeparator()
+        manage = menu.addAction("Manage Global Exclusions…")
+        chosen = menu.exec(self._collection_chip.mapToGlobal(pos))
+        menu.deleteLater()
+        if chosen == toggle:
+            (self.collection_include_requested if excluded else self.collection_exclude_requested).emit(pid, value)
+        elif chosen == manage:
+            self.manage_exclusions_requested.emit()
+
+    # ------------------------------------------------------------------ #
+    # Rating / TMDb / IMDb chips — private helpers                         #
+    # ------------------------------------------------------------------ #
+
+    def _on_genre_chip_clicked(self) -> None:
+        """One slot for every genre chip; the chip carries its genre as a property."""
+        genre = self.sender().property("genre") if self.sender() else None
+        if genre:
+            self.genre_clicked.emit(str(genre))
+
+    def _on_id_chip_sender_clicked(self) -> None:
+        kind = self.sender().property("id_kind") if self.sender() else None
+        if kind:
+            self._on_id_chip_clicked(str(kind))
+
+    def _on_id_chip_clicked(self, kind: str) -> None:
+        ident = self._tmdb_id if kind == "tmdb" else self._imdb_id
+        if not ident:
+            return
+        QApplication.clipboard().setText(ident)
+        label = "TMDb" if kind == "tmdb" else "IMDb"
+        self.status_message.emit(f"Copied {label} id {ident} to clipboard")

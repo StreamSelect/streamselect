@@ -1,0 +1,964 @@
+"""DEBT-1a — the menu bar and every handler it wires, moved verbatim.
+
+``_MenuActionsMixin`` is mixed into :class:`~streamselect.gui.main_window.MainWindow`
+(main_window.py's class bases), same shape as every other ``main_window_*.py``
+mixin: its methods read/write ``self.*`` attributes MainWindow's
+``__init__``/``setup_ui`` already establish (``self.config``, ``self.executor``,
+``self.status_bar``, ``self.notification_manager``, ``self._tools_menu``, the
+per-action attributes ``create_menu_bar`` itself assigns).
+
+``main_window.py`` is PINNED by the code-health ratchet and is the one file
+that grows at every measurement — this is a pure extraction, not a rewrite.
+Every method here is the SAME body, docstring and rationale comment it had in
+``main_window.py``; nothing was reworded, reordered within a function, or
+changed in behaviour.
+
+Two things this mixin does NOT own, on purpose, even though it calls them:
+``_sync_layout_menu`` (re-ticks the Layout menu from live splitter state) and
+``_whats_new_unseen`` (the testable seam behind ``maybe_show_whats_new``) both
+stayed on ``MainWindow`` itself — they were not in the moved set, and a mixin
+method calling back into a sibling mixin or the host class is the same
+cross-mixin pattern ``main_window_overlays.py``'s ``_OverlaysMixin`` already
+uses (e.g. ``self.play_channel_by_id``). ``self.*`` attribute lookup does not
+care which class in the MRO defines the name.
+"""
+
+from __future__ import annotations
+
+from dataclasses import replace
+
+from loguru import logger
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtWidgets import QApplication
+
+from streamselect.core.config import dev_mode_enabled as _dev_mode_enabled
+from streamselect.core.players.live_playback import LIVE_PROPS, LivePlayback, live_playback_from_props
+from streamselect.gui import deferred_config_save as _cfgsave
+from streamselect.gui import playback_menu
+from streamselect.gui.playback_watch_queue import queue_place, reveal_queue_row
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import settings_apply as _settings_apply
+from streamselect.gui import shortcuts as _shortcuts
+from streamselect.gui.menu_bar_reveal import auto_hide_supported as menu_bar_auto_hide_supported
+from streamselect.gui.whats_new_dialog import WhatsNewDialog
+import streamselect.whats_new as _whats_new
+
+# Auto-dialog backlog cap — above this many unseen entries, show only the
+# newest release's entries (see maybe_show_whats_new).
+_WHATS_NEW_AUTO_CAP = 25
+
+
+class _MenuActionsMixin:
+    """The menu bar (File/View/Style/Layout/Buffer/Tools/Help) and its handlers."""
+
+    _playback_menu_token = [0]  # stale-drop counter: the newest click's read wins
+
+    def create_menu_bar(self):
+        """Create application menu bar"""
+        menubar = self.menuBar()
+        
+        # File menu
+        file_menu = menubar.addMenu("&File")
+        file_menu.addAction("&Add Source...", self.add_provider)
+        file_menu.addSeparator()
+        settings_action = QAction("&Settings", self)
+        settings_action.setShortcut(QKeySequence("Ctrl+,"))
+        settings_action.triggered.connect(self.open_settings)
+        file_menu.addAction(settings_action)
+        file_menu.addSeparator()
+        file_menu.addAction("E&xit", self.close)
+        
+        # View menu
+        view_menu = self._view_menu = menubar.addMenu("&View")
+        view_menu.addAction("&Refresh", self.refresh_channels)
+        view_menu.addAction("&Operations", self.show_operations)
+
+        # Style menu — look-and-feel without digging through Settings (user
+        # request). Both groups drive the SAME live-apply seams Settings uses
+        # (apply_theme / _apply_channel_list_density), so the two surfaces can
+        # never disagree; this is a shortcut to existing behaviour, not a
+        # parallel implementation of it.
+        self._build_style_menu(menubar)
+        self._build_layout_menu(menubar)
+        self._build_buffer_menu(menubar)
+        # Empty here on purpose: every entry in it is a shortcut row, so
+        # shortcuts.install() fills it. Created HERE so it sits between
+        # Buffer and Tools rather than after Help.
+        self._playback_menu = menubar.addMenu("&Playback")
+        
+        # Tools menu
+        tools_menu = self._tools_menu = menubar.addMenu("&Tools")
+        # Stream-quality diagnosis of the SELECTED channel. It had its own
+        # permanent button in the bottom bar, which put a niche action on
+        # screen beside the primary navigation forever; the header's Tools
+        # button opens this menu instead (R5).
+        #
+        # This sat under a SECOND entry called "Diagnostics" whose handler
+        # logged one line and returned — two diagnostics items, one dead. The
+        # dead one is gone; the real one carries the name, matching its dialog.
+        diagnose_action = QAction(_icon_utils.role_icon("diagnose"), "Stream &diagnostics", self)
+        diagnose_action.setToolTip(
+            "Measure the selected channel's stream: reachability, time to first "
+            "byte, throughput, and whether a bigger buffer would help"
+        )
+        diagnose_action.triggered.connect(self.on_diagnose_clicked)
+        tools_menu.addAction(diagnose_action)
+        # "Global Exclusions", never "Filters" — the app's one name for this.
+        # Its handler was a stub too, and had a LIVE trigger beyond the menu:
+        # the details pane emits manage_filters_requested straight into it.
+        exclusions_action = QAction(
+            _icon_utils.role_icon("global_exclusion"), "Global &Exclusions", self
+        )
+        exclusions_action.setToolTip(
+            "Choose which prefixes, categories and keywords are hidden across "
+            "the whole app"
+        )
+        exclusions_action.triggered.connect(self.manage_filters)
+        tools_menu.addAction(exclusions_action)
+        missing_tmdb_action = QAction(
+            _icon_utils.role_icon("missing_data"), "Missing TMDb Data", self
+        )
+        missing_tmdb_action.setToolTip(
+            "Diagnose TMDb-id coverage and drive on-demand enrichment"
+        )
+        missing_tmdb_action.triggered.connect(self.enter_missing_tmdb_mode)
+        tools_menu.addAction(missing_tmdb_action)
+        reconnect_action = QAction(
+            _icon_utils.role_icon("reconnect"), "Reconnect Engaged Content", self
+        )
+        reconnect_action.setToolTip(
+            "Recover favorites/history/queue rows stranded by a removed source "
+            "onto a live copy"
+        )
+        reconnect_action.triggered.connect(self.enter_reconnect_engaged_mode)
+        tools_menu.addAction(reconnect_action)
+        metadata_enrich_action = QAction(
+            _icon_utils.role_icon("metadata_enrich"), "Background Metadata Enrichment", self
+        )
+        metadata_enrich_action.setToolTip(
+            "View progress and start/pause/cancel the background metadata fill"
+        )
+        metadata_enrich_action.triggered.connect(self.enter_metadata_enrichment_mode)
+        tools_menu.addAction(metadata_enrich_action)
+        open_config_action = QAction(
+            _icon_utils.role_icon("folder_open"), "Open config folder", self
+        )
+        open_config_action.setToolTip(
+            "Reveal the folder holding config.yaml and the logs, for support "
+            "and manual edits"
+        )
+        open_config_action.triggered.connect(self.open_config_folder)
+        tools_menu.addAction(open_config_action)
+        log_viewer_action = QAction(
+            _icon_utils.role_icon("log_viewer"), "Log viewer", self
+        )
+        log_viewer_action.setToolTip(
+            "Watch the log as it happens, in a window you can move aside — "
+            "with save, filter and diagnostics for a bug report"
+        )
+        log_viewer_action.triggered.connect(self.show_log_viewer)
+        tools_menu.addAction(log_viewer_action)
+        clear_log_action = QAction(
+            _icon_utils.role_icon("clear_log"), "Clear log files", self
+        )
+        clear_log_action.setToolTip(
+            "Delete every log file, rotated copies included, to reclaim disk"
+        )
+        clear_log_action.triggered.connect(self.clear_log_files)
+        tools_menu.addAction(clear_log_action)
+        tools_menu.addSeparator()
+        # The guided tour: menu-only until a user approves offering it
+        # during a first scan (ROADMAP onboarding 6; guided_tour.py).
+        tour_action = QAction(_icon_utils.role_icon("info"), "Take the &tour", self)
+        tour_action.setToolTip(
+            "A one-minute walk through the main controls. You can take it "
+            "again any time from here."
+        )
+        tour_action.triggered.connect(self.start_tour)
+        tools_menu.addAction(tour_action)
+        tools_menu.addSeparator()
+        for keep, text, tip in (
+            (False, "Fresh start…",
+             "Delete the library, settings and cached images and restart as a new install"),
+            (True, "Fresh start, keep sources…",
+             "Delete everything except your sources, then restart and load them again"),
+        ):
+            fresh_action = QAction(_icon_utils.role_icon("refresh"), text, self)
+            fresh_action.setToolTip(tip)
+            fresh_action.triggered.connect(lambda _=False, k=keep: self.start_fresh(k))
+            tools_menu.addAction(fresh_action)
+
+        # Help menu
+        # The way BACK. The header's Tools button opens this same menu, so
+        # this entry is reachable with the menu bar hidden — which is precisely
+        # when someone needs it. Without it the only off-switch for auto-hide
+        # would be behind the thing auto-hide just hid.
+        tools_menu.addSeparator()
+        self._menu_always_visible_action = QAction(
+            "Menu &bar always visible", self, checkable=True
+        )
+        self._menu_always_visible_action.setToolTip(
+            "When unticked, the menu bar hides until you press Alt. "
+            "Untick only if you want the chrome gone — File, View, Layout, "
+            "Style and Buffer all go behind that Alt press; the header's "
+            "Tools button (this menu) stays reachable either way."
+        )
+        if not menu_bar_auto_hide_supported():
+            self._menu_always_visible_action.setEnabled(False)
+            self._menu_always_visible_action.setToolTip(
+                "On macOS the menu bar is the system bar at the top of the "
+                "screen, not part of this window — there is nothing to hide."
+            )
+        self._menu_always_visible_action.toggled.connect(
+            lambda visible: self.set_menu_bar_auto_hide(not visible)
+        )
+        tools_menu.addAction(self._menu_always_visible_action)
+        tools_menu.aboutToShow.connect(self.sync_menu_bar_actions)
+
+        # Alt-to-reveal, if the user has asked for it. Applied here rather than
+        # at the end of __init__ so the bar is never briefly visible first.
+        self._alt_pressed_alone = False
+        self.apply_menu_bar_auto_hide()
+        self.sync_menu_bar_actions()
+
+        help_menu = menubar.addMenu("&Help")
+        whats_new_action = QAction(_icon_utils.role_icon("whats_new"), "What's New", self)
+        whats_new_action.setToolTip("See what changed in recent updates")
+        whats_new_action.triggered.connect(self.show_whats_new)
+        help_menu.addAction(whats_new_action)
+
+        if _dev_mode_enabled():
+            qa_action = QAction(_icon_utils.role_icon("qa_checklist"), "Testing Checklist", self)
+            qa_action.setToolTip("Open the dev QA testing checklist (STREAMSELECT_DEV mode)")
+            qa_action.triggered.connect(self._open_qa_checklist)
+            help_menu.addAction(qa_action)
+
+        help_menu.addSeparator()
+        help_menu.addAction("&About", self.show_about)
+
+        # LAST, because every menu the table names has to exist first. One
+        # call builds every accelerator in the app, places each one in the
+        # menu its row names, and hangs the two Layout toggles' keys on the
+        # actions that already do that job (KEYS-1).
+        _shortcuts.install(self)
+
+    # ── Keyboard shortcuts (KEYS-1) ─────────────────────────────────────────
+    # The handlers ``gui/shortcuts.py`` names. They live here because this is
+    # the file that owns the menu bar, and every one of them is reachable from
+    # a menu entry as well as from its key.
+
+    def show_keyboard_shortcuts(self) -> None:
+        """Open the cheat-sheet — every shortcut, read off the one table."""
+        from streamselect.gui.shortcuts import ShortcutCheatSheetDialog
+
+        ShortcutCheatSheetDialog(self).exec()
+
+    def _shortcut_focus_search(self) -> None:
+        """Put the caret in the header search box with its text selected.
+
+        Selected, not appended to: the binding is reached to start a NEW
+        search far more often than to extend the last one, and the previous
+        query being highlighted means either intent is one keystroke away.
+        """
+        box = self.__dict__.get("search_input")
+        if box is None:
+            return
+        box.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        box.selectAll()
+
+    def _shortcut_escape(self) -> None:
+        """Escape: give the key back to whatever is in front.
+
+        A window-owned shortcut is matched BEFORE the focus widget's
+        ``keyPressEvent``, so this action takes Escape away from the search
+        box and the overlays, each of which already defines what Escape means
+        there (``ScopedFilterBox`` clears and emits ``escaped``; the
+        lightboxes and the trail-map close). Re-sending the key is how those
+        single definitions stay the only ones — reimplementing "close" here
+        would be a second copy that drifts.
+        """
+        focused = QApplication.focusWidget()
+        if _shortcuts.is_text_entry(focused):
+            _shortcuts.send_escape(focused)
+            if focused is self.__dict__.get("search_input"):
+                focused.clearFocus()
+            return
+        # Front to back: the poster lightbox opens ON TOP of the preview
+        # overlay, and the trail-map replaces it.
+        for attr in ("_poster_lightbox", "_trail_map", "_lightbox"):
+            overlay = self.__dict__.get(attr)
+            if overlay is not None and overlay.isVisible():
+                _shortcuts.send_escape(overlay)
+                return
+
+    def _shortcut_play_pause(self) -> None:
+        """Toggle pause on the current stream.
+
+        ``key=None`` is the most-recently-used mpv instance, which is what
+        "the current stream" means with Split Streams on — and it goes
+        through ``PlayerManager``, never ``MPVPlayer``.
+        """
+        if not self.player_manager.send_command(["cycle", "pause"]):
+            self.status("Nothing is playing", ms=4000)
+
+    def _shortcut_stop(self) -> None:
+        """Stop the current stream (the most-recently-used player instance)."""
+        if self.player_manager.stop():
+            self.status("Playback stopped", ms=4000)
+        else:
+            self.status("Nothing is playing", ms=4000)
+
+    def _shortcut_next_channel(self) -> None:
+        """Select the next channel in the list. Selection only — no play."""
+        self._step_channel_selection(1)
+
+    def _shortcut_prev_channel(self) -> None:
+        """Select the previous channel in the list. Selection only — no play."""
+        self._step_channel_selection(-1)
+
+    def _step_channel_selection(self, delta: int) -> None:
+        """Move the channel list's current row by *delta*, skipping headers.
+
+        Grouped mode puts section and person headings in the same model as
+        the channels and marks them not-selectable; stepping onto one would
+        move the details pane to nothing, so they are stepped OVER.
+
+        Args:
+            delta: ``+1`` for the next row, ``-1`` for the previous one.
+        """
+        view = self.__dict__.get("channels_list")
+        model = view.model() if view is not None else None
+        if model is None:
+            return
+        total = model.rowCount()
+        current = view.currentIndex().row()
+        row = (current if current >= 0 else (-1 if delta > 0 else total)) + delta
+        while 0 <= row < total:
+            index = model.index(row, 0)
+            if model.flags(index) & Qt.ItemFlag.ItemIsSelectable:
+                view.setCurrentIndex(index)
+                view.scrollTo(index)
+                return
+            row += delta
+
+    def show_operations(self):
+        """Show operations panel"""
+        logger.info("Show operations panel")
+    
+    def show_log_viewer(self) -> None:
+        """Open (or re-raise) the floating log window.
+
+        One window, kept on the instance: opening it twice would attach a
+        second loguru sink and show every line twice, and the second window
+        would keep streaming after the first was closed.
+        """
+        from streamselect.gui.log_viewer_window import LogViewerWindow
+
+        existing = self.__dict__.get("_log_viewer")
+        if existing is not None:
+            try:
+                existing.show()
+                existing.raise_()
+                existing.activateWindow()
+                return
+            except RuntimeError:  # silent: the previous window's C++ object is
+                # gone (the user closed it and Qt collected it); fall through
+                # and build a new one, which is what they asked for anyway.
+                pass
+        viewer = LogViewerWindow(self.config, self)
+        self._log_viewer = viewer
+        viewer.show()
+        viewer.raise_()
+
+    def start_fresh(self, keep_sources: bool) -> None:
+        """Confirm, record a fresh start (core/fresh_start.py) and close to restart.
+
+        The wipe itself runs in the NEXT process, before the database opens —
+        this one still holds it.
+        """
+        from pathlib import Path
+
+        from PyQt6.QtWidgets import QMessageBox
+
+        from streamselect.core import fresh_start
+        from streamselect.core.database import ProviderDB
+
+        sources = None
+        if keep_sources:
+            with self.db.session_scope(commit=False) as session:
+                sources = [{f: getattr(p, f, None) for f in fresh_start.SOURCE_FIELDS}
+                           for p in session.query(ProviderDB).all()]
+        kept = (f"Your {len(sources)} source(s) are kept and load again as if just added."
+                if sources is not None else "Your sources are deleted too.")
+        answer = QMessageBox.question(
+            self,
+            "Fresh start",
+            "Delete the library, watch history, favourites, ratings, settings and "
+            f"cached images, then restart StreamSelect?\n\n{kept}\n\n"
+            "Logs and recordings/downloads are not touched. This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        db_path = Path(self.config.database_url.removeprefix("sqlite:///"))
+        fresh_start.request(db_path, sources)
+        if not self.close():
+            # Closing was refused (a recording is due and the user kept the app
+            # open). Withdraw the request, or the NEXT ordinary launch would
+            # wipe everything without being asked again.
+            fresh_start.cancel()
+
+    def start_tour(self) -> None:
+        """Tools ▸ Take the tour — the guided tour over this window."""
+        from streamselect.gui.guided_tour import start_tour
+        start_tour(self)
+
+    def clear_log_files(self) -> None:
+        """Delete every log file after confirming, and report what was freed.
+
+        Confirmed because it is not reversible and the logs are the evidence
+        for whatever the user is about to report. Routed through the viewer
+        module's helper so this and the viewer's own button cannot become two
+        answers to "which files count as the log".
+        """
+        from PyQt6.QtWidgets import QMessageBox
+
+        from streamselect.core.log_paths import all_log_files
+        from streamselect.gui.log_viewer_window import clear_log_files
+
+        files = all_log_files(self.config)
+        if not files:
+            self.status("No log files to clear", ms=4000)
+            return
+        total = 0
+        for path in files:
+            try:
+                total += path.stat().st_size
+            except OSError:  # silent: a file that vanished cannot be offered
+                # for deletion, and excluding it from the total is correct.
+                continue
+        answer = QMessageBox.question(
+            self,
+            "Clear log files",
+            f"Delete {len(files)} log file(s), freeing "
+            f"{total / 1_048_576:.1f} MB?\n\n"
+            "This cannot be undone. Save anything you still need first.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        removed, freed = clear_log_files(self.config)
+        self.status(
+            f"Cleared {removed} log file(s), freeing {freed / 1_048_576:.1f} MB",
+            ms=6000,
+        )
+
+    def open_config_folder(self) -> None:
+        """Reveal the config directory in the system file manager.
+
+        The folder, not ``config.yaml`` itself. Three reasons: a ``.yaml`` file
+        has no registered handler on many systems, so opening it can silently do
+        nothing or launch something unhelpful; the logs live in the same folder
+        and someone fetching one usually needs the other; and revealing a
+        directory cannot put an editor in front of a file the user did not mean
+        to change.
+
+        Uses ``QDesktopServices`` so each platform's own file manager opens —
+        Finder, Explorer, or whatever the desktop registers.
+        """
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+
+        path = self.config.config_dir
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logger.exception("Could not create the config folder at {}", path)
+
+        if QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            logger.info("Opened config folder: {}", path)
+            return
+
+        # No file manager, or the desktop refused. Say where it is rather than
+        # failing silently — the path is the useful half of this action.
+        logger.warning("Could not open a file manager for {}", path)
+        self.notification_manager.show(
+            f"Config folder: {path}",
+            duration_ms=12000,
+        )
+
+    def open_settings(self, tab: str | None = None):
+        """Open settings dialog.
+
+        Args:
+            tab: Optional tab label substring (case-insensitive). When given and
+                matched, the dialog opens with that tab selected — used by QA
+                deep-links (``settings:<tab>``).  Unmatched/None opens the first
+                tab as before (backward-compatible).
+        """
+        from streamselect.gui.settings_dialog import SettingsDialog
+        dialog = SettingsDialog(self.config, self, executor=self.executor)
+        # ONE slot, not eleven connections. The list itself lives in
+        # gui/settings_apply.HANDLERS — same single enumeration, moved to where
+        # it can be ordered, timed and guarded. It also coalesces the list
+        # reload: two handlers called load_channels() independently, so one OK
+        # re-ran the whole 785k-row filter twice.
+        dialog.settings_applied.connect(lambda: _settings_apply.run(self))
+        dialog.check_updates_requested.connect(self._manual_update_check)
+        if tab:
+            dialog.select_section_by_label(tab)
+        dialog.exec()
+        # NOTHING is re-run here. There used to be a hand-written tail repeating
+        # some of the handlers above, because OK saved without emitting
+        # settings_applied — and it listed three of the five, so OK silently
+        # dropped row density, thumbnails, platform-name style and
+        # collapse-variants. OK emits now, so the connections ARE the list;
+        # re-running them here would only let the two drift apart again.
+
+    def _apply_menu_bar_setting(self) -> None:
+        """Settings changed the menu-bar option — apply it and re-tick Tools."""
+        self.apply_menu_bar_auto_hide()
+        self.sync_menu_bar_actions()
+
+    def _build_layout_menu(self, menubar) -> None:
+        """Build the Layout menu — which panels are on screen.
+
+        Separate from Style because they answer different questions. Style is
+        what things LOOK like (theme, density, posters); Layout is what is
+        *present*. Keeping them apart is what makes either menu predictable —
+        a user reaching for "hide the sidebar" should not have to consider
+        whether that counts as styling.
+
+        The filter-panel toggle moved here from Style for that reason: it is
+        the third of the three panels, and grouping it with the other two beats
+        having one panel toggle live somewhere else.
+
+        Every entry drives the SAME path the panel's own control uses
+        (``CollapsibleSplitter.collapse_panel``/``expand_panel``, and
+        ``toggle_filters``), so a menu tick can never disagree with the screen.
+        """
+        layout_menu = self._layout_menu = menubar.addMenu("&Layout")
+        layout_menu.aboutToShow.connect(self._sync_layout_menu)
+
+        self._sidebar_visible_action = QAction("&Sidebar", self, checkable=True)
+        self._sidebar_visible_action.setToolTip(
+            "Show or hide the left sidebar. Its width is remembered."
+        )
+        self._sidebar_visible_action.triggered.connect(self._toggle_sidebar_from_menu)
+        layout_menu.addAction(self._sidebar_visible_action)
+
+        self._details_visible_action = QAction("&Details pane", self, checkable=True)
+        self._details_visible_action.setToolTip(
+            "Show or hide the details pane on the right. Its width is remembered."
+        )
+        self._details_visible_action.triggered.connect(self._toggle_details_from_menu)
+        layout_menu.addAction(self._details_visible_action)
+
+        self._filters_visible_action = QAction("&Filter panel", self, checkable=True)
+        self._filters_visible_action.setToolTip(
+            "Show or hide the filter panel beside the results list."
+        )
+        self._filters_visible_action.triggered.connect(self._toggle_filters_from_menu)
+        layout_menu.addAction(self._filters_visible_action)
+
+        layout_menu.addSeparator()
+        self._filter_chips_action = QAction("Filters as &chips", self, checkable=True)
+        self._filter_chips_action.setToolTip(
+            "Show active filters as a line of removable chips above the results, "
+            "opening the full panel on demand. Unticked, the Includes column is "
+            "always present instead."
+        )
+        self._filter_chips_action.triggered.connect(self.toggle_filter_ui_mode)
+        layout_menu.addAction(self._filter_chips_action)
+
+        self._sync_layout_menu()
+
+    def _toggle_sidebar_from_menu(self) -> None:
+        """Collapse or restore the sidebar from the Layout menu."""
+        self._toggle_main_panel(self._SIDEBAR_PANEL, self._sidebar_visible_action)
+
+    def _toggle_details_from_menu(self) -> None:
+        """Collapse or restore the details pane from the Layout menu."""
+        self._toggle_main_panel(self._DETAILS_PANEL, self._details_visible_action)
+
+    def _toggle_main_panel(self, index: int, action) -> None:
+        """Toggle one ``main_splitter`` panel and re-sync *action* from reality.
+
+        Args:
+            index: Panel index in ``main_splitter``.
+            action: The menu entry whose tick mirrors that panel.
+        """
+        splitter = self.__dict__.get("main_splitter")
+        if splitter is None:
+            return
+        splitter.toggle_panel(index)
+        # Re-read rather than assume: expand_panel restores a remembered size
+        # and a minimum width can clamp the result, so the splitter is the only
+        # authority on what actually happened.
+        action.setChecked(not splitter.is_panel_collapsed(index))
+        self.save_splitter_sizes()
+
+    def _set_theme_from_menu(self, name: str) -> None:
+        """Apply and persist a theme chosen from the Style menu.
+
+        Routes through the same ``apply_configured_theme()`` the Settings
+        dialog uses rather than calling ``apply_theme`` directly — that method
+        owns reading the name off ``config`` and the channel-list repaint, and
+        skipping it would reproduce the half-switched rendering an earlier change/an earlier change
+        fixed.
+
+        Args:
+            name: A palette name from ``theme.available_themes()``.
+        """
+        if getattr(self.config, "theme_name", None) == name:
+            return
+        self.config.theme_name = name
+        _cfgsave.save_soon(self)
+        self.apply_configured_theme()
+
+    def _build_buffer_menu(self, menubar) -> None:
+        """Build the Buffer menu — how much mpv reads ahead while playing.
+
+        Its own top-level menu rather than a Style entry, deliberately: Style is
+        appearance, and this is playback tuning with no visual result. It earns
+        a menu because it is the setting you reach for WHILE a stream is
+        stuttering, which is exactly when opening Settings is most annoying.
+
+        Labels mirror Settings → Playback verbatim so the two read as one
+        setting rather than two similar ones. The "deep" profile is deliberately
+        absent — Settings exposes it through its own control, and a second
+        entry point for it here would be a third way to say the same thing.
+
+        Args:
+            menubar: The window's ``QMenuBar``.
+        """
+        from PyQt6.QtGui import QActionGroup
+
+        buffer_menu = menubar.addMenu("&Buffer")
+        self._buffer_action_group = QActionGroup(self)
+        self._buffer_action_group.setExclusive(True)
+        current = getattr(self.config, "buffer_profile", "modest")
+        for value, label in (
+            ("reconnect_only", "&Reconnect only (no extra buffer)"),
+            ("modest", "&Modest (~10s buffer)"),
+            ("large", "&Large (~30s buffer)"),
+            ("open_ended", "&Open-ended (disk-backed, max buffer)"),
+        ):
+            action = QAction(label, self, checkable=True)
+            action.setChecked(value == current)
+            # Says plainly that it is not retroactive — mpv flags are composed
+            # when a stream launches, so the change lands on the NEXT play.
+            action.setToolTip("Applies to the next stream you start")
+            action.triggered.connect(lambda _c, v=value: self._set_buffer_from_menu(v))
+            self._buffer_action_group.addAction(action)
+            buffer_menu.addAction(action)
+        buffer_menu.setToolTipsVisible(True)
+
+    def _set_buffer_from_menu(self, value: str) -> None:
+        """Persist a buffer profile chosen from the Buffer menu.
+
+        No live re-apply: mpv's buffer flags are composed at launch
+        (``MPVPlayer._compose_extra_args``), so this takes effect on the next
+        stream. Restarting playback to apply it would be a destructive surprise
+        from a menu click.
+
+        Args:
+            value: One of ``"reconnect_only"``/``"modest"``/``"large"``/
+                ``"open_ended"``.
+        """
+        if getattr(self.config, "buffer_profile", None) == value:
+            return
+        self.config.buffer_profile = value
+        _cfgsave.save_soon(self)
+        self.status(
+            "Buffer setting saved — applies to the next stream you start", ms=4000
+        )
+
+    def _apply_player_settings(self) -> None:
+        """Bring open player windows in line with the audio and decoder settings.
+
+        Off the UI thread: each window takes a blocking IPC round trip, and a
+        wedged one can take seconds to time out.
+        """
+        player_manager = self.player_manager
+        self._run_query(
+            lambda _repos: player_manager.sync_player_settings(),
+            lambda _changed: None,
+            on_error=lambda e: logger.warning("Player settings not applied: {}", e),
+        )
+
+    def _send_player_command(self, command: list, key: str | None, message: str) -> None:
+        """Send one mpv command off the UI thread and say whether it landed."""
+        player_manager = self.player_manager
+
+        def report(delivered: bool) -> None:
+            if delivered:
+                self.status(message, ms=4000)
+            else:
+                self.status("The player didn't respond", ms=4000, level="warn")
+
+        self._run_query(lambda _repos: player_manager.send_command(command, key=key), report,
+                        on_error=lambda e: logger.warning("Player command failed: {}", e))
+
+    def _show_playback_menu(self) -> None:
+        """Read the shown window's tracks and queue off-thread, then pop the menu.
+
+        A wedged window can take seconds to answer. A second click supersedes the
+        first, so impatience never stacks up menus.
+        """
+        player_manager = self.player_manager
+        keys = player_manager.active_keys()
+        if not keys:
+            self._pop_playback_menu(None)
+            return
+        key = self._resolve_health_key(keys)
+        info = self.__dict__.get("_watch_tracking", {}).get(key) or {}
+        titles = [item.get("title") for item in info.get("queue") or []]
+
+        def failed(error: Exception) -> None:
+            logger.warning("Couldn't read the player for its menu: {}", error)
+            self._on_playback_menu_read(LivePlayback(key=key))
+
+        self._run_query(
+            lambda _repos: live_playback_from_props(
+                key, player_manager.get_properties(LIVE_PROPS, key=key), titles),
+            self._on_playback_menu_read, token_ref=self._playback_menu_token, on_error=failed)
+
+    def _playing_content(self, key: str | None, position: int) -> tuple[str, str] | None:
+        """What a window is playing now: the queue's current item, not the one that began it.
+
+        Args:
+            key: The player instance.
+            position: mpv's 1-based place in the queue; 0 if unknown.
+
+        Returns:
+            ``("episode" | "channel", id)``, or None when it can't be known for sure.
+        """
+        info = self.__dict__.get("_watch_tracking", {}).get(key) or {}
+        queue = info.get("queue")
+        if queue:
+            if not 1 <= position <= len(queue):
+                return None
+            entry = queue[position - 1]
+            media_type = entry.get("media_type") or info.get("media_type") or "episode"
+            return ("episode" if media_type == "episode" else "channel", entry["content_id"])
+        episode_id = self.__dict__.get("_playing_episodes", {}).get(key)
+        if episode_id:
+            return "episode", episode_id
+        channel_id = self.__dict__.get("_playing_channels", {}).get(key)
+        return ("channel", channel_id) if channel_id else None
+
+    def _on_playback_menu_read(self, live: LivePlayback) -> None:
+        """Main thread: add what only this side knows to mpv's answer, then pop the menu."""
+        content = self._playing_content(live.key, live.position)
+        section = self.sidebar_sections.get("queue")
+        place, total = (queue_place(section, content[1] if content else None)
+                        if section else (None, None))
+        self._pop_playback_menu(replace(live, content=content, watch_queue_place=place,
+                                        watch_queue_total=total))
+
+    def _jump_play_queue(self, key: str | None, index: int, title: str) -> None:
+        """Play another item of a window's queue.
+
+        Watch tracking reads "the playlist moved past it" as "it played to the end",
+        so it is told first: a half-watched episode you skip must keep its place.
+        Setting this before the command goes out means no tick can see the new
+        position without it.
+
+        Args:
+            key: The player instance.
+            index: The item's 0-based place in mpv's playlist.
+            title: Its name, for the status bar.
+        """
+        info = self.__dict__.get("_watch_tracking", {}).get(key)
+        if info and info.get("queue"):
+            info["last_seen_pos"] = index
+        self._send_player_command(["set_property", "playlist-pos", index], key,
+                                  f"Playing {title}")
+
+    def _reveal_in_watch_queue(self, content_id: str) -> None:
+        """Select what's playing in the sidebar's Watch Queue."""
+        section = self.sidebar_sections.get("queue")
+        if not (section and reveal_queue_row(section, content_id)):
+            self.status("That's no longer in the Watch Queue", ms=4000)
+
+    def _show_playing_details(self, content: tuple[str, str]) -> None:
+        """Fill the details pane with what's playing, opening the pane if it's collapsed."""
+        splitter = self.__dict__.get("main_splitter")
+        if splitter is not None and splitter.is_panel_collapsed(self._DETAILS_PANEL):
+            self._toggle_details_from_menu()
+        kind, content_id = content
+        if kind == "channel":
+            self.show_channel_details_by_id(content_id)
+            return
+        self._run_query(
+            lambda repos: (repos.stream_info.series_copy_of_episode(content_id),
+                           repos.episodes.get_episode_dto(content_id)),
+            self._on_playing_episode_read,
+            on_error=lambda e: logger.warning("Couldn't load the episode's details: {}", e))
+
+    def _on_playing_episode_read(self, found: tuple) -> None:
+        """Main thread: show the series, then lay the episode over it as the tree does."""
+        series_id, episode = found
+        if not (series_id and episode):
+            self.status("No details found for this episode", ms=4000, level="warn")
+            return
+
+        def show_episode() -> None:
+            pane = self.details_pane
+            pane.show_episode(episode, pane.current_channel, self._episode_display_title(episode))
+            self._load_stream_info(episode.id)
+
+        self.show_channel_details_by_id(series_id, on_shown=show_episode)
+
+    def _pop_playback_menu(self, live: LivePlayback | None) -> None:
+        """Show the menu under the header's readout."""
+        label = self._playback_health_label
+        menu = playback_menu.build_playback_menu(self, live)
+        menu.exec(label.mapToGlobal(label.rect().bottomLeft()))
+        menu.deleteLater()
+
+    def _toggle_filters_from_menu(self) -> None:
+        """Show/hide the filter panel from the Style menu.
+
+        Delegates to :meth:`toggle_filters` — the existing splitter-collapse
+        path that also persists ``filter_section_visible`` — rather than setting
+        the flag here, so the menu and the panel's own toggle stay one
+        behaviour. Re-reads the resulting state instead of assuming it, since
+        the toggle is what decides.
+        """
+        self.toggle_filters()
+        self._filters_visible_action.setChecked(
+            bool(getattr(self.config, "filter_section_visible", True))
+        )
+
+    def _open_adult_settings(self) -> None:
+        """Open Settings → Content — the adult segment's click target.
+
+        The section LABEL: ``open_settings`` forwards it to
+        ``select_section_by_label``.
+        """
+        self.open_settings("Content")
+
+    def show_about(self):
+        """Open the About dialog.
+
+        This logged "Show about" and returned for as long as the menu item has
+        existed — a discoverable entry point that did nothing, and nothing
+        tested it, so nothing said so.
+        """
+        from streamselect.gui.about_dialog import AboutDialog
+
+        AboutDialog(self).exec()
+
+    def show_whats_new(self) -> None:
+        """Open the What's New dialog with the full changelog (on-demand viewer).
+
+        Also advances the seen cursor to the latest entry and saves config,
+        so the auto-show guard treats it as seen.
+        """
+        entries = sorted(_whats_new.WHATS_NEW, key=lambda e: e.id, reverse=True)
+        dlg = WhatsNewDialog(entries, self)
+        dlg.exec()
+        self.config.last_seen_whats_new_id = _whats_new.latest_id()
+        self.config.save()
+
+    def maybe_show_whats_new(self) -> None:
+        """Show the What's New dialog once if there are unseen entries.
+
+        Idempotent: guarded by ``_whats_new_checked`` so it cannot fire twice
+        even if called from multiple code paths.  After showing, advances the
+        cursor and saves config so it will not appear again until new entries
+        are added.
+        """
+        if self._whats_new_checked:
+            return
+        self._whats_new_checked = True
+
+        # In dev/QA mode the app is launched to exercise features, not to greet the
+        # user — and the harness routinely runs a fresh isolated config (last_seen=0)
+        # that would replay the ENTIRE historical changelog every launch. Skip the
+        # auto-dialog under STREAMSELECT_DEV (the Help ▸ What's New menu still works).
+        if _dev_mode_enabled():
+            return
+
+        # First launch on a fresh config (cursor 0): don't replay the entire
+        # historical changelog — fast-forward silently. A cursor of 0 in normal
+        # mode can only mean a just-created config, because dismissing the dialog
+        # always advances the cursor. Upgrades keep showing their delta as before.
+        if self.config.last_seen_whats_new_id == 0:
+            self.config.last_seen_whats_new_id = _whats_new.latest_id()
+            self.config.save()
+            return
+
+        unseen = self._whats_new_unseen()
+        if not unseen:
+            return
+
+        # Backlog cap: a stale cursor must never replay a wall of history — cap
+        # the AUTO dialog to the newest release's entries and say what was
+        # skipped (Help ▸ What's New still has everything). The cursor still
+        # advances past the skipped entries: they are old news by definition.
+        footnote = None
+        if len(unseen) > _WHATS_NEW_AUTO_CAP:
+            newest_version = unseen[0].version  # entries_since is newest-first
+            capped = [e for e in unseen if e.version == newest_version]
+            if capped and len(capped) < len(unseen):
+                footnote = (
+                    f"{len(unseen) - len(capped)} earlier entries from older "
+                    "releases — browse them anytime in Help ▸ What's New"
+                )
+                unseen = capped
+
+        dlg = WhatsNewDialog(unseen, self, footnote=footnote)
+        dlg.exec()
+        self.config.last_seen_whats_new_id = _whats_new.latest_id()
+        self.config.save()
+
+    def _open_qa_checklist(self) -> None:
+        """Open (or focus) the floating QA Testing Checklist window.
+
+        Constructs lazily on first call; subsequent calls bring the existing
+        window to the front.  No-op when not in dev mode.
+        """
+        if not _dev_mode_enabled():
+            return
+        from streamselect.gui.qa_checklist_window import QAChecklistWindow  # local import — dev only
+        if self._qa_checklist_window is None:
+            self._qa_checklist_window = QAChecklistWindow(
+                self.config, _whats_new.WHATS_NEW, parent=self
+            )
+        win = self._qa_checklist_window
+        win.show()
+        win.raise_()
+        win.activateWindow()
+
+    def _maybe_show_qa_checklist(self) -> None:
+        """Auto-show the QA checklist on startup if there are open test items.
+
+        Only fires when STREAMSELECT_DEV is set.  An "open" item is an entry with
+        test_steps, id > qa_verified_id, and at least one step that is not yet
+        marked ``pass`` in ``qa_step_results`` (untested OR failed).
+        """
+        if not _dev_mode_enabled():
+            return
+        verified = self.config.qa_verified_id
+        results = self.config.qa_step_results or {}
+        for entry in _whats_new.WHATS_NEW:
+            if not entry.test_steps or entry.id <= verified:
+                continue
+            ent = results.get(str(entry.id), {})
+            n_pass = sum(
+                1 for i in range(len(entry.test_steps))
+                if (ent.get(str(i)) or {}).get("state") == "pass"
+            )
+            if n_pass < len(entry.test_steps):
+                # At least one open item — show the window
+                logger.debug(
+                    "QA checklist: open items found (entry id={}), auto-showing", entry.id
+                )
+                self._open_qa_checklist()
+                return

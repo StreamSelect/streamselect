@@ -1,0 +1,227 @@
+"""Missing TMDb data — diagnostic list of idless VOD rows + enrichment analytics.
+
+A read-only diagnostic surface (Phase-2 reshape parts 5 + 6).  It shows:
+
+1. **Enrichment funnel** (analytics) — of the visible VOD corpus, how many rows
+   already carry a tmdb id and *how* it was resolved (list harvest / title-sibling
+   propagation / provider-detail fetch), and the **residual** that only the
+   external TMDb API could resolve.  Decision-support for whether to build the
+   Phase-2b TMDb-API layer — never a call to build it.
+2. **Idless rows grouped by source** — a drill-down with per-source counts and a
+   sample.  Because it is a result surface, opening it feeds the loaded sample ids
+   back through the enqueue chokepoint (``MainWindow._enqueue_tmdb_enrichment``),
+   so it drives the lazy provider-detail fetch — the list fills in + shrinks as
+   ids land (the coalesced toast explains the reflow).
+
+All data loads asynchronously via the ``MainWindow._run_query`` seam and returns
+frozen DTOs (no ORM objects cross the boundary).  State is encoded with icons +
+text (never colour alone).
+"""
+
+from __future__ import annotations
+
+import html as _html
+
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QScrollArea, QLabel, QFrame,
+)
+
+from streamselect.core.repositories.dtos import TmdbFunnelDTO, MissingTmdbSourceDTO
+from streamselect.gui import icons as _icons
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+from streamselect.gui.tool_view import ToolView, clear_layout
+
+
+class MissingTmdbView(ToolView):
+    """Diagnostic view: idless VOD rows by source + the enrichment funnel.
+
+    Opening it (``on_activate``) loads the funnel + per-source groups and enqueues
+    the loaded sample ids for lazy enrichment.  ``reload`` re-runs the loads (called
+    by the host after an enrichment batch collapses rows) so counts settle down.
+    """
+
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        # One token per logical query (seam contract) so the two concurrent loads
+        # don't drop each other as stale; a deactivate bumps both.
+        self._funnel_token = [0]
+        self._sources_token = [0]
+        self._build_ui()
+
+    # ── UI scaffold ─────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        top_bar = self.build_top_bar(f"{_icon_utils.role_html('missing_data')}&nbsp; Missing TMDb Data")
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+
+        self._funnel_panel = QWidget()
+        self._funnel_layout = QVBoxLayout(self._funnel_panel)
+
+        self._sources_panel = QWidget()
+        self._sources_layout = QVBoxLayout(self._sources_panel)
+
+        content_layout.addWidget(self.section_header("Enrichment Coverage"))
+        content_layout.addWidget(self._funnel_panel)
+        content_layout.addSpacing(16)
+        content_layout.addWidget(self.section_header("Idless Titles by Source"))
+        hint = QLabel(
+            f"{_icon_utils.role_html('info')}&nbsp; Opening this view asks your providers for the "
+            "TMDb ids of the sampled titles — the counts shrink as ids arrive."
+        )
+        _theme.style(hint, "SECTION_HINT")
+        hint.setWordWrap(True)
+        content_layout.addWidget(hint)
+        content_layout.addWidget(self._sources_panel)
+        content_layout.addStretch()
+
+        scroll.setWidget(content)
+        layout.addLayout(top_bar)
+        layout.addWidget(scroll)
+
+    # ── Lifecycle ───────────────────────────────────────────────────────────
+
+    def on_activate(self) -> None:
+        """Show a loading state, then kick the async loads."""
+        for lay in (self._funnel_layout, self._sources_layout):
+            self.show_loading(lay)
+        self._load()
+
+    def on_deactivate(self) -> None:
+        """Cancel pending loads (bump both query tokens)."""
+        self._funnel_token[0] += 1
+        self._sources_token[0] += 1
+
+    def reload(self) -> None:
+        """Re-run the loads when visible (host calls this after a collapse settle)."""
+        if self.isVisible():
+            self._load()
+
+    # ── Data loading ────────────────────────────────────────────────────────
+
+    def _load(self) -> None:
+        self.main_window._run_query(
+            self._query_funnel,
+            self._on_funnel_loaded,
+            token_ref=self._funnel_token,
+            on_error=lambda e: self.show_panel_error(self._funnel_layout, e),
+        )
+        self.main_window._run_query(
+            self._query_sources,
+            self._on_sources_loaded,
+            token_ref=self._sources_token,
+            on_error=lambda e: self.show_panel_error(self._sources_layout, e),
+        )
+
+    @staticmethod
+    def _query_funnel(repos) -> TmdbFunnelDTO:
+        excluded = set(repos.providers.get_hidden_provider_ids())
+        return repos.channels.tmdb_enrichment_funnel(excluded)
+
+    @staticmethod
+    def _query_sources(repos) -> list[MissingTmdbSourceDTO]:
+        excluded = set(repos.providers.get_hidden_provider_ids())
+        return repos.channels.missing_tmdb_by_source(excluded)
+
+    # ── Render: funnel / analytics (Part 6) ─────────────────────────────────
+
+    def _on_funnel_loaded(self, dto: TmdbFunnelDTO) -> None:
+        clear_layout(self._funnel_layout)
+
+        if dto.total_vod == 0:
+            self._funnel_layout.addWidget(QLabel("No movie/series content to analyse yet."))
+            return
+
+        headline = QLabel(
+            f"{_icon_utils.role_html('notification_success')}&nbsp; Source methods identified "
+            f"{dto.resolved_pct:.0f}% of {dto.total_vod:,} titles "
+            f"({dto.resolved:,} with a TMDb id)."
+        )
+        _theme.style(headline, "SECTION_HDR")
+        headline.setWordWrap(True)
+        self._funnel_layout.addWidget(headline)
+
+        # Provenance breakdown — icon + label + count (never colour alone).
+        for glyph, label, count in (
+            (_icon_utils.role_html('info'), "From source list", dto.from_list),
+            (_icon_utils.role_html('tag_include'), "Propagated from a title sibling", dto.propagated),
+            (_icon_utils.role_html('search'), "Fetched from source detail", dto.fetched),
+            (_icons.playback_neutral_icon, "Not yet attempted", dto.unattempted),
+        ):
+            self._funnel_layout.addWidget(self._stat_row(glyph, label, count, dto.total_vod))
+
+        # The residual — the only-TMDb-API-addressable gap (the decision point).
+        residual = QLabel(
+            f"{_icon_utils.role_html('warning')}&nbsp; {dto.residual:,} titles "
+            f"({dto.residual_pct:.0f}%) remain that only the TMDb API could resolve "
+            "(provider detail was asked and carried no id)."
+        )
+        _theme.style(residual, "SECTION_HINT")
+        residual.setWordWrap(True)
+        self._funnel_layout.addSpacing(6)
+        self._funnel_layout.addWidget(residual)
+
+    def _stat_row(self, glyph: str, label: str, count: int, total: int) -> QLabel:
+        pct = (count / total * 100.0) if total else 0.0
+        prefix = f"{glyph}&nbsp; " if glyph else ""
+        row = QLabel(f"{prefix}{label}: {count:,} ({pct:.0f}%)")
+        _theme.style(row, "SECTION_HINT")
+        return row
+
+    # ── Render: idless rows by source (Part 5) ──────────────────────────────
+
+    def _on_sources_loaded(self, groups: list[MissingTmdbSourceDTO]) -> None:
+        clear_layout(self._sources_layout)
+
+        if not groups:
+            done = QLabel(
+                f"{_icon_utils.role_html('notification_success')}&nbsp; Every visible title has a TMDb id."
+            )
+            _theme.style(done, "SECTION_HINT")
+            self._sources_layout.addWidget(done)
+            return
+
+        for group in groups:
+            self._sources_layout.addWidget(self._source_block(group))
+
+        # Drive enrichment: feed the loaded sample ids through the one chokepoint
+        # (same contract as every other result surface — enqueue what we rendered).
+        ids = [row.channel_id for g in groups for row in g.sample]
+        self.main_window._enqueue_tmdb_enrichment(ids)
+
+    def _source_block(self, group: MissingTmdbSourceDTO) -> QWidget:
+        block = QFrame()
+        block_layout = QVBoxLayout(block)
+        block_layout.setContentsMargins(0, 4, 0, 8)
+
+        header = QLabel(
+            f"{_icon_utils.role_html('provider')}&nbsp; {_html.escape(group.provider_name, quote=False)} — "
+            f"{group.missing_count:,} without an id"
+            + (f"  ({group.residual_count:,} TMDb-API-only)" if group.residual_count else "")
+        )
+        _theme.style(header, "SECTION_HDR")
+        header.setWordWrap(True)
+        block_layout.addWidget(header)
+
+        for row in group.sample:
+            mtype = _icon_utils.role_html('movie') if row.media_type == "movie" else _icon_utils.role_html('series')
+            if row.tmdb_addressable:
+                flag = f"{_icon_utils.role_html('notification_success')} likely matchable"
+            else:
+                flag = f"{_icon_utils.role_html('warning')} unclear title"
+            title = row.detected_title or row.name
+            year = f" ({row.detected_year})" if row.detected_year else ""
+            line = QLabel(f"&nbsp;&nbsp;&nbsp;&nbsp;{mtype}  {_html.escape(title, quote=False)}{year}  ·  {flag}")
+            _theme.style(line, "SECTION_HINT")
+            line.setWordWrap(True)
+            block_layout.addWidget(line)
+
+        return block
+

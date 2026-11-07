@@ -1,0 +1,245 @@
+"""Facet lenses: "everything matching this person / this genre", one definition.
+
+A *lens* is the metadata-adjacency query behind a cast-name or genre click —
+deliberately distinct from ``get_similar_channels``'s crude title-token
+adjacency (DR-0003): same anchor, different neighbours, and the contrast is the
+point.
+
+Why this is a module and not more methods on ``ChannelRepository``
+------------------------------------------------------------------
+Two callers need the SAME answer or the feature lies to the user: the lightbox
+lens (which pages the set inside the overlay) and the channel-list context chip
+(where "See all in Search" lands). Keeping the predicates here — as plain
+functions over a query — means neither can grow a private rule. It also keeps
+them out of ``channel.py``, which is 4k lines of recorded debt the code-health
+ratchet exists to stop growing.
+
+Everything here is pure: functions take a query or rows and return a query or
+rows. No session state, no Config held anywhere (the control layer resolves
+exclusions and passes them in, same as ``VisibilityScope``).
+"""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, List, Optional, Set
+
+from loguru import logger
+
+from streamselect.core import channel_visibility
+from streamselect.core.visibility_resolver import resolve_scope
+from sqlalchemy import or_
+
+from streamselect.core.filter_utils import normalize_genre
+from streamselect.core.database import ChannelDB, MetadataDB
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from sqlalchemy.orm import Session
+
+# Max rows a lens scans before collapsing (mirrors the Similar query's guard):
+# one click must never become an unbounded table scan.
+LENS_CANDIDATE_SCAN = 200
+
+# Strict-genre only ever means movies/series — a live channel's provider genre
+# is a bouquet label, not a production genre.
+GENRE_MEDIA_TYPES = ["movie", "series"]
+
+
+def tag_value_exists(tag_types, pattern: str):
+    """Correlated EXISTS: the channel carries a tag of one of *tag_types* whose
+    value matches *pattern* (``ILIKE``). The indexed path for credits and
+    alternate titles (``cast``/``director``/``title`` tags) — one vocabulary row
+    per name, the link found by channel_key."""
+    from sqlalchemy import exists as _exists, select as _sa_select
+    from streamselect.core.database import ContentTagDB, TagDB
+    from streamselect.core.tag_source import tag_storage
+    # cast/director are roles of ONE person tag; "is this person in it" asks
+    # for the person in any role (or named in the title), so match the stored type.
+    tag_types = {tag_storage(t)[0] for t in tag_types}
+    return _exists(
+        _sa_select(ContentTagDB.tag_id)
+        .join(TagDB, TagDB.id == ContentTagDB.tag_id)
+        .where(ContentTagDB.channel_key == ChannelDB.channel_key,
+               TagDB.type.in_(list(tag_types)),
+               TagDB.value.ilike(pattern))
+        .correlate(ChannelDB)
+    )
+
+
+def person_predicate(name: str):
+    """Single definition of "this channel is associated with this person".
+
+    Four sources, OR-ed, in order of trustworthiness:
+
+    - the enriched ``MetadataDB`` cast/director (what the UI displays);
+    - the channel NAME itself, **live included** — providers ship whole curated
+      actor categories ("24/7 TOM HANKS", "BS| NICOLAS CAGE COLLECTION") and the
+      parser folds a trailing performer into ``detected_title``, so the person
+      is visibly on the row; hiding those is censorial (mirror-not-cage);
+    - the raw provider ``cast`` / ``director`` blobs, for the ~99.8% of rows
+      that were never enriched.
+
+    Args:
+        name: Raw person name; wildcards are added here.
+    """
+    from sqlalchemy import text as _text
+
+    pattern = f"%{name}%"
+    return or_(
+        tag_value_exists(("cast", "director"), pattern),
+        ChannelDB.name.ilike(pattern),
+        _text(
+            "json_extract(raw_data, '$.cast') LIKE :_person_cast"
+        ).bindparams(_person_cast=pattern),
+        _text(
+            "json_extract(raw_data, '$.director') LIKE :_person_dir"
+        ).bindparams(_person_dir=pattern),
+    )
+
+
+def genre_predicate(genre: str):
+    """Single definition of "this channel carries this genre".
+
+    Matches the ingested ``detected_genres`` JSON array on the CANONICAL genre
+    (so a French "Drame" click answers with the rows stored as "Drama"), falling
+    back to a substring match on the raw provider genre for rows written before
+    that field existed. Pair it with a ``media_type`` restriction to
+    :data:`GENRE_MEDIA_TYPES`.
+
+    Args:
+        genre: Genre as displayed; canonicalised here.
+    """
+    from sqlalchemy import text as _text
+
+    canon = normalize_genre(genre)
+    return or_(
+        _text(
+            "EXISTS (SELECT 1 FROM json_each(channels.detected_genres) AS dg_je "
+            "WHERE dg_je.value = :_strict_genre_exact)"
+        ).bindparams(_strict_genre_exact=canon),
+        _text(
+            "json_extract(raw_data, '$.genre') LIKE :_strict_genre"
+        ).bindparams(_strict_genre=f"%{genre}%"),
+    )
+
+
+def collapse_best_variant(rows, config=None, limit=None) -> "List[ChannelDB]":
+    """Collapse same-production variants, keeping the best copy of each.
+
+    The read-time half of the content-identity rule: group on the STORED
+    ``content_key`` (so localized/translated/"MULTI" copies collapse exactly as
+    they do on Discover and in Other Versions), falling back to the normalized
+    title only for rows written before the backfill. Within a group the winner
+    is whichever the user's own version preferences score highest; without a
+    *config* the first row encountered wins.
+
+    Args:
+        rows: Candidate ``ChannelDB`` rows, in preference order.
+        config: Optional ``Config`` scoring the per-group winner.
+        limit: Max groups to return (None = all).
+
+    Returns:
+        One row per content group, in first-seen group order.
+    """
+    from streamselect.core.content_dedup import normalize_title
+    from streamselect.core.preference_engine import version_score
+
+    best: "dict[str, tuple[ChannelDB, int]]" = {}
+    for ch in rows:
+        group_key = ch.content_key or normalize_title(ch.name, ch.detected_prefix)
+        score = version_score(ch, config) if config is not None else 0
+        existing = best.get(group_key)
+        if existing is None or score > existing[1]:
+            best[group_key] = (ch, score)
+    out = [ch for ch, _ in best.values()]
+    return out[:limit] if limit else out
+
+
+def lens_channels(
+    session: "Session",
+    lens: str,
+    value: str,
+    excluded_provider_ids: "Optional[Set[str] | List[str]]" = None,
+    limit: int = 24,
+    config=None,
+) -> "List[ChannelDB]":
+    """Every visible title matching a facet, collapsed to one row per title.
+
+    Resolves the SAME set the channel-list context chip would, because both
+    route through :func:`person_predicate` / :func:`genre_predicate` — so the
+    lightbox lens and "See all in Search" can never disagree.
+
+    Visibility — every gate the other adjacency surfaces apply:
+
+    - ``is_hidden == False`` (per-channel hide);
+    - ``provider_id NOT IN excluded_provider_ids`` — the absolute DR-0007 gate
+      (inactive ∪ expired ∪ orphaned), supplied by the caller from
+      ``ProviderRepository.get_hidden_provider_ids()``;
+    - the user's Global Exclusions, via :func:`apply_global_exclusions`.
+
+    Args:
+        session: Caller's open session; the rows are ORM objects, so consume
+            them inside it and map to DTOs before crossing a thread.
+        lens: ``"person"`` (cast or director) or ``"genre"``.
+        value: The clicked name / genre, as displayed.
+        excluded_provider_ids: Hidden provider ids to exclude.
+        limit: Max collapsed titles to return.
+        config: Optional ``Config`` — supplies the Global Exclusions and scores
+            the per-title variant winner.
+
+    Returns:
+        Collapsed ``ChannelDB`` rows; ``[]`` for an unknown lens or empty value.
+    """
+    value = (value or "").strip()
+    if not value:
+        return []
+
+    query = session.query(ChannelDB)
+    if lens == "person":
+        query = query.filter(person_predicate(value))
+    elif lens == "genre":
+        query = query.filter(
+            ChannelDB.media_type.in_(GENRE_MEDIA_TYPES),
+            genre_predicate(value),
+        )
+    else:
+        logger.warning("lens_channels: unknown lens '{}'", lens)
+        return []
+
+    # Every exclusion axis, through the one predicate — is_hidden and the
+    # provider gate included, which used to be hand-rolled here.
+    query = channel_visibility.apply(
+        query, resolve_scope(session, config,
+                             excluded_provider_ids=excluded_provider_ids or ()))
+
+    # Ordering by name keeps the bounded scan window deterministic rather than
+    # whatever order the planner happens to return.
+    candidates = query.order_by(ChannelDB.name).limit(LENS_CANDIDATE_SCAN).all()
+    return collapse_best_variant(candidates, config=config, limit=limit)
+
+
+def metadata_years_for_chunk(session: "Session", channel_ids) -> "dict[str, str]":
+    """``{channel.id: str(metadata.year)}`` for every row in *channel_ids* whose
+    linked ``MetadataDB`` row carries a year.
+
+    W-1 (2a): the name-parse ``detected_year`` fallback in
+    ``update_detected_prefixes()`` — many series (49.3%) have a year in
+    ``metadata.year`` (harvested from the TMDb/provider detail fetch) and none
+    in ``detected_year`` because their NAME carries no parseable year at all
+    (e.g. a bare title with no ``(YYYY)``). Lives here rather than inline in
+    ``channel_ingestion.py`` — a pinned file at its code-health ceiling — same
+    "pure query, session passed in" shape as :func:`lens_channels`.
+
+    Args:
+        session: Caller's open session.
+        channel_ids: The batch's channel ids (a query filter, not a full scan).
+
+    Returns:
+        A plain dict — no ORM objects escape.
+    """
+    rows = (
+        session.query(ChannelDB.id, MetadataDB.year)
+        .join(MetadataDB, ChannelDB.metadata_id == MetadataDB.id)
+        .filter(ChannelDB.id.in_(channel_ids))
+        .filter(MetadataDB.year.isnot(None))
+        .all()
+    )
+    return {cid: str(year) for cid, year in rows}

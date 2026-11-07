@@ -1,0 +1,229 @@
+"""MetadataEnrichmentView — Tools-menu progress + controls for the background
+metadata enrichment queue (roadmap an earlier change, ``streamselect/core/metadata_enrichment_queue.py``).
+
+Modeled on ``missing_tmdb_view.py``'s shape (back bar, section headers, scroll
+area) but the data source is different: instead of a one-shot query on
+``on_activate``, this view tracks a LIVE background pass via
+``MetadataEnrichmentQueue``'s signals — the queue itself is owned by
+``MainWindow`` and keeps running whether or not this view is visible; the view
+only starts/stops *listening* to it in ``on_activate``/``on_deactivate``
+(symmetric activate/deactivate — the project rules view-lifecycle rule), matching
+``get_status()`` for an immediate snapshot on open in case a pass is already
+mid-flight (auto-started at launch, or left running from a prior visit).
+"""
+
+from __future__ import annotations
+
+import html as _html
+
+from PyQt6.QtWidgets import (
+    QHBoxLayout, QLabel, QProgressBar, QPushButton, QScrollArea,
+    QVBoxLayout, QWidget,
+)
+from loguru import logger
+
+from streamselect.gui import icons as _icons
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+from streamselect.gui.tool_view import ToolView, clear_layout
+
+# Recent-failures rows shown (the queue itself keeps a slightly larger ring —
+# see metadata_enrichment_queue._MAX_FAILURE_LOG).
+_VISIBLE_FAILURES = 10
+
+
+class MetadataEnrichmentView(ToolView):
+    """Tools view: start/pause/resume/cancel the background enrichment queue.
+
+    ``on_activate`` connects the queue's signals and renders its current
+    snapshot; ``on_deactivate`` disconnects them (the queue itself is
+    independent of this view's visibility — it is owned by ``MainWindow`` and
+    keeps draining in the background either way).
+    """
+
+    def __init__(self, main_window) -> None:
+        super().__init__(main_window)
+        self._connected = False
+        self._build_ui()
+
+    # ── UI scaffold ─────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        top_bar = self.build_top_bar(f"{_icon_utils.role_html('metadata_enrich')}&nbsp; Background Metadata Enrichment")
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+
+        content_layout.addWidget(self.section_header("Status"))
+        hint = QLabel(
+            f"{_icon_utils.role_html('info')}&nbsp; Fills in missing/stale posters, plot, cast and "
+            "ratings across your library — favorited, queued, and recently played "
+            "titles first. Safe to pause or close the app; it resumes where it "
+            "left off."
+        )
+        _theme.style(hint, "SECTION_HINT")
+        hint.setWordWrap(True)
+        content_layout.addWidget(hint)
+
+        self._state_label = QLabel("Idle")
+        _theme.style(self._state_label, "SECTION_HDR")
+        content_layout.addWidget(self._state_label)
+
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setMinimum(0)
+        self._progress_bar.setMaximum(0)  # indeterminate until a total is known
+        self._progress_bar.setTextVisible(True)
+        _theme.style(self._progress_bar, "PROGRESS_BAR")
+        content_layout.addWidget(self._progress_bar)
+
+        self._current_label = QLabel("")
+        _theme.style(self._current_label, "SECTION_HINT")
+        self._current_label.setWordWrap(True)
+        content_layout.addWidget(self._current_label)
+
+        self._failed_label = QLabel("")
+        _theme.style(self._failed_label, "SECTION_HINT")
+        content_layout.addWidget(self._failed_label)
+
+        controls = QHBoxLayout()
+        self._start_btn = QPushButton("Start")
+        _icon_utils.set_button_icon(self._start_btn, "play")
+        self._start_btn.setToolTip("Begin (or resume) a background enrichment pass")
+        _theme.style(self._start_btn, "SAVE_BTN")
+        self._start_btn.clicked.connect(self._on_start_clicked)
+        controls.addWidget(self._start_btn)
+
+        self._pause_btn = QPushButton("Pause")
+        _icon_utils.set_button_icon(self._pause_btn, "enrich_pause")
+        self._pause_btn.setToolTip("Pause after the current title finishes")
+        _theme.style(self._pause_btn, "PANEL_BTN")
+        self._pause_btn.clicked.connect(self._on_pause_clicked)
+        controls.addWidget(self._pause_btn)
+
+        self._cancel_btn = QPushButton("Cancel")
+        _icon_utils.set_button_icon(self._cancel_btn, "enrich_cancel")
+        self._cancel_btn.setToolTip("Stop this pass after the current title finishes")
+        _theme.style(self._cancel_btn, "DELETE_BTN")
+        self._cancel_btn.clicked.connect(self._on_cancel_clicked)
+        controls.addWidget(self._cancel_btn)
+
+        controls.addStretch()
+        content_layout.addLayout(controls)
+
+        content_layout.addSpacing(16)
+        content_layout.addWidget(self.section_header("Recent Failures"))
+        self._failures_panel = QWidget()
+        self._failures_layout = QVBoxLayout(self._failures_panel)
+        self._failures_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.addWidget(self._failures_panel)
+        content_layout.addStretch()
+
+        scroll.setWidget(content)
+        layout.addLayout(top_bar)
+        layout.addWidget(scroll)
+
+    # ── Lifecycle ───────────────────────────────────────────────────────────
+
+    def on_activate(self) -> None:
+        """Connect the queue's live signals and render its current snapshot."""
+        queue = self.main_window.metadata_enrichment_queue
+        if not self._connected:
+            queue.progress_changed.connect(self._on_progress)
+            queue.state_changed.connect(self._on_state)
+            queue.enrichment_failed.connect(self._on_failure)
+            self._connected = True
+        self._render(queue.get_status())
+
+    def on_deactivate(self) -> None:
+        """Disconnect the queue's signals (the queue itself keeps running)."""
+        if self._connected:
+            queue = self.main_window.metadata_enrichment_queue
+            queue.progress_changed.disconnect(self._on_progress)
+            queue.state_changed.disconnect(self._on_state)
+            queue.enrichment_failed.disconnect(self._on_failure)
+            self._connected = False
+
+    # ── Controls ────────────────────────────────────────────────────────────
+
+    def _on_start_clicked(self) -> None:
+        queue = self.main_window.metadata_enrichment_queue
+        status = queue.get_status()
+        if status.state == "paused":
+            queue.resume()
+        else:
+            queue.start()
+
+    def _on_pause_clicked(self) -> None:
+        self.main_window.metadata_enrichment_queue.pause()
+
+    def _on_cancel_clicked(self) -> None:
+        self.main_window.metadata_enrichment_queue.cancel()
+
+    # ── Live signal slots (main thread — queued-connection delivery) ────────
+
+    def _on_progress(self, done: int, total: int, current_title: str) -> None:
+        self._render_progress(done, total, current_title)
+
+    def _on_state(self, state: str) -> None:
+        self._render_state(state)
+
+    def _on_failure(self, title: str, reason: str) -> None:
+        logger.debug("metadata_enrichment_view: failure — {} ({})", title, reason)
+        self._render(self.main_window.metadata_enrichment_queue.get_status())
+
+    # ── Render ──────────────────────────────────────────────────────────────
+
+    def _render(self, status) -> None:
+        self._render_state(status.state)
+        self._render_progress(status.done, status.total, status.current_title)
+        self._render_failures(status.failed_count, status.recent_failures)
+
+    def _render_state(self, state: str) -> None:
+        labels = {
+            "idle": (f"{_icons.playback_neutral_icon}  Idle — no pass has run yet", False),
+            "running": (f"{_icon_utils.role_html('loading')}&nbsp; Running…", True),
+            "paused": (f"{_icon_utils.role_html('enrich_pause')}&nbsp; Paused", False),
+            "cancelled": (f"{_icon_utils.role_html('warning')}&nbsp; Cancelled", False),
+            "finished": (f"{_icon_utils.role_html('notification_success')}&nbsp; Up to date", False),
+        }
+        text, running = labels.get(state, (state, False))
+        self._state_label.setText(text)
+
+        self._start_btn.setEnabled(not running)
+        self._start_btn.setText("Resume" if state == "paused" else "Start")
+        _icon_utils.set_button_icon(self._start_btn, "play")
+        self._pause_btn.setEnabled(running)
+        self._cancel_btn.setEnabled(running or state == "paused")
+
+    def _render_progress(self, done: int, total: int, current_title: str) -> None:
+        if total > 0:
+            self._progress_bar.setMaximum(total)
+            self._progress_bar.setValue(min(done, total))
+            self._progress_bar.setFormat(f"{done:,} / {total:,}")
+        else:
+            self._progress_bar.setMaximum(0)  # indeterminate — total not yet known
+            self._progress_bar.setValue(0)
+            self._progress_bar.setFormat("")
+        self._current_label.setText(f"Now enriching: {current_title}" if current_title else "")
+
+    def _render_failures(self, failed_count: int, recent_failures) -> None:
+        self._failed_label.setText(
+            f"{_icon_utils.role_html('warning')}&nbsp; {failed_count:,} failed this pass"
+            if failed_count else ""
+        )
+        clear_layout(self._failures_layout)
+        if not recent_failures:
+            empty = QLabel(f"{_icon_utils.role_html('notification_success')}&nbsp;No failures yet.")
+            _theme.style(empty, "SECTION_HINT")
+            self._failures_layout.addWidget(empty)
+            return
+        for title, reason in list(recent_failures)[-_VISIBLE_FAILURES:]:
+            row = QLabel(f"{_icon_utils.role_html('notification_error')}&nbsp;{_html.escape(title, quote=False)} — {reason}")
+            _theme.style(row, "SECTION_HINT")
+            row.setWordWrap(True)
+            self._failures_layout.addWidget(row)

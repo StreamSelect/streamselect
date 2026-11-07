@@ -1,0 +1,148 @@
+"""Stored stream measurements, one row per channel (PLAYED-1)."""
+from __future__ import annotations
+
+from datetime import datetime
+
+from loguru import logger
+from sqlalchemy import func, or_
+
+from streamselect.core.database import ChannelDB, StreamInfoDB
+from streamselect.core.stream_info import audio_contradicts_prefix, summarize
+
+
+class StreamInfoRepository:
+    """Read and replace a channel's stored stream record."""
+
+    def __init__(self, session):
+        self.session = session
+
+    def get(self, channel_id: str) -> dict | None:
+        """``{"info", "source", "measured_at"}`` as plain data, or None."""
+        row = self.session.get(StreamInfoDB, channel_id)
+        if row is None:
+            return None
+        return {"info": row.info, "source": row.source, "measured_at": row.measured_at}
+
+    def get_many(self, channel_ids: list[str]) -> dict[str, dict]:
+        """``{channel_id: record}`` for every channel that has one, in one query."""
+        if not channel_ids:
+            return {}
+        rows = self.session.query(StreamInfoDB).filter(StreamInfoDB.channel_id.in_(channel_ids)).all()
+        return {r.channel_id: {"info": r.info, "source": r.source, "measured_at": r.measured_at}
+                for r in rows}
+
+    def prefix_exempt_ids(self, excluded_prefixes) -> set[str]:
+        """Channels a Global Exclusion would hide by prefix, but whose measured
+        audio proves they are not in the language that prefix denotes (an
+        excluded |SE| copy measured as English). A verified fact outranks the
+        prefix guess, so the exclusion predicates keep these."""
+        if not excluded_prefixes:
+            return set()
+        rows = (
+            self.session.query(StreamInfoDB.channel_id, StreamInfoDB.info,
+                               func.coalesce(ChannelDB.detected_exclusion_code, ChannelDB.detected_prefix))
+            .join(ChannelDB, ChannelDB.id == StreamInfoDB.channel_id)
+            .filter(or_(ChannelDB.detected_prefix.in_(list(excluded_prefixes)),
+                        ChannelDB.detected_exclusion_code.in_(list(excluded_prefixes))))
+            .all()
+        )
+        return {
+            cid for cid, info, prefix in rows
+            if audio_contradicts_prefix(
+                (summarize({"info": info}) or {}).get("audio", ()), prefix)
+        }
+
+    def upsert_provider_records(self, pairs) -> None:
+        """Store each ``(id, provider info dict)``'s ffprobe block as a
+        ``"provider"`` record (episodes at series load; never over a real
+        measurement). Rows must already exist so the series roll-up finds them.
+        """
+        from streamselect.core.stream_info import provider_stream_record
+        for item_id, info in pairs:
+            record = provider_stream_record(info)
+            if record:
+                self.upsert(item_id, record, source="provider")
+
+    def upsert(self, channel_id: str, info: dict, source: str = "played") -> None:
+        """Replace the channel's record with a fresh measurement.
+
+        Ranking: what mpv read from the stream itself ("played"/"probe") is the
+        truth; the provider's own ffprobe ("provider") only fills a gap — it
+        never replaces a real measurement.
+        """
+        row = self.session.get(StreamInfoDB, channel_id)
+        if source == "provider" and row is not None and row.source != "provider":
+            return
+        if row is None:
+            row = StreamInfoDB(channel_id=channel_id)
+            self.session.add(row)
+        row.info = info
+        row.source = source
+        row.measured_at = datetime.utcnow()
+        row.fingerprint = self._current_name(channel_id)
+        # Searchable: a language heard in the stream becomes a language tag.
+        # Episodes have no channel row to tag (their ids miss the channel join).
+        from streamselect.core.repositories.tag import TagRepository
+        tags = TagRepository(self.session)
+        tags.apply_measured_tags(channel_id, info, source)
+        # An episode has no channel row to tag; its languages roll up to the
+        # series COPY that holds it (same source, same series id) — never to a
+        # sibling variant, whose episodes are a different file.
+        series_id = self.series_copy_of_episode(channel_id)
+        if series_id:
+            tags.apply_measured_tags(series_id, info, source)
+
+    def _current_name(self, item_id: str) -> "str | None":
+        """The name a measurement is about: the channel's, or the episode's title."""
+        from streamselect.core.database import EpisodeDB
+        ch = self.session.get(ChannelDB, item_id)
+        if ch is not None:
+            return ch.name
+        ep = self.session.get(EpisodeDB, item_id)
+        return ep.title if ep is not None else None
+
+    def invalidate_changed(self, channel_ids) -> int:
+        """Drop measurements whose channel now carries a DIFFERENT title.
+
+        Called at catalog refresh with the ids whose row changed. Only a name
+        change under the same id discards anything — a rating or timestamp
+        change in raw_data does not. A record with no fingerprint yet (written
+        before this existed) adopts the current name rather than being lost.
+        The measured/provider-reported language tags go with it, before the
+        refresh re-tags, so they cannot be re-applied from the stale record.
+
+        Returns:
+            How many measurements were discarded.
+        """
+        ids = list(channel_ids or [])
+        if not ids:
+            return 0
+        rows = (self.session.query(StreamInfoDB, ChannelDB.name)
+                .join(ChannelDB, ChannelDB.id == StreamInfoDB.channel_id)
+                .filter(StreamInfoDB.channel_id.in_(ids)).all())
+        stale = []
+        for record, name in rows:
+            if record.fingerprint is None:
+                record.fingerprint = name
+            elif record.fingerprint != name:
+                stale.append(record.channel_id)
+                self.session.delete(record)
+        if stale:
+            from streamselect.core.repositories.tag import TagRepository
+            TagRepository(self.session).drop_feeders(stale, ("played_tracks", "provider_probe"))
+            logger.info("stream_info: discarded {} measurement(s) whose channel now "
+                        "names a different title", len(stale))
+        return len(stale)
+
+    def series_copy_of_episode(self, episode_id: str) -> "str | None":
+        """The ``ChannelDB.id`` of the series copy an episode belongs to, or None."""
+        from streamselect.core.database import EpisodeDB
+        ep = self.session.get(EpisodeDB, episode_id)
+        if ep is None:
+            return None
+        row = (self.session.query(ChannelDB.id)
+               .filter(ChannelDB.source_id == ep.series_id,
+                       ChannelDB.provider_id == ep.provider_id,
+                       ChannelDB.media_type == "series")
+               .first())
+        return row[0] if row else None

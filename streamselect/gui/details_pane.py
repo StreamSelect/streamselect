@@ -1,0 +1,1000 @@
+"""Details pane — thin orchestrator that assembles section widgets."""
+import time
+from typing import Optional
+
+from loguru import logger
+
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QFrame, QLabel,
+)
+from PyQt6.QtCore import Qt, QEvent, pyqtSignal
+from PyQt6.QtGui import QPixmap
+
+from streamselect.core import watchlist
+from streamselect.core.database import Database
+from streamselect.core.models import MediaType
+from streamselect.core.stream_info import summarize
+from streamselect.gui.epg_agenda_widget import EpgAgendaWidget
+from streamselect.metadata_providers.base import MetadataResult
+
+# Section widgets
+from streamselect.gui.details_sections import (
+    _PosterSection, _PlotSection, _CastSection, _no_width_force,
+)
+from streamselect.gui.details_facts import _DetailsSection
+from streamselect.gui.details_title import _MetadataSection, _rating_rich_text, rating_tooltip
+from streamselect.gui.flow_layout import enable_height_for_width
+from streamselect.gui.episode_heading import aired_text, episode_eyebrow
+from streamselect.gui.details_actions import ChannelActionState, _ActionBar, resume_state
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+from streamselect.gui.details_versions import ChannelVersion, _VersionSection
+from streamselect.gui.details_similar import _SimilarSection
+
+
+class DetailsPaneWidget(QWidget):
+    """Right-side details pane showing channel metadata.
+
+    All DB state is loaded asynchronously via action_state_requested →
+    apply_action_state(). Section widgets are pure renderers.
+    """
+
+    # Public signals — wired by main_window (unchanged API)
+    play_requested             = pyqtSignal(str)        # channel_id
+    resume_requested           = pyqtSignal(str)        # channel_id — resume from saved position
+    play_version_requested     = pyqtSignal(str)        # channel_id — play a specific source variant
+    download_requested         = pyqtSignal(str)        # channel_id — download a specific source variant
+    favorite_toggled           = pyqtSignal(str)        # channel_id
+    monitor_toggled            = pyqtSignal(str)        # channel_id (series monitor toggle)
+    queue_toggled              = pyqtSignal(str)        # channel_id
+    episode_favorite_toggled   = pyqtSignal(str)        # episode_id (episode-mode favorite click, Slice 2B)
+    episode_queue_toggled      = pyqtSignal(str)        # episode_id (episode-mode queue click, Slice 2B)
+    rating_requested           = pyqtSignal(str, int)   # channel_id, ±1
+    suppression_requested      = pyqtSignal(str, bool)  # channel_id, suppressed
+    hide_requested             = pyqtSignal(str)        # channel_id
+    unhide_requested           = pyqtSignal(str)        # channel_id
+    clear_epg_link_requested   = pyqtSignal(str)        # channel_id — toggles clear/re-link per current blocked state
+    trailer_requested          = pyqtSignal(str, str)  # url, title — play it here
+    trailer_youtube_requested  = pyqtSignal(str)       # url — open it in the browser
+    watched_toggled            = pyqtSignal(str, bool)  # channel_id, is_watched (VOD)
+    channel_versions_requested = pyqtSignal(str)        # channel_id
+    version_selected           = pyqtSignal(str)        # channel_id — show details
+    prefix_block_requested     = pyqtSignal(str)        # prefix
+    prefix_unblock_requested   = pyqtSignal(str)        # prefix
+    prefix_name_saved          = pyqtSignal(str, str)   # prefix, name
+    manage_filters_requested   = pyqtSignal()
+    collection_exclude_requested = pyqtSignal(str, str)   # (provider_id, collection value)
+    collection_include_requested = pyqtSignal(str, str)
+    genre_filter_requested     = pyqtSignal(str)        # genre name
+    person_filter_requested    = pyqtSignal(str)        # person name
+    tag_filter_requested       = pyqtSignal(str, str)   # (facet_type, value) — left-click tag chip
+    tag_discover_requested     = pyqtSignal(str, str)   # (facet_type, value) — right-click tag chip
+    status_message            = pyqtSignal(str)         # one-line status text (e.g. id-chip copy feedback)
+    similar_titles_requested   = pyqtSignal(str)        # channel_id
+    similar_preview_requested  = pyqtSignal(list, int, str)
+    action_state_requested     = pyqtSignal(str)        # channel_id — triggers async DB load
+    episode_action_state_requested = pyqtSignal(str)    # episode_id — episode-mode queue/favorite async load (Slice 2B)
+    watchlist_changed          = pyqtSignal()           # the agenda's bell changed the watchlist (D60)
+    channel_tags_requested     = pyqtSignal(str)        # channel_id — triggers async tags load
+    stream_probe_requested     = pyqtSignal()           # "Get stream details" pressed (PLAYED-2)
+    weights_requested          = pyqtSignal(str)        # channel_id — triggers async taste-weight load
+    poster_enlarged            = pyqtSignal(QPixmap)    # full-res pixmap — open lightbox
+    play_episode_requested     = pyqtSignal()           # play the episode shown in the pane (read current_episode)
+    resume_episode_requested   = pyqtSignal()           # resume the episode shown in the pane (read current_episode)
+
+    def __init__(self, config, image_cache, db: Database | None = None, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.image_cache = image_cache
+        self._db = db
+        self.current_channel = None
+        self.current_metadata: MetadataResult | None = None
+        # Episode-detail mode: when an episode is selected in the series tree the pane
+        # keeps the SERIES as current_channel but overlays episode-specific bits (byline,
+        # plot/poster fallback, "Play Episode" button).  current_episode holds the DTO the
+        # host reads on play_episode_requested; _in_episode_mode routes the Play click.
+        self.current_episode = None
+        self._in_episode_mode: bool = False
+        # Trailer URL + display title for the CURRENT channel; cleared by
+        # clear() so the button can never play the previous title's trailer.
+        self._trailer_url: str = ""
+        self._trailer_title: str = ""
+        self.provider_urls: list = []
+        self._provider_map: dict = {}
+        self._last_versions: "list[ChannelVersion] | None" = None
+        self._last_similar: "list[ChannelVersion] | None" = None
+        self._current_record: "dict | None" = None
+        # "Currently playing" indicator — last play-state report from the host's
+        # player-position poll; the green Play-button outline + live timer fire only
+        # while the shown channel matches _playing_channel_id.
+        self._playing_channel_id: str | None = None
+        self._playing_base_pos: float = 0.0
+        self._playing_base_ts: float = 0.0
+
+        self._setup_ui()
+        self._connect_sections()
+
+        self.image_cache.image_loaded.connect(self._on_image_loaded)
+        self.image_cache.image_failed.connect(self._on_image_failed)
+
+    # ------------------------------------------------------------------ #
+    # Public API (unchanged from previous version)                         #
+    # ------------------------------------------------------------------ #
+
+    def set_provider_urls(self, urls: list) -> None:
+        self.provider_urls = urls
+        self._poster.set_provider_urls(urls)
+
+    def set_provider_map(self, provider_map: dict) -> None:
+        self._provider_map = provider_map
+
+    def provider_name(self, provider_id: str) -> str:
+        """Display name for *provider_id* from the current provider map —
+        the SAME lookup ``_MetadataSection.load_basic`` uses to build the
+        "Source:" chip (VERS-1's source-notice text reuses it rather than
+        re-deriving provider naming). Falls back to the raw id when the
+        provider map has nothing for it (e.g. an orphaned provider row).
+        """
+        info = self._provider_map.get(provider_id)
+        return (info or {}).get("name") or provider_id
+
+    def set_source_notice(self, text: "str | None") -> None:
+        """The dim line under the Source chip explaining a live-copy redirect
+        (VERS-1) — ``None`` hides it. Owned by the pane, like ``_byline``."""
+        self._source_notice_lbl.setText(text or "")
+        self._source_notice_lbl.setVisible(bool(text))
+
+    def set_collection_excluded_check(self, fn) -> None:
+        """``fn(provider_id, value) -> bool`` — whether a collection is excluded."""
+        self._meta.collection_excluded = fn
+
+    def set_versions(self, versions: list[ChannelVersion]) -> None:
+        self._last_versions = versions
+        self._versions.load(
+            versions, provider_map=self._provider_map, current=self._current_version(),
+        )
+
+    def _current_version(self) -> "ChannelVersion | None":
+        """The copy already shown in the pane, as a ``ChannelVersion`` — the
+        first, selected chip in "Available in" (DETAILS-3c). ``None`` only
+        when the pane has nothing shown at all.
+        """
+        ch = self.current_channel
+        if ch is None:
+            return None
+        return ChannelVersion(
+            channel_id=ch.id,
+            name=ch.name,
+            in_queue=False,
+            detected_prefix=getattr(ch, "detected_prefix", None),
+            detected_title=getattr(ch, "detected_title", None),
+            detected_year=getattr(ch, "detected_year", None),
+            detected_quality=getattr(ch, "detected_quality", None),
+            detected_region=getattr(ch, "detected_region", None),
+            provider_id=getattr(ch, "provider_id", None),
+            media_type=getattr(ch, "media_type", "") or "",
+            measured=summarize(self._current_record),
+        )
+
+    def _on_similar_mode_changed(self, _mode: str) -> None:
+        """Similar [Titles | Content] flipped: refetch for the title on screen."""
+        if self.current_channel is not None:
+            self.similar_titles_requested.emit(self.current_channel.id)
+
+    def set_similar_titles(self, titles: list[ChannelVersion]) -> None:
+        self._last_similar = titles
+        origin = self.current_channel.name if self.current_channel else ""
+        self._similar.load(titles, origin)
+
+    def on_channel_state(self, channel_id: str, delta: dict) -> None:
+        """Bus subscriber (D60): a Similar / Other versions row for *channel_id*
+        takes the change made elsewhere — queued, favourited, watched, rated."""
+        from dataclasses import replace
+
+        from streamselect.gui.channel_state_bus import row_changes
+
+        def patched(rows):
+            hit = [r for r in rows or () if r.channel_id == channel_id]
+            return hit and [replace(r, **row_changes(delta, r)) if r.channel_id == channel_id else r
+                            for r in rows]
+        if new := patched(self._last_versions):
+            self.set_versions(new)
+        if new := patched(self._last_similar):
+            self.set_similar_titles(new)
+
+    def set_recommendation_reason(self, reason: str | None) -> None:
+        self._meta.set_recommendation_reason(reason)
+
+    def set_playing(self, channel_id: str | None, position_seconds: float = 0.0) -> None:
+        """Report which channel is actively playing, and its position.
+
+        Called from the host's player-position poll (the same mpv poll that drives
+        the nav-bar playback-health readout).  The green "currently playing"
+        indicator + live elapsed timer appear on the Play button only while
+        ``channel_id`` matches the title currently shown in the pane.  Pass
+        ``channel_id=None`` (or a different id) when playback stops or moves to
+        another title to clear the indicator.
+
+        Args:
+            channel_id: The channel id now playing, or None when nothing plays.
+            position_seconds: Current playback position in seconds.
+        """
+        self._playing_channel_id = channel_id
+        if channel_id is not None:
+            self._playing_base_pos = float(position_seconds or 0.0)
+            self._playing_base_ts = time.monotonic()
+        self._apply_playing_indicator()
+
+    def _apply_playing_indicator(self) -> None:
+        """Show the playing indicator iff the shown channel is the one playing."""
+        ch = self.current_channel
+        if (ch is not None and self._playing_channel_id is not None
+                and getattr(ch, "id", None) == self._playing_channel_id):
+            pos = self._playing_base_pos + (time.monotonic() - self._playing_base_ts)
+            self._action_bar.set_playing_active(pos)
+        else:
+            self._action_bar.clear_playing()
+
+    def apply_action_state(self, state: ChannelActionState) -> None:
+        """Called from main_window when the async DB load completes."""
+        if not self.current_channel or self.current_channel.id != state.channel_id:
+            return  # stale response — user already moved on
+        self._action_bar.load(state)
+        if state.media_type and state.media_type != "live" and not self._in_episode_mode:
+            self._poster.set_watched(state.watch_completed)   # D60: marked elsewhere
+
+    def refresh_episode_state(self, episode_ids) -> None:
+        """An episode's stored state changed: re-read the buttons if it is shown (D60).
+
+        The pane only ever learned episode state when it opened one, so a
+        favourite/queue/watched change — from the pane itself or the series
+        tree — left its buttons showing the old answer.
+        """
+        ep = self.current_episode
+        if self._in_episode_mode and ep is not None and getattr(ep, "id", None) in set(episode_ids):
+            self.episode_action_state_requested.emit(ep.id)
+
+    def apply_episode_action_state(
+        self, episode_id: str, in_queue: bool, is_favorite: bool, watch_progress: int = 0, watch_completed: bool = False
+    ) -> None:
+        """Called from main_window when the async per-EPISODE action-state load
+        completes (Slice 2B) — queue/favorite state for the episode shown in
+        episode mode, kept separate from the series-level ``apply_action_state``.
+        Episodes can also have saved watch progress and completion state.
+        """
+        if (
+            not self._in_episode_mode
+            or self.current_episode is None
+            or getattr(self.current_episode, "id", None) != episode_id
+        ):
+            return  # stale response — user already moved on, or left episode mode
+        self._action_bar.set_episode_queue_favorite(in_queue, is_favorite)
+        self._action_bar.set_resume(watch_progress > 0 and not watch_completed, watch_progress)
+
+    def apply_channel_tags(self, channel_id: str, tags: list) -> None:
+        """Called from main_window when the async tag load completes.
+
+        Args:
+            channel_id: The channel these tags belong to — used as a stale-drop guard.
+            tags: List of ChannelTagDTO objects; empty list hides the section.
+        """
+        if not self.current_channel or self.current_channel.id != channel_id:
+            return  # stale response — user already moved on
+        self._details.load_tags(tags)
+        # Title block: genre-facet tags fold into the genre row (dashed when
+        # guessed); the first collection-facet tag's value feeds the source
+        # row's collection chip.
+        self._meta.set_genre_tags([t for t in tags if t.facet_type == "genre"])
+        collection_tags = [t for t in tags if t.facet_type == "collection"]
+        self._meta.set_collection(collection_tags[0].value if collection_tags else None)
+
+    def apply_stream_info(self, channel_id: str, record: "dict | None") -> None:
+        """Called from main_window when the channel's stored stream record
+        (PLAYED-1) loads — at show time, and again after a fresh measurement."""
+        if getattr(self.current_episode, "id", None) == channel_id:
+            # Episode mode: the measurement is the episode's own; the copies row
+            # describes the series, so it is left alone.
+            self._details.load_stream_info(
+                record, claimed_quality=getattr(self.current_channel, "detected_quality", None))
+            return
+        if not self.current_channel or self.current_channel.id != channel_id:
+            return  # stale response — user already moved on
+        self._details.load_stream_info(
+            record, claimed_quality=getattr(self.current_channel, "detected_quality", None))
+        # The selected copy chip in "Available in" shows the measured quality too.
+        self._current_record = record
+        if self._last_versions is not None:
+            self.set_versions(self._last_versions)
+
+    def has_original_language(self) -> bool:
+        """Whether the title on screen already shows its original language."""
+        return bool(self._details._original_language)
+
+    def apply_original_language(self, channel_id: str, language: str) -> None:
+        """The title's original language arrived from its provider (LANG-2)."""
+        if self.current_channel is not None and self.current_channel.id == channel_id:
+            self._details.set_original_language(language)
+
+    def set_probe_running(self, running: bool) -> None:
+        """Reflect a "Get stream details" probe in progress (PLAYED-2)."""
+        self._details.set_probe_running(running)
+
+    def apply_taste_weights(self, channel_id: str, weights) -> None:
+        """Called from main_window when the async taste-weight load completes.
+
+        Args:
+            channel_id: The channel these weights were requested for — the same
+                stale-drop guard ``apply_action_state``/``apply_channel_tags`` use.
+            weights: An ``AttributeWeights``, or None when there is no taste
+                signal yet (or the read failed) — the un-annotated render stands.
+        """
+        if not self.current_channel or self.current_channel.id != channel_id:
+            return  # stale response — user already moved on
+        if weights is None or self.current_metadata is None:
+            # Weights are an enhancement: keep what is already painted. Never
+            # clear — an empty library and a failed read must both look like a
+            # details pane without preference markers, not an empty one.
+            logger.debug(f"No taste weights to annotate {channel_id} with")
+            return
+        self._render_people(self.current_metadata, weights)
+
+    def show_channel(self, channel, metadata: Optional[MetadataResult] = None) -> None:
+        """Display a channel. Triggers async version/similar/action-state fetches."""
+        logger.debug(f"show_channel: {channel.name}, metadata={metadata is not None}")
+        self.current_channel = channel
+        self.current_metadata = metadata
+        self._current_record = None          # a new title: its measurement loads next
+        self._last_versions = self._last_similar = None
+        is_live = getattr(channel, "media_type", None) == MediaType.LIVE
+
+        # Configure sections for channel type before clearing (reduces flicker)
+        self._configure_for(is_live)
+
+        # Clear all sections
+        for s in (self._poster, self._meta, self._plot, self._details,
+                  self._cast, self._action_bar):
+            s.clear()
+        if metadata is None:
+            self._versions.clear()
+            self._similar.clear()
+
+        # Reset episode-detail mode — show_channel always renders a whole channel
+        # (series root / movie / live), never a single episode.  Drop the byline,
+        # forget any stored episode, and un-hide the movie-only affordances the
+        # episode view had hidden.
+        self._in_episode_mode = False
+        self._meta.set_episode_mode(False)
+        self._plot.rekey("overview", "Overview", self.config.details_pane_collapsed_sections)
+        self.current_episode = None
+        # Forget the previous title's trailer. _apply_metadata only runs when
+        # this channel HAS metadata, so without this the button would keep the
+        # last one's URL and play the wrong trailer on the next channel.
+        self._trailer_url = ""
+        self._trailer_title = ""
+        self._byline.hide()
+        self._source_notice_lbl.hide()   # a new title starts with no redirect note
+        self._episode_rating_lbl.hide()
+        self._episode_air_date_lbl.hide()
+        self._episode_meta_row.hide()
+        self._action_bar.exit_episode_mode()
+
+        # Tier 1: instant display from channel attributes
+        self._meta.load_basic(channel, self._provider_map)
+        self._details.set_copy(
+            provider_name=self.provider_name(channel.provider_id) if channel.provider_id else "",
+            copy_code=getattr(channel, "detected_prefix", None) or "",
+        )
+        # A series root has no stream to probe — its episodes do (show_episode).
+        self._details.set_probe_available(getattr(channel, "media_type", None) != "series")
+        self._action_bar.update_favorite(channel.is_favorite)
+        _is_series = getattr(channel, "media_type", None) == MediaType.SERIES
+        # Primary button caption: a SERIES root drills in (🗂 Browse); movies/live
+        # play (▶ Play).  The click behaviour is unchanged — play_requested still
+        # fires; the host's series branch drills in.
+        self._action_bar.set_primary_mode("browse" if _is_series else "play")
+        _is_mon = False
+        _check = getattr(self.config, "is_series_monitored", None)
+        if _is_series and callable(_check):
+            _is_mon = bool(_check(channel.id))
+        self._action_bar.set_monitorable(_is_series, _is_mon)
+
+        # Alert-visibility green: flag the Alert button when this title has UNVIEWED
+        # matched content (a VOD watch-for match the user hasn't acknowledged).
+        _unviewed = getattr(self.config, "is_vod_match_unviewed", None)
+        _has_match = bool(_unviewed(channel.id)) if callable(_unviewed) else False
+        self._action_bar.set_new_match(_has_match)
+
+        # Resume button — movies with a saved, incomplete position only; the
+        # same predicate the bus re-read applies in _ActionBar.load (RESUME-1).
+        _completed = bool(getattr(channel, "watch_completed", False))
+        self._action_bar.set_resume(*resume_state(
+            getattr(channel, "media_type", None),
+            getattr(channel, "watch_progress", 0),
+            _completed,
+        ))
+
+        # Watched badge (VOD only) — reflect the stored watch_completed flag on the
+        # clickable poster badge.  (For live, set_mode already hides the badge.)
+        if not is_live:
+            self._poster.set_watched(_completed)
+
+        if is_live:
+            self._poster.set_country_info(channel.name)
+            logo = getattr(channel, "logo_url", None)
+            if logo:
+                self._poster.load_live_logo(logo)
+
+        # EPG agenda (live only)
+        if self._epg_agenda:
+            if is_live:
+                self._epg_agenda.load_for_channel(channel.id)
+            else:
+                self._epg_agenda.clear()
+
+        # Tier 2/3: enriched metadata
+        if metadata:
+            self._apply_metadata(metadata)
+        elif not is_live:
+            self._plot.show_loading()
+            self._poster.poster_label.setText(f"{_icon_utils.role_html('loading')}&nbsp;Loading poster...")
+
+        # Re-evaluate the "currently playing" indicator for the new title: the
+        # action_bar.clear() above reset it; light it back up if this title is the
+        # one actively playing (the per-2s position poll keeps it fresh after).
+        self._apply_playing_indicator()
+
+        # Async fetches
+        self.action_state_requested.emit(channel.id)
+        self.channel_tags_requested.emit(channel.id)
+        self.channel_versions_requested.emit(channel.id)
+        if not is_live and getattr(channel, "detected_prefix", None):
+            self.similar_titles_requested.emit(channel.id)
+
+    def show_episode(self, episode, series_channel, display_title=None,
+                     season_episode_count: int | None = None) -> None:
+        """Display a single episode, reusing the parent series' details as fallback.
+
+        The SERIES stays the pane's ``current_channel`` — its title, rail actions,
+        versions and tags remain the series'.  Only the episode-specific surface
+        changes: a wrapping byline carrying the episode title, the episode plot (or
+        the series plot when the DTO has none), the episode image (or the series
+        poster when the DTO has none), and a ``▶ Play Episode: S##E##`` primary
+        button.  No heavy metadata is fetched synchronously — whatever the series is
+        already showing is the fallback.
+
+        Clicking Play Episode fires the bare ``play_episode_requested`` signal; the
+        host reads :attr:`current_episode`.  Selecting a season / the series root
+        reverts the pane via :meth:`show_channel`.
+
+        Args:
+            episode: The :class:`~streamselect.core.repositories.dtos.EpisodeDTO` to show.
+            series_channel: The parent series channel (the mixin's ``current_series``).
+            season_episode_count: How many episodes this source lists for the
+                episode's season — the eyebrow's "OF 12". ``None`` omits it.
+            display_title: The CLEANED episode title (what the series tree shows —
+                ``series - SxxExx -`` prefixes stripped).  When ``None`` the byline
+                falls back to the DTO's raw ``title`` (then ``Episode <n>``).
+        """
+        if series_channel is None or episode is None:
+            return
+
+        # Establish the series context if the pane isn't already showing this series
+        # — its title / rail / poster / plot are the fallback surface for the episode.
+        # When the user is paging through episodes of the already-shown series this is
+        # a no-op, so we don't clear + re-fetch on every episode click (race-free).
+        cur = self.current_channel
+        if cur is None or getattr(cur, "id", None) != getattr(series_channel, "id", None):
+            self.show_channel(series_channel)
+
+        self.current_episode = episode
+        self._details.load_stream_info(None)   # the series' measurement is not this episode's
+        self._details.set_probe_available(True)  # an episode IS a stream
+        self._in_episode_mode = True
+        self._meta.set_episode_mode(True)
+
+        # Byline — the cleaned episode title (matches the tree row); fall back to the
+        # DTO's raw title when the host didn't pass one.  Never overwrite the series
+        # title above it.
+        ep_title = (
+            display_title
+            or getattr(episode, "title", None)
+            or f"Episode {getattr(episode, 'episode_num', '?')}"
+        )
+        self._byline.setText(ep_title)
+        self._byline.setToolTip(ep_title)
+        self._byline.show()
+
+        # Rating + air date — episode-grain fields computed at ingestion (Wave 4 —
+        # an earlier change, EpisodeDB.rating/air_date). A rating of 0/None means "no rating
+        # shipped" — hidden rather than showing "0.0 of 10" (mirrors
+        # _MetadataSection.load_basic's raw_rating treatment). Star formatting
+        # matches that same series-level treatment exactly (same config icon,
+        # same "X.X of 10" caption) so ratings read identically pane-wide.
+        self._episode_eyebrow_lbl.setText(
+            episode_eyebrow(episode, season_episode_count).upper())
+        self._episode_eyebrow_lbl.setToolTip(
+            f"{season_episode_count} episodes in this season from this source"
+            if season_episode_count else "")
+
+        # Rating — the episode's own, as the series rating's five stars.
+        # 0/None means none shipped, so it is hidden rather than five empty stars.
+        ep_rating = getattr(episode, "rating", None)
+        if ep_rating:
+            self._episode_rating_lbl.setText(_rating_rich_text(float(ep_rating)))
+            self._episode_rating_lbl.setToolTip(rating_tooltip(float(ep_rating)))
+            self._episode_rating_lbl.show()
+        else:
+            self._episode_rating_lbl.hide()
+
+        aired = aired_text(getattr(episode, "air_date", None))
+        self._episode_air_date_lbl.setText(aired.upper())
+        self._episode_air_date_lbl.setVisible(bool(aired))
+
+        self._episode_meta_row.show()
+
+        # Plot — episode plot if the DTO carries one, else keep the series plot.
+        ep_plot = getattr(episode, "plot", None)
+        # No overview of its own (most sources send none): the series' stays,
+        # headed "Series overview" so it is not mistaken for the episode's.
+        self._plot.rekey(*(("overview", "Overview") if ep_plot else
+                           ("overview_series", "Series overview")),
+                         self.config.details_pane_collapsed_sections)
+        if ep_plot:
+            self._plot.load(ep_plot)
+
+        # Poster — episode still image if the DTO carries one, else keep the series poster.
+        ep_image = (
+            getattr(episode, "still_url", None)
+            or getattr(episode, "image_url", None)
+            or getattr(episode, "poster_url", None)
+            or getattr(episode, "image", None)
+        )
+        if ep_image:
+            self._poster.load_poster(ep_image, self.provider_urls)
+
+        # Episode coordinate for the button caption — derived defensively from the DTO.
+        s = getattr(episode, "season_num", None)
+        e = getattr(episode, "episode_num", None)
+        code = f"S{s:02d}E{e:02d}" if (s and e) else (f"E{e:02d}" if e else "")
+
+        # Primary button → "Play Episode: S##E##"; hide the movie-only Resume button
+        # (Watch Later stays visible — Slice 2B — now targeting this episode).
+        self._action_bar.enter_episode_mode(code)
+
+        # Async: fetch this EPISODE's own queue/favorite state (separate from the
+        # series-level action_state_requested fired by show_channel above).
+        self.episode_action_state_requested.emit(episode.id)
+
+        # Resume button — from the EPISODE's own saved position, not the series'.
+        # MUST come after both show_channel() (above, which hides Resume via its
+        # movie-only gate) and enter_episode_mode() (which also hides it) — either
+        # would otherwise clobber this back to hidden.
+        _ep_progress = int(getattr(episode, "watch_progress", 0) or 0)
+        _ep_completed = bool(getattr(episode, "watch_completed", False))
+        self._action_bar.set_resume(_ep_progress > 0 and not _ep_completed, _ep_progress)
+
+    # ------------------------------------------------------------------ #
+    # Internal                                                             #
+    # ------------------------------------------------------------------ #
+
+    def _setup_ui(self) -> None:
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._scroll = scroll
+
+        content = QWidget()
+        # Size the column from height-for-width, not the plain size hint: a
+        # flow of chips reports its hint as if every chip sat on its own line,
+        # and the difference showed up as a gap under the title block.
+        enable_height_for_width(content)
+        self._content = content
+        self._content_layout = QVBoxLayout(content)
+        # Reserve a hard right gutter for the vertical scrollbar so the poster / text can
+        # never slide under it or off the right edge (a hard right boundary).  On themes
+        # with an overlay scrollbar the content would otherwise extend the full viewport
+        # width and the scrollbar would paint over the last ~15px.
+        _sb = max(scroll.verticalScrollBar().sizeHint().width(), 14)
+        # Right gutter ≈ half what it was: the container-width authority (see
+        # _sync_content_width) already keeps content off the scrollbar, so the old full
+        # 10+scrollbar reservation read as a too-wide right gap.  Halve it for a tighter,
+        # more symmetric inset while still clearing an overlay scrollbar.
+        self._content_layout.setContentsMargins(10, 10, (10 + _sb) // 2, 10)
+        # 4px between sections (the design's rhythm); "Available in" adds 8 of
+        # its own on top so the copies row stands 12px clear of the source row.
+        self._content_layout.setSpacing(4)
+
+        self._poster   = _PosterSection(self.config, self.image_cache)
+        self._meta     = _MetadataSection(self.config)
+        # Episode byline — the episode title, shown just under the title/meta area only
+        # in episode mode (normally hidden).  MUST word-wrap AND opt out of driving the
+        # column width (via _no_width_force) so a long/odd episode title can never widen
+        # the pane or clip content off the right edge (the design notes →
+        # "Width discipline").
+        self._byline = QLabel()
+        self._byline.setWordWrap(True)
+        _theme.style(self._byline, "DETAIL_TITLE_EPISODE")   # the episode is the subject
+        _no_width_force(self._byline)
+        self._byline.hide()
+
+        # Source notice (VERS-1) — "Shown from Source A — your Source B copy is
+        # expired". Same shape as the byline: wraps, never drives the width.
+        self._source_notice_lbl = QLabel()
+        self._source_notice_lbl.setWordWrap(True)
+        _theme.style(self._source_notice_lbl, "LABEL_MUTED")
+        _no_width_force(self._source_notice_lbl)
+        self._source_notice_lbl.hide()
+
+        # Episode head (user report), shown only in episode mode:
+        #   Bonus Money                                  7.4 / 10
+        #   SEASON 2 · EPISODE 1 OF 12            AIRED 5 JUN 2025
+        # The line UNDER the title says where it sits (user report);
+        # each row keeps its
+        # second fact at the right edge, as the genre/rating row above does.
+        self._episode_meta_row = QWidget()
+        _episode_head = QVBoxLayout(self._episode_meta_row)
+        _episode_head.setContentsMargins(0, 2, 0, 2)
+        _episode_head.setSpacing(2)
+
+        _eyebrow_row = QHBoxLayout()
+        _eyebrow_row.setSpacing(8)
+        self._episode_eyebrow_lbl = QLabel()
+        _theme.style(self._episode_eyebrow_lbl, "DETAIL_GROUP_HEADING")
+        _no_width_force(self._episode_eyebrow_lbl)
+        _eyebrow_row.addWidget(self._episode_eyebrow_lbl, 1)
+        self._episode_air_date_lbl = QLabel()
+        _theme.style(self._episode_air_date_lbl, "DETAIL_GROUP_HEADING")
+        self._episode_air_date_lbl.hide()
+        _eyebrow_row.addWidget(self._episode_air_date_lbl, 0, Qt.AlignmentFlag.AlignRight)
+
+        _title_row = QHBoxLayout()
+        _title_row.setSpacing(8)
+        _title_row.addWidget(self._byline, 1)
+        self._episode_rating_lbl = QLabel()
+        self._episode_rating_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._episode_rating_lbl.hide()
+        _title_row.addWidget(
+            self._episode_rating_lbl, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        _episode_head.addLayout(_title_row)
+        _episode_head.addLayout(_eyebrow_row)
+        self._episode_meta_row.hide()
+        # Directly under the show's title, above its genres (user report).
+        self._meta.place_under_title(self._episode_meta_row)
+
+        self._versions = _VersionSection(self.config)
+        # Parented and hidden (ledger F45): it owns the buttons the poster rail
+        # reparents and is never laid out; parentless it was a top-level window
+        # for the app's lifetime, repainted by every theme switch.
+        self._action_bar = _ActionBar(self.config, parent=self)
+        self._action_bar.hide()
+        self._plot     = _PlotSection()
+        self._versions.setContentsMargins(0, 8, 0, 0)
+        self._cast     = _CastSection(self.config)
+        self._details  = _DetailsSection(self.config)
+        self._similar  = _SimilarSection(self.config)
+
+        # Restore collapse state. Every section that owns a CollapsibleHeader
+        # is listed here — Overview included, since the shared header made
+        # collapsing it cheap, so "remembers its state" is true of all of
+        # them rather than of the four that happened to have hand-rolled it.
+        # "Available in" (_versions) is NOT one of these (DETAILS-3c): it is
+        # the copy you are on plus every sibling, always visible, never
+        # collapsible — the shared header never applied to it the way it did
+        # to the other five.
+        self._collapsible_sections = (
+            self._plot, self._cast, self._details, self._similar,
+        )
+        for section in self._collapsible_sections:
+            section.restore_collapse_state(self.config.details_pane_collapsed_sections)
+
+        # NOTE: _action_bar is intentionally NOT added to the content layout — it is
+        # the logical owner of the action buttons, which are reparented into the
+        # poster's left rail by set_action_buttons() below.
+        for widget in (
+            self._poster, self._meta, self._source_notice_lbl, self._versions,
+            self._plot, self._cast, self._details, self._similar,
+        ):
+            self._content_layout.addWidget(widget)
+
+        self._epg_agenda = EpgAgendaWidget(self._db, self.config) if self._db else None
+        if self._epg_agenda:
+            self._content_layout.addWidget(self._epg_agenda)
+            self._epg_agenda.now_title_changed.connect(self._on_epg_title_changed)
+            self._epg_agenda.watchlist_changed.connect(self.watchlist_changed)
+
+        # Wire action buttons into their tiered visual slots.  _ActionBar owns all
+        # state/signals; _PosterSection provides the slots (Play/Resume → primary
+        # row below the poster; the rest → the slim rail).  Must happen after both
+        # are constructed.
+        self._poster.set_action_buttons(
+            favorite=self._action_bar.favorite_button,
+            play=self._action_bar.play_button,
+            resume=self._action_bar.resume_button,
+            queue=self._action_bar.queue_button,
+            trailer=self._action_bar.trailer_button,
+            like=self._action_bar.like_button,
+            not_interested=self._action_bar.not_interested_button,
+            dislike=self._action_bar.dislike_button,
+            watchlist=self._action_bar.watchlist_button,
+            monitor=self._action_bar.monitor_button,
+            clear_epg_link=self._action_bar.clear_epg_link_button,
+            hide=self._action_bar.hide_button,
+        )
+
+        self._content_layout.addStretch()
+        scroll.setWidget(content)
+        # Container is the width authority: cap the content widget to the viewport so no
+        # child section can ever floor the column wider than the pane (h-scroll is off, so
+        # an over-wide child would clip every section's right edge).  Responsive children
+        # (wrapping labels, flow layouts) reflow within; nothing can push past the
+        # container.  This is the structural guarantee that replaces per-label width
+        # opt-outs (the recurring "content clips off the right edge" trap).
+        scroll.viewport().installEventFilter(self)
+        self._sync_content_width()
+        main_layout.addWidget(scroll)
+
+        # Resizable width range — NOT a fixed width.  setFixedWidth() pins
+        # min==max so the enclosing QSplitter handle can't drag-resize the pane
+        # at all (the "details resize bar does nothing" bug); the saved width is
+        # already applied by MainWindow via main_splitter.setSizes(), and live
+        # drags persist through the debounced layout save.
+        self.setMinimumWidth(300)
+        self.setMaximumWidth(500)
+
+    def _sync_content_width(self) -> None:
+        """Pin the content widget's max width to the viewport — the container ceiling."""
+        if hasattr(self, "_content") and hasattr(self, "_scroll"):
+            self._content.setMaximumWidth(self._scroll.viewport().width())
+
+    def eventFilter(self, obj, event):
+        """Keep the content width pinned to the viewport on every viewport resize."""
+        if obj is self._scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self._sync_content_width()
+        return super().eventFilter(obj, event)
+
+    def _connect_sections(self) -> None:
+        """Wire internal section signals to public DetailsPaneWidget signals."""
+        # Poster lightbox + clickable Watched badge
+        self._poster.poster_enlarged.connect(self.poster_enlarged)
+        self._poster.watched_toggled.connect(self._on_watched)
+
+        # Version chips
+        v = self._versions
+        v.version_selected.connect(self.version_selected)
+        v.play_version_requested.connect(self.play_version_requested)
+        v.download_requested.connect(self.download_requested)
+        v.favorite_toggled.connect(self.favorite_toggled)
+        v.queue_toggled.connect(self.queue_toggled)
+        v.hide_requested.connect(self.hide_requested)
+        v.prefix_block_requested.connect(self.prefix_block_requested)
+        v.prefix_unblock_requested.connect(self.prefix_unblock_requested)
+        v.prefix_name_saved.connect(self.prefix_name_saved)
+        v.manage_filters_requested.connect(self.manage_filters_requested)
+
+        # Genre chips
+        self._meta.genre_clicked.connect(self.genre_filter_requested)
+        # Collection chip (title block) — same strict-filter entry point a
+        # Tags-section collection chip uses.
+        self._meta.collection_clicked.connect(
+            lambda value: self.tag_filter_requested.emit("collection", value)
+        )
+        self._meta.collection_exclude_requested.connect(self.collection_exclude_requested)
+        self._meta.collection_include_requested.connect(self.collection_include_requested)
+        self._meta.manage_exclusions_requested.connect(self.manage_filters_requested)
+        # Source chip (title block) + its id-chip copy status feedback.
+        self._meta.status_message.connect(self.status_message)
+
+        # Cast / director / crew person chips
+        self._cast.person_clicked.connect(self.person_filter_requested)
+
+        # Tag / collection chips — left-click filters, right-click opens Discover.
+        self._details.tag_filter_clicked.connect(self.tag_filter_requested)
+        self._details.tag_discover_clicked.connect(self.tag_discover_requested)
+        self._details.probe_requested.connect(self.stream_probe_requested)
+
+        # Similar titles
+        s = self._similar
+        s.play_requested.connect(self.play_requested)
+        s.mode_changed.connect(self._on_similar_mode_changed)
+        s.version_selected.connect(self.version_selected)
+        s.favorite_toggled.connect(self.favorite_toggled)
+        s.queue_toggled.connect(self.queue_toggled)
+        s.prefix_exclude_requested.connect(self.prefix_block_requested)
+        s.similar_preview_requested.connect(self.similar_preview_requested)
+
+        # Action bar — wrap with channel_id
+        ab = self._action_bar
+        ab.play_clicked.connect(self._on_play)
+        ab.resume_clicked.connect(self._on_resume)
+        ab.favorite_clicked.connect(self._on_favorite)
+        ab.queue_clicked.connect(self._on_queue)
+        ab.like_clicked.connect(self._on_like)
+        ab.dislike_clicked.connect(self._on_dislike)
+        ab.not_interested_clicked.connect(self._on_not_interested)
+        ab.hide_clicked.connect(self._on_hide)
+        ab.unhide_clicked.connect(self._on_unhide)
+        ab.watchlist_clicked.connect(self._on_watchlist)
+        ab.monitor_clicked.connect(self._on_monitor)
+        ab.clear_epg_link_clicked.connect(self._on_clear_epg_link)
+        ab.trailer_clicked.connect(self._on_trailer)
+        ab.trailer_youtube_clicked.connect(self._on_trailer_youtube)
+
+        # Collapse state persistence
+        # One connection per section, from the same tuple that restored them —
+        # so a seventh section cannot be restored-but-never-saved, which is what
+        # a hand-listed pair of blocks eventually produces.
+        for section in self._collapsible_sections:
+            section._header.toggled.connect(
+                lambda _collapsed, sec=section: sec.save_state(self)
+            )
+
+    def _configure_for(self, is_live: bool) -> None:
+        self._poster.set_mode(is_live)
+        self._meta.set_mode(is_live)
+        self._plot.set_mode(is_live)
+        self._details.set_mode(is_live)
+        self._cast.set_mode(is_live)
+        self._action_bar.set_mode(is_live)
+
+    def _apply_metadata(self, metadata: MetadataResult) -> None:
+        self._meta.load_metadata(metadata)
+        # Trailer — the button appears only when there is something behind it.
+        # Held on the pane rather than read back off the button, because the
+        # button carries a label, not a URL.
+        self._trailer_url = metadata.trailer_url or ""
+        self._trailer_title = f"{metadata.title or ''} — Trailer".strip(" —")
+        self._action_bar.set_trailer(bool(self._trailer_url))
+        # Always route through _plot.load — it shows the section when a plot is
+        # present and hides the whole 'Overview' box when it is empty.
+        self._plot.load(metadata.plot)
+        if metadata.poster_url:
+            self._poster.load_poster(metadata.poster_url, self.provider_urls)
+        else:
+            self._poster.poster_label.setText("No poster available")
+
+        # Render first, annotate second. This used to call compute_weights()
+        # inline — every UserRatingDB row, every rated channel, every favourite
+        # WITH its metadata — and a user's watchdog caught 28.7s of it with
+        # the paint held. The pane paints un-annotated now and the host fills the
+        # preference markers in when its off-thread read lands.
+        self._render_people(metadata, None)
+        self.weights_requested.emit(self.current_channel.id)
+
+    def _render_people(self, metadata: MetadataResult, weights) -> None:
+        """Paint the release date (Details) + Cast. ``weights`` adds the ▲/▼ preference markers.
+
+        The one place both sections are rendered, so the first (un-annotated)
+        pass and the later annotated one cannot drift apart.
+        """
+        self._details.load_metadata(metadata)
+        self._cast.load(metadata.cast or [], director=metadata.director, weights=weights)
+
+    # ------------------------------------------------------------------ #
+    # Image callbacks                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _on_image_loaded(self, url: str, pixmap: QPixmap) -> None:
+        self._poster.on_image_loaded(url, pixmap)
+
+    def _on_image_failed(self, url: str, error: str) -> None:
+        self._poster.on_image_failed(url, error)
+
+    # ------------------------------------------------------------------ #
+    # EPG                                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _on_epg_title_changed(self, title: str) -> None:
+        self._action_bar.update_epg_title(title, list(watchlist.patterns(self.config)))
+
+    def _on_watchlist(self) -> None:
+        title = self._action_bar._current_epg_title
+        if not title:
+            return
+        if not watchlist.remove(self.config, title):
+            watchlist.add(self.config, title)
+        # Through the one method that knows how to re-read the list. This line
+        # passed a bare ``patterns``, which is not a name in this module — so
+        # every click of the watch bell toggled the rule and then raised
+        # NameError before the button could redraw. ruff's F821 is in the
+        # project's ignore list (pyproject.toml), which is why it stood.
+        self._on_epg_title_changed(title)
+
+    # ------------------------------------------------------------------ #
+    # Action bar wrappers (add channel_id to signals)                      #
+    # ------------------------------------------------------------------ #
+
+    def _on_trailer(self) -> None:
+        """Play the current title's trailer, if one was resolved."""
+        if self._trailer_url:
+            self.trailer_requested.emit(self._trailer_url, self._trailer_title)
+
+    def _on_trailer_youtube(self) -> None:
+        """Open the current title's trailer in the system browser."""
+        if self._trailer_url:
+            self.trailer_youtube_requested.emit(self._trailer_url)
+
+    def _on_play(self) -> None:
+        # In episode mode the primary button plays the selected episode, not the
+        # series channel — emit the bare episode signal (host reads current_episode).
+        if self._in_episode_mode:
+            if self.current_episode is not None:
+                self.play_episode_requested.emit()
+            return
+        if self.current_channel:
+            self.play_requested.emit(self.current_channel.id)
+
+    def _on_resume(self) -> None:
+        # Mirrors _on_play's episode-mode branch above: in episode mode Resume
+        # must target the EPISODE shown, not the series channel — emitting the
+        # channel-grain resume_requested here would resume the wrong item.
+        if self._in_episode_mode:
+            if self.current_episode is not None:
+                self.resume_episode_requested.emit()
+            return
+        if self.current_channel:
+            self.resume_requested.emit(self.current_channel.id)
+
+    def _on_favorite(self) -> None:
+        # Episode mode (Slice 2B): favorite the EPISODE shown, not the series —
+        # mirrors _on_play's episode-mode branch above.
+        if self._in_episode_mode and self.current_episode is not None:
+            self.episode_favorite_toggled.emit(self.current_episode.id)
+            return
+        if self.current_channel:
+            self.favorite_toggled.emit(self.current_channel.id)
+
+    def _on_monitor(self) -> None:
+        if self.current_channel:
+            self.monitor_toggled.emit(self.current_channel.id)
+
+    def _on_queue(self) -> None:
+        # Episode mode (Slice 2B): queue the EPISODE shown, not the series.
+        if self._in_episode_mode and self.current_episode is not None:
+            self.episode_queue_toggled.emit(self.current_episode.id)
+            return
+        if self.current_channel:
+            self.queue_toggled.emit(self.current_channel.id)
+
+    def _on_like(self) -> None:
+        if self.current_channel:
+            self.rating_requested.emit(self.current_channel.id, 1)
+
+    def _on_dislike(self) -> None:
+        if self.current_channel:
+            self.rating_requested.emit(self.current_channel.id, -1)
+
+    def _on_not_interested(self) -> None:
+        if self.current_channel:
+            suppressed = self._action_bar._suppressed
+            self.suppression_requested.emit(self.current_channel.id, suppressed)
+
+    def _on_hide(self) -> None:
+        if self.current_channel:
+            self.hide_requested.emit(self.current_channel.id)
+
+    def _on_unhide(self) -> None:
+        if self.current_channel:
+            self.unhide_requested.emit(self.current_channel.id)
+
+    def _on_clear_epg_link(self) -> None:
+        # The single click routes to either "Clear EPG link" or its "Re-link EPG
+        # data" inverse, depending on the last-loaded blocked state — the host's
+        # handler (mirroring the channel-menu toggle) checks epg_link_blocklist
+        # itself, so this just re-emits the channel_id.
+        if self.current_channel:
+            self.clear_epg_link_requested.emit(self.current_channel.id)
+
+    def _on_watched(self, is_watched: bool) -> None:
+        if self.current_channel:
+            # The poster badge carries the new optimistic state; route it to the
+            # host's shared mark/unmark chokepoint.
+            self.watched_toggled.emit(self.current_channel.id, is_watched)
+
+    # ------------------------------------------------------------------ #
+    # Collapse state persistence                                           #
+    # ------------------------------------------------------------------ #

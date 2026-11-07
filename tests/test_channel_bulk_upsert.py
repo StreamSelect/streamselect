@@ -1,0 +1,790 @@
+"""Behavioral tests for the bulk-upsert channel store path.
+
+These tests drive ``ProviderLoadThread._store_channels`` (extracted helper)
+directly with fake Channel objects so they run without a network or Qt event
+loop.  The file-backed tmp_path DB (not :memory:) ensures pooled connections
+each see the same rows — matching production SQLite behaviour.
+
+Critical regression guarded:
+  ON CONFLICT DO UPDATE must NOT overwrite derived/user columns (is_favorite,
+  play_count, detected_prefix, user_category, etc.).  The old merge() path
+  preserved these silently because it only set the columns it knew about;
+  a naive INSERT OR REPLACE would wipe them.  These tests fail if the upsert
+  ever clobbers user data.
+"""
+
+from unittest.mock import MagicMock
+from datetime import datetime
+
+import pytest
+
+from tests.conftest import capture_sql_statements, make_channel_double
+
+from streamselect.core.database import Database, ChannelDB
+from streamselect.core.provider_loader import ProviderLoadThread, _STORE_BATCH
+from streamselect.core.models import Provider
+from streamselect.core.migrations.sports_reclassify import DERIVED_FIELDS
+from streamselect.core.special_content import update_channel_special_content
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fake_provider():
+    """Minimal Provider instance for testing (no network calls)."""
+    p = Provider.__new__(Provider)
+    p.id = "test_prov"
+    p.name = "Test Provider"
+    p.type = "xtream"
+    p.url = "http://example.com"
+    p.username = "user"
+    p.password = "pass"
+    p.urls = []
+    return p
+
+
+@pytest.fixture
+def store_thread(fake_provider, tmp_db):
+    """ProviderLoadThread with signals disconnected (no Qt event loop needed)."""
+    thread = ProviderLoadThread(fake_provider, tmp_db)
+    return thread
+
+
+def _make_channel(
+    ch_id: str,
+    name: str = "Test Channel",
+    media_type: str = "live",
+    stream_url: str = "http://example.com/stream",
+    category: str = "General",
+    quality: str = "hd",
+    raw_data: dict | None = None,
+    detected_tmdb_id: str | None = None,
+    detected_rating: float | None = None,
+    detected_added: int | None = None,
+) -> MagicMock:
+    """Return a fake Channel-like object (duck-typing; no import of Channel dataclass)."""
+    return make_channel_double(
+        id=ch_id,
+        source_id=ch_id,
+        provider_id="test_prov",
+        name=name,
+        stream_url=stream_url,
+        category=category,
+        category_id="cat_1",
+        logo_url="",
+        media_type=media_type,
+        quality=quality,
+        raw_data=raw_data if raw_data is not None else {},
+        detected_tmdb_id=detected_tmdb_id,
+        detected_rating=detected_rating,
+        detected_added=detected_added,
+    )
+
+
+def _read_channel(db: Database, ch_id: str) -> dict:
+    """Read a single ChannelDB row and return it as a plain dict (session-safe)."""
+    session = db.get_session()
+    try:
+        row = session.query(ChannelDB).filter_by(id=ch_id).one_or_none()
+        if row is None:
+            return {}
+        return {
+            "id": row.id,
+            "name": row.name,
+            "stream_url": row.stream_url,
+            "category": row.category,
+            "media_type": row.media_type,
+            "quality": row.quality,
+            "is_adult": row.is_adult,
+            "source_category": row.source_category,
+            "source_quality_flags": row.source_quality_flags,
+            "is_favorite": row.is_favorite,
+            "play_count": row.play_count,
+            "detected_prefix": row.detected_prefix,
+            "user_category": row.user_category,
+            "special_view": row.special_view,
+            "sport_type": row.sport_type,
+            "league_name": row.league_name,
+            "team_name": row.team_name,
+            "event_start_time": row.event_start_time,
+            "event_stop_time": row.event_stop_time,
+            "event_metadata": row.event_metadata,
+            "event_team_a": row.event_team_a,
+            "event_team_b": row.event_team_b,
+        }
+    finally:
+        session.close()
+
+
+def _count_channels(db: Database) -> int:
+    """Return the total number of ChannelDB rows."""
+    session = db.get_session()
+    try:
+        return session.query(ChannelDB).count()
+    finally:
+        session.close()
+
+
+def _store(thread: ProviderLoadThread, db: Database, channels: list) -> set:
+    """Helper: obtain a session, store channels, and close.
+
+    Returns the changed-id set ``_store_channels`` now reports (DERIVE-1) —
+    ids whose stored name/category/raw_data differed from the incoming row.
+    """
+    session = db.get_session()
+    try:
+        return thread._store_channels(session, channels, total=len(channels))
+    finally:
+        session.close()
+
+
+# ---------------------------------------------------------------------------
+# Test 1 — Insert: new channels are written with correct catalog fields
+# ---------------------------------------------------------------------------
+
+def test_insert_new_channels(store_thread, tmp_db):
+    """Storing new channels writes all catalog fields correctly."""
+    channels = [
+        _make_channel("ch1", name="BBC One", category="News", stream_url="http://ex.com/s/1"),
+        _make_channel("ch2", name="CNN", category="News", stream_url="http://ex.com/s/2"),
+        _make_channel("ch3", name="Action Movie", media_type="movie", stream_url="http://ex.com/s/3"),
+    ]
+
+    _store(store_thread, tmp_db, channels)
+
+    assert _count_channels(tmp_db) == 3, "All three channels must be inserted"
+
+    ch1 = _read_channel(tmp_db, "ch1")
+    assert ch1["name"] == "BBC One"
+    assert ch1["category"] == "News"
+    assert ch1["stream_url"] == "http://ex.com/s/1"
+    assert ch1["media_type"] == "live"
+
+    ch2 = _read_channel(tmp_db, "ch2")
+    assert ch2["name"] == "CNN"
+
+    ch3 = _read_channel(tmp_db, "ch3")
+    assert ch3["media_type"] == "movie"
+
+
+# ---------------------------------------------------------------------------
+# Test 2 — Upsert preserves user/derived data (THE critical test)
+# ---------------------------------------------------------------------------
+
+def test_upsert_preserves_user_and_derived_columns(store_thread, tmp_db):
+    """ON CONFLICT must NOT overwrite USER columns, and MUST invalidate derived ones.
+
+    is_favorite / play_count / user_category are the user's and survive.
+    detected_prefix is derived from the name; when the name changes it is stale
+    by definition and is cleared for re-derivation.
+
+    Sequence:
+      1. Insert channel ch1 via _store_channels.
+      2. Set user/derived columns directly in the DB (simulates user interaction + prefix detection).
+      3. Store ch1 again via _store_channels with a *changed* catalog field (name, stream_url).
+      4. Assert the catalog field updated AND all user/derived columns survived.
+    """
+    # --- Step 1: initial insert ---
+    _store(store_thread, tmp_db, [_make_channel("ch1", name="Old Name", stream_url="http://old.com/stream")])
+
+    # --- Step 2: simulate user interaction + prefix detection ---
+    with tmp_db.session_scope() as s:
+        row = s.query(ChannelDB).filter_by(id="ch1").one()
+        row.is_favorite = True
+        row.play_count = 7
+        row.detected_prefix = "EN"
+        row.user_category = "Faves"
+
+    # --- Step 3: re-store with changed catalog fields ---
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="New Name", stream_url="http://new.com/stream", category="Updated Category")
+    ])
+
+    # --- Step 4: assert catalog updated AND user/derived preserved ---
+    row = _read_channel(tmp_db, "ch1")
+
+    # Catalog fields must be updated
+    assert row["name"] == "New Name", "name (catalog) must be updated by the upsert"
+    assert row["stream_url"] == "http://new.com/stream", "stream_url (catalog) must be updated"
+    assert row["category"] == "Updated Category", "category (catalog) must be updated"
+
+    # User/derived fields must be preserved
+    assert row["is_favorite"] is True, "is_favorite must survive a provider refresh"
+    assert row["play_count"] == 7, "play_count must survive a provider refresh"
+    # detected_prefix is DERIVED FROM THE NAME, not user data — and this step
+    # renamed the row. Keeping it was the defect a user hit earlier: a
+    # sports slot renamed by the provider kept the previous game's derived
+    # title, so the list showed "Royals x Blue Jays" for a row whose name said
+    # "Mariners x Red Sox", and a restart could not help because the stale value
+    # was persisted. Grouping a derived column with is_favorite/play_count is
+    # what made that look correct.
+    #
+    # It is cleared so update_detected_prefixes recomputes it from the new name.
+    # The user columns above are the ones that must survive, and still do.
+    assert row["detected_prefix"] is None, (
+        "a renamed row must drop its name-derived fields so they re-derive")
+    assert row["user_category"] == "Faves", "user_category must survive a provider refresh"
+
+
+# ---------------------------------------------------------------------------
+# Test 3 — Batch boundary: > _STORE_BATCH channels all persist
+# ---------------------------------------------------------------------------
+
+def test_batch_boundary_all_channels_persisted(store_thread, tmp_db):
+    """Storing more than _STORE_BATCH channels flushes multiple batches correctly.
+
+    Uses _STORE_BATCH + 101 channels so there are two batches: one full batch
+    and a non-trivial partial batch of 101 rows.
+    """
+    count = _STORE_BATCH + 101
+    channels = [_make_channel(f"ch{i}", name=f"Channel {i}") for i in range(count)]
+
+    _store(store_thread, tmp_db, channels)
+
+    stored_count = _count_channels(tmp_db)
+    assert stored_count == count, (
+        f"All {count} channels must be stored across batch boundaries "
+        f"(got {stored_count})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 4 — Hash-header state: source_category propagates to subsequent live channels
+# ---------------------------------------------------------------------------
+
+def test_hash_header_source_category_propagates(store_thread, tmp_db):
+    """##SPORTS## header must set source_category on all subsequent live channels.
+
+    This guards the stateful hash-header logic: a header line must carry
+    forward to every following channel until the next header appears.
+    """
+    channels = [
+        _make_channel("h1", name="## SPORTS ##", media_type="live"),    # header
+        _make_channel("ch1", name="Match 1", media_type="live"),
+        _make_channel("ch2", name="Match 2", media_type="live"),
+        _make_channel("h2", name="## NEWS ##", media_type="live"),      # new header
+        _make_channel("ch3", name="Evening News", media_type="live"),
+        _make_channel("ch4", name="Movie Night", media_type="movie"),   # movie — no source_category
+    ]
+
+    _store(store_thread, tmp_db, channels)
+
+    ch1 = _read_channel(tmp_db, "ch1")
+    ch2 = _read_channel(tmp_db, "ch2")
+    ch3 = _read_channel(tmp_db, "ch3")
+    ch4 = _read_channel(tmp_db, "ch4")
+
+    assert ch1["source_category"] == "SPORTS", (
+        "ch1 must inherit source_category from the preceding ## SPORTS ## header"
+    )
+    assert ch2["source_category"] == "SPORTS", (
+        "ch2 must inherit source_category from the preceding ## SPORTS ## header"
+    )
+    assert ch3["source_category"] == "NEWS", (
+        "ch3 must inherit source_category from the ## NEWS ## header"
+    )
+    assert ch4["source_category"] is None, (
+        "movie channels must NOT get source_category (live-only field)"
+    )
+
+
+def test_hash_header_channels_are_not_stored(store_thread, tmp_db):
+    """##...## header rows are positional markers (bumper/loop streams), not
+    content — they must NOT be stored as channels, while their label still
+    propagates as source_category to the channels that follow.  Covers the
+    trailing-token form (``#### X ##### · UHD``) the old end-anchored regex missed.
+    """
+    channels = [
+        _make_channel("h1", name="## SPORTS ##", media_type="live"),                   # header
+        _make_channel("ch1", name="Match 1", media_type="live"),
+        _make_channel("h2", name="#### BAMBINI HD/4K ##### · UHD", media_type="live"),  # trailing-token header
+        _make_channel("ch2", name="Cartoon", media_type="live"),
+    ]
+
+    _store(store_thread, tmp_db, channels)
+
+    # Header rows are skipped — never stored as browsable channels.
+    assert _read_channel(tmp_db, "h1") == {}, "## SPORTS ## header must not be stored"
+    assert _read_channel(tmp_db, "h2") == {}, (
+        "trailing-token header '#### BAMBINI HD/4K ##### · UHD' must not be stored"
+    )
+
+    # …but the channels that follow still inherit each header's label.
+    assert _read_channel(tmp_db, "ch1").get("source_category") == "SPORTS"
+    assert _read_channel(tmp_db, "ch2").get("source_category") == "BAMBINI HD/4K"
+
+
+def test_parse_hash_header_matches_trailing_token_form():
+    """Regex guard: a closing-hash run may be followed by a trailing token."""
+    from streamselect.core.provider_loader import _parse_hash_header
+    assert _parse_hash_header("#### BAMBINI HD/4K ##### · UHD") == ("BAMBINI HD/4K", "")
+    assert _parse_hash_header("### M. LIGA DE CAMPEONES ###")[0] == "M. LIGA DE CAMPEONES"
+    assert _parse_hash_header("Real Channel HD") is None       # not a header
+    assert _parse_hash_header("CNN ## breaking") is None        # leading text, not a header
+
+
+# ---------------------------------------------------------------------------
+# Test 5 — is_adult extracted from raw_data correctly
+# ---------------------------------------------------------------------------
+
+def test_is_adult_extracted_from_raw_data(store_thread, tmp_db):
+    """is_adult must be derived from raw_data['is_adult'] (int 1 / string '1' / bool True)."""
+    channels = [
+        _make_channel("adult_int",  raw_data={"is_adult": 1}),
+        _make_channel("adult_str",  raw_data={"is_adult": "1"}),
+        _make_channel("adult_bool", raw_data={"is_adult": True}),
+        _make_channel("not_adult",  raw_data={"is_adult": 0}),
+        _make_channel("no_field",   raw_data={}),
+    ]
+
+    _store(store_thread, tmp_db, channels)
+
+    assert _read_channel(tmp_db, "adult_int")["is_adult"] is True
+    assert _read_channel(tmp_db, "adult_str")["is_adult"] is True
+    assert _read_channel(tmp_db, "adult_bool")["is_adult"] is True
+    assert _read_channel(tmp_db, "not_adult")["is_adult"] is False
+    assert _read_channel(tmp_db, "no_field")["is_adult"] is False
+
+
+# ---------------------------------------------------------------------------
+# Test 6 — Event-slot channels drop sports classification when renamed
+# ---------------------------------------------------------------------------
+
+def test_renamed_row_drops_sports_classification(store_thread, tmp_db):
+    """Renamed event-slot channels must clear all nine sports/event classification columns.
+
+    When a provider rotates an event-slot's title in place (same channel id, different name),
+    the row's stale sports classification must be cleared so _categorize_special_content
+    can reclassify it from the new name. The rename-clear list now includes all nine
+    DERIVED_FIELDS.
+
+    Sequence:
+      1. Insert channel slot1 named "FLSP 988 | ATP tennis: Open Final".
+      2. In a session, set all nine classification columns to test values.
+      3. Assert that the mapping keys match DERIVED_FIELDS exactly.
+      4. Store the same id with a DIFFERENT name (wrestling event).
+      5. Read the row and assert every one of the nine columns is None.
+      6. Store again with the SAME name and pre-set columns → assert preserved.
+    """
+    # --- Step 1: initial insert ---
+    _store(store_thread, tmp_db, [
+        _make_channel("slot1", name="FLSP 988 | ATP tennis: Open Final")
+    ])
+
+    # --- Step 2: set all classification columns ---
+    mapping = {
+        "special_view": "sports",
+        "sport_type": "tennis",
+        "league_name": "ATP",
+        "team_name": "A vs B",
+        "event_start_time": datetime(2026, 9, 12, 8, 0),
+        "event_stop_time": datetime(2026, 9, 12, 10, 0),
+        "event_metadata": {"event_name": "Open Final"},
+        "event_team_a": "A",
+        "event_team_b": "B",
+    }
+
+    # --- Step 3: prove the test knows about all DERIVED_FIELDS ---
+    assert set(mapping) == set(DERIVED_FIELDS), (
+        f"Test mapping {set(mapping)} must match DERIVED_FIELDS {set(DERIVED_FIELDS)}"
+    )
+
+    with tmp_db.session_scope() as s:
+        row = s.query(ChannelDB).filter_by(id="slot1").one()
+        for key, value in mapping.items():
+            setattr(row, key, value)
+
+    # --- Step 4: re-store with a DIFFERENT name (renamed by provider) ---
+    _store(store_thread, tmp_db, [
+        _make_channel("slot1", name="(FLSP 988) | WWE: Florida Super 32 Early Entry (Mat 1)")
+    ])
+
+    # --- Step 5: assert all nine columns are cleared ---
+    row = _read_channel(tmp_db, "slot1")
+    for field in DERIVED_FIELDS:
+        assert row.get(field) is None, (
+            f"Field {field} must be None after rename (got {row.get(field)})"
+        )
+
+    # --- Step 6 (bonus): unchanged name must preserve columns ---
+    with tmp_db.session_scope() as s:
+        row = s.query(ChannelDB).filter_by(id="slot1").one()
+        for key, value in mapping.items():
+            setattr(row, key, value)
+
+    _store(store_thread, tmp_db, [
+        _make_channel("slot1", name="(FLSP 988) | WWE: Florida Super 32 Early Entry (Mat 1)")
+    ])
+
+    row = _read_channel(tmp_db, "slot1")
+    for field in DERIVED_FIELDS:
+        assert row.get(field) == mapping[field], (
+            f"Field {field} must be preserved when name doesn't change "
+            f"(got {row.get(field)}, expected {mapping[field]})"
+        )
+
+
+def test_renamed_slot_reclassified_from_new_name(store_thread, tmp_db):
+    """A renamed event slot is reclassified from its new name in the same refresh.
+
+    This proves that rename-clear + _categorize_special_content handoff works end-to-end:
+    after a provider rotates an event slot's name, the row lands with special_view IS NULL
+    (the rename cleared it) and _categorize_special_content picks it up and reclassifies it.
+
+    Sequence:
+      1. Insert slot2 named "ATP Tennis Tournament".
+      2. In a session, run update_channel_special_content(row) and commit.
+      3. Assert sport_type == "tennis".
+      4. Store the same id renamed to "UFC Boxing Match".
+      5. Read the row: assert special_view IS NULL (handoff point for reclassify).
+      6. Run update_channel_special_content again on the live row and commit.
+      7. Assert sport_type == "boxing" (reclassified from new name).
+    """
+    # --- Step 1: initial insert ---
+    _store(store_thread, tmp_db, [
+        _make_channel("slot2", name="ATP Tennis Tournament")
+    ])
+
+    # --- Step 2-3: classify and assert tennis ---
+    with tmp_db.session_scope() as s:
+        row = s.query(ChannelDB).filter_by(id="slot2").one()
+        update_channel_special_content(row)
+    # (session closed, row detached; read fresh)
+
+    row = _read_channel(tmp_db, "slot2")
+    assert row["sport_type"] == "tennis", f"Initial classification must be tennis (got {row['sport_type']})"
+
+    # --- Step 4: rename to UFC event ---
+    _store(store_thread, tmp_db, [
+        _make_channel("slot2", name="UFC Boxing Match")
+    ])
+
+    # --- Step 5: assert special_view IS NULL (handoff point) ---
+    row = _read_channel(tmp_db, "slot2")
+    assert row["special_view"] is None, (
+        f"Rename must clear special_view so reclassify picks it up (got {row['special_view']})"
+    )
+
+    # --- Step 6-7: reclassify and assert boxing ---
+    with tmp_db.session_scope() as s:
+        row = s.query(ChannelDB).filter_by(id="slot2").one()
+        update_channel_special_content(row)
+
+    row = _read_channel(tmp_db, "slot2")
+    assert row["sport_type"] == "boxing", (
+        f"Reclassified row must be boxing (got {row['sport_type']})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 7 — DB-4: detected_rating/detected_added are catalog columns
+# ---------------------------------------------------------------------------
+
+def _read_rating_added(db: Database, ch_id: str) -> tuple:
+    session = db.get_session()
+    try:
+        row = session.query(ChannelDB).filter_by(id=ch_id).one()
+        return row.detected_rating, row.detected_added
+    finally:
+        session.close()
+
+
+def test_insert_writes_detected_rating_and_added(store_thread, tmp_db):
+    """The columns ingestion computed on the Channel double land in the row."""
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", detected_rating=7.4, detected_added=1725500000),
+    ])
+    assert _read_rating_added(tmp_db, "ch1") == (7.4, 1725500000)
+
+
+def test_refresh_overwrites_rating_and_added_not_preserves(store_thread, tmp_db):
+    """Unlike a name-derived detected_* field, a refresh must UPDATE these —
+    a provider rating changes over time, same reasoning as detected_tmdb_id
+    (which the surrounding _CATALOG_COLS comment documents), but with a plain
+    overwrite rather than detected_tmdb_id's COALESCE (there is no separate
+    enrichment writer here to protect)."""
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", detected_rating=5.0, detected_added=1000000000),
+    ])
+    assert _read_rating_added(tmp_db, "ch1") == (5.0, 1000000000)
+
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", detected_rating=8.2, detected_added=2000000000),
+    ])
+    assert _read_rating_added(tmp_db, "ch1") == (8.2, 2000000000), (
+        "a refresh must update rating/added — they are provider facts, not "
+        "preserved user/derived state"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 8 — DERIVE-1: a changed name/category/raw_data is reported as changed
+# and can be force-recomputed without waiting for a later whole-provider sweep.
+# ---------------------------------------------------------------------------
+
+def _read_detected(db: Database, ch_id: str) -> dict:
+    session = db.get_session()
+    try:
+        row = session.query(ChannelDB).filter_by(id=ch_id).one()
+        return {
+            "detected_title": row.detected_title,
+            "detected_collection": row.detected_collection,
+            "detected_genre": row.detected_genre,
+        }
+    finally:
+        session.close()
+
+
+def _full_derive(db: Database, provider_id: str = "test_prov") -> None:
+    """Run the real whole-provider recompute — what a normal refresh does today."""
+    from streamselect.core.repositories import RepositoryFactory
+    with db.session_scope() as session:
+        RepositoryFactory(session).channels.update_detected_prefixes(provider_id=provider_id)
+
+
+def _forced_recompute(db: Database, changed_ids: set, provider_id: str = "test_prov") -> int:
+    """Run ONLY the new channel_ids-scoped recompute — never the whole-provider pass."""
+    from streamselect.core.repositories import RepositoryFactory
+    with db.session_scope() as session:
+        return RepositoryFactory(session).channels.update_detected_prefixes(
+            provider_id=provider_id, channel_ids=changed_ids)
+
+
+def test_new_row_is_not_a_changed_id(store_thread, tmp_db):
+    """A brand-new row is never reported as 'changed' — the missing-field recompute covers it."""
+    changed = _store(store_thread, tmp_db, [_make_channel("ch1", category="News")])
+    assert changed == set(), "a first-seen id must never be reported as changed"
+
+
+def test_unchanged_refresh_reports_zero_changed_ids(store_thread, tmp_db):
+    """Re-serving byte-identical name/category/raw_data reports no changed ids."""
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", category="News", raw_data={"genre": "Drama"})
+    ])
+    changed = _store(store_thread, tmp_db, [
+        _make_channel("ch1", category="News", raw_data={"genre": "Drama"})
+    ])
+    assert changed == set(), "identical catalog fields must never be reported as changed"
+
+
+def test_category_change_forces_detected_recompute(store_thread, tmp_db):
+    """DERIVE-1: a provider re-listing a channel under a new category recomputes
+    detected_collection/detected_genre WITHOUT waiting for a later whole-provider sweep.
+
+    Mirrors a large library gap (provider 'Cedar', id ..._12405: category
+    flipped 'NETFLIX DOC'->'AR| NEWS', genre 'Reality'->empty, and
+    detected_collection/detected_genre never followed).
+    """
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="AR| CNN ENGLISH", category="NETFLIX DOC",
+                      raw_data={"genre": "Reality"})
+    ])
+    _full_derive(tmp_db)
+
+    before = _read_detected(tmp_db, "ch1")
+    assert before["detected_collection"] == "NETFLIX DOC"
+    assert before["detected_genre"] == "Reality"
+
+    # Refresh #2: same id, provider now lists it under a different category/genre.
+    changed = _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="AR| CNN ENGLISH", category="News",
+                      raw_data={"genre": ""})
+    ])
+    assert changed == {"ch1"}, "a changed category/raw_data must be reported as changed"
+
+    # Force recompute for exactly the changed ids — never the whole-provider sweep.
+    updated = _forced_recompute(tmp_db, changed)
+    assert updated == 1
+
+    after = _read_detected(tmp_db, "ch1")
+    assert after["detected_collection"] == "News", (
+        "detected_collection must follow the new category, not the stale 'NETFLIX DOC'")
+    assert after["detected_genre"] is None, (
+        "detected_genre must follow the cleared raw_data genre, not the stale 'Reality'")
+
+
+def test_raw_data_genre_change_alone_forces_recompute(store_thread, tmp_db):
+    """A raw_data genre change with the SAME name/category is still reported as changed."""
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="Test Channel", category="News",
+                      raw_data={"genre": "Reality"})
+    ])
+    _full_derive(tmp_db)
+    assert _read_detected(tmp_db, "ch1")["detected_genre"] == "Reality"
+
+    changed = _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="Test Channel", category="News",
+                      raw_data={"genre": "Sports"})
+    ])
+    assert changed == {"ch1"}
+
+    _forced_recompute(tmp_db, changed)
+    assert _read_detected(tmp_db, "ch1")["detected_genre"] == "Sports"
+
+
+def test_name_change_is_reported_as_changed_and_recomputes_title(store_thread, tmp_db):
+    """A renamed row is reported as changed and its detected_title follows the new name.
+
+    ``_store_channels`` already NULLs ``detected_title`` on a name change (see
+    ``test_upsert_preserves_user_and_derived_columns``); this proves the id is
+    ALSO surfaced via the new changed-id return, so a caller can force its
+    recompute rather than relying on the missing-field shortcut alone.
+    """
+    _store(store_thread, tmp_db, [_make_channel("ch1", name="Old Title")])
+    _full_derive(tmp_db)
+    assert _read_detected(tmp_db, "ch1")["detected_title"] == "Old Title"
+
+    changed = _store(store_thread, tmp_db, [_make_channel("ch1", name="New Title")])
+    assert changed == {"ch1"}
+
+    _forced_recompute(tmp_db, changed)
+    assert _read_detected(tmp_db, "ch1")["detected_title"] == "New Title"
+
+
+# ---------------------------------------------------------------------------
+# Test 9 — DB-7: the upsert gate. A byte-identical row skips the full
+# catalog upsert entirely, but last_seen_at still advances — the pruner
+# (channel_pruning.py) diffs on that column and was NOT changed by this
+# slice, so presence tracking must keep moving on every row, gated or not.
+# ---------------------------------------------------------------------------
+
+def _last_seen_at(db: Database, ch_id: str):
+    session = db.get_session()
+    try:
+        return session.query(ChannelDB.last_seen_at).filter_by(id=ch_id).scalar()
+    finally:
+        session.close()
+
+
+def test_unchanged_row_skips_the_full_upsert(store_thread, tmp_db):
+    """A second, byte-identical refresh must not re-run the multi-column
+    INSERT..ON CONFLICT upsert for a row nothing about it changed.
+    """
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="Test Channel", category="News", raw_data={"genre": "Drama"})
+    ])
+
+    with capture_sql_statements(tmp_db.engine) as stmts:
+        _store(store_thread, tmp_db, [
+            _make_channel("ch1", name="Test Channel", category="News", raw_data={"genre": "Drama"})
+        ])
+
+    assert not any("INSERT INTO channels" in s for s in stmts), (
+        "an unchanged row must skip the full catalog upsert entirely — "
+        f"statements were: {stmts}"
+    )
+    assert any("UPDATE channels" in s and "last_seen_at" in s for s in stmts), (
+        "an unchanged row must still take the cheap last_seen_at-only UPDATE path"
+    )
+
+
+def test_unchanged_row_still_advances_last_seen_at(store_thread, tmp_db):
+    """The gate skips the full upsert, but the pruner's timestamp diff
+    (channel_pruning.prune_vanished_channels: last_seen_at < seen_at) must
+    keep working — an unchanged row is exactly the case a change gate could
+    silently stop stamping and get pruned as "vanished" on the very next
+    refresh.
+    """
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="Test Channel", category="News", raw_data={"genre": "Drama"})
+    ])
+
+    # Backdate directly (bypassing the loader) so the second store's stamp
+    # is provably NEWER, not just "not None" — avoids relying on two
+    # datetime.utcnow() calls a few lines apart differing by enough to notice.
+    old = datetime(2020, 1, 1)
+    with tmp_db.session_scope() as s:
+        s.query(ChannelDB).filter_by(id="ch1").update({"last_seen_at": old})
+    assert _last_seen_at(tmp_db, "ch1") == old
+
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="Test Channel", category="News", raw_data={"genre": "Drama"})
+    ])
+
+    seen = _last_seen_at(tmp_db, "ch1")
+    assert seen is not None and seen > old, (
+        "last_seen_at must advance on an unchanged row even though the change "
+        "gate skips the full upsert — pruning correctness depends on this"
+    )
+
+
+def test_mixed_batch_gates_only_the_unchanged_member(store_thread, tmp_db):
+    """One batch with a changed row and an unchanged row: the changed row's
+    catalog fields update and the unchanged row's don't get rewritten, but
+    BOTH advance last_seen_at.
+    """
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="Channel One", stream_url="http://old.example/1"),
+        _make_channel("ch2", name="Channel Two", stream_url="http://old.example/2"),
+    ])
+    old = datetime(2020, 1, 1)
+    with tmp_db.session_scope() as s:
+        s.query(ChannelDB).filter(ChannelDB.id.in_(["ch1", "ch2"])).update(
+            {"last_seen_at": old}, synchronize_session=False)
+
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="Channel One", stream_url="http://new.example/1"),  # changed
+        _make_channel("ch2", name="Channel Two", stream_url="http://old.example/2"),  # unchanged
+    ])
+
+    ch1 = _read_channel(tmp_db, "ch1")
+    ch2 = _read_channel(tmp_db, "ch2")
+    assert ch1["stream_url"] == "http://new.example/1", "the changed row's catalog field must update"
+    assert ch2["stream_url"] == "http://old.example/2", "the unchanged row's catalog field is untouched"
+    assert _last_seen_at(tmp_db, "ch1") > old, "the changed row still advances last_seen_at"
+    assert _last_seen_at(tmp_db, "ch2") > old, "the unchanged row must ALSO advance last_seen_at"
+
+
+def test_rating_only_change_is_not_gated(store_thread, tmp_db):
+    """A DB-7 regression guard: name/category/raw_data are unchanged but
+    detected_rating differs — the gate must widen its comparison beyond the
+    three DERIVE-1 columns, or a provider-fact update (rating/added, which
+    CAN change independent of raw_data per the _CATALOG_COLS comment) would
+    silently stop landing.
+    """
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="Test Channel", category="News", detected_rating=5.0)
+    ])
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="Test Channel", category="News", detected_rating=8.2)
+    ])
+    assert _read_rating_added(tmp_db, "ch1")[0] == 8.2, (
+        "a rating-only change must still be written even though name/category/"
+        "raw_data are identical — the gate must not suppress it"
+    )
+
+
+def test_incoming_null_tmdb_id_does_not_defeat_the_gate(store_thread, tmp_db):
+    """The steady-state case after enrichment: the list refresh's incoming
+    detected_tmdb_id is None (enrichment, not the list endpoint, owns it),
+    while the stored row already carries a real id from a prior enrichment
+    pass. _flush_batch's COALESCE keeps the stored id either way, so this
+    must still be gated — otherwise the gate would never fire again for any
+    provider using tmdb enrichment, which is most of the win.
+    """
+    _store(store_thread, tmp_db, [
+        _make_channel("ch1", name="Test Channel", category="Movies", detected_tmdb_id=None)
+    ])
+    # Simulate enrichment populating the id out-of-band (as MetadataManager does).
+    with tmp_db.session_scope() as s:
+        s.query(ChannelDB).filter_by(id="ch1").update({"detected_tmdb_id": "12345"})
+
+    with capture_sql_statements(tmp_db.engine) as stmts:
+        _store(store_thread, tmp_db, [
+            _make_channel("ch1", name="Test Channel", category="Movies", detected_tmdb_id=None)
+        ])
+
+    assert not any("INSERT INTO channels" in s for s in stmts), (
+        "an incoming NULL tmdb id against a populated stored id must still gate "
+        "— COALESCE would keep the stored value either way"
+    )
+    row = _read_channel(tmp_db, "ch1")
+    session = tmp_db.get_session()
+    try:
+        tmdb_id = session.query(ChannelDB.detected_tmdb_id).filter_by(id="ch1").scalar()
+    finally:
+        session.close()
+    assert tmdb_id == "12345", "the enriched tmdb id must survive the gated pass"

@@ -1,0 +1,432 @@
+name: Release (macOS)
+
+# Builds an unsigned StreamSelect.app / .dmg on a version tag, or on demand via
+# workflow_dispatch (test build → uploaded as a workflow artifact, no Release).
+#
+# Dual-arch: the build job is a matrix over both macOS architectures. Each job
+# builds NATIVELY for its runner's arch — Homebrew installs a single-arch `mpv`
+# matching the runner, which is exactly why we build per-runner rather than a
+# universal2 binary. The two jobs run in parallel and attach their arch-named
+# dmg to the SAME GitHub Release.
+#
+# OS floors (accepted limitation): brew bottles pin the deployment floor to the
+# runner's OS. So:
+#   * x86_64 build (macos-15-intel) → runs on macOS 15 (Intel). GitHub retired the
+#     macos-13 Intel image earlier (jobs targeting it hang queued forever);
+#     macos-15-intel is GitHub's Intel/x86_64 label, available through Aug 2027.
+#   * arm64  build (macos-15)       → runs on macOS 15+ (Apple Silicon). Moved
+#     from macos-14 earlier: Homebrew stopped shipping a macos-14 bottle
+#     for mpv's vapoursynth dependency, its source build failed, and no .dmg
+#     was produced earlier on. A user accepted the macOS 15 floor.
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# One build per ref at a time, newest wins.
+#
+# Merging a batch of PRs pushes to main several times in a row, and without
+# this each push started its own ~15-minute macOS build. They then RACED to
+# publish the same `rolling` release: the winner is whichever FINISHES last,
+# not whichever commit is newest, so a batch could publish an older tree and
+# leave the tester on a build missing the fix they were waiting for.
+#
+# Grouping on github.ref keeps tags independent — refs/tags/v1.2.3 is its own
+# group, so cutting an immutable release never cancels another and never gets
+# cancelled by a merge to main.
+concurrency:
+  group: release-${{ github.ref }}
+  # false: a running build always finishes and only the newest waiting one is
+  # kept. With true, merges ~5 min apart cancelled every macOS build before its
+  # runner queue + Homebrew step were over, so no .dmg shipped for 7h.
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # needed to create/update a GitHub Release + upload assets
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # Don't cancel the other arch if one build fails — we want as many dmgs
+      # attached to the release as succeed, and the failure is easier to see.
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15   # Apple Silicon runner (macOS 15+ floor)
+            arch: arm64
+          # Intel/x86_64 dropped (v0.13.1): Sequoia is the last macOS for
+          # Intel Macs and demand is negligible — arm64-only going forward.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Install mpv + packaging tools (Homebrew)
+        run: |
+          brew update
+          # The macos-15 image ships openssl@1.1 linked at /opt/homebrew/bin/openssl,
+          # so linking the openssl@3 that mpv's dependency chain pulls in conflicts
+          # and `brew install` exits 1 ("The `brew link` step did not complete
+          # successfully"). `brew unlink openssl@1.1` removes nothing ("0 symlinks
+          # removed") because brew does not consider those links its own, so
+          # delete every symlink in the prefix that points into the 1.1 keg.
+          # Nothing here uses 1.1, and the runner is thrown away after the job.
+          find "$(brew --prefix)"/{bin,lib,include,share} -maxdepth 2 \
+            -lname '*openssl@1.1*' -print -delete 2>/dev/null || true
+          brew install mpv dylibbundler create-dmg
+
+      - name: Resolve version and release metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION="$(python -c "import re,pathlib; print(re.search(r'__version__\s*=\s*[\"\x27]([^\"\x27]+)', pathlib.Path('streamselect/__init__.py').read_text()).group(1))")"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME}"
+            # Strip a pre-release suffix (e.g. v0.10.0-rc1 -> v0.10.0) before the
+            # equality guard against the source __version__.
+            BASE_TAG="${TAG%%-*}"
+            if [ "$BASE_TAG" != "v${VERSION}" ]; then
+              echo "::error::Tag '$TAG' (base '$BASE_TAG') does not match v$VERSION from streamselect/__init__.py"
+              exit 1
+            fi
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
+            echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+            if echo "$TAG" | grep -q -- '-rc'; then
+              echo "prerelease=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            fi
+          elif [ "${GITHUB_REF_NAME:-}" = "main" ] && [ "${GITHUB_EVENT_NAME:-}" = "push" ]; then
+            # Rolling build. The identifier is derived, never hand-chosen: a
+            # UTC date plus the short SHA, which is what actually answers
+            # "which code is this?" when a tester reports a bug. __version__
+            # stays in the string as the batch label What's New groups by.
+            BUILD_ID="$(scripts/build_id.sh)"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+            echo "is_rolling=true" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "tag=rolling" >> "$GITHUB_OUTPUT"
+            echo "build_id=$BUILD_ID" >> "$GITHUB_OUTPUT"
+            echo "Rolling build: $BUILD_ID"
+          else
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+            echo "is_rolling=false" >> "$GITHUB_OUTPUT"
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run tests (green gate)
+        # Tagged releases only. On a rolling build this was 48 of the job's 54
+        # minutes, re-running the suite CI already runs on every PR (Linux and
+        # macOS) — and every newer push cancelled it, so no .dmg finished on a
+        # busy day. The smoke test below still proves the app launches.
+        if: steps.meta.outputs.is_tag == 'true'
+        run: |
+          pytest tests/ -q
+
+      - name: Build the macOS .icns from the PNG set
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          # iconutil is part of macOS and wants a .iconset directory whose file
+          # names encode size and scale. The PNGs are committed, so this is a
+          # rename step rather than a render, and the icon cannot drift from
+          # the SVG that produced them.
+          ICONSET=packaging/icon/streamselect.iconset
+          mkdir -p "$ICONSET"
+          for s in 16 32 128 256 512; do
+            cp "packaging/icon/streamselect-${s}.png" "$ICONSET/icon_${s}x${s}.png"
+          done
+          for s in 16 32 128 256 512; do
+            d=$((s * 2))
+            cp "packaging/icon/streamselect-${d}.png" "$ICONSET/icon_${s}x${s}@2x.png"
+          done
+          iconutil -c icns "$ICONSET" -o packaging/icon/streamselect.icns
+          ls -la packaging/icon/streamselect.icns
+
+      - name: Stamp the build id
+        run: |
+          set -euo pipefail
+          # Written before PyInstaller so it is baked into the bundle. A packaged
+          # app has no git, so without this a rolling build could not say which
+          # commit it is — and under rolling releases the version string alone
+          # no longer distinguishes two builds. Gitignored: generated per build,
+          # never committed.
+          scripts/build_id.sh --stamp "${{ steps.meta.outputs.build_id || steps.meta.outputs.version }}"
+
+      - name: Build StreamSelect.app (PyInstaller)
+        run: |
+          pyinstaller packaging/streamselect.spec --noconfirm
+
+      - name: Vendor mpv into the app bundle
+        run: |
+          set -euo pipefail
+          BREW_PREFIX="$(brew --prefix)"
+          RES_DIR="dist/StreamSelect.app/Contents/Resources/mpv"
+          # Create both the mpv dir AND the libs/ subdir dylibbundler writes into
+          # (dylibbundler errors "Dest folder does not exist" instead of creating it).
+          mkdir -p "$RES_DIR/libs"
+          cp "$BREW_PREFIX/bin/mpv" "$RES_DIR/mpv"
+          # Gather + rewrite mpv's dylib dependencies into Resources/mpv/libs so
+          # the bundle is self-contained (no Homebrew needed on the user's Mac).
+          # -p MUST be @executable_path, NOT @loader_path.
+          #
+          # @loader_path resolves relative to whichever binary is doing the
+          # loading, and dylibbundler applies this one prefix to EVERY rewritten
+          # install name — the executable's and the dylibs' alike:
+          #   from  Resources/mpv/mpv          -> Resources/mpv/libs/      correct
+          #   from  Resources/mpv/libs/lib*.dylib -> Resources/mpv/libs/libs/  WRONG
+          # A dylib already sitting in libs/ has libs/ as its own @loader_path,
+          # so the extra libs/ prefix sends it one level too deep. That shipped
+          # in v0.23.0: mpv failed to launch with
+          #   Library not loaded: @loader_path/libs/libsamplerate.0.2.2.dylib
+          #   Referenced from .../Resources/mpv/libs/librubberband.3.dylib
+          # and playback silently did nothing.
+          #
+          # @executable_path is the directory of the running PROCESS executable.
+          # mpv is spawned as its own subprocess over IPC (never dlopen'd into
+          # StreamSelect), so it is constantly Resources/mpv/ — correct from the
+          # executable AND from every dylib, which is what makes one prefix valid
+          # for both.
+          dylibbundler \
+            -of -b \
+            -x "$RES_DIR/mpv" \
+            -d "$RES_DIR/libs" \
+            -p "@executable_path/libs/" \
+            -s "$BREW_PREFIX/lib"
+          chmod +x "$RES_DIR/mpv"
+          echo "Vendored mpv:"
+          ls -la "$RES_DIR"
+
+          # ── Verify the vendored mpv actually LOADS ────────────────────────
+          # v0.23.0 shipped a bundle whose dylib install names pointed at
+          # libs/libs/ (see the -p note above). Nothing caught it: the files all
+          # existed, the app launched, and playback just silently did nothing
+          # until a user reported it. These two checks fail the BUILD instead.
+
+          # 1. No rewritten install name may contain a doubled libs/libs — the
+          #    exact signature of the v0.23.0 bug.
+          if otool -L "$RES_DIR/mpv" "$RES_DIR"/libs/*.dylib 2>/dev/null \
+               | grep -F "libs/libs/"; then
+            echo "::error::Vendored mpv has doubled libs/libs/ install names — the v0.23.0 bug. Check dylibbundler's -p prefix."
+            exit 1
+          fi
+
+          # 2. The real proof: run it. A bundle that cannot resolve its own
+          #    dylibs fails here rather than in a user's hands.
+          if ! "$RES_DIR/mpv" --version; then
+            echo "::error::Vendored mpv failed to execute — the bundle cannot resolve its dylibs."
+            exit 1
+          fi
+          echo "Vendored mpv loads and runs."
+
+      - name: Ad-hoc re-sign the app bundle
+        # dylibbundler rewrites dylibs INSIDE the .app after PyInstaller's ad-hoc
+        # sign, which invalidates that signature. A quarantined app with a *broken*
+        # signature is what makes macOS say "StreamSelect is damaged" (vs the milder
+        # "unidentified developer"). Re-sign the whole bundle ad-hoc so the shipped
+        # signature is valid. (Full Developer ID notarization would remove the
+        # Gatekeeper prompt entirely but needs a paid account — this is the free fix.)
+        run: |
+          set -euo pipefail
+          codesign --force --deep --sign - dist/StreamSelect.app
+          codesign --verify --deep --strict dist/StreamSelect.app \
+            || echo "codesign verify reported issues (non-fatal)"
+
+      - name: Smoke test — the built app must actually launch
+        # Every packaging bug found so far has been a MISSING FILE, not bad code,
+        # and the suite cannot see any of them: tests run from a source checkout
+        # where every file is present by definition. CI built the .dmg and never
+        # once started it, so the first thing to run each release was the
+        # tester's Mac.
+        #
+        # Two shipped that way:
+        #   - vendored mpv could not resolve its dylibs (v0.23.0) — now caught by
+        #     the `mpv --version` check above.
+        #   - streamselect/gui/tokens/*.tokens.json were never added to the spec, so
+        #     theme.py raised FileNotFoundError at IMPORT, before any window.
+        #     The app died instantly on launch for every user.
+        #
+        # QT_QPA_PLATFORM=offscreen so this works on a headless runner while
+        # still exercising the real bundle: the same binary, the same imports,
+        # the same data-file lookups. A fresh HOME keeps it off the runner's
+        # state and proves first-run works.
+        run: |
+          set -uo pipefail
+          APP="dist/StreamSelect.app/Contents/MacOS/StreamSelect"
+          LOG="$RUNNER_TEMP/streamselect-smoke.log"
+          export HOME="$RUNNER_TEMP/smoke-home"
+          mkdir -p "$HOME"
+
+          QT_QPA_PLATFORM=offscreen "$APP" >"$LOG" 2>&1 &
+          APP_PID=$!
+
+          # Give it time to boot, import every module and build the main window.
+          for _ in $(seq 1 20); do
+            sleep 1
+            kill -0 "$APP_PID" 2>/dev/null || break
+          done
+
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            kill "$APP_PID" 2>/dev/null || true
+            wait "$APP_PID" 2>/dev/null || true
+            echo "App stayed up — launch OK."
+          else
+            wait "$APP_PID" 2>/dev/null || true   # -e would exit here, before the log is printed
+            echo "::error::StreamSelect.app exited during launch — the bundle is broken."
+            echo "----- launch log -----"
+            cat "$LOG" || true
+            exit 1
+          fi
+
+          # Alive is necessary but not sufficient: a swallowed exception can
+          # leave a running process with a broken feature.
+          if grep -qE "Traceback \(most recent call last\)|ModuleNotFoundError|FileNotFoundError" "$LOG"; then
+            echo "::error::Exception during launch — see the log below."
+            cat "$LOG"
+            exit 1
+          fi
+          echo "----- launch log (tail) -----"
+          tail -30 "$LOG" || true
+
+      - name: Create DMG
+        id: dmg
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.meta.outputs.version }}"
+          ARCH="${{ matrix.arch }}"
+          DMG="StreamSelect-${VERSION}-${ARCH}.dmg"
+          # create-dmg gives a nice drag-to-Applications window; fall back to a
+          # plain hdiutil image if the styled build fails on the headless runner.
+          create-dmg \
+            --volname "StreamSelect ${VERSION}" \
+            --window-pos 200 120 \
+            --window-size 600 380 \
+            --icon-size 100 \
+            --app-drop-link 430 180 \
+            --no-internet-enable \
+            "$DMG" \
+            "dist/StreamSelect.app" \
+          || hdiutil create -volname "StreamSelect ${VERSION}" \
+               -srcfolder "dist/StreamSelect.app" -ov -format UDZO "$DMG"
+          echo "dmg=$DMG" >> "$GITHUB_OUTPUT"
+          ls -la "$DMG"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          # Arch-unique so the two parallel matrix jobs don't collide.
+          name: StreamSelect-${{ steps.meta.outputs.version }}-${{ matrix.arch }}-dmg
+          path: ${{ steps.dmg.outputs.dmg }}
+          if-no-files-found: error
+
+      - name: Publish rolling build
+        if: steps.meta.outputs.is_rolling == 'true'
+        # ONE release, moved forward on every push to main. The tester bookmarks
+        # a single URL and always gets the newest build; there is no version to
+        # choose and no release chore to perform.
+        #
+        # Old builds are deliberately NOT warehoused. The only reason to want a
+        # previous build is "worked before, broken now", and any commit can be
+        # rebuilt on demand via workflow_dispatch — so keeping stale dmgs around
+        # buys nothing and makes "which one is current?" ambiguous.
+        #
+        # The moving tag is force-updated to this commit first, otherwise the
+        # release keeps pointing at whatever commit first created it and the
+        # generated notes drift from the actual contents.
+        run: |
+          set -euo pipefail
+          git tag -f rolling
+          git push -f origin rolling
+          if gh release view rolling >/dev/null 2>&1; then
+            gh release edit rolling \
+              --title "StreamSelect (rolling) — ${{ steps.meta.outputs.build_id }}" \
+              --notes "Latest build of \`main\`.
+
+          **Build:** \`${{ steps.meta.outputs.build_id }}\`
+          **Built:** $(date -u '+%Y-%m-%d %H:%M UTC')
+          **Commit:** ${{ github.sha }}
+
+          > GitHub shows this release's ORIGINAL publish date, not the last
+          > update — a rolling release is edited in place rather than
+          > recreated, so that date keeps reporting something old. The
+          > **Built** stamp above and the asset's own timestamp are current.
+
+          **Linux:** \`StreamSelect.flatpak\` — install with
+          \`flatpak install --user StreamSelect.flatpak\` (attached by flatpak-rolling.yml).
+
+          **Windows (experimental):** \`StreamSelect-windows-x64.zip\` — unzip anywhere and
+          run \`StreamSelect.exe\`. Unsigned, so SmartScreen asks once: More info → Run
+          anyway (attached by windows-rolling.yml).
+
+          This release always points at the newest code. Re-download to update —
+          there is no in-app updater yet. See the in-app What's New for what
+          changed." \
+              --target "${{ github.sha }}"
+          else
+            gh release create rolling \
+              --title "StreamSelect (rolling) — ${{ steps.meta.outputs.build_id }}" \
+              --notes "Latest build of \`main\`." \
+              --target "${{ github.sha }}"
+          fi
+          # The rolling asset name must NOT contain the version. --clobber only
+          # replaces a file of the SAME name, and the build artifact is called
+          # StreamSelect-<version>-<arch>.dmg — so the moment __version__ moved
+          # (0.25.0 -> 0.26.0) the previous dmg stayed attached beside the new
+          # one and the release offered the tester two downloads, one stale.
+          # That is exactly the "which one is current?" ambiguity this release
+          # model exists to remove. Rolling therefore publishes under a stable
+          # filename; the version lives in the release title and the in-app
+          # build id, which are the places it is actually useful.
+          # (Tagged releases below keep the versioned filename on purpose —
+          # they are immutable, so the version in the name is an asset.)
+          ROLLING_DMG="StreamSelect-${{ matrix.arch }}.dmg"
+          cp "${{ steps.dmg.outputs.dmg }}" "$ROLLING_DMG"
+          gh release upload rolling "$ROLLING_DMG" --clobber
+          # Prune dmgs left by the old versioned naming. Matched narrowly to
+          # THIS arch's versioned form so a future second arch's stable asset
+          # is never deleted by a parallel matrix job.
+          for asset in $(gh release view rolling --json assets --jq '.assets[].name'); do
+            case "$asset" in
+              StreamSelect-*-${{ matrix.arch }}.dmg)
+                echo "Removing stale versioned asset: $asset"
+                gh release delete-asset rolling "$asset" -y || true
+                ;;
+            esac
+          done
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish to GitHub Release
+        if: steps.meta.outputs.is_tag == 'true'
+        # Both matrix jobs target the SAME release with identical metadata. The
+        # action appends assets to an existing release and only overwrites an
+        # asset of the SAME name — the two dmgs have distinct arch-named files,
+        # so neither clobbers the other. Do NOT add any clean/clobber option
+        # (that would delete the sibling job's already-uploaded dmg). Whichever
+        # job wins the create race sets the (identical) metadata.
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: StreamSelect ${{ steps.meta.outputs.tag }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          generate_release_notes: true
+          files: ${{ steps.dmg.outputs.dmg }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

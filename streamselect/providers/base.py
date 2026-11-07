@@ -1,0 +1,114 @@
+"""Provider plugin base class"""
+
+from abc import ABC, abstractmethod
+from typing import List, Optional, Dict, Any, Set, Tuple
+from streamselect.core.models import Channel, Provider
+
+
+class ProviderPlugin(ABC):
+    """Base class for provider plugins"""
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Plugin name"""
+    
+    @property
+    @abstractmethod
+    def provider_type(self) -> str:
+        """Provider type identifier (e.g., 'xtream', 'm3u', 'plex')"""
+    
+    @abstractmethod
+    async def test_connection(self, url: str, username: Optional[str] = None, 
+                            password: Optional[str] = None, **kwargs) -> Tuple[bool, Optional[str]]:
+        """Test connection to provider
+        
+        Returns:
+            (success, error_message)
+        """
+    
+    @abstractmethod
+    async def fetch_channels(self, provider: Provider,
+                           progress_callback: Optional[callable] = None,
+                           media_types: Optional[Set[str]] = None) -> List[Channel]:
+        """Fetch channels from provider
+
+        Args:
+            provider: Provider instance
+            progress_callback: Optional callback(current, total, message)
+            media_types: Restrict the fetch to these ``MediaType`` values
+                (e.g. ``{"live"}``). ``None`` (default) fetches every type —
+                the historical full-catalog behaviour. LIVE-1's live-only
+                refresh passes ``{"live"}`` so the round trip is a single
+                ``get_live_streams`` call rather than the whole catalog.
+                A plugin that has no cheaper per-type fetch may ignore this
+                and always return everything.
+
+        Returns:
+            List of Channel objects
+        """
+    
+    @abstractmethod
+    async def get_categories(self, provider: Provider) -> List[Dict[str, Any]]:
+        """Get available categories from provider
+        
+        Returns:
+            List of category dictionaries
+        """
+    
+    @abstractmethod
+    async def fetch_series_info(self, provider: Provider, series_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch detailed series information including seasons and episodes
+        
+        Args:
+            provider: Provider instance
+            series_id: Provider-specific series identifier
+        
+        Returns:
+            Dictionary containing series info with seasons and episodes, or None if not found
+            Expected structure:
+            {
+                'info': {...},  # Series metadata
+                'seasons': [...],  # List of season dicts
+                'episodes': [...]  # List of episode dicts or nested lists
+            }
+        """
+
+    async def fetch_vod_info(self, provider: Provider, vod_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch detailed movie/VOD information (optional, default: not supported).
+
+        The detail endpoint carries the canonical TMDb id even when the bulk
+        list row omitted it — used by the provider-native tmdb enrichment.
+
+        Args:
+            provider: Provider instance
+            vod_id: Provider-specific movie/VOD identifier
+
+        Returns:
+            Dictionary with VOD info (``{'info': {...}, ...}``), or None if not
+            supported / not found.
+        """
+        # Default implementation: not supported
+        return None
+
+    async def search_content(self, provider: Provider, query: str) -> List[Channel]:
+        """Search for content (optional, default: not supported)
+        
+        Args:
+            provider: Provider instance
+            query: Search query string
+        
+        Returns:
+            List of matching Channel objects
+        """
+        # Default implementation: not supported
+        return []
+    
+    async def get_server_info(self, provider: Provider) -> Optional[Dict[str, Any]]:
+        """Get server/provider information (optional)
+        
+        Returns:
+            Dictionary with server info, or None if not supported
+        """
+        # Default implementation: not supported
+        return None

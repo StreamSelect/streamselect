@@ -1,0 +1,757 @@
+"""Lightbox overlay for browsing similar titles without leaving the current details pane.
+
+Opening a Similar Titles row (right-click, or the ⤢ preview button) raises this
+poster-hero overlay. The user can browse the origin's similar list with the
+prev/next chevrons, dive deeper into any similar title or Other Version
+(rabbit-hole with a Back step), and close to return to the untouched details pane.
+
+Architecture:
+- ``SimilarTitleLightbox`` (this file) is a child QWidget of the main window,
+  raised above everything via ``raise_()``. It owns the backdrop, the prev/next
+  chevrons flanking the card, the navigation state, the background DB read
+  (``_bg_load``) and the ImageCache. It is intentionally thin.
+- ``_LightboxCard`` (``similar_lightbox_card.py``) owns the card's widget tree and
+  populate logic. It emits user intents as signals; this overlay attaches the
+  current channel id and relays them to the main window (the existing external
+  play/queue/favorite/rating/suppress/hide paths — unchanged signatures).
+- Background DB reads marshal results back via the ``_data_ready`` signal (never a
+  QTimer from a worker thread); QPixmaps are only ever built on the main thread.
+"""
+from __future__ import annotations
+
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from typing import TYPE_CHECKING
+
+from loguru import logger
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QPainter, QPixmap
+from PyQt6.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
+
+from streamselect.core.quality_vocab import quality_display
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+from streamselect.gui.similar_lightbox_card import _LightboxCard
+
+if TYPE_CHECKING:
+    from streamselect.core.config import Config
+    from streamselect.core.database import Database
+    from streamselect.core.image_cache import ImageCache
+    from streamselect.core.metadata_manager import MetadataManager
+
+
+# Max titles a facet lens pages through. Generous enough that a prolific actor's
+# set is worth walking, bounded so one click never becomes an unbounded scan.
+_LENS_LIMIT = 24
+
+
+class SimilarTitleLightbox(QWidget):
+    """Full-window overlay that previews a similar title without replacing the details pane."""
+
+    play_requested        = pyqtSignal(str)       # channel_id
+    queue_toggled         = pyqtSignal(str)
+    favorite_toggled      = pyqtSignal(str)
+    hide_requested        = pyqtSignal(str)
+    rating_requested      = pyqtSignal(str, int)  # channel_id, ±1
+    suppression_requested = pyqtSignal(str, bool) # channel_id, suppressed
+    explore_requested     = pyqtSignal(list)      # seed channel_ids (the walked trail)
+    poster_expand_requested = pyqtSignal(QPixmap) # enlarge the main poster (peek)
+    # The one hand-off OUT of the overlay to the channel list, from the lens
+    # strip's "See all in Search" — never something a metadata click does on its
+    # own (the list is invisible behind the overlay).
+    lens_search_requested = pyqtSignal(str, str)  # lens ("person"/"genre"), value
+
+    # Internal signals — background thread emits these; main thread receives them
+    _data_ready = pyqtSignal(str, object)   # channel_id, data dict
+    _lens_ready = pyqtSignal(str, str, object)  # lens, value, [(id, title), …]
+
+    def __init__(
+        self,
+        parent: QWidget,
+        config: "Config",
+        image_cache: "ImageCache",
+        db: "Database",
+        metadata_manager: "MetadataManager",
+    ) -> None:
+        super().__init__(parent)
+        self._config = config
+        self._image_cache = image_cache
+        self._db = db
+        # The canonical metadata seam — same 3-tier (DB cache → provider raw_data →
+        # external API) that the details pane uses; get_metadata also persists on
+        # fetch, so repeat opens are cheap. The lightbox must NOT re-read raw
+        # MetadataDB rows for the main card (only ~0.2% of channels have a stored
+        # row — metadata is fetched on demand), else its card is bare.
+        self._metadata_manager = metadata_manager
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="lightbox")
+
+        # Navigation state
+        self._origin_ids: list[str] = []
+        self._origin_idx: int = 0
+        self._origin_title: str = ""
+        self._nav_stack: list[str] = []
+        # channel_id → title, captured as the user dives so the breadcrumb never
+        # queries the DB on the UI thread (it repaints on every navigation).
+        self._nav_titles: dict[str, str] = {}
+        self._current_id: str = ""
+        self._last_data: dict | None = None   # what the card shows, for on_channel_state
+        # Facet lenses. Clicking a cast name or genre chip re-seeds the overlay
+        # with that facet's titles instead of punching through to the channel
+        # list — the list is hidden behind the overlay, so a click there would
+        # rewrite something the user cannot see and would cost them the trail
+        # (Back/Esc/breadcrumb) this overlay exists to preserve.
+        # ``_lens`` is the set currently being paged; ``_lens_stack`` holds the
+        # whole nav state to restore when Back leaves it, so lenses nest.
+        self._lens: tuple[str, str] | None = None
+        self._lens_stack: list[dict] = []
+        self._pending_lens: tuple[str, str] | None = None
+
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+        self._build_ui()
+        self._data_ready.connect(self._apply_data)
+        self._lens_ready.connect(self._apply_lens)
+        self._image_cache.image_loaded.connect(self._on_image_loaded)
+        self.hide()
+
+    # ------------------------------------------------------------------ #
+    # Public API                                                           #
+    # ------------------------------------------------------------------ #
+
+    def shutdown(self) -> None:
+        """Stop the background executor (registered in the host's cleanup registry).
+
+        This widget owns a pool and had NO shutdown of any kind — no method, no
+        ``closeEvent``, no registration — so its worker outlived the window that
+        created it. Its sibling nine lines away in ``main_window.py``, the trail
+        map, was registered from the day it was written; this one was simply
+        never wired, which is what a hand-maintained registry costs.
+
+        A pool running past teardown is the same fault that has been aborting
+        this app on quit: a thread still executing when the
+        objects it touches are destroyed.
+        """
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def show_preview(
+        self,
+        channel_ids: list[str],
+        index: int,
+        origin_title: str,
+    ) -> None:
+        """Open (or refresh) the lightbox at channel_ids[index]."""
+        if not channel_ids:
+            return
+        self._origin_ids = list(channel_ids)
+        self._origin_idx = max(0, min(index, len(channel_ids) - 1))
+        self._origin_title = origin_title
+        self._nav_stack = []
+        self._lens = None
+        self._lens_stack = []
+        self._pending_lens = None
+        self._card.clear_lens()
+        self._card.set_header(origin_title)
+        self._card.set_back_visible(False)
+        self.resize(self.parent().size())
+        self.show()
+        self.raise_()
+        self.setFocus()
+        self._load_channel(channel_ids[self._origin_idx])
+
+    # ------------------------------------------------------------------ #
+    # UI construction                                                      #
+    # ------------------------------------------------------------------ #
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(12)
+        row.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self._prev_chev = self._make_chevron("nav_prev", "Previous similar title (←)")
+        self._prev_chev.clicked.connect(self._go_prev)
+        row.addWidget(self._prev_chev, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._card = _LightboxCard()
+        self._card.back_clicked.connect(self._go_back)
+        self._card.close_clicked.connect(self._close)
+        self._card.breadcrumb_crumb_clicked.connect(self._on_breadcrumb_crumb_clicked)
+        self._card.play_clicked.connect(lambda: self.play_requested.emit(self._current_id))
+        self._card.queue_clicked.connect(lambda: self.queue_toggled.emit(self._current_id))
+        self._card.favorite_clicked.connect(lambda: self.favorite_toggled.emit(self._current_id))
+        self._card.hide_clicked.connect(lambda: self.hide_requested.emit(self._current_id))
+        self._card.rating_clicked.connect(lambda r: self.rating_requested.emit(self._current_id, r))
+        self._card.suppression_toggled.connect(
+            lambda on: self.suppression_requested.emit(self._current_id, on)
+        )
+        self._card.dive_requested.connect(self._dive_into)
+        self._card.explore_clicked.connect(self._on_explore)
+        # Facet lenses stay INSIDE the overlay; only the lens strip's explicit
+        # "See all in Search" leaves it.
+        self._card.person_clicked.connect(
+            lambda name: self._open_lens("person", name)
+        )
+        self._card.genre_clicked.connect(
+            lambda genre: self._open_lens("genre", genre)
+        )
+        self._card.lens_search_requested.connect(self._on_lens_search)
+        # Poster-peek relay: the card's enlarge request bubbles to the host, which
+        # feeds the SAME enlarged-poster overlay the details pane / trail-map use.
+        self._card.poster_expand_requested.connect(self.poster_expand_requested)
+        row.addWidget(self._card, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._next_chev = self._make_chevron("nav_next", "Next similar title (→)")
+        self._next_chev.clicked.connect(self._go_next)
+        row.addWidget(self._next_chev, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        row_w = QWidget()
+        row_w.setLayout(row)
+        outer.addWidget(row_w)
+
+    def _make_chevron(self, role: str, tip: str) -> QPushButton:
+        btn = _icon_utils.icon_button(role, tip, style="LIGHTBOX_CHEVRON", px=20)
+        _icon_utils.set_button_icon(btn, role, color=_theme.COLOR_LIGHTBOX_MUTED)
+        btn.setFixedSize(44, 44)
+        btn.setFlat(True)
+        return btn
+
+    # ------------------------------------------------------------------ #
+    # Loading                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _load_channel(self, channel_id: str) -> None:
+        self._current_id = channel_id
+        self._update_nav_state()
+        self._card.reset_loading()
+        self._executor.submit(self._bg_load, channel_id)
+
+    def _bg_load(self, channel_id: str) -> None:
+        """Background: fetch channel + metadata + siblings, emit _data_ready.
+
+        Runs off the UI thread. The MAIN card's rich metadata (poster/plot/cast/
+        genres/rating/runtime/year) comes from the canonical
+        ``metadata_manager.get_metadata`` seam — the SAME on-demand 3-tier fetch the
+        details pane uses (DB cache → provider raw_data → external API; it persists
+        on fetch). Reading only the stored ``MetadataDB`` row here left the card bare
+        for the ~99.8% of channels never previously opened in details. Never touches
+        Qt widgets or the ImageCache (poster pixmaps are built on the main thread in
+        ``_apply_data``). Uses ``session_scope`` and returns a plain dict (no ORM /
+        ``MetadataResult`` object escapes the block — everything is mapped to
+        primitives here).
+        """
+        from streamselect.core.database import ChannelDB, MetadataDB, ProviderDB, UserRatingDB
+        from streamselect.core.discovery_engine import channel_thumbnail
+        from streamselect.core.repositories import RepositoryFactory
+        from streamselect.core.repositories.provider import parse_provider_urls
+
+        # Fetch the main card's metadata via the shared seam FIRST, outside our read
+        # session — get_metadata opens (and may write to) its own session, so keeping
+        # them non-overlapping avoids any SQLite lock contention.
+        meta = self._fetch_main_metadata(channel_id)
+
+        data: dict = {}
+        try:
+            with self._db.session_scope(commit=False) as session:
+                ch = session.get(ChannelDB, channel_id)
+                if not ch:
+                    self._data_ready.emit(channel_id, {})
+                    return
+
+                repos = RepositoryFactory(session)
+                # Absolute gate (DR-0007): hidden = inactive ∪ expired ∪ orphaned.
+                hidden = set(repos.providers.get_hidden_provider_ids())
+                provider = session.get(ProviderDB, ch.provider_id) if ch.provider_id else None
+                provider_name = provider.name if provider else None
+                provider_active = bool(ch.provider_id) and ch.provider_id not in hidden
+
+                # Provider base URLs for poster failover (provider-hosted-poster
+                # minority) — mirrors the details pane (main_window_metadata).
+                provider_urls: list[str] = []
+                if provider and provider.urls:
+                    provider_urls = [
+                        u.get("url")
+                        for u in parse_provider_urls(provider.urls)
+                        if u.get("is_active", True) and u.get("url")
+                    ]
+
+                # Similar titles — canonical scoped chokepoint (shared with the
+                # details-pane row): owns candidate selection, content_key dedup and
+                # the visibility gate. PERF GUARD: the strip stays lightweight — name/
+                # year from channel fields and the poster resolved ZERO-NETWORK from
+                # the channel's own provider data via ``channel_thumbnail`` (the same
+                # resolver Discover cards use), falling back to the stored MetadataDB
+                # row. We deliberately do NOT call get_metadata for the (up to 12)
+                # strip items — 12 on-demand network fetches per open would make
+                # browsing janky. Only the MAIN card is enriched on demand.
+                # Badge state maps read ONCE (not per item — perf guard preserved): the
+                # queued-id set and the like/dislike map, exactly as the details-pane
+                # Similar rows are shaped (main_window_metadata._bg_fetch_similar_titles).
+                queue_ids = repos.queue.get_queued_ids()
+                ratings_map = {
+                    r.channel_id: r.rating for r in session.query(UserRatingDB).all()
+                }
+                similar: list[dict] = []
+                for c in repos.channels.get_similar_channels(
+                    channel_id, excluded_provider_ids=hidden, limit=12, config=self._config,
+                ):
+                    c_meta = (
+                        session.get(MetadataDB, c.metadata_id) if c.metadata_id else None
+                    )
+                    similar.append({
+                        "id": c.id,
+                        "name": c.detected_title or c.name,
+                        "year": (c_meta.year if c_meta else None) or c.detected_year,
+                        "poster_url": channel_thumbnail(c) or (c_meta.poster_url if c_meta else None),
+                        "media_type": c.media_type or "",
+                        # Strip-card badges (mirror the details-pane Similar rows). All read
+                        # from already-loaded columns / the two maps above — no extra query.
+                        "user_rating": ratings_map.get(c.id, 0),
+                        "in_queue": c.id in queue_ids,
+                        "is_favorite": bool(c.is_favorite),
+                        "watched": bool(c.watch_completed),
+                        "rating": (c_meta.rating if c_meta else None),
+                        "lang": (c.detected_region or "").strip(),
+                    })
+
+                # Other Versions — stored content_key siblings, provider-scoped with
+                # the SAME gate (hidden/expired sources never surface here either).
+                versions: list[dict] = []
+                if ch.content_key:
+                    for s in repos.channels.get_content_key_siblings(
+                        ch.content_key, channel_id, excluded_provider_ids=hidden,
+                    ):
+                        # Version tag prefers quality; route it through the shared
+                        # display map so "RAW" reads "Uncompressed" on the chip.
+                        _qual = s.get("detected_quality")
+                        tag = (
+                            quality_display(_qual) if _qual
+                            else (s.get("detected_region") or s.get("detected_prefix") or "")
+                        )
+                        versions.append({
+                            "id": s["id"],
+                            "name": s.get("name") or "?",
+                            "tag": tag,
+                            "provider_name": s.get("provider_name"),
+                            # Source badge for the compact chip (icon glyph + colour).
+                            "provider_icon": s.get("provider_icon") or "",
+                            "provider_color": s.get("provider_color") or "",
+                        })
+
+                data = {
+                    "id": channel_id,
+                    "name": ch.detected_title or ch.name,
+                    "media_type": ch.media_type or "",
+                    "provider_name": provider_name,
+                    "provider_active": provider_active,
+                    "provider_urls": provider_urls,
+                    "is_favorite": bool(ch.is_favorite),
+                    "is_hidden": bool(ch.is_hidden),
+                    "in_queue": repos.queue.is_queued(channel_id),
+                    # Real like/dislike from UserRatingDB, real suppression from the
+                    # ChannelDB.is_rec_suppressed column (the old getattr(ch,
+                    # "user_rating"/"is_suppressed") read columns that don't exist, so
+                    # the buttons never lit up).
+                    "user_rating": repos.ratings.get(channel_id) or 0,
+                    "is_suppressed": bool(ch.is_rec_suppressed),
+                    # Main card content: the on-demand MetadataResult (not the stored
+                    # row). Falls back to the channel's ingested detected_year.
+                    "poster_url": meta.poster_url if meta else None,
+                    "year": (meta.year if meta else None) or ch.detected_year,
+                    "rating": meta.rating if meta else None,
+                    "runtime": meta.runtime if meta else None,
+                    "genres": self._extract_genres(meta),
+                    "plot": meta.plot if meta else None,
+                    "cast": self._extract_cast(meta),   # structured [{name, role}]
+                    "similar": similar,
+                    "versions": versions,
+                    "version_count": len(versions),
+                }
+        except Exception:
+            logger.exception("Lightbox bg_load failed for %s", channel_id)
+            data = {}
+
+        # Signal is thread-safe — Qt queues delivery to the main thread
+        self._data_ready.emit(channel_id, data)
+
+    def _fetch_main_metadata(self, channel_id: str):
+        """Fetch the main card's metadata via the shared MetadataManager seam.
+
+        ``get_metadata`` is a coroutine; invoked exactly the way the details pane's
+        ``main_window_metadata.fetch_metadata`` does — a private event loop per call,
+        run to completion, then closed (we are already off the UI thread here). Never
+        raises: on any failure it logs and returns ``None`` so the card degrades to
+        the "no rich data" state rather than blanking entirely.
+
+        Returns:
+            A ``MetadataResult`` (mapped to primitives by the caller) or ``None``.
+        """
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(
+                    self._metadata_manager.get_metadata(channel_id)
+                )
+            finally:
+                loop.close()
+        except Exception:
+            logger.exception("Lightbox metadata fetch failed for %s", channel_id)
+            return None
+
+    @staticmethod
+    def _extract_genres(meta) -> list[str]:
+        """Normalize MetadataDB.genres (JSON list, or a legacy comma string) → list."""
+        if not meta:
+            return []
+        raw = getattr(meta, "genres", None)
+        if isinstance(raw, list):
+            return [str(g).strip() for g in raw if str(g).strip()]
+        if isinstance(raw, str):
+            return [g.strip() for g in raw.split(",") if g.strip()]
+        return []
+
+    @staticmethod
+    def _extract_cast(meta) -> list[dict]:
+        """Structured cast + crew: ``[{"name": …, "role": "cast"|"director"}]``.
+
+        Structured rather than the old pre-joined "A, B, C · dir. D" display
+        line because the card now makes every name a LINK into that person's
+        lens — and a display line cannot be split back into names reliably
+        (commas appear inside names, "dir." is a label, not a separator).
+        The card owns the joining; this owns the identity.
+        """
+        from streamselect.core.preference_engine import _split_directors
+
+        if not meta:
+            return []
+        people: list[dict] = []
+        for p in (getattr(meta, "cast", None) or [])[:5]:
+            if isinstance(p, dict) and (p.get("name") or "").strip():
+                people.append({"name": p["name"].strip(), "role": "cast"})
+        for name in _split_directors(getattr(meta, "director", None) or ""):
+            people.append({"name": name, "role": "director"})
+        return people
+
+    def _apply_data(self, channel_id: str, data: object) -> None:
+        """Called on the main thread via _data_ready signal."""
+        if channel_id != self._current_id or not self.isVisible():
+            return
+        if not isinstance(data, dict) or not data:
+            self._card.show_error("Could not load details")
+            return
+        self._last_data = data
+
+        # Remember this title for the breadcrumb, then repaint it now that the
+        # real name is known (the first paint happens before the load returns).
+        _t = (data.get("name") or "").strip()
+        if _t:
+            self._nav_titles[channel_id] = _t
+            self._update_nav_state()
+
+        self._card.populate(data)
+
+        # Poster images — main thread only. Check the sync cache first, fall back
+        # to async (the shared image_loaded slot routes results back to the card).
+        # Provider-hosted-poster failover (get_image_async provider_urls) applies
+        # ONLY to the main channel's poster — strip posters belong to other
+        # channels/providers, so their base URLs don't match.
+        provider_urls = data.get("provider_urls") or []
+        main_url = self._card.main_poster_url
+        for url in self._card.pending_poster_urls():
+            pix = self._image_cache.get_image_sync(url)
+            if pix:
+                self._card.set_poster_pixmap(url, pix)
+            else:
+                self._image_cache.get_image_async(
+                    url, provider_urls=provider_urls if url == main_url else None
+                )
+
+    def on_channel_state(self, channel_id: str, delta: dict) -> None:
+        """Bus subscriber (D60): the card or a strip row for *channel_id* takes a
+        change made elsewhere, without reloading (no "loading" flash)."""
+        from streamselect.gui.channel_state_bus import row_changes
+        data = self._last_data
+        if not self.isVisible() or not data:
+            return
+        strip = data.get("similar") or []
+        if data.get("id") != channel_id and not any(r.get("id") == channel_id for r in strip):
+            return
+        data = {**data, **(row_changes(delta, data) if data.get("id") == channel_id else {})}
+        data["similar"] = [{**r, **row_changes(delta, r)} if r.get("id") == channel_id else r
+                           for r in strip]
+        self._apply_data(self._current_id, data)
+
+    def _on_image_loaded(self, url: str, pix: QPixmap) -> None:
+        if self.isVisible():
+            self._card.set_poster_pixmap(url, pix)
+
+    # ------------------------------------------------------------------ #
+    # Navigation                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _go_prev(self) -> None:
+        if self._nav_stack:
+            return
+        self._origin_idx = max(0, self._origin_idx - 1)
+        self._load_channel(self._origin_ids[self._origin_idx])
+
+    def _go_next(self) -> None:
+        if self._nav_stack:
+            return
+        self._origin_idx = min(len(self._origin_ids) - 1, self._origin_idx + 1)
+        self._load_channel(self._origin_ids[self._origin_idx])
+
+    def _on_explore(self) -> None:
+        """Open the Explore trail-map seeded with the walked dive path.
+
+        The seed is the trail the user actually walked: every prior stop on the
+        nav-stack plus the title currently shown.  Emitting the id list lets the
+        host build the (data-source-agnostic) trail-map — the same component a later
+        Watch-History view seeds with history instead.
+        """
+        seed = [cid for cid in (self._nav_stack + [self._current_id]) if cid]
+        if seed:
+            self.explore_requested.emit(seed)
+
+    # ── Facet lenses (metadata adjacency) ──────────────────────────────────
+
+    @staticmethod
+    def _lens_label(lens: str, value: str, empty: bool = False) -> str:
+        """Name the facet set in the header, the strip and the breadcrumb.
+
+        One phrasing, used in all three, so the crumb the user clicks back to
+        reads the same as the header they were just looking at.
+        """
+        if lens == "person":
+            return f"Nothing else with {value}" if empty else f"With {value}"
+        return f"No other {value} titles" if empty else f"{value} titles"
+
+    def _open_lens(self, lens: str, value: str) -> None:
+        """A cast/crew name or genre chip was clicked — re-seed with that facet.
+
+        Deliberately does NOT close the overlay or filter the channel list: the
+        list is invisible behind the overlay, so the user would get no feedback
+        and would lose the trail. The hop instead becomes another stop with its
+        own Back step, exactly like a dive.
+        """
+        value = (value or "").strip()
+        if not value or not self.isVisible():
+            return
+        self._pending_lens = (lens, value)
+        self._executor.submit(self._bg_load_lens, lens, value, self._current_id)
+
+    def _bg_load_lens(self, lens: str, value: str, anchor_id: str) -> None:
+        """Background: resolve the facet's titles, emit ``_lens_ready``.
+
+        Routes through the canonical ``get_lens_channels`` — the SAME predicates
+        the channel-list context chip uses — so "See all in Search" lands on the
+        set the lens was paging rather than a second, differently-shaped answer.
+        Returns plain (id, title) tuples: no ORM object crosses the thread.
+        """
+        rows: list[tuple[str, str]] = []
+        try:
+            from streamselect.core.repositories import RepositoryFactory
+
+            with self._db.session_scope(commit=False) as session:
+                repos = RepositoryFactory(session)
+                # Absolute gate (DR-0007) + the user's Global Exclusions, applied
+                # inside the query exactly as the Similar strip applies them.
+                hidden = set(repos.providers.get_hidden_provider_ids())
+                for ch in repos.channels.get_lens_channels(
+                    lens, value,
+                    excluded_provider_ids=hidden,
+                    limit=_LENS_LIMIT,
+                    config=self._config,
+                ):
+                    # The anchor itself always matches its own facet; paging back
+                    # onto the title you clicked FROM reads as a broken hop.
+                    if ch.id == anchor_id:
+                        continue
+                    rows.append((ch.id, ch.detected_title or ch.name))
+        except Exception:
+            logger.exception("Lightbox lens load failed for %s=%s", lens, value)
+            rows = []
+        self._lens_ready.emit(lens, value, rows)
+
+    def _apply_lens(self, lens: str, value: str, rows: object) -> None:
+        """Main thread: enter the facet lens (or say plainly that it is empty)."""
+        if self._pending_lens != (lens, value) or not self.isVisible():
+            return
+        self._pending_lens = None
+        rows = list(rows or [])
+        if not rows:
+            # Honest empty state on the card the user is already looking at —
+            # navigating to nothing would be worse than saying so. The strip's
+            # search link stays live so they can still check the full list.
+            self._card.show_notice(self._lens_label(lens, value, empty=True))
+            return
+
+        label = self._lens_label(lens, value)
+        # Save the whole nav state so Back restores this exact spot — lenses nest.
+        self._lens_stack.append({
+            "origin_ids": list(self._origin_ids),
+            "origin_idx": self._origin_idx,
+            "origin_title": self._origin_title,
+            "nav_stack": list(self._nav_stack),
+            "current_id": self._current_id,
+            "anchor_title": self._nav_titles.get(self._current_id) or self._origin_title,
+            "lens": self._lens,
+        })
+        self._origin_ids = [cid for cid, _ in rows]
+        self._origin_idx = 0
+        self._origin_title = label
+        self._nav_stack = []
+        self._lens = (lens, value)
+        for cid, title in rows:
+            if title:
+                self._nav_titles[cid] = title
+        self._card.set_lens(lens, value)
+        self._card.set_header(label, lens=True)
+        self._card.set_back_visible(True)
+        self._load_channel(self._origin_ids[0])
+
+    def _exit_lens(self) -> None:
+        """Back out of a facet lens, restoring the nav state it was opened from."""
+        if not self._lens_stack:
+            return
+        state = self._lens_stack.pop()
+        self._origin_ids = state["origin_ids"]
+        self._origin_idx = state["origin_idx"]
+        self._origin_title = state["origin_title"]
+        self._nav_stack = state["nav_stack"]
+        self._lens = state["lens"]
+        if self._lens:
+            self._card.set_lens(*self._lens)
+            self._card.set_header(self._lens_label(*self._lens), lens=True)
+        else:
+            self._card.clear_lens()
+            self._card.set_header(self._origin_title)
+        if not (self._nav_stack or self._lens_stack):
+            self._card.set_back_visible(False)
+        self._load_channel(state["current_id"])
+
+    def _on_lens_search(self, lens: str, value: str) -> None:
+        """"See all in Search" — the explicit hand-off to the channel list."""
+        self._close()
+        self.lens_search_requested.emit(lens, value)
+
+    def _dive_into(self, channel_id: str) -> None:
+        """Navigate deeper into similar / other-version content (rabbit-hole mode)."""
+        if not channel_id:
+            return
+        self._nav_stack.append(self._current_id)
+        self._card.set_back_visible(True)
+        self._load_channel(channel_id)
+
+    def _go_back(self) -> None:
+        """One step back: out of the dive first, then out of the facet lens."""
+        if self._nav_stack:
+            prev_id = self._nav_stack.pop()
+            if not (self._nav_stack or self._lens_stack):
+                self._card.set_back_visible(False)
+            self._load_channel(prev_id)
+            return
+        self._exit_lens()
+
+    def _on_breadcrumb_crumb_clicked(self, channel_id: str) -> None:
+        """Handle breadcrumb crumb click — truncate stack and load that channel.
+
+        Truncates the nav_stack so it ends just before the clicked channel,
+        effectively "rewinding" to that point.
+        """
+        if not channel_id:
+            return
+        if channel_id in self._nav_stack:
+            # Find the index of the crumb and truncate the stack there
+            idx = self._nav_stack.index(channel_id)
+            self._nav_stack = self._nav_stack[:idx]
+            if not (self._nav_stack or self._lens_stack):
+                self._card.set_back_visible(False)
+            self._load_channel(channel_id)
+            return
+        # A lens anchor crumb ("Adaptation." in "Adaptation. › With Nicolas
+        # Cage"): unwind the lenses opened after it, then leave the lens itself.
+        for i, entry in enumerate(self._lens_stack):
+            if entry["current_id"] == channel_id:
+                del self._lens_stack[i + 1:]
+                self._exit_lens()
+                return
+
+    def _update_nav_state(self) -> None:
+        in_rabbit_hole = bool(self._nav_stack)
+        n = len(self._origin_ids)
+        if in_rabbit_hole:
+            self._card.set_counter("")
+            self._prev_chev.setEnabled(False)
+            self._next_chev.setEnabled(False)
+        else:
+            idx = self._origin_idx
+            self._card.set_counter(f"{idx + 1} of {n}")
+            self._prev_chev.setEnabled(idx > 0)
+            self._next_chev.setEnabled(idx < n - 1)
+        # Update the breadcrumb trail. Lens anchors precede the origin, so a
+        # facet hop reads "Adaptation. › With Nicolas Cage › Con Air".
+        self._card.update_breadcrumb(
+            self._origin_title, self._origin_ids, self._nav_stack,
+            self._current_id, self._nav_titles,
+            [(e["anchor_title"], e["current_id"]) for e in self._lens_stack],
+        )
+
+    # ------------------------------------------------------------------ #
+    # Dismiss                                                              #
+    # ------------------------------------------------------------------ #
+
+    def _close(self) -> None:
+        self._nav_stack.clear()
+        self._nav_titles.clear()
+        self._lens_stack.clear()
+        self._lens = None
+        self._pending_lens = None
+        self._card.clear_lens()
+        self._card.set_back_visible(False)
+        self.hide()
+
+    def mousePressEvent(self, event) -> None:
+        # Close only on a genuine backdrop click. A press on the card (incl. its
+        # padding) or a chevron is a control interaction — walk up from the widget
+        # under the cursor and bail if the card/chevron is an ancestor.
+        node = self.childAt(event.pos())
+        while node is not None:
+            if node in (self._card, self._prev_chev, self._next_chev):
+                super().mousePressEvent(event)
+                return
+            node = node.parent()
+        self._close()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_Escape:
+            self._close()
+        elif event.key() == Qt.Key.Key_Left and not self._nav_stack:
+            self._go_prev()
+        elif event.key() == Qt.Key.Key_Right and not self._nav_stack:
+            self._go_next()
+        elif event.key() == Qt.Key.Key_Backspace and (self._nav_stack or self._lens_stack):
+            self._go_back()
+        else:
+            super().keyPressEvent(event)
+
+    # ------------------------------------------------------------------ #
+    # Backdrop rendering                                                   #
+    # ------------------------------------------------------------------ #
+
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor(0, 0, 0, 185))
+        painter.end()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # Responsive, grow-to-content sizing lives in one seam on the card so the
+        # width fraction and the 0.9×window height cap are computed in a single
+        # place (shared by any offscreen render).
+        self._card.apply_overlay_size(self.width(), self.height())

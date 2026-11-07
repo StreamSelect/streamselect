@@ -1,0 +1,1346 @@
+"""Database models and connection management"""
+
+from contextlib import contextmanager, nullcontext
+from datetime import datetime, timedelta
+import json as _json
+import threading
+import time
+from sqlalchemy import create_engine, Column, String, Integer, Boolean, DateTime, Float, Text, Index, JSON, text, event, ForeignKey, UniqueConstraint
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
+from sqlalchemy.orm import sessionmaker, Session
+from loguru import logger
+
+from streamselect.core import channel_index_policy, write_gate
+from streamselect.core.schema_migrations import COLUMN_MIGRATIONS
+from streamselect.core.tag_source import TagSourceType, FeederList
+
+from streamselect.core.db_base import Base, JSONEncoded, unicode_lower
+
+#: Log a main-thread commit that blocked at least this long. 100ms is the point
+#: a click stops feeling instant; below it the wait is invisible and logging it
+#: would only add noise.
+SLOW_MAIN_THREAD_COMMIT_MS = 100.0
+
+
+class ChannelDB(Base):
+    """Channel database model"""
+    __tablename__ = "channels"
+
+    id = Column(String, primary_key=True)
+    #: DB-9 surrogate key for content_tags (3-byte int vs. 43-byte ``id``);
+    #: seeded from ``rowid``, then assigned by the trigger in content_tags_rebuild.py.
+    channel_key = Column(Integer, unique=True, index=True)
+    source_id = Column(String, nullable=False, index=True)
+    provider_id = Column(String, nullable=False, index=True)
+    name = Column(String, nullable=False, index=True)
+    stream_url = Column(Text)  # Cached URL, can be reconstructed dynamically
+    
+    category = Column(String, default="", index=True)
+    category_id = Column(String)
+    
+    language = Column(String)  # STORAGE-1a: dead column (100% NULL, no readers) — index dropped, not recreated
+    detected_prefix = Column(String, index=True)   # Separator-delimited prefix token (e.g. "EN", "NF", "4K")
+    detected_quality = Column(String)  # Quality token found anywhere in name (e.g. "HD", "4K", "UHD") — partial index, see __table_args__
+    detected_region = Column(String, index=True)   # Parenthetical lang/region suffix (e.g. "(US)"→"US", "(JP)"→"JP")
+    detected_title = Column(String)                # Bare channel name with all prefixes/suffixes stripped
+    detected_year = Column(String)                 # Year or range extracted from name (e.g. "2025", "1993-2002")
+    logo_url = Column(Text)  # Channel logo/icon
+    cover_url = Column(Text)  # Series/Movie cover art (for future use)
+    epg_channel_id = Column(String)
+    
+    media_type = Column(String, default="unknown", index=True)
+    quality = Column(String, default="unknown", index=True)
+    
+    metadata_id = Column(String, index=True)
+    
+    is_favorite = Column(Boolean, default=False)  # STORAGE-1a: dropped (D58), subsumed by ix_channels_favorite_hidden_name
+    is_hidden = Column(Boolean, default=False)  # hidden from all views — STORAGE-1a: dropped, ix_channels_hidden_name (is_hidden, name) already serves is_hidden alone (left-prefix)
+
+    #: When this row was last present in the source's own channel list.
+    #:
+    #: Stamped on EVERY upsert, including rows whose content did not change —
+    #: which is why it is not ``updated_at``. That column moves only when a
+    #: field actually differs, so a channel the source still lists but has not
+    #: edited keeps an ancient timestamp and is indistinguishable from one that
+    #: has vanished.
+    #:
+    #: NULL means "never observed under this scheme" and is NEVER pruned. The backfill
+    #: stamps every existing row once, so a NULL afterwards can only be a row inserted
+    #: by something that bypassed the catalog upsert — deleting on an absence of evidence
+    #: is exactly the mistake an earlier change recorded about inferring a first launch from empty lists.
+    last_seen_at = Column(DateTime, index=True)
+    is_adult = Column(Boolean, default=False)  # partial index, see __table_args__
+    is_rec_suppressed = Column(Boolean, default=False)  # hidden from recommendations only — partial index, see __table_args__
+    last_played = Column(DateTime)  # partial index, see __table_args__
+    play_count = Column(Integer, default=0)
+    # Watch-completion (VOD movies): resume point + sticky "finished" flag (Slice 1).
+    watch_progress = Column(Integer, default=0)        # resume position, seconds
+    watch_completed = Column(Boolean, default=False)  # ever finished (≥ threshold) — partial index, see __table_args__
+    watch_percent = Column(Integer, default=0)         # 0–100: % watched at last capture (graduated glyph)
+    last_played_via = Column(String)                   # how it was played: manual | queue | alert
+
+    raw_data = Column(JSON)
+    
+    # Special content categorization (PPV, Events, Sports)
+    special_view = Column(String)  # 'ppv', 'live_event', 'sports', or NULL — partial index, see __table_args__
+    event_start_time = Column(DateTime)  # Parsed event date/time for PPV/events — partial index, see __table_args__
+    #: The provider's OWN end time, from the "start:… stop:…" slot form — the
+    #: only shape that sends one; NULL elsewhere, where "still on" falls back to
+    #: event_datetime.DEFAULT_EVENT_DURATION. Read by the Sports lane CASE.
+    event_stop_time = Column(DateTime)  # partial index, see __table_args__
+    sport_type = Column(String)  # 'soccer', 'basketball', 'football', etc. — partial index, see __table_args__
+
+    # ── Signal check (core/stream_probe.py) ──────────────────────────────────
+    # What a probe last saw on this stream. a user abandoned the events work
+    # once because "there was hardly anything ever actually on those channels,
+    # just dead air/black screens even when it said there was an event" — these
+    # three columns are what let the app know that without the user finding out
+    # by clicking.
+    #: live | dead | black | frozen, or a connection verdict (refused/gone/
+    #: unknown/cancelled) which says nothing about the picture.
+    signal_verdict    = Column(String)  # partial index, see __table_args__
+    #: Consecutive checks that found no picture. Only a verdict ABOUT the
+    #: picture moves it: a refused connection or a probe cancelled to give the
+    #: stream back to a Play press is not evidence, and counting it would let
+    #: ordinary viewing mark a working channel dead.
+    signal_dead_streak = Column(Integer, nullable=False, default=0)
+    #: When the last probe ran. UTC-naive, like every other stored time.
+    signal_checked_at = Column(DateTime)  # partial index, see __table_args__
+    league_name = Column(String)  # 'Premier League', 'NBA', 'NFL', etc. — partial index, see __table_args__
+    team_name = Column(String)  # 'Manchester United', 'Lakers', etc. — partial index, see __table_args__
+    #: Fixture opponents (SPORT-4, core/fixture_titles.py); @ fixtures: a=away, b=home.
+    event_team_a = Column(String)
+    event_team_b = Column(String)  # NULL for racks/races/racing-venue events
+    event_metadata = Column(JSONEncoded)  # Additional parsed data (event name, quality, etc.)
+
+    rec_shown_count = Column(Integer, default=0)  # impression counter for recommendation decay — partial index, see __table_args__
+    rec_last_shown  = Column(DateTime, nullable=True)           # for per-session cooldown deduplication
+
+    # Incremental tag fingerprint — a short hash of the decomposer feeder fields.
+    # NULL on new/pre-migration rows; set by _update_tags_in_thread after each successful
+    # per-channel tag pass. When a refresh sees a matching fingerprint the channel is
+    # skipped (tags are unchanged); a mismatch forces a re-tag and fingerprint update.
+    # This is a *catalog/derived* column — NOT in _CATALOG_COLS / _CATALOG_UPDATE_COLS so
+    # the provider upsert never overwrites it (same pattern as detected_* columns).
+    tag_fingerprint = Column(String, nullable=True)
+
+    # Stable content identity key — computed once at ingestion from stored detected_* fields,
+    # never from the raw channel name.  Groups same-production channels that differ only by
+    # source/language/quality variant (e.g. "EN Dark Star movie 2017" and "FR Dark Star movie
+    # 2017" both resolve to "dark star|movie|2017").
+    # Format: "{norm_detected_title}|{media_type}|{detected_year}"; when detected_title is
+    # empty the channel id is used instead, so the row never collapses with unrelated rows.
+    # NULL on pre-migration rows; backfilled via ContentKeyBackfillTask (main_window.py).
+    # NOT in _CATALOG_COLS / _CATALOG_UPDATE_COLS — the provider upsert never overwrites it.
+    content_key = Column(String, index=True, nullable=True)
+
+    # Canonical TMDb id shipped by the provider (Xtream ``raw_data["tmdb"]``), captured
+    # once at ingestion via ``valid_tmdb_id`` (content_identity) and stored here — never
+    # re-parsed from raw_data at read time.  When present it is authoritative and drives
+    # ``content_key`` (``tmdb:{id}|{media_type}``, namespaced because TMDb numbers movies
+    # and series separately).  NULL when the provider ships no id (or a sentinel).
+    # A catalog-derived field, but the enrichment layer also writes ids the LIST row
+    # omitted, so the upsert preserves it via COALESCE (see provider_loader._flush_batch)
+    # rather than blindly overwriting to NULL each refresh.
+    detected_tmdb_id = Column(String, nullable=True)
+
+    detected_rating = Column(Float, nullable=True, index=True)    # DB-4: rating_from_raw()
+    detected_added  = Column(Integer, nullable=True, index=True)  # DB-4: added_from_raw()
+    # tmdb enrichment provenance marker (Phase 2 — see tmdb_enrichment_manager.py).
+    # Encodes HOW/whether a row's tmdb id was resolved, driving the fetch-once guard and
+    # the "Missing TMDb data" analytics funnel:
+    #   NULL — unattempted (no id yet; a lazy-fetch candidate) · 'list' — straight from
+    #   the provider list row (Phase-1 harvest) · 'propagated' — adopted from a confident
+    #   same-title sibling (free, no network) · 'fetched' — via the provider's detail
+    #   endpoint (get_vod/series_info) · 'none' — detail endpoint attempted but carried
+    #   no id (the residual gap only the external TMDb API could resolve).
+    # Guarantees an idless row is fetched at most once; on content refresh only STILL-idless
+    # rows are reset to NULL (reset_tmdb_enrich_state) so resolved rows keep their provenance.
+    # NOT in _CATALOG_UPDATE_COLS — the provider upsert never overwrites an existing marker.
+    tmdb_enrich_state = Column(String, nullable=True)  # partial index, see __table_args__
+
+    # Genre-harvest fetch-once marker (see tmdb_enrichment_manager.py backfill_missing_genres).
+    # The list raw_data for MOVIES is sparse (no genre/plot/cast); their real genres live only
+    # in the per-title get_vod_info response. A one-time background pass fetches that endpoint for
+    # movies whose linked MetadataDB row has empty genres and fills them. This marks the attempt so
+    # a residual (detail blob also carried no genre) is never re-fetched:
+    #   NULL       — not yet attempted (a genre-backfill candidate when metadata.genres is empty)
+    #   'fetched'  — detail endpoint carried a genre; harvested into the metadata row
+    #   'none'     — detail endpoint attempted but carried no genre (leave it be)
+    # Movie-scoped (series list rows already carry genre). NOT in _CATALOG_UPDATE_COLS.
+    genre_enrich_state = Column(String, nullable=True)  # partial index, see __table_args__
+
+    # Background metadata enrichment (see core/metadata_enrichment_queue.py). A row is a
+    # candidate when it has no cached MetadataDB row, or one older than
+    # config.metadata_old_content_ttl_days — that freshness check is what actually excludes
+    # a processed row from future candidate queries, so success needs no marker here. This
+    # pair only bounds RETRIES on a row whose fetch keeps failing:
+    #   metadata_enrich_state    — NULL (eligible) or 'failed' (attempts exhausted; skipped
+    #                               permanently rather than re-hit every drain).
+    #   metadata_enrich_attempts — consecutive failure count; reset to 0 on a success.
+    # NOT in _CATALOG_UPDATE_COLS — the provider upsert never overwrites this bookkeeping.
+    metadata_enrich_state = Column(String, nullable=True)  # partial index, see __table_args__
+    metadata_enrich_attempts = Column(Integer, default=0)
+
+    # Audio annotation — extracted from sub/dub/multi parentheticals at ingestion (compute-once).
+    # Shape: {"form": str, "audio": [str], "dub": [str], "sub": [str]}
+    # "form" is one of "Dub", "Original", "Multi", "Dual", "" (unknown).
+    # Lists hold canonical language names (same names as in language: facets).
+    # NULL when no sub/dub annotation was found in the channel name.
+    # NOT in _CATALOG_COLS / _CATALOG_UPDATE_COLS — the provider upsert never overwrites it.
+    detected_audio = Column(JSONEncoded, nullable=True)
+
+    # Canonical genre(s) — derived once at ingestion from raw_data["genre"] via
+    # filter_utils.genres_from_raw() (segment-split on '/'/',' + normalize_genre()
+    # cross-language alias collapse + HTML-entity unescape), computed alongside the
+    # other detected_* fields in update_detected_prefixes() (core/repositories/channel.py).
+    # detected_genre: the FIRST segment's canonical label (e.g. "Drama") — cheap
+    #   indexed equality read for card display (ContentCard.genre).
+    # detected_genres: ALL segments' canonical labels as a JSON list (e.g.
+    #   ["Action & Adventure", "Science Fiction"]) — powers get_by_genre's
+    #   membership match via json_each so a multi-genre row still appears on
+    #   every shelf it belongs to (#genre-perf).  NULL when the channel carries
+    #   no provider genre.  Backfilled for pre-existing rows by
+    #   DetectedGenreBackfillTask (streamselect/core/migrations/detected_genre_backfill.py).
+    # NOT in _CATALOG_COLS / _CATALOG_UPDATE_COLS — the provider upsert never overwrites it.
+    detected_genre  = Column(String, nullable=True)  # partial index, see __table_args__
+    detected_genres = Column(JSONEncoded, nullable=True)
+
+    # Restricted-content detection (user-reported gap): the provider's ``is_adult``
+    # API flag is unreliable — some providers never set it even for content that is
+    # unambiguously marked by naming convention (XXX/ADULT/X-prefix). Computed once
+    # at ingestion via channel_name_utils.is_restricted_name() in the same
+    # update_detected_prefixes() pass that computes the other detected_* fields;
+    # NEVER re-derived at query/render time. Separate provenance from ``is_adult`` (a
+    # provider-supplied fact) — neither column overwrites the other. Read alongside
+    # ``is_adult`` by the adult-mode gate (ChannelRepository._apply_channel_filters /
+    # discovery_engine._apply_adult_filter).
+    # "restricted" is a deliberately neutral internal name — user-facing surfaces keep
+    # the "Adult" label. Pre-existing rows: RestrictedBackfillTask.
+    detected_restricted = Column(Boolean, default=False)  # partial index, see __table_args__
+
+    # Category-marker cleanup (user-reported gap): provider category strings often
+    # carry a leading pipe-delimited marker that duplicates channel-name language
+    # info (e.g. "|EN| ANIME", "|AR-SUB| AMAZON PRIME", "|DE| FILME 1990-2023").
+    # Computed once at ingestion via channel_name_utils.parse_category_marker() in
+    # the same update_detected_prefixes() pass that computes the other detected_*
+    # fields; the raw ``category`` column is NEVER modified (keeps provenance).
+    #   detected_collection: the CLEAN category, marker stripped and whitespace
+    #     collapsed ("ANIME"). NULL when the channel has no category.
+    #   detected_collection_language: a plain-code marker ("EN") that DISAGREES with
+    #     the channel's own detected_prefix — kept as its own "other language" chip
+    #     value rather than silently dropped. NULL when the marker was adopted
+    #     as/matches the prefix, or there was no plain marker.
+    #   detected_collection_subdub: a compound "CODE-SUB"/"CODE-DUB" marker's
+    #     chip-ready display text ("AR-SUB"). The same marker also feeds the
+    #     detected_audio sub/dub facet; this is only its chip's display text.
+    # NOT in _CATALOG_COLS / _CATALOG_UPDATE_COLS — the provider upsert never
+    # overwrites these. Backfilled for pre-existing rows by
+    # CategoryMarkerBackfillTask (streamselect/core/migrations/category_marker_backfill.py).
+    detected_collection          = Column(String, index=True, nullable=True)
+    detected_collection_language = Column(String, nullable=True)
+    detected_collection_subdub   = Column(String, nullable=True)
+    detected_exclusion_code = Column(String, nullable=True)  # region_codes.exclusion_code(prefix)
+    # Provider-appended trailing credits lifted from the channel name at
+    # ingestion, e.g. "NICOLAS CAGE" from
+    # "EN - Adaptation. 4K (2002) NICOLAS CAGE". parse_channel_name's step 1b
+    # already identifies this span as extra credits (it distinguishes it from a
+    # real subtitle and from a qualifier) and used to discard it.
+    #
+    # An INFERENCE, never authoritative cast: it is whatever the provider typed
+    # after the year. Surfaced as a low-confidence "person" tag with provenance,
+    # deliberately NOT merged into MetadataDB.cast — real credits and a filename
+    # guess must stay distinguishable.
+    detected_name_cast           = Column(String, nullable=True)
+    # Collection/studio the parser recognised AFTER a mid-name year, e.g.
+    # "Hallmark" from "Christmas At Castle Hart (2021) Hallmark".  Kept apart
+    # from detected_collection (the cleaned PROVIDER CATEGORY) because they are
+    # different feeders and a title legitimately belongs to BOTH — the provider
+    # files it under CHRISTMAS while the name says Hallmark.  Both become
+    # collection: tags, the provider's denoted and this one inferred, which is
+    # what lets one title carry several collections at all.
+    detected_name_collection     = Column(String, nullable=True)  # partial index, see __table_args__
+    # Episode identity lifted out of the NAME at ingestion. 960 rows in the
+    # a large library are 48 series whose provider filed every episode as a
+    # separate movie, and the "S01E57" in the name is what made them look
+    # distinct — strip it and content_key collapses 414 Konusanlar rows into
+    # one card. Stored as the provider wrote them ("01", "57"), so a display
+    # keeps the zero-padding and a sort can int() at that point.
+    detected_season              = Column(String, nullable=True)
+    detected_episode             = Column(String, nullable=True)  # partial index, see __table_args__
+
+    # Provider-ordering and header-derived category (live channels only)
+    # source_num: the `num` field from the Xtream API — provider's canonical display order
+    # source_category: label extracted from the nearest preceding ##...## header in the stream list
+    # source_quality_flags: comma-separated quality markers decoded from that header (HD,RAW,60FPS,UHD)
+    source_num           = Column(Integer, index=True)
+    source_category      = Column(String)  # partial index, see __table_args__
+    source_quality_flags = Column(String)
+
+    # User-defined category — assigned via "Add to Category" right-click action.
+    # Appears as a custom Discovery shelf; influences recommendations via category_mood.
+    # category_mood: "like" | "curious" | "not_interested" | "dislike" | None (neutral)
+    user_category = Column(String)  # partial index, see __table_args__
+    category_mood = Column(String)
+
+    added_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    # Composite indexes for the channel list, which filters on two columns and
+    # sorts on a third — a shape no single-column index can serve, and there are
+    # 33 of those. The third is PARTIAL, and it is there to undo damage the
+    # second one does: why, on which SQLite builds, and every measurement,
+    # in streamselect/core/migrations/query_indexes.py.
+    __table_args__ = (
+        Index("ix_channels_hidden_type_name", "is_hidden", "media_type", "name"),
+        Index("ix_channels_hidden_name", "is_hidden", "name"),
+        Index("ix_channels_favorite_hidden_name", "is_hidden", "name",
+              sqlite_where=text("is_favorite = 1")),
+    ) + channel_index_policy.CHANNEL_PARTIAL_INDEXES  # STORAGE-1a
+
+
+class MetadataDB(Base):
+    """Metadata database model"""
+    __tablename__ = "metadata"
+    
+    id = Column(String, primary_key=True)
+    title = Column(String, nullable=False, index=True)
+    
+    year = Column(Integer, index=True)
+    runtime = Column(Integer)
+    
+    genres = Column(JSONEncoded)
+    media_type = Column(String, default="unknown", index=True)
+
+    # People (cast is the new name, actors kept for backwards compatibility)
+    actors = Column(JSONEncoded)  # Deprecated: use cast instead
+    cast = Column(JSONEncoded)  # [{name, character, photo_url}]
+    crew = Column(JSONEncoded)  # [{name, job, department}]
+    director = Column(String)
+    
+    plot = Column(Text)
+    tagline = Column(Text)
+    original_language = Column(String)  # LANG-2: TMDb's original language, as a name
+    alt_titles = Column(JSONEncoded)  # other names it is filed under (the provider's o_name, e.g. 'Oskyldigt blod')
+    
+    # Ratings
+    rating = Column(Float)
+    rating_count = Column(Integer)
+    
+    # Images
+    poster_url = Column(Text)
+    backdrop_url = Column(Text)
+    
+    # Links
+    imdb_id = Column(String, index=True)
+    tmdb_id = Column(String, index=True)
+    trailer_url = Column(Text)
+    
+    # Technical
+    content_rating = Column(String)  # PG-13, TV-MA, etc.
+    release_date = Column(String)  # ISO date format
+    
+    source = Column(String, default="unknown")
+    fetched_at = Column(DateTime, default=datetime.now)
+
+
+class ProviderDB(Base):
+    """Provider database model"""
+    __tablename__ = "providers"
+    
+    id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    type = Column(String, nullable=False)
+    
+    url = Column(Text, nullable=False)
+    urls = Column(JSONEncoded)  # List of ProviderURL objects
+    username = Column(String)
+    password = Column(String)  # TODO: Encrypt this
+    
+    refresh_schedule = Column(String, default="manual")
+    last_refresh = Column(DateTime)
+    last_catalog_refresh_at = Column(DateTime, nullable=True)  # Stamped on refresh success (SPORT-7); NULL falls back to MAX(channels.last_seen_at)
+    last_live_refresh_at = Column(DateTime, nullable=True)  # Stamped on live-only OR full refresh success (LIVE-1); a full refresh stamps both
+    
+    is_active = Column(Boolean, default=True)
+    last_sync = Column(DateTime)
+    last_error = Column(Text)
+    
+    total_channels = Column(Integer, default=0)
+    total_categories = Column(Integer, default=0)
+    max_connections = Column(Integer, default=1)  # Maximum simultaneous streams allowed by provider
+
+    # Customization
+    icon = Column(String, default="")       # User-chosen emoji/icon e.g. "🔥" or "⭐"
+    color = Column(String, default="")      # CSS hex color for sidebar label e.g. "#ff8800"
+    epg_url = Column(String, default="")   # XMLTV EPG feed URL
+    force_adult = Column(Boolean, default=False)  # Treat all channels as adult regardless of is_adult flag
+    epg_last_fetched = Column(DateTime, nullable=True)      # When EPG was last downloaded
+    epg_data_start = Column(DateTime, nullable=True)        # Earliest start_time in fetched EPG data
+    epg_data_end = Column(DateTime, nullable=True)          # Latest stop_time in fetched EPG data
+    epg_refresh_hours_before = Column(Integer, default=48)  # Refresh when data expires within N hours
+    epg_enabled = Column(Boolean, default=True)  # If False, skip EPG fetch and exclude from EPG surfaces
+    epg_refresh_interval = Column(String, default="default")  # Per-source throttle: "default"|"every_open"|"4h"|…|"when_stale"
+    epg_url_override = Column(String, nullable=True)  # User-supplied XMLTV URL; blank/NULL = use auto-built epg_url
+    # The HOST that last served a parseable guide, remembered so the next fetch
+    # and the displayed URL start from a host known to work rather than from
+    # whichever one happens to sit first in `urls`.
+    #
+    # A host, deliberately — never the built URL. The `epg_url` column above is
+    # a cached full URL including credentials, with no invalidation, and a
+    # re-subscription on the same row left it serving the previous account's
+    # credentials for 11 days behind a green AUTODETECTED badge. Storing only
+    # the host keeps credentials derived live at every fetch, so that cannot
+    # recur, while still letting a working host survive a restart.
+    epg_last_good_base_url = Column(String, nullable=True)
+    epg_unnamed_refetch_attempted = Column(Boolean, default=False)  # Persistent guard: the one-time re-fetch to name legacy nameless guide rows has been tried (reset on content refresh)
+    # Condensed cause of the LAST failed guide fetch, and when it failed; both
+    # cleared on the next success (core/epg_fetch.py is the only writer). Without
+    # them the freshness line could only blame the SOURCE, which was flatly wrong
+    # whenever OUR fetch failed or the user's URL override was the broken thing.
+    epg_last_fetch_error = Column(Text, nullable=True)
+    epg_last_fetch_error_at = Column(DateTime, nullable=True)
+
+    # Account info cached from provider API
+    account_status = Column(String)         # Active, Expired, Banned, Disabled
+    account_exp_date = Column(DateTime)     # Subscription expiry
+    account_created_at = Column(DateTime)   # Account creation date
+    account_active_cons = Column(Integer, default=0)  # Active connections at last check
+
+    added_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class FilterDB(Base):
+    """Filter database model"""
+    __tablename__ = "filters"
+    
+    id = Column(String, primary_key=True)
+    name = Column(String, nullable=False)
+    description = Column(Text)
+    
+    is_global = Column(Boolean, default=False, index=True)
+    provider_id = Column(String, index=True)
+    
+    rules = Column(JSON, nullable=False)
+    
+    is_enabled = Column(Boolean, default=True)
+    order = Column(Integer, default=0)
+    
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class AlertPatternDB(Base):
+    """Watch alert pattern database model"""
+    __tablename__ = "alert_patterns"
+    
+    id = Column(String, primary_key=True)
+    name = Column(String, nullable=False, index=True)
+    description = Column(Text)
+    
+    pattern_type = Column(String, nullable=False, index=True)  # keyword, regex, genre, actor, quality, media_type
+    pattern_value = Column(String, nullable=False)
+    
+    applies_to = Column(String, default="all", index=True)  # all, live, series, movies
+
+    # WL-1. Whole-word is the settled default ("NFL" matched Inflammation);
+    # False is the "contains, anywhere" escape hatch. exclude_terms is a plain
+    # list. All of these read ONLY through core/watchlist_matching.py.
+    whole_word = Column(Boolean, default=True)
+    exclude_terms = Column(JSONEncoded)
+    # phrase | all | any — how the comma-separated include terms combine.
+    match_mode = Column(String, default="phrase")
+    # Off for old and new rules alike (Q2): two defaults for one setting means
+    # the checkbox can never be predicted from the setting.
+    search_description = Column(Boolean, default=False)
+    # Stored but NOT surfaced: is_live is 0 for all many programmes on the
+    # a large library (only ever set from a superscript badge the feeds do not
+    # use), so a checkbox would silently match nothing. See watchlist_matching.
+    live_only = Column(Boolean, default=False)
+    # notify | download | record. Only notify is reachable today; Download and
+    # Record become VALUES here rather than migrations once the transfer engine
+    # lands — that is only free if the column exists from the start.
+    action = Column(String, default="notify")
+
+    is_enabled = Column(Boolean, default=True, index=True)
+    last_checked = Column(DateTime)
+    
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class AlertMatchDB(Base):
+    """Alert match database model - tracks channels matching alert patterns"""
+    __tablename__ = "alert_matches"
+    
+    id = Column(String, primary_key=True)
+    alert_pattern_id = Column(String, nullable=False, index=True)
+    channel_id = Column(String, nullable=False, index=True)
+    
+    matched_at = Column(DateTime, default=datetime.now, index=True)
+    is_viewed = Column(Boolean, default=False, index=True)
+    is_dismissed = Column(Boolean, default=False, index=True)
+    
+    created_at = Column(DateTime, default=datetime.now)
+
+
+class SeasonDB(Base):
+    """Season database model - for TV series hierarchy"""
+    __tablename__ = "seasons"
+
+    id = Column(String, primary_key=True)  # {provider_id}_{series_id}_s{season_num} (provider-scoped)
+    series_id = Column(String, nullable=False, index=True)  # ChannelDB.source_id, NOT .id (D52)
+    provider_id = Column(String, nullable=False, index=True)
+
+    season_number = Column(Integer, nullable=False, index=True)
+    name = Column(String)  # e.g., "Season 1"
+    cover_url = Column(Text)  # For future cover art display
+    episode_count = Column(Integer, default=0)
+
+    # Series info (denormalized for convenience)
+    series_name = Column(String, index=True)
+
+    # Season-grain favorite (Wave 2 Slice 2B). Schema-only for now — no UI writes
+    # this column yet; episode-grain favoriting shipped first (see EpisodeDB.is_favorite).
+    is_favorite = Column(Boolean, default=False)
+
+    raw_data = Column(JSON)
+
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class EpisodeDB(Base):
+    """Episode database model - for TV series episodes"""
+    __tablename__ = "episodes"
+    
+    id = Column(String, primary_key=True)  # {provider_id}_{episode_id}
+    season_id = Column(String, nullable=False, index=True)  # Links to SeasonDB.id
+    series_id = Column(String, nullable=False, index=True)  # ChannelDB.source_id, NOT .id (D52)
+    provider_id = Column(String, nullable=False, index=True)
+    
+    episode_id = Column(String, nullable=False)  # From API
+    episode_num = Column(Integer, nullable=False, index=True)
+    season_num = Column(Integer, nullable=False, index=True)
+    
+    title = Column(String, nullable=False, index=True)
+    duration = Column(String)  # e.g., "45:30"
+    container_extension = Column(String, default="mp4")
+    stream_url = Column(Text)  # Cached playback URL
+    cover_url = Column(Text)  # Episode thumbnail for future use
+
+    # Episode-grain metadata lifted from raw_data at ingestion (Wave 4 — an earlier change).
+    # raw_data always carried this verbatim from the provider; these columns are
+    # the ONE place it's parsed out (compute-once-at-ingestion, the project rules) so
+    # render code never re-reads raw_data. All nullable, no masking defaults —
+    # NULL means "the provider didn't send it", not "unrated"/"no plot".
+    plot = Column(Text)        # Episode-specific overview/plot (falls back to the series plot in the UI)
+    air_date = Column(String)  # Provider's ISO date verbatim, e.g. "1968-09-20" — never parsed to a date type
+    rating = Column(Float)     # Episode rating (typically 0-10); junk source values coerce to None, never raise
+    still_url = Column(Text)   # Episode-specific still image, distinct from cover_url's movie_image fallback
+
+    # Playback tracking
+    is_watched = Column(Boolean, default=False, index=True)  # sticky "finished" flag
+    watch_progress = Column(Integer, default=0)  # resume position, seconds
+    watch_completed = Column(Boolean, default=False, index=True)  # sticky completion flag (mirrors ChannelDB)
+    watch_percent = Column(Integer, default=0)   # 0–100: % watched at last capture (graduated glyph)
+    last_played = Column(DateTime, index=True)
+    play_count = Column(Integer, default=0)
+    last_played_via = Column(String)             # how it was played: manual | queue | alert
+
+    # Episode-grain favorite (Wave 2 Slice 2B) — independent of the parent
+    # series' ChannelDB.is_favorite; toggled from the details-pane favorite
+    # button in episode mode and the series-tree row context menu.
+    is_favorite = Column(Boolean, default=False)
+
+    # Series info (denormalized for convenience)
+    series_name = Column(String, index=True)
+
+    raw_data = Column(JSON)
+
+    added_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class EpgProgramDB(Base):
+    """EPG programme — one scheduled broadcast slot from an XMLTV feed."""
+    __tablename__ = "epg_programmes"
+
+    id             = Column(Integer, primary_key=True, autoincrement=True)
+    provider_id    = Column(String, nullable=False, index=True)
+    channel_epg_id = Column(String, nullable=False, index=True)  # XMLTV <channel id="...">
+    channel_db_id  = Column(String, nullable=True,  index=True)  # matched ChannelDB.id
+    channel_name   = Column(String, nullable=False, default="")  # XMLTV display-name; enables DB-only fuzzy relink
+    title          = Column(String, nullable=False,  index=True)
+    description    = Column(Text, default="")
+    start_time     = Column(DateTime, nullable=False, index=True)
+    stop_time      = Column(DateTime, nullable=False, index=True)
+    is_live        = Column(Boolean, default=False)  # ᴸᶦᵛᵉ badge stripped from title
+    is_new         = Column(Boolean, default=False)  # ᴺᵉʷ badge stripped from title
+
+
+class UserRatingDB(Base):
+    """User rating for a movie or series — +1 (like) or -1 (dislike)."""
+    __tablename__ = "user_ratings"
+
+    channel_id = Column(String, primary_key=True)   # 1:1 with ChannelDB; upsert replaces
+    rating     = Column(Integer, nullable=False)     # +1 or -1
+    rated_at   = Column(DateTime, default=datetime.utcnow)
+
+
+class DownloadDB(Base):
+    """One VOD saved (or being saved) to the local library.
+
+    Denormalized the same way ``WatchQueueDB`` is, and for the same reason: a
+    provider refresh can replace the channel row this came from, and a file
+    already on disk must not lose its name because its source id was recycled.
+
+    The URL is stored because it is what gets resumed against. Xtream VOD URLs
+    are static files (``/movie/<user>/<pass>/<id>.mkv``), which is what makes an
+    HTTP Range resume possible at all — and why this is a direct GET rather
+    than mpv ``--stream-record``: a preempted download has to CONTINUE, not
+    start again.
+    """
+    __tablename__ = "downloads"
+
+    id            = Column(String, primary_key=True)          # uuid4
+    channel_id    = Column(String, nullable=False, index=True)  # no FK — see above
+    provider_id   = Column(String, nullable=False, index=True)  # whose connection slot it takes
+    channel_name  = Column(String, nullable=False, default="")  # denormalized
+    source_url    = Column(String, nullable=False)
+    dest_path     = Column(String, nullable=False)
+
+    #: queued | running | paused | completed | failed
+    #: "paused" covers BOTH a user pause and a preemption by playback: the
+    #: difference is `paused_by_playback`, because only one of them should
+    #: resume by itself when the slot frees.
+    state         = Column(String, nullable=False, default="queued", index=True)
+    paused_by_playback = Column(Boolean, nullable=False, default=False)
+
+    total_bytes      = Column(Integer, nullable=True)   # None until the server says
+    downloaded_bytes = Column(Integer, nullable=False, default=0)
+    error            = Column(Text, nullable=True)
+
+    position   = Column(Integer, nullable=False, default=0)   # queue order
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    history_cleared = Column(Boolean, nullable=False, default=False)  # forget hides, never deletes
+
+
+class RecordingDB(Base):
+    """One live programme recorded (or scheduled to be) to the local library.
+
+    Denormalized like ``DownloadDB`` and for the same reason: a provider refresh
+    can replace the channel row this came from, and a file on disk must not lose
+    its name because a stream id was recycled.
+
+    **The stop time is NOT stored.** It is computed from the guide window plus
+    the offsets on every scheduler tick, because a running recording can be
+    extended in real time and a frozen stop time makes that impossible — the
+    design note is explicit: *"the live extend is the one that saves an event,
+    and it is the reason the recorder must not compute its stop time once at the
+    start."* ``effective_start``/``effective_end`` below are the only readers.
+
+    Offsets are **signed**, not "record extra": someone skipping a pregame hour
+    wants ``-20 min`` on the start as legitimately as ``+20`` on the end. The
+    shipped defaults are 2 minutes early and 15 minutes late, because sport
+    overruns, always.
+
+    Times are **UTC-naive**, matching EPG ``start_time``/``stop_time``
+    (the project rules: convert for display via ``epg_utils.to_local``, never store a
+    local time).
+    """
+    __tablename__ = "recordings"
+
+    id            = Column(String, primary_key=True)          # uuid4
+    channel_id    = Column(String, nullable=False, index=True)  # no FK — see above
+    provider_id   = Column(String, nullable=False, index=True)  # whose slot it takes
+    channel_name  = Column(String, nullable=False, default="")  # denormalized
+    programme_title = Column(String, nullable=False, default="")
+    source_url    = Column(String, nullable=False)
+    dest_path     = Column(String, nullable=False)
+
+    #: scheduled | recording | completed | failed | cancelled
+    state         = Column(String, nullable=False, default="scheduled", index=True)
+
+    #: The guide's window, unpadded — what the programme itself claims.
+    programme_start = Column(DateTime, nullable=False, index=True)  # UTC-naive
+    programme_end   = Column(DateTime, nullable=False)              # UTC-naive
+
+    #: Signed offsets applied to the guide window. Negative starts earlier /
+    #: ends earlier; positive starts later / ends later.
+    pad_start_seconds = Column(Integer, nullable=False, default=-120)
+    pad_end_seconds   = Column(Integer, nullable=False, default=900)
+    #: Live extension, added to the end. Mutable while recording — this is the
+    #: field "extend a running recording in real time" writes to.
+    extend_seconds    = Column(Integer, nullable=False, default=0)
+
+    #: Whether this recording may take the connection off playback. Per-recording
+    #: because "warn and take" is the default but not a law.
+    preempt_playback = Column(Boolean, nullable=False, default=True)
+
+    recorded_bytes = Column(Integer, nullable=False, default=0)
+    error          = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    @property
+    def effective_start(self) -> datetime:
+        """When the recorder should begin: guide start plus the signed offset."""
+        return self.programme_start + timedelta(seconds=self.pad_start_seconds)
+
+    @property
+    def effective_end(self) -> datetime:
+        """When the recorder should stop, recomputed every read.
+
+        Includes ``extend_seconds``, so extending a running recording moves the
+        stop time immediately rather than at the next schedule.
+        """
+        return self.programme_end + timedelta(
+            seconds=self.pad_end_seconds + self.extend_seconds)
+
+
+class WatchQueueDB(Base):
+    """Ordered watch queue — content the user wants to watch soon.
+
+    Channel-grain rows (movies/live/whole series) leave the ``episode_*``
+    columns NULL. Episode-grain rows (Wave 2 Slice 2B) additionally set them;
+    ``channel_id``/``channel_name`` on an episode-grain row still carry the
+    PARENT SERIES so provider/availability joins (see WatchQueueRepository.get_all)
+    keep working unchanged for both grains.
+    """
+    __tablename__ = "watch_queue"
+
+    id           = Column(Integer, primary_key=True, autoincrement=True)
+    channel_id   = Column(String, nullable=False)            # no FK — channels may be replaced on refresh
+    channel_name = Column(String, nullable=False, default="")  # denormalized — survives channel ID changes
+    media_type   = Column(String, nullable=False, default="")  # "movie", "series", "live"
+    source_id    = Column(String, nullable=False, default="")  # provider's native stream ID (fallback lookup)
+    position     = Column(Integer, nullable=False, default=0)
+    added_at     = Column(DateTime, default=datetime.utcnow)
+
+    # Episode-grain fields (Wave 2 Slice 2B) — NULL on channel-grain rows.
+    # Denormalized (episode_num/episode_title survive an orphaned EpisodeDB row,
+    # same rationale as channel_name above).
+    episode_id    = Column(String, nullable=True, index=True)  # EpisodeDB.id
+    season_num    = Column(Integer, nullable=True)
+    episode_num   = Column(Integer, nullable=True)
+    episode_title = Column(String, nullable=True)
+
+
+class StreamRetryDB(Base):
+    """Tracks streams that failed validation so they can be re-checked later."""
+    __tablename__ = "stream_retry"
+
+    id              = Column(String, primary_key=True)
+    channel_id      = Column(String, nullable=False, unique=True)
+    channel_name    = Column(String, nullable=False, default="")
+    stream_url      = Column(String, nullable=False, default="")
+    first_failed_at = Column(DateTime, default=datetime.utcnow)
+    last_checked_at = Column(DateTime)
+    next_check_at   = Column(DateTime)
+    attempt_count   = Column(Integer, default=0)
+    last_error      = Column(String)
+    status          = Column(String, default="pending")  # "pending" | "online"
+
+    # ── Graduated play-failure ledger (roadmap S3) ───────────────────────────
+    # Tracks USER-INITIATED play failures separately from ``attempt_count``
+    # (the background checker's own re-probe count, above). Every failed play
+    # attempt — including advisory HTTP codes (401/403/511) — increments
+    # ``play_fail_count`` and graduates ``reliability_state``: 1st → "flagged",
+    # 3rd+ → "degraded" (rendered grayed in the channel list), 6th+ → "dead"
+    # (excluded from forward-looking list queries). A background-checker
+    # SUCCESS (``mark_checked(ok=True)``) resets both to 0 / "ok".
+    play_fail_count   = Column(Integer, default=0)
+    last_play_error   = Column(String)
+    reliability_state = Column(String, default="ok")  # "ok"|"flagged"|"degraded"|"dead"
+
+
+class TagDB(Base):
+    """Canonical tag — a (type, value) pair in a known namespace.
+
+    Namespaces: region | language | platform | quality | genre |
+                collection | content_type | decade
+
+    Rows are deduplicated on (type, value); ``get_or_create_tag`` is the only
+    correct way to insert.
+    """
+
+    __tablename__ = "tags"
+
+    id    = Column(Integer, primary_key=True)
+    type  = Column(String, index=True, nullable=False)   # namespace
+    value = Column(String, index=True, nullable=False)   # canonical value
+
+    __table_args__ = (
+        UniqueConstraint("type", "value", name="uq_tag_type_value"),
+    )
+
+
+class TagAliasDB(Base):
+    """Another spelling of a tag ("Denzel Washigton" → Denzel Washington's tag),
+    so a provider sending it again lands on the one identity (person_aliases)."""
+
+    __tablename__ = "tag_aliases"
+
+    type   = Column(String, primary_key=True)
+    value  = Column(String, primary_key=True)   # the alias spelling, as seen
+    tag_id = Column(Integer, ForeignKey("tags.id"), nullable=False)
+
+
+class ContentTagDB(Base):
+    """Link between a channel and a tag, with provenance.
+
+    ``source`` is ``"generated"`` or ``"user"`` (stored as a small int via
+    ``TagSourceType``). ``feeders`` is a list of feeder names that each
+    independently asserted this tag; multiple feeders raise confidence.
+
+    Confidence (v1, LANG-1 weighted): ``min(1.0, sum(weight(f) for f in
+    distinct_feeders) / 3)`` — 1.0/feeder except ``region_inference`` (0.3,
+    see ``tag_content_tags._FEEDER_WEIGHTS``). DB-9 dropped the stored
+    ``confidence`` column — computed at read time (``TagRepository._compute_confidence``).
+
+    DB-9 also rebuilt this table on an integer ``channel_key`` (FK to
+    ``ChannelDB.channel_key``, zero readers outside this join table) instead
+    of the 43-byte string ``ChannelDB.id``, ``WITHOUT ROWID`` with composite
+    PK ``(channel_key, tag_id, source)`` so a ``"generated"`` and a ``"user"``
+    assertion for the same tag coexist. The old surrogate ``id`` had zero
+    production readers; dropping it merges the table + its UNIQUE autoindex.
+    """
+
+    __tablename__ = "content_tags"
+
+    # DB-9: FK to ChannelDB.channel_key. Part of the composite PK, so no
+    # separate index=True needed.
+    channel_key = Column(Integer, ForeignKey("channels.channel_key"),
+                          primary_key=True, nullable=False)
+    tag_id      = Column(Integer, ForeignKey("tags.id"),
+                          primary_key=True, nullable=False)
+    source      = Column(TagSourceType, primary_key=True, nullable=False,
+                          default="generated")  # "generated" | "user"
+    feeders     = Column(FeederList)       # list[str] of feeder names, stored as codes (tag_source.FEEDER_CODES)
+    #: What the tag means ON THIS CHANNEL, per type: cast → the character played,
+    #: director → the job credited ("Director", "First Assistant Director"),
+    #: title → where the name comes from. NULL when the source gave none.
+    detail      = Column(String)
+    #: Order within its type on this channel (cast billing order). NULL = unordered.
+    ord         = Column(Integer)
+    # In what capacity the tag applies here (tag_source: a person's role bits).
+    qualifier   = Column(Integer)
+
+    __table_args__ = (
+        # (tag_id, channel_key) — declared here (DB-6) so QueryIndexTask's
+        # Base.metadata sweep builds it for an existing library too.
+        Index("ix_content_tags_tag_channel", "tag_id", "channel_key"),
+        {"sqlite_with_rowid": False},
+    )
+
+
+class ProfileDB(Base):
+    """One row per ``Config`` field that is the user's state, not the machine's.
+
+    Key/value so the ~46 sites reading ``config.<field>`` do not move; only the
+    persister changes. ``value`` is nullable because ``None`` is a REAL value —
+    the filter sentinels use it for "never configured", distinct from ``[]`` —
+    so a key is owned when its ROW EXISTS, not when its value is truthy.
+    Contract and migration: ``core/profile_store.py``.
+    """
+
+    __tablename__ = "profile"
+
+    key        = Column(String, primary_key=True)
+    value      = Column(JSONEncoded, nullable=True)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+#: How long ``close()`` will wait for the write lock before giving up on its
+#: statistics refresh. Deliberately ~1/30th of the connection default: on the
+#: way out, a stale query plan is invisible and a hung window is not.
+_CLOSE_BUSY_TIMEOUT_MS = 1000
+
+
+class Database:
+    """Database connection manager"""
+
+    def __init__(self, database_url: str):
+        self.engine = create_engine(
+            database_url,
+            echo=False,
+            connect_args={"check_same_thread": False, "timeout": 30},
+        )
+
+        @event.listens_for(self.engine, "connect")
+        def _set_pragmas(dbapi_conn, _record):
+            dbapi_conn.create_function("lower", 1, unicode_lower, deterministic=True)   # F55
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA busy_timeout=30000")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            # auto_vacuum is PERSISTENT — only WRITE it when not already FULL: running it on
+            # EVERY connection takes a write lock even when the value is unchanged, which
+            # raised "database is locked" (bypassing busy_timeout) whenever a concurrent
+            # transaction held the writer — e.g. an off-thread provider delete — and
+            # crashed the app (SIGABRT). New/empty DBs still get FULL here; established
+            # FULL DBs skip the write. Legacy (mode==0) migration: _ensure_auto_vacuum().
+            if cur.execute("PRAGMA auto_vacuum").fetchone()[0] != 1:
+                cur.execute("PRAGMA auto_vacuum=FULL")
+            cur.close()
+
+        self.SessionLocal = sessionmaker(bind=self.engine)
+        logger.info(f"Database initialized: {database_url}")
+
+        # Diagnostics: log the ACTUAL pragma values a fresh connection reports
+        # (read back, not just the literals passed to PRAGMA above) once at
+        # startup, so the next "database is locked" mystery starts with facts
+        # instead of re-deriving whether WAL/busy_timeout are really in effect.
+        try:
+            with self.engine.connect() as conn:
+                journal_mode = conn.exec_driver_sql("PRAGMA journal_mode").scalar()
+                busy_timeout = conn.exec_driver_sql("PRAGMA busy_timeout").scalar()
+            logger.info(
+                "Database pragmas: journal_mode={} busy_timeout={}ms",
+                journal_mode, busy_timeout,
+            )
+        except Exception:
+            logger.exception("Database: failed to read back pragma diagnostics")
+    
+    def create_tables(self):
+        """Create all tables"""
+        Base.metadata.create_all(self.engine)
+        logger.info("Database tables created")
+        self._migrate()
+        self._ensure_auto_vacuum()
+        # Orphaned channels / content_tags left by a removed provider are no
+        # longer swept here — DB-5 moved that to the idempotent
+        # OrphanSweepTask (streamselect/core/migrations/orphan_sweep.py), run by the
+        # Migration Center off the startup path so it re-heals new orphans
+        # whenever they appear instead of once per database.
+        self._clean_polluted_metadata_titles()
+        self._seed_last_seen_at()
+        self._clear_unreliable_signal_verdicts()
+
+    def _migrate(self):
+        """Apply incremental schema migrations (safe to run on every startup)."""
+        migrations = COLUMN_MIGRATIONS   # core/schema_migrations.py — add new columns THERE
+        with self.engine.connect() as conn:
+            for table, col, col_type in migrations:
+                try:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {col_type}"))
+                    conn.commit()
+                    logger.info(f"Migration: added column {col} to {table}")
+                except OperationalError:
+                    pass  # silent: "duplicate column name" — the migration already ran
+
+            legacy_channel_drops = channel_index_policy.legacy_index_drop_sql(conn)  # DB-11
+            if legacy_channel_drops:
+                logger.info(f"Migration: dropping legacy channel index(es): {legacy_channel_drops}")
+            index_migrations = [
+                # Redundant single-column indexes on content_tags — each a strict
+                # left-prefix of an index that already exists. 221 MB on the
+                # a user's 3.1M-row table, plus two extra b-tree writes on every
+                # tag insert, for query shapes the wider indexes already serve.
+                # A drop is policy, not a declaration, so it stays hand-written
+                # here rather than moving to the ORM — ContentTagDB.channel_id/
+                # tag_id must NOT carry index=True, or the generated sweep would
+                # recreate exactly what this removes.
+                "DROP INDEX IF EXISTS ix_content_tags_channel_id",
+                "DROP INDEX IF EXISTS ix_content_tags_tag_id",
+            ] + legacy_channel_drops  # STORAGE-1a; shape-conditional, DB-11
+            for idx_sql in index_migrations:
+                try:
+                    conn.execute(text(idx_sql))
+                    conn.commit()
+                except Exception as exc:
+                    logger.warning(f"Index migration skipped: {exc}")
+
+            # WL-1: record the settled default ON the row rather than letting
+            # a rule inherit one, so a later change to the default cannot
+            # re-read what an old rule meant. Self-healing: runs every start.
+            for col, value in (("whole_word", "1"), ("match_mode", "'phrase'"),
+                               ("search_description", "0"), ("live_only", "0"),
+                               ("action", "'notify'")):
+                try:
+                    res = conn.execute(text(
+                        f"UPDATE alert_patterns SET {col} = {value} "
+                        f"WHERE {col} IS NULL"))
+                    conn.commit()
+                    if res.rowcount:
+                        logger.info(f"Migration: stamped {col}={value} onto "
+                                    f"{res.rowcount} watch rule(s)")
+                except OperationalError:
+                    pass  # table absent on a brand-new database
+
+        # DB-9: a column REPLACEMENT (channel_id -> int channel_key) the ALTER
+        # TABLE loop above cannot express — own module, not a MigrationTask.
+        from streamselect.core.migrations.content_tags_rebuild import rebuild_content_tags_int_key
+        rebuild_content_tags_int_key(self.engine)
+
+        self._normalize_double_encoded_json()
+
+    # JSONEncoded columns that, prior to the B3-3 TypeDecorator, were written via
+    # ``json.dumps(obj)`` into a ``Column(JSON)`` — double-encoding the value on disk.
+    # JSONEncoded decodes exactly once, so those legacy rows would read back as JSON
+    # *strings* instead of lists/dicts. See _normalize_double_encoded_json.
+    _JSON_ENCODED_COLUMNS = [
+        ("metadata",  "cast"),
+        ("metadata",  "crew"),
+        ("metadata",  "actors"),
+        ("metadata",  "genres"),
+        ("providers", "urls"),
+        ("channels",  "event_metadata"),
+    ]
+
+    def _normalize_double_encoded_json(self):
+        """One-time fix for legacy double-encoded JSONEncoded values (pre-B3-3).
+
+        Old code assigned ``json.dumps(obj)`` into ``Column(JSON)``, which serialized
+        the value a second time — storing a JSON *string* (on-disk text begins with a
+        quote, e.g. ``"[{...}]"``) rather than a JSON array/object. ``JSONEncoded``
+        decodes once, so such rows now read back as ``str``. This peels the extra layer.
+
+        Only rows whose raw TEXT begins with ``"`` (a double-encoded string) are
+        touched; correctly single-encoded rows (``[``/``{``) are skipped, so the pass
+        is idempotent. Gated on ``PRAGMA user_version`` so it runs at most once.
+        """
+        with self.engine.connect() as conn:
+            try:
+                version = conn.execute(text("PRAGMA user_version")).scalar() or 0
+            except SQLAlchemyError:
+                version = 0  # silent: no user_version on a pre-pragma DB — treat as 0
+            if version >= 1:
+                return
+
+            for table, col in self._JSON_ENCODED_COLUMNS:
+                try:
+                    rows = conn.execute(text(
+                        f'SELECT rowid, "{col}" FROM {table} WHERE "{col}" LIKE \'"%\''
+                    )).fetchall()
+                except OperationalError:
+                    continue  # silent: table/column not present in this DB
+                fixed = 0
+                for rowid, raw in rows:
+                    try:
+                        inner = _json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue  # silent: not JSON — so not double-encoded, which is the point
+                    if not isinstance(inner, str):
+                        continue  # not actually double-encoded
+                    conn.execute(
+                        text(f'UPDATE {table} SET "{col}" = :v WHERE rowid = :r'),
+                        {"v": inner, "r": rowid},
+                    )
+                    fixed += 1
+                if fixed:
+                    logger.info(f"Migration: normalized {fixed} double-encoded {table}.{col} value(s)")
+
+            conn.execute(text("PRAGMA user_version = 1"))
+            conn.commit()
+
+    def _ensure_auto_vacuum(self) -> None:
+        """Enable auto_vacuum=FULL on existing databases via a one-time VACUUM.
+
+        For brand-new databases the connect-listener pragma already sets FULL mode
+        before any table is created, so this is a fast no-op (mode == 1 on the very
+        first call). For databases that were created before this feature was added
+        (mode == 0 / NONE), a one-time VACUUM rebuilds the file in FULL mode. After
+        that first migration every subsequent startup reads mode 1 and returns
+        immediately at no cost.
+
+        VACUUM cannot run inside a transaction, so we use an AUTOCOMMIT connection.
+        Any failure is logged but never blocks startup — this is an optimisation, not
+        a correctness requirement.
+        """
+        try:
+            with self.engine.connect() as conn:
+                mode = conn.exec_driver_sql("PRAGMA auto_vacuum").scalar()
+            if mode == 1:
+                return  # already FULL — common case after the one-time migration
+            logger.info(
+                "One-time database optimization (enabling auto_vacuum=FULL) — "
+                "running VACUUM to rebuild the file. This may take a moment on large databases."
+            )
+            with self.engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                conn.exec_driver_sql("PRAGMA auto_vacuum=FULL")
+                conn.exec_driver_sql("VACUUM")
+            logger.info("auto_vacuum=FULL migration complete.")
+        except Exception as exc:
+            logger.error(f"Could not enable auto_vacuum=FULL: {exc}")
+
+    def _clean_polluted_metadata_titles(self) -> None:
+        """One-time migration: replace raw-channel-name metadata titles with clean ones.
+
+        The provider-metadata fallback used to store the raw channel name
+        (``info.get('name') or channel.name`` — e.g. ``EN - Cowboy Bebop (1998)``) as
+        ``metadata.title`` whenever no real provider title was available.  The details
+        pane then showed that raw name, duplicating the language chip and year rendered
+        beside it.  The ingestion path now stores the clean title going forward (see
+        ``ProviderMetadataProvider``); this heals rows already written.
+
+        Two gated passes, both reusing the shared channel-name parser (never a new
+        hand-rolled one) and both touching only rows that *look* polluted:
+
+        * Pass 1 (preferred, bulk SQL) — where ``metadata.title`` exactly equals a
+          linked channel's raw ``name`` and that channel's ingestion-computed
+          ``detected_title`` differs, copy the stored ``detected_title`` (the single
+          source of truth produced by the shared parser at ingestion) onto the row.
+        * Pass 2 (fallback) — for any remaining *linked* metadata title the shared
+          parser recognises as carrying a language/region prefix or trailing year,
+          replace it with the parsed ``bare_name``.  Gated on the parser actually
+          stripping a prefix/region/year, so genuinely-clean or distinct titles are
+          left untouched.
+
+        A real provider/TMDb title never equals the prefixed raw name and rarely
+        carries a strip-able qualifier, so genuine titles survive.  Runs once per
+        database (gated on ``PRAGMA user_version == 4``) after the orphan cleanups.
+        Any failure is caught and logged — it must never block startup.
+        """
+        try:
+            with self.engine.connect() as conn:
+                version = conn.execute(text("PRAGMA user_version")).scalar() or 0
+            if version >= 4:
+                return  # already ran — fast path
+
+            # ── Pass 1: copy the linked channel's clean detected_title where the
+            # metadata title is exactly that channel's raw name (the common case).
+            with self.engine.connect() as conn:
+                result = conn.execute(text(
+                    "UPDATE metadata SET title = ("
+                    "  SELECT c.detected_title FROM channels c "
+                    "  WHERE c.metadata_id = metadata.id AND c.name = metadata.title "
+                    "    AND c.detected_title IS NOT NULL AND TRIM(c.detected_title) != '' "
+                    "    AND c.detected_title != c.name LIMIT 1"
+                    ") WHERE EXISTS ("
+                    "  SELECT 1 FROM channels c "
+                    "  WHERE c.metadata_id = metadata.id AND c.name = metadata.title "
+                    "    AND c.detected_title IS NOT NULL AND TRIM(c.detected_title) != '' "
+                    "    AND c.detected_title != c.name"
+                    ")"
+                ))
+                conn.commit()
+                pass1 = result.rowcount or 0
+
+            # ── Pass 2: parse-fallback for any remaining polluted linked titles the
+            # exact-name join above could not reach (e.g. the source channel was
+            # renamed/removed but a sibling variant still shares the metadata row).
+            from streamselect.core.channel_name_utils import parse_channel_name
+            pass2 = 0
+            with self.engine.connect() as conn:
+                rows = conn.execute(text(
+                    "SELECT id, title FROM metadata WHERE EXISTS "
+                    "(SELECT 1 FROM channels c WHERE c.metadata_id = metadata.id)"
+                )).fetchall()
+                for mid, title in rows:
+                    if not title:
+                        continue
+                    try:
+                        parsed = parse_channel_name(title)
+                    except Exception:  # silent: per-row cleanup over the whole table — one
+                        continue       # unparseable title must not log 240k times
+                    bare = (parsed.bare_name or "").strip()
+                    # Gate: only rewrite when the parser actually stripped a
+                    # language/region prefix or a trailing year (looks polluted).
+                    stripped_qualifier = bool(parsed.region or parsed.lang or parsed.year)
+                    if bare and bare != title.strip() and stripped_qualifier:
+                        conn.execute(
+                            text("UPDATE metadata SET title = :t WHERE id = :i"),
+                            {"t": bare, "i": mid},
+                        )
+                        pass2 += 1
+                conn.commit()
+
+            cleaned = pass1 + pass2
+            if cleaned:
+                logger.info(
+                    f"One-time cleanup: cleaned {cleaned} raw-channel-name metadata "
+                    f"title(s) ({pass1} via detected_title, {pass2} via parse)."
+                )
+            else:
+                logger.debug("Metadata-title cleanup: no polluted titles found — nothing to do.")
+
+            # Stamp version 4 so this never reruns
+            with self.engine.connect() as conn:
+                conn.execute(text("PRAGMA user_version = 4"))
+                conn.commit()
+
+        except Exception as exc:
+            logger.error(f"Metadata-title cleanup migration failed (startup unblocked): {exc}")
+
+    def _seed_last_seen_at(self) -> None:
+        """One-time: give every existing channel a ``last_seen_at``.
+
+        Without this the column is NULL on all 785k pre-existing rows, and
+        ``prune_vanished_channels`` never prunes a NULL — deliberately, because
+        deleting on an absence of evidence is how you lose a catalog. So the rows
+        that have ALREADY vanished (980 superseded event slots on a user's
+        library) would sit there for ever, which is the bug this whole change
+        exists to fix.
+
+        Seeding them all to one instant BEFORE any refresh is what makes them
+        prunable: the next refresh stamps a strictly later value on everything the
+        source still lists, so what keeps the seed timestamp is exactly what the
+        source dropped. It cannot mis-fire in the other direction — a row the
+        source still carries gets re-stamped seconds later.
+
+        Runs once, gated on ``PRAGMA user_version``, and never blocks startup.
+        """
+        try:
+            with self.engine.connect() as conn:
+                version = conn.execute(text("PRAGMA user_version")).scalar() or 0
+            if version >= 5:
+                return
+
+            with self.engine.connect() as conn:
+                seeded = conn.execute(
+                    text("UPDATE channels SET last_seen_at = :t "
+                         "WHERE last_seen_at IS NULL"),
+                    {"t": datetime.utcnow()},
+                ).rowcount
+                conn.commit()
+            if seeded:
+                logger.info(
+                    f"One-time: stamped last_seen_at on {seeded:,} existing "
+                    f"channel(s) so rows the source has dropped become prunable."
+                )
+            with self.engine.connect() as conn:
+                conn.execute(text("PRAGMA user_version = 5"))
+                conn.commit()
+        except Exception as exc:
+            logger.error(f"last_seen_at seed failed (startup unblocked): {exc}")
+
+    def _clear_unreliable_signal_verdicts(self) -> None:
+        """One-time: discard the verdicts recorded before the feature was parked.
+
+        Every verdict written by the first shipped version of the signal check is
+        suspect. Channels a user was actively watching came back ``dead``,
+        because ffmpeg exits 145/146 when it cannot OPEN the input — which on a
+        one-connection account usually means the slot was busy — and that stderr
+        matched no recognized pattern, so it fell through to "no video".
+
+        Left in place, these feed ``signal_dead_streak`` and would hide real
+        events the moment anyone turned ``hide_dead_events`` on. Nothing reads
+        them today (the feature is off), which makes this the cheap moment to
+        drop them rather than carry known-wrong data forward.
+
+        Only the three derived signal_* columns are touched — no user state.
+        """
+        try:
+            with self.engine.connect() as conn:
+                version = conn.execute(text("PRAGMA user_version")).scalar() or 0
+            if version >= 6:
+                return
+            with self.engine.connect() as conn:
+                cleared = conn.execute(text(
+                    "UPDATE channels SET signal_verdict = NULL, "
+                    "signal_dead_streak = 0, signal_checked_at = NULL "
+                    "WHERE signal_verdict IS NOT NULL "
+                    "   OR signal_dead_streak != 0 "
+                    "   OR signal_checked_at IS NOT NULL"
+                )).rowcount
+                conn.commit()
+            if cleared:
+                logger.info(
+                    f"One-time: cleared {cleared:,} signal-check verdict(s) "
+                    f"recorded before the feature was parked — they could not "
+                    f"tell a busy connection from a dead stream."
+                )
+            with self.engine.connect() as conn:
+                conn.execute(text("PRAGMA user_version = 6"))
+                conn.commit()
+        except Exception as exc:
+            logger.error(f"Signal-verdict cleanup failed (startup unblocked): {exc}")
+
+    def get_session(self) -> Session:
+        """Get a new database session"""
+        return self.SessionLocal()
+
+    @contextmanager
+    def session_scope(self, commit: bool = True, *, background: bool = False):
+        """Context manager that commits on success, rolls back on exception, always closes.
+
+        Preferred form for new code (supersedes raw try/finally around get_session):
+            with self.db.session_scope() as session:
+                repos = RepositoryFactory(session)
+
+        Pass ``commit=False`` for a read-only scope; ``_run_query`` uses this. Pass
+        ``background=True`` for a background write (DB-10, ``core/write_gate.py``).
+        """
+        with write_gate.background_write_gate() if (background and commit) else nullcontext():
+            session = self.SessionLocal()
+            try:
+                yield session
+                if commit:
+                    _started = time.perf_counter()
+                    session.commit()
+                    _waited_ms = (time.perf_counter() - _started) * 1000.0
+                    if (_waited_ms >= SLOW_MAIN_THREAD_COMMIT_MS
+                            and threading.current_thread() is threading.main_thread()):
+                        # The UI thread blocked on a write. Under WAL readers never
+                        # block, but writer-vs-writer still serialises, so a bulk pass
+                        # holding the write lock stalls a click handler for as long as
+                        # its batch takes — up to busy_timeout (30s) before it fails.
+                        #
+                        # Logged rather than prevented, deliberately: both fixes cost
+                        # something real (routing every user-state mutation through the
+                        # async seam is a wide refactor; a short main-thread busy_timeout
+                        # turns a slow favourite toggle into a FAILED one, which is
+                        # worse), and neither is worth buying before the frequency is
+                        # known. Batches are sized (many rows) so the typical wait
+                        # SHOULD be well under this threshold — this line is the evidence.
+                        logger.warning(
+                            "UI thread blocked {:.0f}ms committing — a background "
+                            "write held the lock. If this is common, user-state "
+                            "writes need the async seam.",
+                            _waited_ms,
+                        )
+                else:
+                    session.rollback()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+
+    def close(self):
+        """Close the connection, refreshing stale query statistics on the way out.
+
+        ``PRAGMA optimize`` re-ANALYZEs only what has drifted, and costs 0.6 ms
+        when nothing has — which is almost every time. Without it the planner
+        keeps reading the statistics QueryIndexTask wrote once, however many
+        rows a catalog refresh has since added.
+
+        It runs with a SHORT busy timeout, not the connection default. Every
+        connection inherits ``busy_timeout=30000`` from the pragma listener,
+        and on close that is exactly the wrong number: if a background writer
+        is still draining, the quit blocks for a full THIRTY SECONDS and then
+        fails anyway. a user hit it twice in one evening and killed the app
+        with Ctrl+C the second time — its log shows 21:08:02 close,
+        21:08:32 "database is locked", a 30.0 s wait for a statistics refresh
+        that is pure optimisation.
+
+        Skipping it costs a slightly stale query plan until the next launch,
+        which is invisible. Waiting for it costs half a minute of the user
+        staring at a window that will not go away.
+        """
+        try:
+            with self.engine.connect() as conn:
+                conn.exec_driver_sql(
+                    f"PRAGMA busy_timeout={_CLOSE_BUSY_TIMEOUT_MS}")
+                conn.exec_driver_sql("PRAGMA optimize")
+                conn.commit()
+        except OperationalError as exc:
+            # Expected whenever a writer is still finishing. Not worth a
+            # traceback in the user's face on the way out.
+            logger.debug("Database: skipped PRAGMA optimize on close ({})", exc)
+        except Exception:
+            logger.exception("Database: PRAGMA optimize failed on close")
+        self.engine.dispose()
+        logger.info("Database connection closed")
+
+
+# Models defined beside their concern, registered on ``Base`` by this import
+# (so ``create_all`` sees them) and re-exported for the existing import sites.
+from streamselect.core.playback_models import PlaybackEventDB, PlaybackWeeklyDB, StreamInfoDB  # noqa: E402
+
+__all__ = ["Base", "Database", "JSONEncoded", "PlaybackEventDB", "PlaybackWeeklyDB", "StreamInfoDB"]

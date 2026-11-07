@@ -1,0 +1,447 @@
+"""Tests for repository DTO methods (B7-2).
+
+Key invariant: each DTO method returns plain data whose attributes are
+accessible AFTER the SQLAlchemy session is closed — no DetachedInstanceError,
+no lazy-load, no live ORM reference in the returned objects.
+"""
+
+import uuid
+import pytest
+from datetime import datetime
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import sessionmaker
+
+from streamselect.core.database import Base, ChannelDB, SeasonDB, EpisodeDB
+from streamselect.core.repositories.dtos import (
+    FavoriteDTO, HistoryDTO, SeasonDTO, EpisodeDTO, build_history_dtos,
+)
+from streamselect.core.repositories.channel import ChannelRepository
+from streamselect.core.repositories.season import SeasonRepository
+from streamselect.core.repositories.episode import EpisodeRepository
+from streamselect.core.repositories import RepositoryFactory
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def session():
+    engine = create_engine("sqlite:///:memory:", echo=False)
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine)
+    s = Session()
+    yield s
+    s.close()
+    engine.dispose()
+
+
+def _make_channel(session, name="Test Channel", media_type="live",
+                  source_id: str | None = None, **kwargs) -> ChannelDB:
+    ch = ChannelDB(
+        id=str(uuid.uuid4()),
+        source_id=source_id or str(uuid.uuid4()),
+        provider_id="prov1",
+        name=name,
+        media_type=media_type,
+        **kwargs,
+    )
+    session.add(ch)
+    session.flush()
+    return ch
+
+
+def _make_season(session, series_id="s1", provider_id="prov1", season_number=1,
+                 name="Season 1", episode_count=3, raw_data=None) -> SeasonDB:
+    s = SeasonDB(
+        id=f"{series_id}_s{season_number}",
+        series_id=series_id,
+        provider_id=provider_id,
+        season_number=season_number,
+        name=name,
+        episode_count=episode_count,
+        raw_data=raw_data,
+    )
+    session.add(s)
+    session.flush()
+    return s
+
+
+def _make_episode(session, season_id="s1_s1", series_id="s1", provider_id="prov1",
+                  episode_num=1, season_num=1, title="Episode 1",
+                  stream_url="http://test/ep1.ts", is_watched=False,
+                  raw_data=None, rating=None) -> EpisodeDB:
+    ep = EpisodeDB(
+        id=str(uuid.uuid4()),
+        season_id=season_id,
+        series_id=series_id,
+        provider_id=provider_id,
+        episode_id=str(episode_num),
+        episode_num=episode_num,
+        season_num=season_num,
+        title=title,
+        stream_url=stream_url,
+        is_watched=is_watched,
+        raw_data=raw_data,
+        rating=rating,
+    )
+    session.add(ep)
+    session.flush()
+    return ep
+
+
+# ---------------------------------------------------------------------------
+# FavoriteDTO tests
+# ---------------------------------------------------------------------------
+
+def test_favorite_dto_attributes_after_session_close(session):
+    """FavoriteDTO attributes must be readable after the session is closed."""
+    _make_channel(session, name="My Fave", media_type="movie", is_favorite=True)
+    session.commit()
+
+    repo = ChannelRepository(session)
+    dtos = repo.get_favorites_dto()
+    session.close()  # close BEFORE reading DTO attributes
+
+    assert len(dtos) == 1
+    dto = dtos[0]
+    # All attribute access must succeed — no DetachedInstanceError
+    assert dto.name == "My Fave"
+    assert dto.media_type == "movie"
+    assert dto.last_played is None
+    assert isinstance(dto, FavoriteDTO)
+
+
+def test_favorite_dto_is_frozen(session):
+    """FavoriteDTO must be immutable (frozen=True)."""
+    _make_channel(session, name="Frozen", is_favorite=True)
+    session.commit()
+    repo = ChannelRepository(session)
+    dtos = repo.get_favorites_dto()
+    with pytest.raises(Exception):   # FrozenInstanceError
+        dtos[0].name = "changed"     # type: ignore[misc]
+
+
+def test_favorite_dto_last_played_preserved(session):
+    """FavoriteDTO.last_played must carry the datetime from the DB row."""
+    ts = datetime(2024, 6, 1, 12, 0, 0)
+    _make_channel(session, name="Watched", is_favorite=True, last_played=ts)
+    session.commit()
+    repo = ChannelRepository(session)
+    dtos = repo.get_favorites_dto()
+    session.close()
+    assert dtos[0].last_played == ts
+
+
+def test_favorite_dto_excludes_hidden(session):
+    """Hidden channels must be excluded from get_favorites_dto()."""
+    _make_channel(session, name="Hidden Fave", is_favorite=True, is_hidden=True)
+    _make_channel(session, name="Visible Fave", is_favorite=True, is_hidden=False)
+    session.commit()
+    repo = ChannelRepository(session)
+    dtos = repo.get_favorites_dto()
+    assert len(dtos) == 1
+    assert dtos[0].name == "Visible Fave"
+
+
+# ---------------------------------------------------------------------------
+# SeasonDTO tests
+# ---------------------------------------------------------------------------
+
+def test_season_dto_attributes_after_session_close(session):
+    """SeasonDTO attributes must be readable after the session is closed."""
+    _make_season(session, season_number=1, name="Season 1", episode_count=5)
+    session.commit()
+
+    repo = SeasonRepository(session)
+    dtos = repo.get_seasons_dto(series_id="s1", provider_id="prov1")
+    session.close()
+
+    assert len(dtos) == 1
+    dto = dtos[0]
+    assert dto.name == "Season 1"
+    assert dto.season_num == 1        # must be populated from SeasonDB.season_number
+    assert dto.episode_count == 5
+    assert dto.rating is None
+    assert isinstance(dto, SeasonDTO)
+
+
+def test_season_dto_rating_extracted_from_raw_data(session):
+    """SeasonDTO.rating must be pre-extracted from raw_data['rating']."""
+    _make_season(session, raw_data={"rating": "8.5"})
+    session.commit()
+
+    repo = SeasonRepository(session)
+    dtos = repo.get_seasons_dto(series_id="s1", provider_id="prov1")
+    session.close()
+
+    assert dtos[0].rating == "8.5"
+
+
+def test_season_dto_rating_none_when_absent(session):
+    """SeasonDTO.rating must be None when raw_data has no rating key."""
+    _make_season(session, raw_data={"other": "stuff"})
+    session.commit()
+
+    repo = SeasonRepository(session)
+    dtos = repo.get_seasons_dto(series_id="s1", provider_id="prov1")
+    session.close()
+
+    assert dtos[0].rating is None
+
+
+def test_season_dto_is_frozen(session):
+    """SeasonDTO must be immutable."""
+    _make_season(session)
+    session.commit()
+    repo = SeasonRepository(session)
+    dtos = repo.get_seasons_dto(series_id="s1", provider_id="prov1")
+    with pytest.raises(Exception):
+        dtos[0].name = "changed"  # type: ignore[misc]
+
+
+def test_season_dto_season_num_matches_season_number(session):
+    """SeasonDTO.season_num must mirror SeasonDB.season_number (gap detection depends on it)."""
+    _make_season(session, series_id="gap_test", season_number=3, name="Season 3")
+    session.commit()
+
+    repo = SeasonRepository(session)
+    dtos = repo.get_seasons_dto(series_id="gap_test", provider_id="prov1")
+    session.close()
+
+    assert dtos[0].season_num == 3
+
+
+def test_season_node_userrole_holds_season_dto_not_orm(session):
+    """After populate_series_tree, each season node's UserRole data['data'] must be
+    a SeasonDTO — not a live ORM object.  This is the boundary regression the fix
+    protects: if a raw SeasonDB were stored instead, accessing its attributes after
+    the session closes raises DetachedInstanceError.
+    """
+    from streamselect.core.repositories.dtos import SeasonDTO
+
+    # Build a season + one episode in the DB.
+    season = _make_season(session, series_id="s_orm_check", season_number=1,
+                          name="Season 1", episode_count=1)
+    _make_episode(session, season_id=season.id, series_id="s_orm_check",
+                  provider_id="prov1", episode_num=1, season_num=1,
+                  title="Ep 1", stream_url="http://x/ep1.ts")
+    session.commit()
+
+    repo = SeasonRepository(session)
+    dtos = repo.get_seasons_dto(series_id="s_orm_check", provider_id="prov1")
+    # Close the session — ORM objects would expire here.
+    session.close()
+
+    # The DTO must still be fully readable with no DetachedInstanceError.
+    assert len(dtos) == 1
+    dto = dtos[0]
+    assert isinstance(dto, SeasonDTO)
+    assert dto.name == "Season 1"
+    assert dto.season_num == 1
+    assert dto.episode_count == 1
+
+
+# ---------------------------------------------------------------------------
+# EpisodeDTO tests
+# ---------------------------------------------------------------------------
+
+def test_episode_dto_attributes_after_session_close(session):
+    """EpisodeDTO attributes must be readable after the session is closed."""
+    _make_episode(session, episode_num=3, season_num=1, title="The Pilot",
+                  stream_url="http://test/s01e03.ts", is_watched=True)
+    session.commit()
+
+    repo = EpisodeRepository(session)
+    dtos = repo.get_episodes_dto_by_season(season_id="s1_s1")
+    session.close()
+
+    assert len(dtos) == 1
+    dto = dtos[0]
+    assert dto.episode_num == 3
+    assert dto.season_num == 1
+    assert dto.title == "The Pilot"
+    assert dto.stream_url == "http://test/s01e03.ts"
+    assert dto.is_watched is True
+    assert isinstance(dto, EpisodeDTO)
+
+
+def test_episode_dto_rating_read_from_stored_column(session):
+    """EpisodeDTO.rating reads the STORED EpisodeDB.rating column.
+
+    an earlier change moved this from runtime ``raw_data['info']['rating']`` parsing to a
+    float column resolved at ingestion (compute-at-ingestion / read-at-render),
+    so the DTO no longer re-parses the JSON blob and the value is a float.
+    Pre-existing rows are populated by EpisodeMetadataBackfillTask.
+    """
+    _make_episode(session, raw_data={"info": {"rating": "9.1"}}, rating=9.1)
+    session.commit()
+
+    repo = EpisodeRepository(session)
+    dtos = repo.get_episodes_dto_by_season(season_id="s1_s1")
+    session.close()
+
+    assert dtos[0].rating == 9.1
+
+
+def test_episode_dto_rating_not_reparsed_from_raw_data(session):
+    """raw_data alone must NOT populate rating — the stored column is the source.
+
+    Guards the compute-at-ingestion contract: a row whose blob still carries a
+    rating but whose column was never populated (pre-backfill) reads as None
+    rather than silently re-parsing at render time.
+    """
+    _make_episode(session, raw_data={"info": {"rating": "9.1"}})
+    session.commit()
+
+    repo = EpisodeRepository(session)
+    dtos = repo.get_episodes_dto_by_season(season_id="s1_s1")
+    session.close()
+
+    assert dtos[0].rating is None
+
+
+def test_episode_dto_rating_none_when_absent(session):
+    """EpisodeDTO.rating must be None when raw_data has no info.rating."""
+    _make_episode(session, raw_data={"info": {}})
+    session.commit()
+
+    repo = EpisodeRepository(session)
+    dtos = repo.get_episodes_dto_by_season(season_id="s1_s1")
+    session.close()
+
+    assert dtos[0].rating is None
+
+
+def test_episode_dto_is_frozen(session):
+    """EpisodeDTO must be immutable."""
+    _make_episode(session)
+    session.commit()
+    repo = EpisodeRepository(session)
+    dtos = repo.get_episodes_dto_by_season(season_id="s1_s1")
+    with pytest.raises(Exception):
+        dtos[0].title = "changed"  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# build_history_dtos tests
+# ---------------------------------------------------------------------------
+
+def test_history_dto_attributes_after_session_close(session):
+    """HistoryDTO attributes must be readable after the session is closed."""
+    ts = datetime(2024, 5, 10, 8, 0, 0)
+    _make_channel(session, name="Action Movie", media_type="movie", last_played=ts)
+    session.commit()
+
+    repos = RepositoryFactory(session)
+    dtos = build_history_dtos(repos, limit=10)
+    session.close()
+
+    assert len(dtos) == 1
+    dto = dtos[0]
+    assert dto.name == "Action Movie"
+    assert dto.media_type == "movie"
+    assert dto.episode_code is None
+    assert isinstance(dto, HistoryDTO)
+
+
+def test_history_dto_episode_code_populated_for_series(session):
+    """HistoryDTO.episode_code must be 'SxxExx' for series with a played episode."""
+    from streamselect.core.models import MediaType
+
+    ch = _make_channel(session, name="My Show", media_type=MediaType.SERIES,
+                       source_id="series_src_1", last_played=datetime.now())
+    session.commit()
+
+    # Add a played episode
+    ep = _make_episode(
+        session, season_id="series_src_1_s2", series_id="series_src_1",
+        provider_id="prov1", episode_num=5, season_num=2, title="Ep 5",
+    )
+    ep.last_played = datetime.now()
+    session.commit()
+
+    repos = RepositoryFactory(session)
+    dtos = build_history_dtos(repos, limit=10)
+    session.close()
+
+    series_dto = next(d for d in dtos if d.name == "My Show")
+    assert series_dto.episode_code == "S02E05"
+
+
+def test_history_dto_episode_code_none_when_no_episode_played(session):
+    """HistoryDTO.episode_code must be None for series with no played episode."""
+    from streamselect.core.models import MediaType
+
+    _make_channel(session, name="Unwatched Series", media_type=MediaType.SERIES,
+                  source_id="series_src_2", last_played=datetime.now())
+    session.commit()
+
+    repos = RepositoryFactory(session)
+    dtos = build_history_dtos(repos, limit=10)
+    session.close()
+
+    dto = next(d for d in dtos if d.name == "Unwatched Series")
+    assert dto.episode_code is None
+
+
+def test_history_dtos_batched_equals_per_row_and_one_query(session):
+    """B8-1: batched build_history_dtos equals the per-row reference AND issues
+    exactly one episodes query for the episode_code lookup regardless of how many
+    series are in the history (the N+1 this test originally pinned).
+
+    Wave 5 added a second batched lookup alongside it — get_resume_targets_for_series
+    (the "Play Next Episode" resume-ladder target) — which is NOT reducible to one
+    SQL statement (get_resume_dto's ladder branches per series: get_last_engaged,
+    then a conditional fallback/next-after query), so the total query count grows
+    by 2 per UNIQUE series (still O(series), never O(history rows) — see
+    test_history_play_next.py's dedup test for that guarantee). With 3 series here,
+    none manually engaged, each falls back to get_last_played_dto (get_last_engaged +
+    get_last_played = 2 queries), so total = 1 (code_map) + 3*2 (resume ladder) = 7.
+    """
+    from streamselect.core.models import MediaType
+
+    # Three series; each with several episodes at different last_played times.
+    specs = [
+        ("series_a", [(1, 1, "2024-01-01"), (1, 2, "2024-03-01"), (2, 1, "2024-02-01")]),  # latest S01E02
+        ("series_b", [(3, 4, "2024-05-05"), (1, 9, "2024-05-01")]),                          # latest S03E04
+        ("series_c", []),                                                                    # no episodes
+    ]
+    for src, eps in specs:
+        _make_channel(session, name=src, media_type=MediaType.SERIES,
+                      source_id=src, last_played=datetime.now())
+        for season_num, episode_num, day in eps:
+            ep = _make_episode(session, season_id=f"{src}_s{season_num}", series_id=src,
+                               provider_id="prov1", episode_num=episode_num,
+                               season_num=season_num, title=f"{src} {episode_num}")
+            ep.last_played = datetime.fromisoformat(day)
+    session.commit()
+
+    repos = RepositoryFactory(session)
+
+    # Per-row reference using the OLD single-row method (issued before the counter).
+    expected = {}
+    for src, _ in specs:
+        last = repos.episodes.get_last_played(series_id=src, provider_id="prov1")
+        expected[src] = f"S{last.season_num:02d}E{last.episode_num:02d}" if last else None
+
+    # Count episodes-table queries during the batched build.
+    engine = session.get_bind()
+    counter = {"n": 0}
+
+    def _count(conn, cursor, statement, *a):
+        if "FROM episodes" in statement:
+            counter["n"] += 1
+
+    event.listen(engine, "before_cursor_execute", _count)
+    try:
+        dtos = build_history_dtos(repos, limit=30)
+    finally:
+        event.remove(engine, "before_cursor_execute", _count)
+
+    got = {d.name: d.episode_code for d in dtos}
+    assert got["series_a"] == "S01E02"
+    assert got["series_b"] == "S03E04"
+    assert got["series_c"] is None
+    assert got == expected           # byte-identical to the per-row reference
+    assert counter["n"] == 7         # see docstring: 1 (code_map) + 3 series * 2 (resume ladder)

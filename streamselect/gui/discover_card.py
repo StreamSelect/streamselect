@@ -1,0 +1,532 @@
+"""Discover view — content card widget and flow layout helper."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING, NamedTuple
+
+from PyQt6.QtCore import QEasingCurve, QPropertyAnimation, QRect, Qt, pyqtSignal
+from PyQt6.QtGui import QContextMenuEvent, QPixmap
+from PyQt6.QtWidgets import (
+    QFrame, QGraphicsOpacityEffect, QLabel, QProgressBar, QSlider, QVBoxLayout, QWidget,
+)
+
+from loguru import logger
+from streamselect.core.config import Config
+from streamselect.core.discovery_engine import ContentCard
+from streamselect.gui import cursor_affordance
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+from streamselect.gui import icons as _icons
+
+if TYPE_CHECKING:
+    from streamselect.core.image_cache import ImageCache
+
+_CARD_W = 120
+_CARD_H = 220
+_POSTER_H = 175
+
+_ZOOM_MIN = 0.6
+_ZOOM_MAX = 1.8
+
+
+def card_zoom_slider(config) -> QSlider:
+    """The one card-size slider: range [60, 180], value = round(zoom * 100).
+
+    Discover's header and Search's poster mode each show one, and both drive
+    ``DiscoverView.set_zoom``, so the size is one setting with two handles.
+    """
+    slider = QSlider(Qt.Orientation.Horizontal)
+    slider.setRange(60, 180)
+    slider.setFixedWidth(110)
+    slider.blockSignals(True)
+    slider.setValue(round(config.discover_zoom * 100))
+    slider.blockSignals(False)
+    return slider
+
+
+class CardMetrics(NamedTuple):
+    """Zoomed card dimensions derived from the base constants."""
+
+    card_w: int
+    card_h: int
+    poster_h: int
+
+
+def card_metrics(zoom: float) -> CardMetrics:
+    """Return card dimensions for the given zoom factor.
+
+    The zoom is clamped to [0.6, 1.8] before scaling.  All three values are
+    rounded to the nearest pixel so geometry stays crisp.
+
+    Args:
+        zoom: Zoom factor requested by the user (e.g. from ``config.discover_zoom``).
+
+    Returns:
+        A :class:`CardMetrics` with integer pixel dimensions.
+    """
+    z = max(_ZOOM_MIN, min(_ZOOM_MAX, zoom))
+    return CardMetrics(
+        card_w=round(_CARD_W * z),
+        card_h=round(_CARD_H * z),
+        poster_h=round(_POSTER_H * z),
+    )
+
+
+class UniformCardGrid:
+    """A virtualized grid for uniformly-sized cards.
+
+    A measuring flow layout sizes each widget to place it, so every card has to
+    EXIST before the layout knows where anything goes — which is why the browse
+    grid built a widget per result and kept it forever. At 84 KB and 0.26 ms per
+    card (measured) a many-result recipe "Show all" is 1.6 GB and 5.2 s, and
+    the O(N) scroll sweep over every card ever created grows with it.
+
+    Every card is ``setFixedSize(card_metrics(zoom))`` — they are all the SAME
+    size. So the position of card *i* is arithmetic, not measurement:
+
+        cols = (width + spacing) // (card_w + spacing)
+        row, col = divmod(i, cols)
+
+    which means the grid can size itself for N cards while materializing only
+    the ones on screen. Memory and per-scroll cost become a function of the
+    VIEWPORT, not the result count — so no cap is needed and none is imposed.
+
+    Widgets outside the window are destroyed and rebuilt on the way back. That
+    is safe because a card holds no state a user can edit; everything it shows
+    comes from its ``ContentCard`` and the shared image cache, and the cache is
+    what makes a rebuild cheap.
+
+    Full-width **bands** can sit between cards (Search's section headers). A
+    band only splits the cards into runs that each restart at column 0, so
+    position stays arithmetic: find the run, then the same ``divmod`` inside it.
+    """
+
+    #: Rows of cards kept alive above and below the viewport. Two screens of
+    #: overscan makes normal scrolling never see a gap, and bounds the live set
+    #: at roughly three viewports' worth regardless of how many results exist.
+    OVERSCAN_ROWS = 2
+
+    def __init__(self, container: "QWidget", *, item_w: int, item_h: int,
+                 spacing: int, factory, band_factory=None) -> None:
+        """
+        Args:
+            container: The widget cards are parented to.
+            item_w: Fixed card width in px.
+            item_h: Fixed card height in px.
+            spacing: Gap between cards in px.
+            factory: ``factory(card) -> QWidget``, called when a card scrolls
+                into the window. Called again if it scrolls back.
+            band_factory: ``band_factory(payload) -> QWidget``, for the bands
+                passed to :meth:`set_cards`. Needed only when there are bands.
+        """
+        self._container = container
+        self._item_w = max(1, int(item_w))
+        self._item_h = max(1, int(item_h))
+        self._spacing = int(spacing)
+        self._factory = factory
+        self._band_factory = band_factory
+        self._cards: list = []
+        self._bands: list[tuple[int, object, int]] = []
+        self._live: dict[int, "QWidget"] = {}
+        self._live_bands: dict[int, "QWidget"] = {}
+        self._runs_cache: dict[int, tuple[list, list]] = {}
+        self._width: int = 0
+
+    # -- geometry, from the index alone ---------------------------------- #
+
+    def columns(self, available_width: int) -> int:
+        step = self._item_w + self._spacing
+        return max(1, (int(available_width) + self._spacing) // step)
+
+    def _runs(self, available_width: int) -> tuple[list, list]:
+        """Lay out the bands: ``(card runs, band tops)``.
+
+        A run is ``(start, end, top)``; a band top pairs with ``self._bands`` by
+        position. Without bands this is one run at 0, which is the plain grid.
+        """
+        cached = self._runs_cache.get(available_width)
+        if cached is not None:
+            return cached
+        cols = self.columns(available_width)
+        step = self._item_h + self._spacing
+        runs: list[tuple[int, int, int]] = []
+        tops: list[int] = []
+        y = start = 0
+        for index, _payload, height in self._bands:
+            if index > start:
+                runs.append((start, index, y))
+                y += ((index - start + cols - 1) // cols) * step
+                start = index
+            tops.append(y)
+            y += height + self._spacing
+        runs.append((start, len(self._cards), y))
+        self._runs_cache[available_width] = (runs, tops)
+        return runs, tops
+
+    def rect_for(self, index: int, available_width: int) -> QRect:
+        cols = self.columns(available_width)
+        start, top = 0, 0
+        for run_start, run_end, run_top in self._runs(available_width)[0]:
+            start, top = run_start, run_top
+            if index < run_end:
+                break
+        row, col = divmod(index - start, cols)
+        return QRect(col * (self._item_w + self._spacing),
+                     top + row * (self._item_h + self._spacing),
+                     self._item_w, self._item_h)
+
+    def total_height(self, available_width: int) -> int:
+        if not self._cards and not self._bands:
+            return 0
+        cols = self.columns(available_width)
+        start, end, top = self._runs(available_width)[0][-1]
+        rows = (end - start + cols - 1) // cols
+        if rows:
+            return top + rows * (self._item_h + self._spacing) - self._spacing
+        return top - self._spacing
+
+    def visible_range(self, scroll_y: int, viewport_h: int,
+                      available_width: int) -> tuple[int, int]:
+        """The half-open index range to keep alive, overscan included."""
+        if not self._cards:
+            return (0, 0)
+        cols = self.columns(available_width)
+        step = self._item_h + self._spacing
+        first, last = None, 0
+        for start, end, top in self._runs(available_width)[0]:
+            rows = (end - start + cols - 1) // cols
+            first_row = max(0, (int(scroll_y) - top) // step - self.OVERSCAN_ROWS)
+            last_row = (int(scroll_y) + max(0, int(viewport_h)) - top) // step + self.OVERSCAN_ROWS
+            if last_row < 0 or first_row >= rows:
+                continue
+            first = start + first_row * cols if first is None else first
+            last = min(end, start + (last_row + 1) * cols)
+        return (0, 0) if first is None else (first, last)
+
+    # -- contents --------------------------------------------------------- #
+
+    def set_cards(self, cards: list, bands=()) -> None:
+        """Replace every card and band. Live widgets are destroyed.
+
+        Args:
+            cards: The cards, in order.
+            bands: ``(card index it sits before, payload, height px)``, ordered
+                by index. Several bands may share an index.
+        """
+        self.clear()
+        self._cards = list(cards)
+        self._bands = list(bands)
+        self._runs_cache.clear()
+
+    def set_item_size(self, item_w: int, item_h: int) -> None:
+        """Change the card size. The caller re-sets the cards to rebuild them."""
+        self._item_w = max(1, int(item_w))
+        self._item_h = max(1, int(item_h))
+        self._runs_cache.clear()
+
+    def count(self) -> int:
+        return len(self._cards)
+
+    def live_widgets(self) -> list:
+        """The materialized widgets, in index order."""
+        return [self._live[i] for i in sorted(self._live)]
+
+    def clear(self) -> None:
+        for w in (*self._live.values(), *self._live_bands.values()):
+            w.setParent(None)
+            w.deleteLater()
+        self._live.clear()
+        self._live_bands.clear()
+        self._cards = []
+        self._bands = []
+        self._runs_cache.clear()
+
+    # -- the window ------------------------------------------------------- #
+
+    def sync(self, scroll_y: int, viewport_h: int, available_width: int) -> None:
+        """Materialize the window, destroy what left it, position what stays."""
+        self._width = int(available_width)
+        first, last = self.visible_range(scroll_y, viewport_h, available_width)
+        wanted = range(first, last)
+
+        for i in [i for i in self._live if i < first or i >= last]:
+            w = self._live.pop(i)
+            w.setParent(None)
+            w.deleteLater()
+
+        for i in wanted:
+            w = self._live.get(i)
+            if w is None:
+                w = self._factory(self._cards[i])
+                w.setParent(self._container)
+                w.show()
+                self._live[i] = w
+            w.setGeometry(self.rect_for(i, available_width))
+
+        tops = self._runs(available_width)[1]
+        for b, (_index, payload, height) in enumerate(self._bands):
+            w = self._live_bands.get(b)
+            if w is None:
+                w = self._band_factory(payload)
+                w.setParent(self._container)
+                w.show()
+                self._live_bands[b] = w
+            w.setGeometry(0, tops[b], int(available_width), height)
+
+
+class _ContentCard(QWidget):
+    """Poster card with shimmer, status overlay, and title.
+
+    The card dimensions are derived from ``card_metrics(config.discover_zoom)``
+    so cards scale with the user's zoom preference.  Pass a ``Config`` instance
+    (already a constructor arg) and the zoom is read from there automatically.
+    """
+
+    clicked              = pyqtSignal(str)          # channel_id
+    doubleClicked        = pyqtSignal(str)
+    middleClicked        = pyqtSignal(str)          # channel_id — configured middle-click play
+    contextMenuRequested = pyqtSignal(str, int, int)
+
+    def __init__(self, card: ContentCard, image_cache: "ImageCache",
+                 config: Config, parent=None) -> None:
+        super().__init__(parent)
+        self._card = card
+        self._image_cache = image_cache
+        self._config = config
+        self._image_requested = False
+
+        # Derive all geometry from the zoom-aware metrics so card + shelf stay in sync.
+        m = card_metrics(config.discover_zoom)
+        cw, ch, ph = m.card_w, m.card_h, m.poster_h
+        z = max(_ZOOM_MIN, min(_ZOOM_MAX, config.discover_zoom))
+
+        self.setFixedSize(cw, ch)
+        cursor_affordance.set_clickable(self)
+
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(0, 0, 0, 0)
+        vl.setSpacing(2)
+
+        # Poster frame
+        self._poster_frame = QFrame()
+        self._poster_frame.setFixedSize(cw, ph)
+        color = _theme.BACKDROP_TINTS[hash(card.channel_id) % len(_theme.BACKDROP_TINTS)]
+        self._poster_frame.setStyleSheet(
+            f"background: {color}; border-radius: 4px;"
+        )
+
+        # Poster image label (fills the frame)
+        self._poster_lbl = QLabel(self._poster_frame)
+        self._poster_lbl.setGeometry(0, 0, cw, ph)
+        self._poster_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._poster_lbl.setStyleSheet("background: transparent; border-radius: 4px;")
+
+        # Remember the zoomed poster dimensions for image-loaded crop math.
+        self._zoomed_cw = cw
+        self._zoomed_ph = ph
+
+        # Shimmer animation — created here but only STARTED in request_image()
+        # so collapsed-shelf cards don't burn CPU with hundreds of idle animations.
+        #
+        # IMG-4: the loop count is FINITE (20 loops * 900ms ~= 18s), not -1.
+        # A delivery hole that leaves a card un-notified (IMG-3's bug: the
+        # resident-LRU fast path only broadcast, so any subscribe()-only
+        # caller — every Discover card — never heard back) used to leave an
+        # infinite QPropertyAnimation repainting forever; with hundreds of
+        # stuck cards that turned a cosmetic bug into ~1.1s main-thread
+        # stalls whose Python stack was empty (the work is Qt C++, invisible
+        # to a profiler that only samples Python frames). 18s is far longer
+        # than any healthy load and short enough that a genuinely stuck card
+        # settles to a static placeholder on its own — no per-card QTimer,
+        # which would add an extra object per card across hundreds of cards.
+        if card.thumbnail_url:
+            effect = QGraphicsOpacityEffect(self._poster_lbl)
+            self._poster_lbl.setGraphicsEffect(effect)
+            self._shimmer = QPropertyAnimation(effect, b"opacity", self)
+            self._shimmer.setDuration(900)
+            self._shimmer.setStartValue(0.35)
+            self._shimmer.setEndValue(0.85)
+            self._shimmer.setEasingCurve(QEasingCurve.Type.InOutSine)
+            self._shimmer.setLoopCount(20)
+            self._shimmer.finished.connect(self._stop_shimmer)
+        else:
+            self._shimmer = None
+
+        # Placeholder media-type icon (centered) — font size scales with zoom.
+        self._icon_lbl = QLabel(self._poster_frame)
+        self._icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon_h = round(40 * z)
+        self._icon_lbl.setGeometry(0, ph // 2 - icon_h // 2, cw, icon_h)
+        self._icon_lbl.setStyleSheet("background: transparent;")
+        _icon_utils.set_label_icon(self._icon_lbl, "movie" if card.media_type == "movie" else "series",
+                                   max(16, round(icon_h * 0.8)))
+
+        # Rating badge (bottom-left overlay) — magic numbers scaled by zoom.
+        if card.rating:
+            rating_lbl = QLabel(f"{_icon_utils.role_html('rating_star')} {card.rating:.1f}", self._poster_frame)
+            badge_y = ph - round(22 * z)
+            badge_h = round(18 * z)
+            badge_w = round(60 * z)
+            rating_lbl.setGeometry(round(4 * z), badge_y, badge_w, badge_h)
+            rating_lbl.setFont(_theme.zoomed_font(_theme.FONT_SM, z))
+            _theme.style_fn(rating_lbl, lambda: f"background: {_theme.OVERLAY_BLACK_65}; color: {_theme.COLOR_GOLD};"
+                " border-radius: 3px; padding: 1px 4px;")
+
+        # Category badge (bottom-right overlay) — provider's prefix label.
+        if card.detected_prefix:
+            cat_lbl = QLabel(card.detected_prefix, self._poster_frame)
+            cat_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            cat_lbl.setFont(_theme.zoomed_font(_theme.FONT_XS, z))
+            _theme.style_fn(cat_lbl, lambda: f"background: {_theme.OVERLAY_BLACK_55}; color: {_theme.COLOR_ON_FILL_LIGHT};"
+                " border-radius: 3px; padding: 1px 3px;")
+            cat_lbl.adjustSize()
+            cat_lbl.move(cw - cat_lbl.width() - round(4 * z), ph - round(22 * z))
+
+        # Status overlay (top-right corner) — badges scale with zoom.
+        badges = [role for on, role in ((card.is_liked, "like"), (card.is_favorite, "favorite"),
+                                         (card.in_queue, "watch_later"), (card.already_watched, "watched"))
+                  if on]
+        if badges:
+            status_lbl = QLabel(" ".join(_icon_utils.role_html(r) for r in badges), self._poster_frame)
+            status_lbl.setFont(_theme.zoomed_font(_theme.FONT_XS, z))
+            _theme.style_fn(status_lbl, lambda: f"background: {_theme.OVERLAY_BLACK_60}; border-radius: 3px;"
+                f" padding: 1px 3px; color: {_theme.COLOR_ON_FILL_LIGHT};")
+            status_lbl.adjustSize()
+            status_lbl.move(cw - status_lbl.width() - round(4 * z), round(4 * z))
+            status_lbl.raise_()
+
+        # Resume-progress bar — thin strip at the very bottom of the poster frame.
+        # Shown only when the movie has been partially watched (not completed).
+        # Already-watched cards use the ✓ badge above instead.
+        if card.progress_fraction > 0.0 and not card.already_watched:
+            bar_h = max(3, round(4 * z))
+            progress_bar = QProgressBar(self._poster_frame)
+            progress_bar.setRange(0, 100)
+            progress_bar.setValue(round(card.progress_fraction * 100))
+            progress_bar.setFixedSize(cw, bar_h)
+            progress_bar.setTextVisible(False)
+            progress_bar.setGeometry(0, ph - bar_h, cw, bar_h)
+            progress_bar.setToolTip(f"Resume at {round(card.progress_fraction * 100)}% watched")
+            # Orange, and the same orange the details pane's Resume button and
+            # the channel list's ▶ indicator use — this bar means "resume here".
+            _theme.style_fn(progress_bar, lambda: _theme.progress_bar(
+                _theme.COLOR_ACCENT_ORANGE, thin=True))
+            progress_bar.raise_()
+
+        # Variant-count badge (bottom-left overlay) — shown only when variant_count > 1.
+        # Signals that this card represents multiple source/quality copies of the same
+        # production.  Uses the ×N glyph (e.g. "×3") with VARIANT_BADGE styling.
+        if card.variant_count > 1:
+            vc_lbl = QLabel(
+                f"{_icons.variant_count_icon}{card.variant_count}",
+                self._poster_frame,
+            )
+            vc_lbl.setFont(_theme.zoomed_font(_theme.FONT_SM, z))
+            _theme.style(vc_lbl, "VARIANT_BADGE")
+            vc_lbl.adjustSize()
+            # Position: bottom-left, below the rating badge (if any).
+            # If rating is present, move 2 rows up from the bottom; otherwise 1 row.
+            _badge_row = 2 if card.rating else 1
+            vc_lbl.move(
+                round(4 * z),
+                ph - round(_badge_row * 22 * z),
+            )
+            vc_lbl.setToolTip(
+                f"{card.variant_count} source / quality variants of this title available"
+            )
+            vc_lbl.raise_()
+
+        vl.addWidget(self._poster_frame)
+
+        # Title label (2 lines, word-wrapped) — width and font scale with zoom.
+        title_h = ch - ph - 4  # card_h − poster_h − spacing; ≈38px at 1.0×
+        self._title_lbl = QLabel(card.title)
+        self._title_lbl.setFixedWidth(cw)
+        self._title_lbl.setFixedHeight(max(24, title_h))
+        self._title_lbl.setWordWrap(True)
+        self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._title_lbl.setFont(_theme.zoomed_font(_theme.FONT_MD, z))
+        _theme.style_fn(self._title_lbl, lambda: f"color: {_theme.COLOR_TEXT};")
+        self._title_lbl.setToolTip(card.title)
+        vl.addWidget(self._title_lbl)
+
+    def request_image(self) -> None:
+        """Request poster image load — idempotent, only fires once.
+
+        Also starts the shimmer and connects the image_loaded / image_failed
+        signals here (not in __init__) so collapsed-shelf cards incur zero
+        overhead.  Both signals are disconnected when either one fires.
+        """
+        if not self._image_requested and self._card.thumbnail_url:
+            self._image_requested = True
+            if self._shimmer:
+                self._shimmer.start()
+            # subscribe(), NOT the image_loaded broadcast.
+            #
+            # A shelf builds one card per title, and every card waiting for a
+            # poster used to connect to the shared signal — so each arriving
+            # image invoked the slot on ALL waiting cards and all but one
+            # returned immediately on a url mismatch. Filling a screen of
+            # posters cost N² dispatches: 157 ms of pure signal plumbing at
+            # 800 cards, before decoding anything. That is the choppy scroll
+            # into unloaded posters; scrolling back over loaded ones was
+            # smooth because a card left the fan-out once its image arrived.
+            self._image_cache.subscribe(
+                self._card.thumbnail_url,
+                self._on_image_loaded,
+                self._on_image_failed,
+            )
+            self._image_cache.get_image_async(self._card.thumbnail_url)
+
+    def _stop_shimmer(self) -> None:
+        """Stop the shimmer animation and reset the poster opacity to 1.0."""
+        if self._shimmer:
+            self._shimmer.stop()
+            effect = self._poster_lbl.graphicsEffect()
+            if effect:
+                effect.setOpacity(1.0)
+
+    def _on_image_loaded(self, url: str, pixmap: QPixmap) -> None:
+        # No disconnect and no url guard needed: subscribe() routes this url to
+        # this card only, and drops the subscription once it has fired.
+        self._stop_shimmer()
+        # Crop to the zoomed card dimensions (stored at construction time so we
+        # don't re-derive from config here — the card is already the right size).
+        cw, ph = self._zoomed_cw, self._zoomed_ph
+        scaled = pixmap.scaled(
+            cw, ph,
+            Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        x = (scaled.width() - cw) // 2
+        y = (scaled.height() - ph) // 2
+        cropped = scaled.copy(x, y, cw, ph)
+        self._poster_lbl.setPixmap(cropped)
+        self._icon_lbl.setVisible(False)
+
+    def _on_image_failed(self, url: str, error: str) -> None:
+        """Handle image-load failure: stop the shimmer and clean up connections.
+
+        The placeholder icon remains visible (it is never hidden on failure),
+        so the card shows a meaningful fallback rather than a blank shimmer.
+        """
+        logger.debug(f"Poster load failed for {url!r}: {error}")
+        self._stop_shimmer()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit(self._card.channel_id)
+        elif event.button() == Qt.MouseButton.MiddleButton:
+            self.middleClicked.emit(self._card.channel_id)
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.doubleClicked.emit(self._card.channel_id)
+        super().mouseDoubleClickEvent(event)
+
+    def contextMenuEvent(self, event: QContextMenuEvent) -> None:
+        self.contextMenuRequested.emit(
+            self._card.channel_id, event.globalPos().x(), event.globalPos().y()
+        )
+        event.accept()

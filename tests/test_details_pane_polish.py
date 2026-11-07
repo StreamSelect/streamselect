@@ -1,0 +1,512 @@
+"""Behavioral tests for details-pane polish fixes.
+
+an earlier change — variant chip queue context-menu shows correct "Add/Remove from Queue" label
+an earlier change — genre chips wrap via _FlowLayout rather than overflowing a single-line QLabel
+e87956eb — comma-joined genre strings split into one chip each (no over-wide chip)
+backlog — empty Overview / Cast & Crew sections hide themselves (no empty boxes)
+"""
+
+from __future__ import annotations
+
+import pytest
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    from PyQt6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def _make_config():
+    from streamselect.core.config import Config
+    return Config()
+
+
+# ── Fix an earlier change: variant chip queue label ─────────────────────────────────────
+#
+# DETAILS-3c removed the status-glyph suffix (queue/favorite/history icons on
+# a chip's face) entirely — the chip label is now display_code(prefix) +
+# quality token only, and two same-prefix copies disambiguate via the "×N"
+# merge menu instead. ``_chip_status_suffix`` no longer exists; the menu's
+# own queue-label behaviour (tested below) is unaffected.
+
+
+def test_version_chip_menu_queue_action_label_and_optimistic_flip(qapp, monkeypatch, owned_widgets):
+    """Queue menu action text must match v.in_queue; choosing it flips in_queue optimistically.
+
+    Strategy: subclass QMenu so that exec() returns whichever action the code added for
+    the queue slot.  This exercises the real _show_version_chip_menu code path and
+    verifies that:
+      - the action text is 'Add to Watch Later' when in_queue=False (and flips to True)
+      - the action text is 'Remove from Watch Later' when in_queue=True (and flips to False)
+    """
+    from PyQt6.QtCore import QPoint
+    from PyQt6.QtWidgets import QMenu
+    from streamselect.gui.details_versions import ChannelVersion, _VersionSection
+    from tests.conftest import destroy_widget
+
+    # MENU-1: the menu is built by channel_menu.build_channel_menu now, not a
+    # QMenu constructed in this module — patch QMenu.exec on the class itself
+    # (every instance, whichever module constructed it) rather than the
+    # module-level import, which build_channel_menu no longer reads.
+    def _pick_queue_action(self, pos=None):  # type: ignore[override]
+        # MENU-1: the registry wires the handler via triggered.connect, not a
+        # chosen-action return-value dispatch (the old hand-rolled menu's
+        # shape) — .trigger() it, same as a real exec() firing the signal
+        # when the user picks it.
+        for act in self.actions():
+            if "Watch Later" in act.text():
+                act.trigger()
+                return act
+        return None
+
+    monkeypatch.setattr(QMenu, "exec", _pick_queue_action)
+
+    section = _VersionSection(_make_config())
+    emitted: list[str] = []
+    section.queue_toggled.connect(lambda cid: emitted.append(cid))
+
+    try:
+        # Case A: not yet queued — choosing the action should flip in_queue True
+        v_off = ChannelVersion(channel_id="c1", name="T", in_queue=False)
+        section._show_version_chip_menu(QPoint(0, 0), v_off)
+        assert v_off.in_queue is True, (
+            "After choosing the 'Add to Queue' action, v.in_queue must flip True"
+        )
+        assert "c1" in emitted, "queue_toggled must emit the channel_id"
+
+        # Case B: already queued — choosing the action should flip in_queue False
+        emitted.clear()
+        v_on = ChannelVersion(channel_id="c2", name="T", in_queue=True)
+        section._show_version_chip_menu(QPoint(0, 0), v_on)
+        assert v_on.in_queue is False, (
+            "After choosing the 'Remove from Queue' action, v.in_queue must flip False"
+        )
+        assert "c2" in emitted, "queue_toggled must emit the channel_id"
+    finally:
+        # MENU-1: build_channel_menu's actions connect closures that reference
+        # section back — a real Qt reference cycle the old hand-rolled menu
+        # (no .connect() at all, dispatched on menu.exec()'s return value)
+        # never created; section has no Qt parent, so nothing else destroys it.
+        destroy_widget(section)
+
+
+# DETAILS-3c removed the chip-text refresh-on-queue-toggle behaviour along
+# with the status-glyph suffix it existed to repaint — a chip's face no
+# longer encodes queue/favorite/history state at all (see the comment above
+# test_version_chip_menu_queue_action_label_and_optimistic_flip).
+
+
+# ── Fix an earlier change: genre chips wrap in flow layout ─────────────────────────────
+
+def test_genre_load_populates_flow_container(qapp, owned_widgets):
+    """After load_metadata with genres, _genres_container holds one chip per genre."""
+    from PyQt6.QtWidgets import QPushButton
+    from streamselect.gui.details_title import _MetadataSection
+    from streamselect.gui.flow_layout import FlowLayout as _FlowLayout
+    from streamselect.metadata_providers.base import MetadataResult
+
+    section = owned_widgets.own(_MetadataSection(_make_config()))
+    section.load_metadata(MetadataResult(genres=["Action", "Drama", "Science Fiction"]))
+
+    assert not section._genres_container.isHidden(), (
+        "_genres_container should not be hidden after genres are loaded"
+    )
+    assert isinstance(section._genres_layout, _FlowLayout), (
+        "Genre row must use _FlowLayout so chips can wrap at the panel width"
+    )
+    chip_texts = {c.text() for c in [c for c in section._genres_container.findChildren(QPushButton) if c.property("genre")]}
+    assert chip_texts == {"Action", "Drama", "Science Fiction"}, (
+        f"Expected one chip per genre; got {chip_texts}"
+    )
+
+
+def test_genre_chip_click_emits_genre_clicked(qapp, owned_widgets):
+    """Clicking a genre chip emits genre_clicked with the raw (unescaped) genre name."""
+    from PyQt6.QtWidgets import QPushButton
+    from streamselect.gui.details_title import _MetadataSection
+    from streamselect.metadata_providers.base import MetadataResult
+
+    section = owned_widgets.own(_MetadataSection(_make_config()))
+    section.load_metadata(MetadataResult(genres=["Science Fiction", "Drama"]))
+
+    emitted: list[str] = []
+    section.genre_clicked.connect(lambda g: emitted.append(g))
+
+    chips = [c for c in section._genres_container.findChildren(QPushButton) if c.property("genre")]
+    sf_chip = next((c for c in chips if c.text() == "Science Fiction"), None)
+    assert sf_chip is not None, "Should have a 'Science Fiction' chip button"
+    sf_chip.click()
+
+    assert emitted == ["Science Fiction"], (
+        f"genre_clicked should emit the raw genre name; got {emitted}"
+    )
+
+
+def test_genre_chips_not_shown_for_live_channels(qapp, owned_widgets):
+    """Live channels (no metadata genres) must leave the genre area hidden."""
+    from streamselect.gui.details_title import _MetadataSection
+
+    section = owned_widgets.own(_MetadataSection(_make_config()))
+    section.set_mode(is_live=True)
+
+    assert section._genres_container.isHidden(), (
+        "_genres_container should be hidden for live channels"
+    )
+    assert section._genres_loading_lbl.isHidden(), (
+        "Loading label should be hidden for live channels"
+    )
+
+
+def test_genre_loading_label_shown_while_metadata_pending(qapp, owned_widgets):
+    """After load_basic for a non-live channel, loading label is shown, not the container."""
+    from unittest.mock import MagicMock
+    from streamselect.gui.details_title import _MetadataSection
+
+    section = owned_widgets.own(_MetadataSection(_make_config()))
+    # Minimal stub channel DTO
+    ch = MagicMock()
+    ch.name = "Test Movie (2023)"
+    ch.media_type = "movie"
+    ch.is_favorite = False
+    ch.is_adult = False
+    ch.detected_title = "Test Movie"
+    ch.detected_year = "2023"
+    ch.detected_prefix = None
+    ch.detected_quality = None
+    ch.detected_region = None
+    ch.raw_data = None
+    ch.provider_id = None
+    ch.watch_completed = False
+    ch.watch_progress = 0
+
+    section.load_basic(ch)
+
+    assert not section._genres_loading_lbl.isHidden(), (
+        "Loading label should be shown while metadata is pending"
+    )
+    assert section._genres_container.isHidden(), (
+        "Genre container should be hidden until load_metadata is called"
+    )
+
+
+def test_genre_clear_hides_container(qapp, owned_widgets):
+    """After clear(), the genre container and loading label are hidden."""
+    from streamselect.gui.details_title import _MetadataSection
+    from streamselect.metadata_providers.base import MetadataResult
+
+    section = owned_widgets.own(_MetadataSection(_make_config()))
+    section.load_metadata(MetadataResult(genres=["Action"]))
+    assert not section._genres_container.isHidden(), (
+        "_genres_container should not be hidden after genres loaded"
+    )
+    section.clear()
+    assert section._genres_container.isHidden(), (
+        "_genres_container should be hidden after clear()"
+    )
+    assert section._genres_loading_lbl.isHidden(), (
+        "Loading label should be hidden after clear()"
+    )
+
+
+# ── e87956eb: comma-joined genre strings split into separate wrapping chips ──
+
+def test_comma_joined_genres_split_into_separate_chips(qapp, owned_widgets):
+    """A single comma-joined genre string becomes one chip per genre so they wrap.
+
+    Providers (e.g. for "Cowboy Bebop") often deliver all genres as one
+    comma-separated string in a single list element.  Previously only '/' was
+    split, so this produced one over-wide chip; now both ',' and '/' split.
+    """
+    from PyQt6.QtWidgets import QPushButton
+    from streamselect.gui.details_title import _MetadataSection
+    from streamselect.metadata_providers.base import MetadataResult
+
+    section = owned_widgets.own(_MetadataSection(_make_config()))
+    section.load_metadata(MetadataResult(
+        genres=["Animation, Action, Adventure, Comedy, Drama, Science Fiction"]
+    ))
+    chip_texts = {c.text() for c in [c for c in section._genres_container.findChildren(QPushButton) if c.property("genre")]}
+    assert chip_texts == {
+        "Animation", "Action", "Adventure", "Comedy", "Drama", "Science Fiction"
+    }, f"comma-joined genres must split into one chip each; got {chip_texts}"
+
+
+def test_comma_joined_genres_do_not_force_wide_minimum(qapp, owned_widgets):
+    """The over-wide single chip is the bug e87956eb: after splitting, the flow
+    layout's minimum width is just the widest single genre, never the whole joined
+    string — so it can never push the details panel (min 300px) wider."""
+    from streamselect.gui.details_title import _MetadataSection
+    from streamselect.metadata_providers.base import MetadataResult
+
+    joined = "Animation, Action, Adventure, Comedy, Drama, Science Fiction"
+
+    # Sanity: the un-split joined string is genuinely wider than the panel.
+    unsplit = owned_widgets.own(_MetadataSection(_make_config()))
+    unsplit._populate_genre_chips([joined])
+    unsplit_w = unsplit._genres_layout.minimumSize().width()
+    assert unsplit_w > 300, (
+        f"precondition: a single joined chip should be over-wide; got {unsplit_w}"
+    )
+
+    section = owned_widgets.own(_MetadataSection(_make_config()))
+    section.load_metadata(MetadataResult(genres=[joined]))
+    split_w = section._genres_layout.minimumSize().width()
+    assert split_w < 200, (
+        f"genre flow min width {split_w} too wide — chips not wrapping; "
+        "a single joined chip forces the panel wider than its width"
+    )
+
+
+def test_ampersand_genre_not_split(qapp, owned_widgets):
+    """'Sci-Fi & Fantasy' / 'Action & Adventure' are single TMDB genres — '&'
+    must never split them, only ',' and '/' do.
+
+    The chip text is escaped for display ('&' → '&&' so a QPushButton does not
+    treat it as a mnemonic); normalise that back before comparing so this test
+    stays about the *split* behaviour, not the display escaping."""
+    from PyQt6.QtWidgets import QPushButton
+    from streamselect.gui.details_title import _MetadataSection
+    from streamselect.metadata_providers.base import MetadataResult
+
+    section = owned_widgets.own(_MetadataSection(_make_config()))
+    section.load_metadata(MetadataResult(genres=["Sci-Fi & Fantasy, Action"]))
+    chip_texts = {
+        c.text().replace("&&", "&")
+        for c in [c for c in section._genres_container.findChildren(QPushButton) if c.property("genre")]
+    }
+    assert chip_texts == {"Sci-Fi & Fantasy", "Action"}, (
+        f"'&' must not split a genre; got {chip_texts}"
+    )
+
+
+def test_duplicate_genres_deduped(qapp, owned_widgets):
+    """Merged multi-provider metadata can repeat a genre — render it once."""
+    from PyQt6.QtWidgets import QPushButton
+    from streamselect.gui.details_title import _MetadataSection
+    from streamselect.metadata_providers.base import MetadataResult
+
+    section = owned_widgets.own(_MetadataSection(_make_config()))
+    section.load_metadata(MetadataResult(genres=["Action, Drama", "drama / Action"]))
+    chips = [c.text() for c in [c for c in section._genres_container.findChildren(QPushButton) if c.property("genre")]]
+    assert sorted(chips) == ["Action", "Drama"], (
+        f"duplicate genres (case-insensitive) must collapse to one chip; got {chips}"
+    )
+
+
+# ── backlog: empty Overview / Cast & Crew sections hide themselves ──────────
+# The section sequence below (set_mode -> clear -> load) mirrors exactly what
+# DetailsPaneWidget.show_channel() does per selection, so these execute the
+# real reset path used when the reused pane switches between titles.
+
+def test_overview_hidden_when_no_plot(qapp, owned_widgets):
+    """A non-live title with no overview text hides the whole Overview section."""
+    from streamselect.gui.details_sections import _PlotSection
+
+    s = owned_widgets.own(_PlotSection())
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load(None)
+    assert s.isHidden(), "Overview section must be hidden when there is no plot text"
+
+
+def test_overview_visible_when_plot_present(qapp, owned_widgets):
+    """A title with an overview shows the Overview section with its text."""
+    from streamselect.gui.details_sections import _PlotSection
+
+    s = owned_widgets.own(_PlotSection())
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load("A bounty hunter drifts through space.")
+    assert not s.isHidden(), "Overview section must be visible when a plot is present"
+    assert s.plot_label.text() == "A bounty hunter drifts through space."
+
+
+def test_overview_visible_while_loading(qapp, owned_widgets):
+    """While metadata is still loading the Overview section stays visible."""
+    from streamselect.gui.details_sections import _PlotSection
+
+    s = owned_widgets.own(_PlotSection())
+    s.set_mode(is_live=False)
+    s.clear()
+    s.show_loading()
+    assert not s.isHidden(), "Overview must be visible while metadata is loading"
+
+
+def test_overview_visibility_resets_across_reuse(qapp, owned_widgets):
+    """Reused pane: title WITH plot -> title WITHOUT plot hides -> back re-shows."""
+    from streamselect.gui.details_sections import _PlotSection
+
+    s = owned_widgets.own(_PlotSection())
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load("Plot one.")
+    assert not s.isHidden()
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load(None)
+    assert s.isHidden(), "must hide when reused for a plot-less title"
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load("Plot three.")
+    assert not s.isHidden(), "must re-show when reused for a title that has a plot"
+
+
+def test_cast_hidden_when_no_cast_or_crew(qapp, owned_widgets):
+    """A title with neither cast nor director hides the whole Cast & Crew section."""
+    from streamselect.gui.details_sections import _CastSection
+
+    s = owned_widgets.own(_CastSection(_make_config()))
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load(cast=[], director=None)
+    assert s.isHidden(), "Cast & Crew must hide with no cast and no director"
+
+
+def test_cast_visible_with_cast(qapp, owned_widgets):
+    """Any cast members make the Cast & Crew section visible."""
+    from streamselect.gui.details_sections import _CastSection
+
+    s = owned_widgets.own(_CastSection(_make_config()))
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load(cast=[{"name": "Jane Doe"}], director=None)
+    assert not s.isHidden(), "Cast & Crew must be visible when there is cast"
+
+
+def test_cast_visible_with_director_only(qapp, owned_widgets):
+    """A director alone is enough to show the Cast & Crew section."""
+    from streamselect.gui.details_sections import _CastSection
+
+    s = owned_widgets.own(_CastSection(_make_config()))
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load(cast=[], director="Shinichiro Watanabe")
+    assert not s.isHidden(), "director alone is enough content to show the section"
+
+
+def test_cast_visibility_resets_across_reuse(qapp, owned_widgets):
+    """Reused pane: title WITH people -> title WITHOUT -> hides -> back re-shows."""
+    from streamselect.gui.details_sections import _CastSection
+
+    s = owned_widgets.own(_CastSection(_make_config()))
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load(cast=[{"name": "A"}], director="D")
+    assert not s.isHidden()
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load(cast=[], director=None)
+    assert s.isHidden(), "must hide when reused for a title with no cast/crew"
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load(cast=[{"name": "B"}], director=None)
+    assert not s.isHidden(), "must re-show when reused for a title with cast"
+
+
+def test_cast_summary_states_the_count(qapp, owned_widgets):
+    """the project rules: 'a disclosure states its count' — Cast never did (CHV-2)."""
+    from streamselect.gui.details_sections import _CastSection
+
+    s = owned_widgets.own(_CastSection(_make_config()))
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load(cast=[{"name": "A"}, {"name": "B"}, {"name": "C"}], director=None)
+    assert s._header.summary() == "3", "the Cast header must state how many cast members"
+
+
+def test_cast_summary_is_empty_with_director_only(qapp, owned_widgets):
+    """A director alone shows the section but has no CAST count to state —
+    the director is already named in its own label, not folded into this
+    number."""
+    from streamselect.gui.details_sections import _CastSection
+
+    s = owned_widgets.own(_CastSection(_make_config()))
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load(cast=[], director="Shinichiro Watanabe")
+    assert s._header.summary() == ""
+
+
+def test_cast_summary_clears_on_reuse(qapp, owned_widgets):
+    """Reused pane: a title with 5 cast -> a title with none must not keep '5'."""
+    from streamselect.gui.details_sections import _CastSection
+
+    s = owned_widgets.own(_CastSection(_make_config()))
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load(cast=[{"name": n} for n in "ABCDE"], director=None)
+    assert s._header.summary() == "5"
+    s.set_mode(is_live=False)
+    s.clear()
+    s.load(cast=[], director=None)
+    assert s._header.summary() == ""
+
+
+# ── the details-pane watch bell ───────────────────────────────────────────────
+
+def test_the_watch_bell_toggles_without_raising(qapp, tmp_path, owned_widgets):
+    """Every click of the bell toggled the rule and then raised NameError.
+
+    ``_on_watchlist`` ended with ``update_epg_title(title, patterns)`` and
+    ``patterns`` is not a name in ``details_pane`` — so the write landed, the
+    button never redrew, and the traceback surfaced as a dead-looking control.
+    ruff's F821 is in the project's ignore list (pyproject.toml), which is how
+    a second live undefined name stood after the first was fixed.
+    """
+    from streamselect.core import watchlist
+    from streamselect.core.config import Config
+    from streamselect.core.image_cache import ImageCache
+    from streamselect.gui.details_pane import DetailsPaneWidget
+
+    config = Config(config_dir=tmp_path)
+    pane = owned_widgets.own(
+        DetailsPaneWidget(config, ImageCache(cache_dir=tmp_path / "img")))
+    # _ActionBar is deliberately never added to a layout (details_pane.py:499 —
+    # it owns the buttons the poster rail reparents), so it is a top-level of
+    # its own that destroying the pane does not take with it. Ledger F45.
+    owned_widgets.own(pane._action_bar)
+    pane._on_epg_title_changed("Match of the Day")
+    assert pane._action_bar.watchlist_button.isChecked() is False
+
+    pane._on_watchlist()
+    assert watchlist.patterns(config) == ("Match of the Day",)
+    assert pane._action_bar.watchlist_button.isChecked() is True, (
+        "the bell did not redraw after the rule was added")
+
+    pane._on_watchlist()
+    assert watchlist.patterns(config) == ()
+    assert pane._action_bar.watchlist_button.isChecked() is False
+
+
+# ── the deferred re-fit must not outlive its section ─────────────────────────
+
+def test_the_deferred_refit_dies_with_the_poster_section(qapp, owned_widgets):
+    """A bare ``QTimer.singleShot(0, bound_method)`` outlived a section torn down
+    in the same event-loop turn and fired into the dead widget — one of the
+    timer-on-a-dead-widget shapes behind the CI teardown crashes.
+    The re-fit is now a timer the section owns: gone with it, and still firing
+    while it lives."""
+    from PyQt6.QtGui import QPixmap
+    from tests.conftest import destroy_widget
+    from streamselect.gui.details_sections import _PosterSection
+
+    from unittest.mock import MagicMock
+
+    section = owned_widgets.own(_PosterSection(_make_config(), MagicMock()))
+    fired: list[str] = []
+    section._apply_scaled_poster = lambda: fired.append("poster")
+    section._display_poster(QPixmap(40, 60))
+    assert section._refit_timer.isActive(), "the re-fit was not scheduled"
+    qapp.processEvents()
+    for _ in range(3):
+        qapp.processEvents()
+    assert fired, "the deferred re-fit never ran while the section was alive"
+
+    section._display_poster(QPixmap(40, 60))
+    fired.clear()              # the synchronous first fit just ran; only the timer is left
+    assert section._refit_timer.isActive()
+    destroy_widget(section)
+    for _ in range(3):
+        qapp.processEvents()
+    assert not fired, "the re-fit fired after the section was destroyed"

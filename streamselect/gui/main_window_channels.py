@@ -1,0 +1,2184 @@
+"""Channel-list load, filter pipeline, and context-menu glue mixin for :class:`MainWindow`.
+
+This module holds :class:`_ChannelListMixin` — the channel-list loading, filter
+pipeline, and unified context-menu infrastructure methods extracted verbatim from
+``main_window.py`` as part of the B10 decomposition.  It covers:
+
+* Filter panel toggle (``toggle_filters``)
+* Search debounce handler (``_on_search_text_changed``)
+* Non-blocking channel load + async query worker (``load_channels``, ``_query_channels``)
+* Load-error and load-result handlers (``_on_channels_load_error``, ``_on_channels_loaded``)
+* Channel-list render pass (``filter_channels``)
+* Media-type helpers and category picker (``get_enabled_media_types``, ``_open_category_picker``)
+* Tier-1 bypass ("show filtered results") and filter-change handler
+  (``_show_filtered_results``, ``on_filter_changed``)
+* Filter-statistics background load (``initialize_filter_stats``, ``_on_filter_stats_loaded``)
+* Unified context-menu seam: ``_show_channel_menu``, ``_bg_fetch_ctx_data``,
+  ``_on_ctx_data_ready``, ``_build_handlers``, ``_show_context_menu_for``
+
+The methods rely on attributes and sibling methods defined on ``MainWindow``
+(e.g. ``self.db``, ``self.executor``, ``self._run_query``, ``self.config``,
+``self.player_manager``); they resolve via ``self``/MRO at runtime, so the
+split is behaviour-preserving.
+"""
+
+from __future__ import annotations
+
+from PyQt6.QtCore import Qt as _Qt, QTimer
+from loguru import logger
+
+from streamselect.core.repositories.channel_list_rows import rows_to_dtos
+from streamselect.core.quality_vocab import quality_display
+from streamselect.gui.empty_state import EmptyState
+from streamselect.gui import deferred_config_save as _cfgsave
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import downloaded_scope as _dl_scope
+from streamselect.gui import ui_phase as _phase
+from streamselect.gui.channel_transparency import AT_LEAST as _transparency_at_least
+from streamselect.core.filter_utils import is_channel_excluded
+from streamselect.core.repositories import RepositoryFactory
+
+
+def _apply_python_exclusions(channels: list, excluded_prefixes: set, excluded_user_cats: set,
+                             excluded_channel_ids: set | None = None, keep_ids=None) -> list:
+    """Drop channels hidden by the Python-side Global Exclusions.
+
+    The batch Python twin of the canonical Global-Exclusion predicate — routes
+    each candidate row through :func:`~streamselect.core.filter_utils.is_channel_excluded`
+    (the single source of truth for "language wins over region"; see its
+    docstring). Used by both ``_query_channels`` and its pagination sibling, and
+    by the ``hidden_by_search`` recount so the diff compares like with like. Ids in
+    ``keep_ids`` pass the prefix rule anyway (measured audio contradicts the prefix).
+    A channel is also excluded when its user category is in ``excluded_user_cats``,
+    or when its id is in ``excluded_channel_ids`` (the content-provenance layer —
+    channels carrying a globally-excluded ``content_type`` tag, pre-resolved via
+    ``TagRepository.channel_ids_for_content_types`` because the fetched rows carry
+    no tags; the Python-side twin of
+    ``filter_utils.tag_content_type_exclusion_criterion``).
+
+    Args:
+        channels: The candidate ChannelDB rows.
+        excluded_prefixes: Prefix/region codes the user has globally excluded
+            (build via ``filter_utils.global_exclusion_set``).
+        excluded_user_cats: User categories the user has globally excluded.
+        excluded_channel_ids: Channel ids carrying a globally-excluded
+            ``content_type`` tag (resolved off-thread; ``None``/empty → no
+            content-type layer).
+
+    Returns:
+        The surviving channels (a new list; the input is not mutated).
+    """
+    if excluded_prefixes:
+        channels = [
+            c for c in channels if (keep_ids and c.id in keep_ids)
+            or not is_channel_excluded(c.detected_prefix, c.detected_region, excluded_prefixes)]
+    if excluded_user_cats:
+        channels = [c for c in channels if c.user_category not in excluded_user_cats]
+    if excluded_channel_ids:
+        channels = [c for c in channels if c.id not in excluded_channel_ids]
+    return channels
+
+
+def _resolve_exclusions(repos, params: dict) -> tuple[tuple, dict]:
+    """``(sets, rank)``: the ``_apply_python_exclusions`` argument tuple
+    (prefixes, user categories, content-type ids, heard-keep ids), and the
+    ``get_all`` kwargs that let ``collapse_variants`` elect a copy that pass
+    keeps — heard-keep included (ledger D69). Page 1 and page N share it."""
+    prefixes = params.get('excluded_prefixes', set())
+    user_cats = params.get('excluded_user_categories', set())
+    ct_slugs = params.get('excluded_tag_content_types') or set()
+    ct_ids = repos.tags.channel_ids_for_content_types(ct_slugs) if ct_slugs else set()
+    heard_keep = repos.stream_info.prefix_exempt_ids(prefixes)
+    rank = {'excluded_prefixes': prefixes or None, 'excluded_user_categories': user_cats or None,
+            'excluded_channel_ids': ct_ids or None, 'exclusion_exempt_ids': heard_keep or None}
+    return (prefixes, user_cats, ct_ids, heard_keep), rank
+
+
+class _ChannelListMixin:
+    """Channel-list load, filter pipeline, and context-menu glue methods mixed into :class:`MainWindow`."""
+
+    def toggle_filters(self):
+        """Show/hide the filter panel.
+
+        Hides the WIDGET rather than collapsing the splitter. ``filter_panel``
+        sets ``setMinimumWidth(160)``, so ``setSizes([0, …])`` can never reach 0
+        — Qt clamps it to the minimum. That produced the user-reported
+        behaviour exactly: the panel only got narrower, and because the old code
+        chose its direction from the measured size (``sizes[0] > 0``, still true
+        at 160) every later toggle took the hide branch again, so it could never
+        be turned back on.
+
+        Direction now comes from the persisted flag, which is the actual state,
+        and the panel's width is captured before hiding so restoring returns it
+        to where the user had it rather than a default.
+        """
+        if not hasattr(self, '_inner_splitter'):
+            return
+        currently_visible = bool(getattr(self.config, 'filter_section_visible', True))
+        if currently_visible:
+            width = self._inner_splitter.sizes()[0]
+            if width > 0:
+                self.config.filter_panel_width = width
+            self.filter_panel.setVisible(False)
+            self.config.filter_section_visible = False
+        else:
+            self.filter_panel.setVisible(True)
+            w = getattr(self.config, 'filter_panel_width', 220) or 220
+            total = sum(self._inner_splitter.sizes())
+            self._inner_splitter.setSizes([w, max(200, total - w)])
+            self.config.filter_section_visible = True
+        _cfgsave.save_soon(self)
+
+    def _on_search_text_changed(self, text: str) -> None:
+        """Handle search input changes — debounce to avoid per-keystroke DB queries."""
+        if getattr(self, "_suppress_search_handler", False):
+            return  # programmatic restore — caller issues the load; skip debounce/save
+        self._bypass_tier1_filters = False  # new search term — cancel any bypass
+        self._bypass_global_exclusions = False  # …including the exclusions reveal
+        self._bypass_dead_gate = False  # …and the dead-stream-gate reveal
+        self._bypass_keyword_exclusions = False  # …and the keyword-axis reveal
+        self._clear_id_filter()             # a new search drops the ephemeral alert id-filter
+        self._save_search_state()
+        self._search_debounce.start()  # restart the 200ms timer on each keystroke
+
+    def _on_search_submitted(self) -> None:
+        """Enter in the header search box: go to Search and run the query.
+
+        The box is always present now (see
+        ``_AppHeaderMixin._sync_header_search_visibility``), so it has to work
+        as a way INTO the Search view rather than only as a filter you can
+        reach once you are already there. Typing while on Discover and pressing
+        Enter switches and searches, which is what a permanently-visible search
+        field implies.
+
+        Deliberately does nothing on an empty box: Enter on an empty field
+        would yank you out of whatever view you were reading, having asked for
+        nothing. The debounced ``_on_search_text_changed`` still owns the
+        as-you-type path; this only adds the explicit submit.
+        """
+        text = ""
+        box = self.__dict__.get("search_input")
+        if box is not None:
+            text = box.text().strip()
+        if not text:
+            return
+        # switch_to_list_view already hides the other views, deactivates their
+        # chips and enables Search — isHidden(), not isVisible() (False for
+        # any child of an unshown window), since every content view, series
+        # tree included, hides the list via setVisible(False).
+        if not self.search_chip.is_enabled() or self.channels_list.isHidden():
+            self.switch_to_list_view()
+        # Run it now rather than waiting out the keystroke debounce — pressing
+        # Enter says "this one, now".
+        self._search_debounce.stop()
+        self.load_channels()
+
+    def _clear_id_filter(self) -> bool:
+        """Drop the ephemeral alert "show matches" id-filter (and its chip) if active.
+
+        Unlike the persistent details-pane context chips, the id-filter is one-shot:
+        any normal search or filter change clears it so it never silently sticks.
+        Context filters are mutually exclusive, so if the id-filter is active the
+        context chip belongs to it — safe to hide.
+
+        Returns:
+            True if an id-filter was active and cleared, else False.
+        """
+        self._bypass_global_exclusions = False  # any id-filter change drops the exclusions reveal
+        self._bypass_dead_gate = False  # …and the dead-stream-gate reveal
+        self._bypass_keyword_exclusions = False  # …and the keyword-axis reveal
+        if getattr(self, "_details_id_filter", None) is None:
+            return False
+        self._details_id_filter = None
+        self._id_filter_show_all = False  # never leak the reveal into normal browsing
+        if hasattr(self, "_context_filter_chip"):
+            self._context_filter_chip.hide()
+        return True
+
+    def _set_search_text_silently(self, text: str) -> None:
+        """Set the search box text without retriggering the load — keeping the clear ×.
+
+        ``blockSignals(True)`` would suppress the QLineEdit clear button (its
+        visibility is driven by ``textChanged``), so on startup-with-restored-text
+        the × never appeared until the user edited the box.  Guard the handler
+        instead of blocking the signal, so the button stays in sync.
+        """
+        self._suppress_search_handler = True
+        try:
+            self.search_input.setText(text)
+        finally:
+            self._suppress_search_handler = False
+
+    # ── Search state persistence ────────────────────────────────────────────
+
+    def _save_search_state(self) -> None:
+        """Persist the current search/filter state to config (no-op if remember_search is off)."""
+        if not getattr(self.config, 'remember_search', True):
+            return
+        query = self.search_input.text() if hasattr(self, 'search_input') else ""
+        scope = _dl_scope.scope_from_host(self)  # DL-5
+        state = {
+            "query": query,
+            "provider_id": getattr(self, 'selected_provider_id', None),
+            "hidden_mode": scope == 'hidden',
+            "list_scope": scope,
+            "genre_filter": getattr(self, '_details_genre_filter', None),
+            "person_filter": getattr(self, '_details_person_filter', None),
+            # Tag chip is a (facet_type, value) tuple → a list for YAML.
+            "tag_filter": (list(self._details_tag_filter)
+                           if getattr(self, '_details_tag_filter', None) else None),
+            "category_filter": getattr(self, '_details_category_filter', None),
+        }
+        self.config.last_search_state = state
+        _cfgsave.save_soon(self)   # per keystroke — see gui/deferred_config_save
+
+    def restore_search_state(self) -> bool:
+        """Restore a previously saved search state and trigger a channel load.
+
+        Returns True if a non-trivial state was restored (caller can skip their own
+        ``load_channels()`` call since this method issues one).  Returns False if the
+        feature is disabled or nothing was saved — the caller must call ``load_channels()``
+        themselves.
+
+        Must be called on the main thread after the UI is fully set up.
+        """
+        if not getattr(self.config, 'remember_search', True):
+            return False
+        state = getattr(self.config, 'last_search_state', {})
+        if not state:
+            return False
+
+        query = state.get("query", "")
+        provider_id = state.get("provider_id")
+        scope, hidden_mode, downloaded_mode = _dl_scope.scope_from_state(state)  # DL-5
+        genre_filter = state.get("genre_filter")
+        person_filter = state.get("person_filter")
+        tag_filter = state.get("tag_filter")          # [facet_type, value] | None
+        category_filter = state.get("category_filter")  # curated category | None
+
+        any_non_trivial = (
+            query or provider_id or hidden_mode or downloaded_mode or genre_filter
+            or person_filter or tag_filter or category_filter
+        )
+        if not any_non_trivial:
+            return False  # saved state is the empty default — nothing to restore
+
+        logger.info(
+            "Restoring search state: query={!r} provider={} scope={} genre={} "
+            "person={} tag={} category={}",
+            query, provider_id, scope, genre_filter, person_filter,
+            tag_filter, category_filter,
+        )
+
+        # Restore context chips (genre / person / tag / collection — mutually exclusive)
+        if genre_filter:
+            self._details_genre_filter = genre_filter
+            self._details_person_filter = None
+            if hasattr(self, '_context_filter_label'):
+                self._context_filter_label.setText(f"Genre: {genre_filter}")
+            if hasattr(self, '_context_filter_chip'):
+                self._context_filter_chip.show()
+        elif person_filter:
+            self._details_person_filter = person_filter
+            self._details_genre_filter = None
+            if hasattr(self, '_context_filter_label'):
+                self._context_filter_label.setText(f"Cast/Crew: {person_filter}")
+            if hasattr(self, '_context_filter_chip'):
+                self._context_filter_chip.show()
+        elif tag_filter and len(tag_filter) == 2:
+            facet_type, value = tag_filter[0], tag_filter[1]
+            self._details_tag_filter = (facet_type, value)
+            if hasattr(self, '_context_filter_label'):
+                label = facet_type.replace("_", " ").title()
+                self._context_filter_label.setText(f"{label}: {value}")
+            if hasattr(self, '_context_filter_chip'):
+                self._context_filter_chip.show()
+        elif category_filter:
+            self._details_category_filter = category_filter
+            if hasattr(self, '_context_filter_label'):
+                self._context_filter_label.setText(f"Collection: {category_filter}")
+            if hasattr(self, '_context_filter_chip'):
+                self._context_filter_chip.show()
+
+        # Restore the All/Downloaded/Hidden scope (DL-5) — buttons only, no
+        # load yet (the restored load is issued once, below).
+        self._list_scope = scope
+        self._hidden_mode = hidden_mode
+        _dl_scope.sync_scope_buttons(self, scope, hidden_mode, downloaded_mode)
+        if hidden_mode and hasattr(self, '_hidden_banner'):
+            self._hidden_banner.setVisible(True)
+
+        # Restore source filter — update Sources UI selection without triggering load
+        if provider_id:
+            self.selected_provider_id = provider_id
+            src = self._sources_status_target() if hasattr(self, '_sources_status_target') else None
+            if src is not None and hasattr(src, 'select_provider'):
+                src.select_provider(provider_id)
+
+        # Restore query text without retriggering the debounce (load is issued below).
+        if hasattr(self, 'search_input') and query:
+            self._set_search_text_silently(query)
+
+        # Re-run the async channel load with restored state
+        self.load_channels(provider_id)
+        return True
+
+    def load_channels(self, provider_id: str | None = None, *, keep_rows: bool = False) -> None:
+        """Load channels; with keep_rows=True, old rows stay visible during refreshes."""
+        # Stop any pending debounce timer so we don't queue a second load
+        self._search_debounce.stop()
+
+        # Show loading state (reset model + banner), unless keep_rows=True preserves
+        # old rows during background refresh.
+        if not keep_rows:
+            self.all_channels = []
+            self.channel_model.set_channels(
+                [],
+                provider_icon_map={},
+                show_provider_icon=False,
+                has_more=False,
+                query_params={},
+            )
+            self._show_channel_banner(f"{_icon_utils.role_html('loading')}&nbsp;Loading channels…")
+            self.stats_label.setText("Loading channels…")
+        self.status("Refreshing…" if keep_rows else "Loading channels…", ms=0)
+
+        # --- All UI-state reads must happen here on the main thread ---
+        filter_state = self.current_filter_state or (
+            self.filter_panel.get_filter_state()
+            if hasattr(self, 'filter_panel')
+            else {}
+        )
+
+        # Tag-model (Slice B): tag_includes from get_filter_state() replaces the old
+        # prefix-list resolution.  The legacy '_language_prefixes' etc. fields are
+        # kept in the state dict as None so the params block below still compiles;
+        # they are not passed to get_all() when tag_includes is present.
+        tag_includes = filter_state.get('tag_includes')  # dict[str, set[str]] | None
+        language_prefixes: list = []
+        region_prefixes:   list = []
+        platform_prefixes: list = []
+        quality_prefixes:  list = []
+
+        # Resolve provider filter on main thread (tiny queries)
+        session = self.db.get_session()
+        try:
+            repos = RepositoryFactory(session)
+            active_providers = repos.providers.get_all(active_only=True)
+            all_providers   = repos.providers.get_all()
+        finally:
+            session.close()
+
+        active_provider_ids = [p.id for p in active_providers]
+        inactive_provider_ids = [p.id for p in all_providers if p.id not in active_provider_ids]
+        force_adult_ids     = [p.id for p in all_providers if getattr(p, 'force_adult', False)]
+        excluded_ids        = set(filter_state.get('excluded_provider_ids', []))
+
+        if provider_id:
+            target_provider_id = provider_id
+        else:
+            visible_ids = [pid for pid in active_provider_ids if pid not in excluded_ids]
+            if len(visible_ids) == len(active_provider_ids) and len(visible_ids) == 1:
+                target_provider_id = visible_ids[0]
+            elif len(visible_ids) < len(active_provider_ids):
+                target_provider_id = visible_ids if visible_ids else None
+            else:
+                target_provider_id = None
+
+        # Build provider icon map (used later for display)
+        show_provider_icon = (target_provider_id is None)
+        provider_icon_map: dict = {}
+        if show_provider_icon:
+            for p in all_providers:
+                provider_icon_map[p.id] = (getattr(p, "icon", "") or self.config.provider_icon)
+
+        from streamselect.core.filter_utils import global_exclusion_set, keyword_exclusion_list
+        from streamselect.core.tag_exclusions import excluded_tag_content_types
+        from streamselect.core.visibility_resolver import dead_signal_streak_floor as _resolve_dead_signal_streak_floor
+        _filter_paused = self.config.global_filter_paused
+        # Canonical paused-aware builder: category blacklist (group→leaf) ∪ "Block [PREFIX]".
+        _global_excluded_prefixes = global_exclusion_set(self.config)
+        # Content-provenance layer (paused-aware slugs) → the worker resolves an excluded
+        # channel-id set so the Python exclusion pass drops channels
+        # carrying an excluded content_type tag (e.g. AI Generated / AI Voiceover).
+        _excluded_ct_slugs = excluded_tag_content_types(self.config)
+        # Keyword axis (paused-aware): applied entirely in SQL inside get_all()/
+        # _apply_channel_filters — unlike the prefix/content-type layers above,
+        # it never needs a Python id-set resolve.
+        _excluded_keywords = keyword_exclusion_list(self.config)
+        _search_text = (self.search_input.text().strip()
+                        if hasattr(self, 'search_input') else "")
+        # _bypass_tier1_filters: set when user clicks "Show filtered results" in the
+        # zero-results state. Allows them to see what's hidden without changing settings.
+        _bypassing = self._bypass_tier1_filters
+        _genre_filters = filter_state.get('_genre_filters')
+        params = {
+            'provider_id': target_provider_id,
+            'media_types': filter_state.get('media_types', ['live', 'movie', 'series']),
+            # Legacy prefix lists — now always empty (tag_includes is the active path).
+            # Kept in params so _query_channels_page (pagination) still has these keys.
+            'language_prefixes': None,
+            'region_prefixes': None,
+            'quality_prefixes': None,
+            'platform_prefixes': None,
+            'genre_filters': None if _bypassing else _genre_filters,
+            'invert_prefix_filters': False,
+            'include_untagged': filter_state.get('include_untagged', True),
+            'include_untagged_quality': filter_state.get('include_untagged_quality', True),
+            'adult_mode': filter_state.get('adult_mode', 'hide'),
+            'force_adult_ids': force_adult_ids,
+            # Tag facet filter — the active filter path (Slice B).
+            # None when bypassing or no facet is constrained.
+            'tag_includes': None if _bypassing else tag_includes,
+            # Global filter — bypassed when paused so the user can see everything
+            'excluded_prefixes': _global_excluded_prefixes,
+            'excluded_user_categories': set() if _filter_paused else set(self.config.global_filter_excluded_user_categories),
+            # content_type tag slugs to hide (paused-aware); worker resolves the id-set.
+            'excluded_tag_content_types': _excluded_ct_slugs,
+            # View-scoped reveal: skip the Python-side Global Exclusions for this one
+            # load so the user can see exactly what those exclusions hide (mirror-not-
+            # cage). Never mutates the stored settings; reset on next search/filter change.
+            'bypass_global_exclusions': self._bypass_global_exclusions,
+            # View-scoped reveal: lift the dead-stream gate for this one load so the
+            # user can see channels held back by repeated play failures (mirror-not-
+            # cage). Never mutates stored settings; reset on next search/filter change.
+            # __dict__.get: a __new__-built bare host raises RuntimeError on attribute access.
+            'bypass_dead_gate': self.__dict__.get('_bypass_dead_gate', False),
+            'excluded_keywords': _excluded_keywords,  # paused-aware list; empty = no-op
+            # View-scoped reveal (mirror-not-cage): skip the keyword axis for this one
+            # load so the user sees what the list hides; never stored, reset on next change.
+            'bypass_keyword_exclusions': self.__dict__.get('_bypass_keyword_exclusions', False),
+            # VE-1 floor: read once here (config is main-thread only), paged like collapse_variants.
+            'dead_signal_streak_floor': _resolve_dead_signal_streak_floor(self.config),
+            'search_query': _search_text or None,
+            'strict_genre_filter': self._details_genre_filter,
+            'person_filter': self._details_person_filter,
+            # Details-pane tag/collection context chips (strict, mutually exclusive).
+            'context_tag_filter': self._details_tag_filter,
+            'context_category_filter': self._details_category_filter,
+            # Alert "show matches": strict set of stored matched channel ids (ephemeral).
+            'context_id_filter': self._details_id_filter,
+            # Gold-bar "reveal all matches": return the FULL matched set, relaxing the
+            # visibility filters (provider-scoping/media-type/exclusions/hide-watched).
+            'id_filter_show_all': self._id_filter_show_all,
+            'page_size': self._search_page_size,
+            'show_provider_icon': show_provider_icon,
+            'provider_icon_map': provider_icon_map,
+            'given_provider_id': provider_id,
+            'hidden_only': self._hidden_mode,
+            'downloaded_only': _dl_scope.scope_from_host(self) == 'downloaded',
+            'bypassing_tier1': _bypassing,
+            # Watched filter — OFF by default; when ON excludes watch_completed channels
+            'hide_watched': filter_state.get('hide_watched', False),
+            # Settings → Interface → Channel List opt-in (default off): collapse
+            # quality/language/source variants of the same content_key group into
+            # one representative row + a "×N" badge. Read once here (self.config
+            # is only reachable on the main thread) and carried in this SAME dict
+            # through pagination (ChannelListModel stores/re-emits query_params
+            # verbatim for fetchMore()), so every page of a search uses one
+            # consistent collapse setting.
+            'collapse_variants': getattr(self.config, "collapse_variants_in_list", False),
+            # Zero-sources empty state (main thread, already read above — no extra
+            # query): distinguishes "no source configured at all" from "sources
+            # exist but filters/search/exclusions hide everything", which
+            # _on_channels_loaded needs to pick the honest empty-state message.
+            'has_any_provider': bool(all_providers),
+        }
+
+        # Run the heavy query off the UI thread via the async seam; stale results
+        # are dropped by the seam's token_ref. _on_channels_loaded receives the
+        # (dtos, params) tuple the query_fn returns and renders on the main thread.
+        self._run_query(
+            lambda repos: self._query_channels(repos, params),
+            self._on_channels_loaded,
+            token_ref=self._load_channels_token,
+            on_error=self._on_channels_load_error,
+        )
+
+    #: Rendered prefix for a count that only knows a lower bound. Aliases the
+    #: one definition in ``channel_transparency`` so the two cannot drift.
+    _AT_LEAST = _transparency_at_least
+
+    @staticmethod
+    def _hidden_by_axis(
+        visible: list,
+        comparison: list,
+        page_size: int,
+        raw_visible: int | None = None,
+        raw_comparison: int | None = None,
+    ) -> tuple[int, bool]:
+        """How many rows one axis hides, and whether that number is a FLOOR.
+
+        *comparison* is the same query with the measured axis lifted, so it is a
+        SUPERSET of *visible*: any id present there and absent here was removed
+        by that axis. Counting the set difference is therefore **provable at
+        every input** — it is 0 when there is no evidence of hiding, and exact
+        when neither SQL fetch reached the cap.
+
+        This replaced a length subtraction that reported ``page_size`` whenever
+        either side saturated. That was not a floor. Two saturated pages imply
+        nothing about the difference between the underlying sets: with an axis
+        that hides nothing (a keyword matching no row, a tag every row carries)
+        both lists are identical and full, and the old form claimed "≥ many
+        hidden" behind a reveal button that revealed nothing. A transparency
+        feature that invents withholding is worse than the zero it replaced —
+        the zero under-claimed, this over-claimed. The mixed case was wrong too:
+        many visible against a capped comparison claimed many where the
+        provable floor is 1.
+
+        Saturation is judged on the RAW pre-Python-filter lengths. The exclusion
+        pass runs before this, so a SQL-saturated fetch trimmed to many rows
+        would otherwise read as unsaturated and label truncated data "exact".
+
+        The floor is only sound if both plans order ties identically; ``get_all``
+        sorts by ``name, id`` for that reason.
+
+        Args:
+            visible: The surviving rows (post-exclusion).
+            comparison: The same query with the measured axis lifted.
+            page_size: The cap both were fetched under.
+            raw_visible: Rows the visible query fetched BEFORE Python filtering.
+                Defaults to ``len(visible)``.
+            raw_comparison: Same for the comparison query.
+
+        Returns:
+            ``(count, is_floor)`` — count is a lower bound; ``is_floor`` says so.
+        """
+        def _ids(rows):
+            return {getattr(r, "id", r) for r in rows}
+
+        hidden = len(_ids(comparison) - _ids(visible))
+        rv = len(visible) if raw_visible is None else raw_visible
+        rc = len(comparison) if raw_comparison is None else raw_comparison
+        return hidden, (rv >= page_size or rc >= page_size)
+
+    @staticmethod
+    def _query_channels(repos, params: dict) -> tuple[list, dict]:
+        """Worker (off-thread): run the heavy DB query and return (dtos, params).
+
+        Receives the seam's RepositoryFactory; reads only. Maps the surviving
+        ChannelDB rows to ChannelListDTOs so no ORM object crosses the boundary.
+        """
+        from streamselect.core.database import ChannelDB
+
+        force_adult_ids = params['force_adult_ids']
+        hidden_only = params.get('hidden_only', False)
+        downloaded_only = params.get('downloaded_only', False)
+        _record_view = hidden_only or downloaded_only  # DR-0007/DL-5: both skip the probes below
+        _page_size = params.get('page_size', 5_000)
+
+        # ── The Global-Exclusion sets, resolved ONCE and early ─────────────────
+        # Early because ``collapse_variants`` elects one representative per title
+        # inside SQL, and an election that cannot see these sets can crown a row
+        # that the Python pass below then drops — taking the whole title with it,
+        # including variants the user never excluded. Measured on the real
+        # library before this change: many titles vanished that way.
+        # get_all() uses them to RANK candidates, never to filter; the Python
+        # pass below stays authoritative so the hidden-by-exclusions count and
+        # the ×N variant badge are unaffected.
+        _excl_sets, _rank_excl = _resolve_exclusions(repos, params)
+        excluded_prefixes, excluded_user_cats, excluded_ct_ids, heard_keep = _excl_sets
+        # The reveal ("show" on the gold bar) must not deprioritise anything, or
+        # the revealed rows would still lose the representative slot.
+        if params.get('bypass_global_exclusions') or hidden_only:
+            _rank_excl = {}
+        # Canonical provider scoping: hide inactive + expired sources (see
+        # ProviderRepository.get_hidden_provider_ids — single source of truth).
+        providers_to_exclude = repos.providers.get_hidden_provider_ids()
+        # Alert "reveal all matches": a curated matched set is a record/engaged view
+        # (DR-0007 exempts it from active-source scoping), so when the user clicks the
+        # gold bar we return the ENTIRE stored id-set with the visibility filters that
+        # were hiding matches RELAXED — provider-scoping, media-type, adult, hidden,
+        # hide-watched, tag-includes, and the Python-side exclusions below.
+        _id_filter = params.get('context_id_filter')
+        id_filter_show_all = bool(_id_filter) and bool(params.get('id_filter_show_all'))
+        # View-scoped reveal: lift the dead-stream gate for this one load (mirrors
+        # bypass_global_exclusions below). Only meaningful on the main branch — the
+        # hidden_only/id_filter_show_all branches already set include_hidden=True,
+        # which bypasses the whole is_hidden/dead block in _apply_channel_filters.
+        bypass_dead_gate = bool(params.get('bypass_dead_gate'))
+        # View-scoped reveal: skip the keyword axis for this one load (mirrors
+        # bypass_dead_gate above). The axis lives IN the SQL query (get_all's
+        # excluded_keywords), not a Python post-filter, so "bypass" here simply
+        # means "don't pass it" rather than "undo it afterwards".
+        bypass_keywords = bool(params.get('bypass_keyword_exclusions'))
+        _excl_keywords = params.get('excluded_keywords') or []
+        # ── The channel-list query's axes, built ONCE ─────────────────────────
+        # Each of the three transparency diffs below re-runs THIS query with
+        # exactly ONE key overridden. That is what makes a diff mean "what that
+        # one axis hides", and building the axes once is what makes it TRUE.
+        #
+        # They used to be four hand-copied argument lists of ~28 entries. The
+        # tag-filter one omitted NINE axes — language/region/quality/platform
+        # prefixes, hidden_only, include_hidden, include_dead, channel_ids and
+        # facets_hiding_untagged — so its comparison set was wider than "the
+        # main query minus tag_includes" and rows the PREFIX filter had removed
+        # were reported as hidden by the TAG filter. Measured in
+        # tests/test_filter_transparency.py: a count of 3 where the truth is 1.
+        #
+        # _rank_excl is in here too, which the three diffs also used to omit.
+        # It decides which variant is elected representative under
+        # collapse_variants, so a diff that elects differently from the query it
+        # is subtracted from is not measuring one axis either.
+        _axes = dict(
+            provider_id=params['provider_id'],
+            media_types=params['media_types'],
+            language_prefixes=params.get('language_prefixes'),
+            region_prefixes=params.get('region_prefixes'),
+            quality_prefixes=params.get('quality_prefixes'),
+            platform_prefixes=params.get('platform_prefixes'),
+            genre_filters=params.get('genre_filters'),
+            invert_prefix_filters=params['invert_prefix_filters'],
+            include_untagged=params['include_untagged'],
+            include_untagged_quality=params.get('include_untagged_quality', True),
+            adult_mode=params['adult_mode'],
+            force_adult_provider_ids=force_adult_ids or None,
+            include_uncategorized_content_types=True,
+            hidden_only=False,
+            include_hidden=False,
+            include_dead=bypass_dead_gate,
+            search_query=params.get('search_query'),
+            strict_genre_filter=params.get('strict_genre_filter'),
+            person_filter=params.get('person_filter'),
+            context_tag_filter=params.get('context_tag_filter'),
+            context_category_filter=params.get('context_category_filter'),
+            channel_ids=params.get('context_id_filter'),
+            excluded_provider_ids=providers_to_exclude or None,
+            tag_includes=params.get('tag_includes'),
+            facets_hiding_untagged=params.get('facets_hiding_untagged'),
+            exclude_watched=params.get('hide_watched', False),
+            collapse_variants=params.get('collapse_variants', False),
+            excluded_keywords=None if bypass_keywords else (_excl_keywords or None),
+            dead_signal_streak_floor=params.get('dead_signal_streak_floor'),
+            limit=_page_size,
+            **_rank_excl,
+        )
+        if hidden_only:
+            channels = repos.channels.get_hidden_channels(
+                excluded_user_categories=params.get('excluded_user_categories'),
+                search_query=params.get('search_query'),
+                provider_id=params['provider_id'],
+                excluded_provider_ids=providers_to_exclude or None,
+            )
+        elif downloaded_only:
+            channels = _dl_scope.load(repos, params, force_adult_ids, _page_size)
+        elif id_filter_show_all:
+            # Relax only the SOFT filters — provider-scoping stays applied: content on
+            # disabled/expired sources (get_hidden_provider_ids) is a top-level gate and
+            # is NEVER revealed by "show all".  To view it, re-enable the source.
+            channels = repos.channels.get_all(
+                channel_ids=_id_filter,
+                media_types=None,
+                adult_mode='all',
+                include_hidden=True,
+                exclude_watched=False,
+                tag_includes=None,
+                excluded_provider_ids=providers_to_exclude or None,
+                limit=_page_size,
+            )
+        else:
+            channels = repos.channels.get_all(**_axes)
+        # Raw count of SQL rows fetched BEFORE the Python-side exclusion filtering
+        # below. Paging (has_more + the next OFFSET) must be based on this, not on
+        # the surviving count — otherwise an active exclusion makes page 1 look
+        # short (has_more=False → list dead-ends early) and would overlap rows.
+        params['raw_fetched'] = len(channels)
+        total = repos.channels.count(provider_id=params['provider_id'])
+        has_adult = bool(force_adult_ids) or repos.session.query(ChannelDB).filter(
+            ChannelDB.is_adult == True
+        ).limit(1).count() > 0
+        # ── Filter layer 1 — Global Exclusions (Python-side) ───────────────────────
+        # Capture a before/after count so the gold bar can report exactly how many
+        # results THIS layer hides for THIS view.  Skipped entirely when the user has
+        # revealed the layer (bypass_global_exclusions) — so revealed content is not
+        # re-excluded and the reported count correctly reads 0.  The count is accurate
+        # for the small alert/search result sets; for a huge corpus it is capped at the
+        # page (same acceptable compromise as the existing counts).
+        bypass_exclusions = bool(params.get('bypass_global_exclusions'))
+        exclusions_applied = not _record_view and not id_filter_show_all and not bypass_exclusions
+        hidden_by_exclusions = 0
+        if exclusions_applied:
+            _before_excl = len(channels)
+            channels = _apply_python_exclusions(
+                channels, excluded_prefixes, excluded_user_cats, excluded_ct_ids, heard_keep
+            )
+            hidden_by_exclusions = _before_excl - len(channels)
+            # Exact for the rows fetched, but the fetch stopped at the page cap
+            # — every excluded row beyond it was never seen, so on a saturated
+            # page this is a floor like its three siblings. It rendered as a
+            # bare number beside their "≥" labels until an earlier change; the adjacent
+            # comment calling that "the same acceptable compromise as the
+            # existing counts" went stale when they were upgraded.
+            params['hidden_by_exclusions_is_floor'] = (
+                params['raw_fetched'] >= _page_size
+            )
+
+        # ── Filter layer 2 — search / Tier-1 tag filters ───────────────────────────
+        # Whenever a tag facet filter is active, re-fetch the SAME query WITHOUT
+        # tag_includes (every other axis + the Global Exclusions held equal) and diff:
+        # hidden_by_search is exactly what the Tier-1 filters remove.  Computed only
+        # when tag_includes is truthy (perf: one extra bounded query).  Also serves as
+        # the zero-results "N filtered" figure for backward compatibility.
+        filtered_out_count = 0
+        hidden_by_search = 0
+        tier1_active = bool(params.get('tag_includes'))
+        if not _record_view and not id_filter_show_all and tier1_active:
+            unfiltered = repos.channels.get_all(**{**_axes, 'tag_includes': None})
+            _raw_unfiltered = len(unfiltered)
+            # Mirror the exclusion filtering applied to `channels` so the diff isolates
+            # ONLY the tag filters (never the exclusion layer counted separately above).
+            if exclusions_applied:
+                unfiltered = _apply_python_exclusions(
+                    unfiltered, excluded_prefixes, excluded_user_cats, excluded_ct_ids, heard_keep
+                )
+            hidden_by_search, floor_search = _ChannelListMixin._hidden_by_axis(
+                channels, unfiltered, _page_size,
+                raw_visible=params['raw_fetched'], raw_comparison=_raw_unfiltered)
+            params['hidden_by_search_is_floor'] = floor_search
+            filtered_out_count = hidden_by_search
+
+        # ── Filter layer 3 — dead-stream gate (repeated play failures) ─────────────
+        # Channels whose reliability_state has graduated to "dead" (StreamRetryDB —
+        # 6+ consecutive user-initiated play failures) are gated out by
+        # _apply_channel_filters right beside is_hidden.  Re-run the SAME query with
+        # ONLY that gate lifted (include_dead=True, every other axis held equal,
+        # same bounded page_size as the layers above — no unbounded scan) and diff
+        # against the surviving set: hidden_by_dead is exactly what this layer
+        # removes.  Skipped when hidden_only/id_filter_show_all already bypass the
+        # whole block (nothing to measure), or when the user already revealed this
+        # layer for the view (bypass_dead_gate) — the main query above already
+        # returned the dead rows, so there is nothing further hidden to report.
+        #
+        # Also skipped when NO channel is in the dead state, which is a one-row
+        # probe (`has_dead`) against a table that is empty for most users and
+        # for a user. The gate cannot hide what does not exist, so the count
+        # is exactly 0 — the floor semantics are untouched — and the comparison
+        # is a provable no-op. It is not a cheap no-op: the comparison inherits
+        # the same variant-collapse window function as the main query, measured
+        # at 6.5 s on a large library. ED-6 sized this pair against a 1.1 ms
+        # load, which predates the collapse path.
+        hidden_by_dead = 0
+        dead_active = (
+            not _record_view
+            and not id_filter_show_all
+            and not bypass_dead_gate
+            and repos.stream_retry.has_dead()
+        )
+        if dead_active:
+            with_dead = repos.channels.get_all(**{**_axes, 'include_dead': True})
+            _raw_with_dead = len(with_dead)
+            # Mirror the exclusion filtering applied to `channels` so the diff isolates
+            # ONLY the dead-stream gate (never the exclusion layer counted above).
+            if exclusions_applied:
+                with_dead = _apply_python_exclusions(
+                    with_dead, excluded_prefixes, excluded_user_cats, excluded_ct_ids, heard_keep
+                )
+            hidden_by_dead, floor_dead = _ChannelListMixin._hidden_by_axis(
+                channels, with_dead, _page_size,
+                raw_visible=params['raw_fetched'], raw_comparison=_raw_with_dead)
+            params['hidden_by_dead_is_floor'] = floor_dead
+
+        # ── Filter layer 4 — Global Exclusions keyword axis (SQL) ──────────────────
+        # Unlike layer 1 (prefix/category/content-type, applied Python-side above),
+        # the keyword axis is already baked into the `channels` query itself (SQL
+        # ilike chain — see excluded_keywords on get_all). Measuring what it hides
+        # therefore means re-running the SAME query with ONLY that axis lifted
+        # (mirrors the dead-stream-gate diff immediately above) rather than an
+        # after-the-fact Python filter. Skipped when there are no keywords to
+        # measure, or the user already revealed this layer (bypass_keywords).
+        hidden_by_keywords = 0
+        keywords_active = (
+            not _record_view and not id_filter_show_all
+            and not bypass_keywords and bool(_excl_keywords)
+        )
+        if keywords_active:
+            with_keywords = repos.channels.get_all(**{**_axes, 'excluded_keywords': None})
+            _raw_with_keywords = len(with_keywords)
+            # Mirror the Python-side exclusion filtering applied to `channels` so the
+            # diff isolates ONLY the keyword axis (never the layer-1 exclusions).
+            if exclusions_applied:
+                with_keywords = _apply_python_exclusions(
+                    with_keywords, excluded_prefixes, excluded_user_cats, excluded_ct_ids, heard_keep
+                )
+            hidden_by_keywords, floor_keywords = _ChannelListMixin._hidden_by_axis(
+                channels, with_keywords, _page_size,
+                raw_visible=params['raw_fetched'], raw_comparison=_raw_with_keywords)
+            params['hidden_by_keywords_is_floor'] = floor_keywords
+
+        # ── Filter layer 5 — the adult gate ───────────────────────────────────────
+        # Measured like the keyword axis (re-run with only this axis lifted), but
+        # ONLY on an empty page. Its trigger is the DEFAULT, so probing on every
+        # load would add a second full get_all() to every channel-list load on a
+        # 785k-row corpus to answer a question nobody asked. An empty page is when
+        # it IS asked — every PORNBOX channel is flagged, so that category
+        # returned 0 of 28 under "try a different search".
+        hidden_by_adult = 0
+        if (not channels and not _record_view and not id_filter_show_all
+                and params['adult_mode'] != 'all' and has_adult):
+            with_adult = repos.channels.get_all(**{**_axes, 'adult_mode': 'all'})
+            _raw_with_adult = len(with_adult)
+            # Mirror the layer-1 filtering so the diff isolates only this axis.
+            if exclusions_applied:
+                with_adult = _apply_python_exclusions(
+                    with_adult, excluded_prefixes, excluded_user_cats, excluded_ct_ids, heard_keep
+                )
+            hidden_by_adult, floor_adult = _ChannelListMixin._hidden_by_axis(
+                channels, with_adult, _page_size,
+                raw_visible=params['raw_fetched'], raw_comparison=_raw_with_adult)
+            params['hidden_by_adult_is_floor'] = floor_adult
+
+        # When "Hide watched" is ON, count how many results are hidden because they're
+        # watched — used to show "N watched hidden" in the stats label.
+        watched_hidden_count = 0
+        if not _record_view and params.get('hide_watched', False):
+            # Splat the SAME axis dict get_all() was given, so the "N hidden
+            # because watched" count is computed from one definition of the axes
+            # rather than a hand-copy of them.  This block used to re-list 22 of
+            # them by hand; three axes had already gone missing from the copy.
+            # count_watched_matching forwards what SQL can apply and knowingly
+            # skips the Python-side ones (see its docstring's "Known limit").
+            watched_hidden_count = repos.channels.count_watched_matching(**_axes)
+
+        # ── Alert "show matches" id-filter: constrain to a stored id-set and report
+        # hidden = stored − surviving through the SAME stats/gold-bar surfaces (reuse,
+        # not a parallel banner).  Total becomes the id-set size so "Showing N of M ·
+        # K filtered out" and the gold bar read against the matched set, not the corpus.
+        id_filter = params.get('context_id_filter')
+        id_filter_active = bool(id_filter)
+        if id_filter_active:
+            total = len(id_filter)
+            filtered_out_count = max(0, total - len(channels))
+
+        # get_all() now returns results sorted and limited — no extra sort needed
+        params['total_channels']    = total
+        params['has_adult']         = has_adult
+        params['filtered_out_count'] = filtered_out_count
+        # Per-layer transparency counts read by _show_channel_filter_breakdown.
+        params['hidden_by_exclusions'] = hidden_by_exclusions
+        params['hidden_by_search']     = hidden_by_search
+        params['hidden_by_dead']       = hidden_by_dead
+        params['hidden_by_keywords']   = hidden_by_keywords
+        params['hidden_by_adult']      = hidden_by_adult
+        params['id_filter_active']  = id_filter_active
+        params['watched_hidden_count'] = watched_hidden_count
+        # Batch-fetch all user ratings in one query (avoids N+1) then map surviving
+        # ORM rows → DTOs so no ChannelDB crosses the boundary.
+        return rows_to_dtos(repos, channels, params.get('search_query')), params
+
+    def _on_channels_load_error(self, exc: Exception) -> None:
+        """Main thread: clear the loading state when the channel query fails."""
+        logger.error(f"Channel query failed: {exc}")
+        self._clear_provider_busy()
+        # Clear the loading banner so the spinner doesn't hang.
+        self._hide_channel_banners()
+        self.stats_label.setText("Couldn't load channels")
+        self.status("Couldn't load channels", ms=0, level="error")
+
+    def _on_channels_loaded(self, result) -> None:
+        """Main thread: populate the virtualized channel model from query results.
+
+        ``result`` is the ``(dtos, params)`` tuple returned by ``_query_channels``.
+        Stale results are already dropped by the seam's ``token_ref``.
+        """
+        channels, params = result
+
+        # Lazy TMDb enrichment: feed the loaded page (covers text search too — it
+        # renders through this same slot) so idless variants the user is viewing get
+        # a provider-detail lookup. The manager filters to real candidates off-thread.
+        self._enqueue_tmdb_enrichment([c.id for c in channels])
+
+        # A current channel load finished — the visible result of a provider toggle's
+        # canonical refresh. Clear any provider busy/spinner state now.
+        self._clear_provider_busy()
+        self._hide_channel_banners()
+
+        total_channels    = params.get('total_channels', 0)
+        show_provider_icon = params.get('show_provider_icon', False)
+        provider_icon_map  = params.get('provider_icon_map', {})
+        given_provider_id  = params.get('given_provider_id')
+
+        # Track bypass state so filter_channels() can show the right suspend banner.
+        # Set BEFORE the zero-results return so a bypass that still yields nothing is
+        # reflected correctly.
+        self._currently_bypassing = params.get('bypassing_tier1', False)
+        self._currently_bypassing_exclusions = params.get('bypass_global_exclusions', False)
+        self._currently_bypassing_dead = params.get('bypass_dead_gate', False)
+        self._currently_bypassing_keywords = params.get('bypass_keyword_exclusions', False)
+
+        # Per-layer transparency counts (0 for a layer that is bypassed/revealed).
+        hidden_excl   = params.get('hidden_by_exclusions', 0)
+        hidden_search = params.get('hidden_by_search', 0)
+        hidden_dead   = params.get('hidden_by_dead', 0)
+        hidden_kw     = params.get('hidden_by_keywords', 0)
+        hidden_adult  = params.get('hidden_by_adult', 0)
+
+        logger.info(f"=== Loading {len(channels):,} channels (filtered from {total_channels:,} total) ===")
+
+        if not channels:
+            logger.warning("No channels match current filters!")
+            # The panel's state for this result (empty_state); the source-level
+            # states (no source, first load) outrank it in _sync_empty_state.
+            query = (params.get('search_query') or '').strip()
+            list_state = {}
+            if not params.get('has_any_provider', True):
+                # Nothing to read from: the empty-state panel says so (and why)
+                # and offers Add Source. Arm the one-shot first-run hand-off:
+                # Discover is the intended landing view once channels arrive
+                # (task an earlier change); consumed by the branch below, cleared if the user
+                # picks a view themselves.
+                self.status("No sources configured — add a source to start browsing channels", ms=0)
+                self.stats_label.setText("No sources configured")
+                self._first_source_pending = True
+            elif params.get('hidden_only'):
+                self.status("No hidden channels found", ms=0)
+                self.stats_label.setText("No hidden channels")
+            elif params.get('downloaded_only'):
+                _dl_scope.show_empty(self, self.stats_label)
+            elif params.get('id_filter_active'):
+                # Dormant alert id-filter: single "N filtered — show" segment.
+                id_hidden = params.get('filtered_out_count', 0)
+                if id_hidden > 0:
+                    self._show_channel_filter_breakdown(0, id_hidden)
+                    self.status(
+                        f"No results — {id_hidden:,} match{'es' if id_hidden == 1 else ''} hidden by current filters", ms=0
+                    )
+                    self.stats_label.setText(f"0 shown · {id_hidden:,} filtered")
+                else:
+                    self.status("No channels match — try a different search or check filter settings", ms=0)
+                    self.stats_label.setText(f"Showing 0 of {total_channels:,}")
+            elif hidden_excl or hidden_search or hidden_dead or hidden_kw or hidden_adult:
+                # Results exist but are hidden by one or more filter layers — show the
+                # per-layer breakdown so the user can reveal each independently.
+                self._show_channel_filter_breakdown(
+                    hidden_excl, hidden_search, hidden_dead, hidden_kw, hidden_adult,
+                    hidden_by_exclusions_is_floor=params.get(
+                        'hidden_by_exclusions_is_floor', False),
+                    hidden_by_search_is_floor=params.get('hidden_by_search_is_floor', False),
+                    hidden_by_dead_is_floor=params.get('hidden_by_dead_is_floor', False),
+                    hidden_by_keywords_is_floor=params.get('hidden_by_keywords_is_floor', False),
+                    hidden_by_adult_is_floor=params.get('hidden_by_adult_is_floor', False),
+                )
+                total_hidden = hidden_excl + hidden_search + hidden_dead + hidden_kw + hidden_adult
+                list_state = {"state": EmptyState.FILTERED, "hidden": total_hidden}
+                self.status(
+                    f"No results — {total_hidden:,} match{'es' if total_hidden == 1 else ''} hidden by filters (click to reveal)", ms=0
+                )
+                self.stats_label.setText(f"0 shown · {total_hidden:,} filtered")
+            else:
+                self.status("No channels match — try a different search or check filter settings", ms=0)
+                self.stats_label.setText(f"Showing 0 of {total_channels:,}")
+                list_state = ({"state": EmptyState.NO_RESULTS, "query": query} if query
+                              else {"state": EmptyState.NOTHING_HERE})
+            self._set_list_empty_state(**list_state)
+            return
+        self._set_list_empty_state()
+
+        # Build legacy all_channels cache (still used by toggle_favorite / the
+        # favorites cache update in _apply_favorite_toggle path).
+        self.all_channels = []
+        for channel in channels:
+            src_badge  = ""
+            if show_provider_icon and channel.provider_id in provider_icon_map:
+                src_badge = provider_icon_map[channel.provider_id] + " "
+            prefix_str   = f"[{channel.detected_prefix}] " if channel.detected_prefix else ""
+            lang_str     = f"[{channel.detected_region}] " if channel.detected_region else ""
+            prefix_group = prefix_str + lang_str
+            dot_sep      = "· " if prefix_group.strip() else ""
+            quality_str  = (f" · {quality_display(channel.detected_quality)}"
+                            if channel.detected_quality else "")
+            year_str     = f" · {channel.detected_year}" if channel.detected_year else ""
+            bare         = channel.detected_title or channel.name
+            display_text = f"{src_badge}{prefix_group}{dot_sep}{bare}{quality_str}{year_str}"
+            if channel.category:
+                display_text += f" [{channel.category}]"
+            self.all_channels.append((display_text, channel))
+
+        shown = len(channels)
+        # Paging is keyed off the RAW SQL rows fetched (before Python exclusions),
+        # not the surviving `shown` — otherwise an active exclusion shortens page 1
+        # and wrongly reports exhaustion. hidden_only/downloaded_only load
+        # everything in one shot (no offset/limit), so neither ever pages.
+        raw_fetched = params.get('raw_fetched', shown)
+        page_size = params.get('page_size', self._search_page_size)
+        has_more = not (params.get('hidden_only') or params.get('downloaded_only')) and raw_fetched >= page_size
+
+        # Populate the virtualized model — this replaces the old addItem loop.
+        # Pass through display helpers so the model can compose identical text.
+        self.channel_model.set_channels(
+            channels,
+            provider_icon_map=provider_icon_map,
+            show_provider_icon=show_provider_icon,
+            has_more=has_more,
+            next_offset=raw_fetched,
+            query_params=params,
+            get_media_type_icon=self.get_media_type_icon,
+            partial_threshold_pct=int(
+                getattr(self.config, "watch_partial_threshold", 0.10) * 100
+            ),
+            new_match_ids=self.config.get_unviewed_vod_match_ids(),
+        )
+
+        # Stash the stats context so _refresh_channel_stats_label() can recompute
+        # the "Showing N of M" label live as fetchMore() streams in more pages.
+        self._stats_total_channels = total_channels
+        self._stats_hidden_only = bool(params.get('hidden_only'))
+        self._stats_downloaded_only = bool(params.get('downloaded_only'))
+        # tag_includes is the active filter indicator (Slice B); the alert id-filter
+        # also drives "Showing N of M · K filtered out" (M = the matched id-set size).
+        self._stats_panel_filtering = bool(params.get('tag_includes')) or bool(params.get('id_filter_active'))
+        # Watched-filter context: count hidden because watched (0 when filter is OFF).
+        self._stats_watched_hidden = int(params.get('watched_hidden_count', 0))
+        self._stats_hide_watched   = bool(params.get('hide_watched', False))
+        self._refresh_channel_stats_label()
+
+        if params.get('hidden_only'):
+            self.status(f"{shown:,} hidden channel{'s' if shown != 1 else ''} — right-click to unhide", ms=0)
+        elif params.get('downloaded_only'):
+            self.status(_dl_scope.count_text(shown), ms=0)
+        elif given_provider_id:
+            self.status(f"{shown:,} channels from selected source", ms=0)
+        else:
+            self.status(f"{shown:,} channels from active providers", ms=0)
+
+        self.filter_channels()
+
+        # First-run hand-off: the user had zero sources, has now imported one,
+        # and real channels just arrived. Take them to Discover — the intended
+        # default view they could never reach on a fresh install. One-shot, and
+        # only when they haven't already chosen a view themselves.
+        #
+        # Deferred to the next event-loop turn so this render pass finishes
+        # first; switching views mid-populate would tear down the list we are
+        # still filling.
+        if self.__dict__.pop('_first_source_pending', False) and shown:
+            logger.info(
+                f"First source imported ({shown:,} channels) — landing on Discover"
+            )
+            QTimer.singleShot(0, self.switch_to_discover_view)
+
+        # Surface the per-layer transparency bar even with a non-empty result set
+        # (partial exclusion): filter_channels() may have shown a suspend banner and
+        # hidden the bar, so re-render it here as the last step.  The counts already
+        # read 0 for any layer the user revealed, so only still-hidden layers show —
+        # and the exclusions segment can appear alongside the Tier-1 suspend banner.
+        if params.get('id_filter_active'):
+            # Dormant alert id-filter: single segment, unless it was revealed.
+            if not getattr(self, '_currently_bypassing', False):
+                id_hidden = params.get('filtered_out_count', 0)
+                if id_hidden > 0:
+                    self._show_channel_filter_breakdown(0, id_hidden)
+        elif hidden_excl or hidden_search or hidden_dead or hidden_kw:
+            # The floor flags must come through HERE too, not only on the
+            # zero-results branch above. This call omitted them, so every count
+            # rendered as an exact number on the normal path while the same
+            # count rendered "≥ N" when the view happened to be empty — the
+            # saturated case, which is precisely when the number is a floor, is
+            # far more likely to have rows than not.
+            self._show_channel_filter_breakdown(
+                hidden_excl, hidden_search, hidden_dead, hidden_kw,
+                hidden_by_exclusions_is_floor=params.get(
+                    'hidden_by_exclusions_is_floor', False),
+                hidden_by_search_is_floor=params.get('hidden_by_search_is_floor', False),
+                hidden_by_dead_is_floor=params.get('hidden_by_dead_is_floor', False),
+                hidden_by_keywords_is_floor=params.get('hidden_by_keywords_is_floor', False),
+            )
+
+    def _refresh_channel_stats_label(self) -> None:
+        """Set the stats label from the current loaded row count.
+
+        Called on the initial load and again after every fetchMore() page so the
+        "Showing N of M" count grows as the user scrolls (N = rows loaded so far;
+        M = the provider's total). Reads the context stashed by the last load.
+        """
+        if not hasattr(self, 'channel_model'):
+            return
+        shown = self.channel_model.loaded_count()
+        total = getattr(self, '_stats_total_channels', shown)
+        if getattr(self, '_stats_hidden_only', False):
+            self.stats_label.setText(f"{shown:,} hidden channel{'s' if shown != 1 else ''}")
+        elif self.__dict__.get('_stats_downloaded_only', False):
+            self.stats_label.setText(_dl_scope.count_text(shown))
+        elif getattr(self, '_stats_panel_filtering', False):
+            excluded = max(0, total - shown)
+            watched_hidden = getattr(self, '_stats_watched_hidden', 0)
+            if getattr(self, '_stats_hide_watched', False) and watched_hidden > 0:
+                self.stats_label.setText(
+                    f"Showing {shown:,} of {total:,} · {excluded:,} filtered out"
+                    f" · {watched_hidden:,} watched hidden"
+                )
+            else:
+                self.stats_label.setText(
+                    f"Showing {shown:,} of {total:,} · {excluded:,} filtered out"
+                )
+        elif getattr(self, '_stats_hide_watched', False):
+            watched_hidden = getattr(self, '_stats_watched_hidden', 0)
+            if watched_hidden > 0:
+                self.stats_label.setText(
+                    f"Showing {shown:,} of {total:,} channels · {watched_hidden:,} watched hidden"
+                )
+            else:
+                self.stats_label.setText(f"Showing {shown:,} of {total:,} channels")
+        else:
+            self.stats_label.setText(f"Showing {shown:,} of {total:,} channels")
+
+    def filter_channels(self, _unused: str = "") -> None:
+        """Update banner/status state after a channel load completes.
+
+        With the virtualized model, SQL-side filtering is the only filter and
+        the model itself renders visible rows.  This method now manages only the
+        bypass banner (shown above the list when Tier 1 filters are suspended)
+        and the status bar message.  The _unused parameter is kept for callers
+        that still pass a text argument (e.g., search-input signal connections).
+        """
+        from streamselect.gui import icon_utils as _icon_utils
+
+        if self._currently_bypassing:
+            self._show_channel_banner(
+                f"{_icon_utils.role_html('alert')}&nbsp; Showing results from filtered categories — "
+                "filters suspended. Change search or filters to restore."
+            )
+        elif getattr(self, '_currently_bypassing_exclusions', False):
+            self._show_channel_banner(
+                f"{_icon_utils.role_html('global_exclusion')}&nbsp; Showing content your Global Exclusions "
+                "normally hide — exclusions suspended for this view. "
+                "Change search or filters to restore."
+            )
+        elif getattr(self, '_currently_bypassing_dead', False):
+            self._show_channel_banner(
+                f"{_icon_utils.role_html('dead_stream')}&nbsp; Showing channels held back by repeated "
+                "play failures — the dead-stream gate is suspended for this view. "
+                "Change search or filters to restore."
+            )
+        elif getattr(self, '_currently_bypassing_keywords', False):
+            self._show_channel_banner(
+                f"{_icon_utils.role_html('keyword_exclusion')}&nbsp; Showing content your Global Exclusions "
+                "keyword list normally hides — the keyword axis is suspended for this view. "
+                "Change search or filters to restore."
+            )
+        else:
+            self._hide_channel_banners()
+
+        total = self.channel_model.loaded_count()
+        logger.debug(f"filter_channels: model has {total} rows")
+        if total == 0:
+            self.status("No channels match — try a different search or filter", ms=0)
+        else:
+            self.status(f"{total:,} channels loaded", ms=0)
+
+    # ---- Banner helpers (main thread only) ------------------------------------
+
+    def _show_channel_banner(self, text: str) -> None:
+        """Show the info banner strip above the channel list."""
+        if not hasattr(self, '_channel_banner'):
+            return
+        self._channel_banner.setText(text)
+        self._channel_banner.setVisible(True)
+        if hasattr(self, '_channel_filter_bar'):
+            self._channel_filter_bar.setVisible(False)
+
+    @staticmethod
+    def _count_label(n: int, is_floor: bool) -> str:
+        """Format a hidden-count, marking a floor as one rather than a total.
+
+        Delegates: the definition lives beside the segments that render it, in
+        :mod:`streamselect.gui.channel_transparency`. Kept here because callers and
+        tests reach it through the mixin.
+        """
+        from streamselect.gui.channel_transparency import count_label
+
+        return count_label(n, is_floor)
+
+    def _show_channel_filter_breakdown(
+        self,
+        hidden_by_exclusions: int = 0,
+        hidden_by_search: int = 0,
+        hidden_by_dead: int = 0,
+        hidden_by_keywords: int = 0,
+        hidden_by_adult: int = 0,
+        # Keyword-only, and AFTER the counts. Callers pass the counts
+        # positionally, so a flag inserted between them silently rebinds every
+        # later argument — `hidden_search` landed in `hidden_by_exclusions_is_floor`
+        # and CI caught it as a duplicate-argument TypeError. Keyword-only makes
+        # that class of mistake impossible for the next flag as well.
+        *,
+        hidden_by_exclusions_is_floor: bool = False,
+        hidden_by_search_is_floor: bool = False,
+        hidden_by_dead_is_floor: bool = False,
+        hidden_by_keywords_is_floor: bool = False,
+        hidden_by_adult_is_floor: bool = False,
+    ) -> None:
+        """Render the per-layer filter-transparency bar.
+
+        The named parameters are kept as the call signature — several callers and
+        tests pass them by name — but the SEGMENTS live in
+        :mod:`streamselect.gui.channel_transparency`, one descriptor per axis. What
+        each segment says, which icon it carries and what its click does are data
+        there; this method only forwards the numbers.
+
+        Coexists with the suspend banner (``_channel_banner``): after revealing
+        one layer its count is 0, so only the still-hidden layer's segment
+        remains.
+
+        Args:
+            hidden_by_exclusions: Results this view dropped via Global Exclusions.
+            hidden_by_search: Results dropped via search / Tier-1 filters.
+            hidden_by_dead: Results dropped via the dead-stream gate.
+            hidden_by_keywords: Results dropped via the Global Exclusions keyword
+                axis (user-defined free-text terms matched against the title).
+            hidden_by_adult: Dropped by the adult gate (``filter_adult_mode``);
+                measured only on an empty page — see "Filter layer 5" in
+                ``_query_channels`` for why.
+            hidden_by_exclusions_is_floor: True when the page cap means more were
+                dropped beyond what was fetched. Siblings likewise.
+        """
+        from streamselect.gui import channel_transparency as _transparency
+
+        _transparency.render(
+            self,
+            counts={
+                "exclusions": hidden_by_exclusions,
+                "search": hidden_by_search,
+                "dead": hidden_by_dead,
+                "keywords": hidden_by_keywords,
+                "adult": hidden_by_adult,
+            },
+            floors={
+                "exclusions": hidden_by_exclusions_is_floor,
+                "search": hidden_by_search_is_floor,
+                "dead": hidden_by_dead_is_floor,
+                "keywords": hidden_by_keywords_is_floor,
+                "adult": hidden_by_adult_is_floor,
+            },
+        )
+
+    def _hide_channel_banners(self) -> None:
+        """Hide the info banner and the filter-transparency bar (the empty-state
+        panel is not a banner: ``_sync_empty_state`` owns it) — the single reset point every render
+        pass starts from, and the one `_hide_all_content_views()` calls when
+        switching away from the channel list, before deciding which (if any)
+        banner applies.
+
+        __dict__.get, not hasattr: PyQt raises RuntimeError (not
+        AttributeError) for attribute access on a __new__'d MainWindow, so
+        hasattr does NOT absorb it — the guard itself would explode. Same trap
+        as an earlier change/an earlier change, and the form already used elsewhere in this file.
+        """
+        for name in ('_channel_banner', '_channel_filter_bar'):
+            widget = self.__dict__.get(name)
+            if widget is not None:
+                widget.setVisible(False)
+
+    def get_enabled_media_types(self) -> list:
+        """Get list of enabled media types from the filter panel."""
+        if hasattr(self, 'filter_panel'):
+            return self.filter_panel.get_filter_state().get(
+                'media_types', ['live', 'movie', 'series'])
+        return ['live', 'movie', 'series']
+
+    def _open_category_picker(self, channel_ids: list[str]) -> None:
+        """Open the CategoryPickerDialog and assign the selected category to channel_ids."""
+        from streamselect.gui.category_picker_dialog import CategoryPickerDialog
+        dlg = CategoryPickerDialog(self.db, self.config, len(channel_ids), self)
+        if dlg.exec() != CategoryPickerDialog.DialogCode.Accepted:
+            return
+
+        category = dlg.selected_category()
+        mood     = dlg.selected_mood()
+        exclude  = dlg.add_to_exclusions()
+
+        if not category:
+            return
+
+        # Global Exclusions — update config on main thread before submitting the worker
+        # so the signal-triggered reload sees the updated exclusion set.
+        if exclude and category not in self.config.global_filter_excluded_user_categories:
+            self.config.global_filter_excluded_user_categories.append(category)
+            self.config.save()
+            self._update_filter_btn_state()
+
+        # Assign in background — emit signal after commit so reload is guaranteed post-write
+        def _do_assign():
+            session = self.db.get_session()
+            try:
+                repos = RepositoryFactory(session)
+                updated = repos.channels.assign_user_category(channel_ids, category, mood)
+                logger.info(
+                    f"Assigned {updated} channels to category {category!r} mood={mood!r}"
+                )  # noqa
+            finally:
+                session.close()
+            self._category_assigned.emit(bool(exclude))
+
+        self.executor.submit(_do_assign)
+
+        # Notify the user
+        n = len(channel_ids)
+        excl_note = " (added to Global Exclusions)" if exclude else ""
+        self.status(
+            f"{n:,} channel{'s' if n != 1 else ''} → \"{category}\"{excl_note}", ms=0
+        )
+
+        if hasattr(self, "discover_view"):
+            QTimer.singleShot(500, self.discover_view.reload)
+
+    def _show_filtered_results(self) -> None:
+        """Reveal what the filters are hiding — clicked on the gold "N filtered" bar.
+
+        Two modes:
+        - Alert "show matches" (id-filter active): reveal the ENTIRE stored matched
+          set with the visibility filters relaxed.  The matches are held back by
+          provider-scoping / media-type / exclusions / hide-watched — none of which
+          the tier-1 bypass touches — and a curated matched set is a record/engaged
+          view (DR-0007 exempts it from active-source scoping), so showing all of it
+          on demand is correct.
+        - Otherwise: the original behaviour — temporarily bypass the Tier 1 tag
+          filters to show what they hide.
+
+        Filters are not changed — the next search or filter change restores the view.
+        """
+        if getattr(self, "_details_id_filter", None) is not None:
+            self._id_filter_show_all = True
+            self.load_channels()
+            return
+        self._bypass_tier1_filters = True
+        self.load_channels()
+
+    def _show_exclusion_hidden(self) -> None:
+        """Reveal what the Global Exclusions are hiding — clicked on the 🔒 segment.
+
+        View-scoped: sets the one-load ``_bypass_global_exclusions`` flag and reloads,
+        so the excluded content surfaces in THIS view only.  The user's stored Global
+        Exclusions are never changed — the next search or filter change restores them.
+        """
+        self._bypass_global_exclusions = True
+        self.load_channels()
+
+    def _show_dead_hidden(self) -> None:
+        """Reveal channels held back by repeated play failures — clicked on the ⚠ segment.
+
+        View-scoped: sets the one-load ``_bypass_dead_gate`` flag and reloads, so
+        channels whose ``reliability_state`` has graduated to "dead" surface in
+        THIS view only (mirror-not-cage — nothing is deleted, just held back from
+        the default list). Revealed rows keep their existing degraded/dim styling
+        (``ChannelListDTO.reliability_state`` drives that, unchanged here). The
+        next search or filter change restores the default (gated) view.
+        """
+        self._bypass_dead_gate = True
+        self.load_channels()
+
+    def _show_keyword_hidden(self) -> None:
+        """Reveal what the Global Exclusions keyword axis is hiding — clicked on the 🔤 segment.
+
+        View-scoped: sets the one-load ``_bypass_keyword_exclusions`` flag and
+        reloads, so content matching one of the user's excluded keywords surfaces
+        in THIS view only. The user's stored keyword list is never changed — the
+        next search or filter change restores it.
+        """
+        self._bypass_keyword_exclusions = True
+        self.load_channels()
+
+    #: How long to wait for the filter state to settle before reloading.
+    #:
+    #: Every filter widget connects to on_filter_changed and it reloaded
+    #: immediately, so one gesture that touches several widgets — a state
+    #: restore, a Clear, a chip that implies others — fired one full reload per
+    #: widget (a user's startup log showed five reloads in seven seconds,
+    #: each a query over many channels, all but the last thrown away).
+    #:
+    #: 120 ms matches the existing batch debounce in discover_view: below what
+    #: a person notices, above the gap between two widgets changing in one pass.
+    _FILTER_RELOAD_DEBOUNCE_MS = 120
+
+    def on_filter_changed(self):
+        """Coalesce a burst of filter changes into one reload.
+
+        The state is captured on EVERY call — only the query is deferred — so
+        the reload that eventually runs uses the final state, and anything
+        reading ``current_filter_state`` in between still sees the truth.
+        """
+        from PyQt6.QtCore import QTimer
+
+        self._capture_filter_state()
+        panel = self.__dict__.get("filter_panel")
+        self._pending_reload_keep_rows = bool(getattr(panel, "_pending_restore_reload", False))
+        if self._pending_reload_keep_rows:
+            panel._pending_restore_reload = False
+
+        timer = getattr(self, "_filter_reload_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(self._reload_after_filter_change)
+            self._filter_reload_timer = timer
+        timer.start(self._FILTER_RELOAD_DEBOUNCE_MS)
+
+    def _capture_filter_state(self):
+        """Read the filter widgets into ``current_filter_state``. Cheap; no query."""
+        self._bypass_tier1_filters = False  # user changed filters — cancel any bypass
+        self._clear_id_filter()             # a filter change drops the ephemeral alert id-filter
+        self.current_filter_state = (
+            self.filter_panel.get_filter_state()
+            if hasattr(self, 'filter_panel')
+            else {}
+        )
+        # Chip state drives provider filtering; ``selected_provider_id`` is the
+        # separate per-source filter cursor (restored from saved search state —
+        # see load_channels()). Reset it here so a filter change starts clean.
+        self.selected_provider_id = None
+        self._sync_filter_chips()   # chips describe the state about to be queried
+
+    def _reload_after_filter_change(self):
+        """Run the deferred reload. One per burst.
+
+        Guarded on ``_shutting_down`` because deferring created a window that
+        did not exist before: the timer can fire AFTER closeEvent has begun,
+        and ``load_channels`` submits to an executor the cleanup registry has
+        already shut down. CI caught exactly that —
+        ``RuntimeError: cannot schedule new futures after shutdown`` out of a
+        Qt event loop during test teardown.
+
+        The same shape as EpgView's pool in an earlier change: making something happen later
+        means it can now happen after the thing it needs is gone.
+        """
+        if getattr(self, "_shutting_down", False):
+            return
+        logger.info("Filter changed, reloading channels...")
+        # keep_rows: True only for FilterPanel's own restore-settling burst.
+        self.load_channels(None, keep_rows=bool(self.__dict__.get("_pending_reload_keep_rows", False)))
+
+    def stop_filter_reload_timer(self) -> None:
+        """Cancel any pending reload. Registered for cleanup by MainWindow."""
+        timer = getattr(self, "_filter_reload_timer", None)
+        if timer is not None:
+            timer.stop()
+
+    def initialize_filter_stats(self) -> None:
+        """Kick off a background load of tag-facet statistics for the filter bar.
+
+        Runs ``TagRepository.get_facet_value_counts`` off the UI thread via
+        ``_run_query``; ``_on_filter_stats_loaded`` applies the result on the
+        main thread once it arrives.
+
+        The query is a single GROUP BY over content_tags JOIN tags JOIN channels,
+        scoped to visible channels on active sources — memory-safe over 1M+ rows.
+
+        Also applies ALL FOUR Global Exclusion axes (prefix/region, user
+        category, content-type, keyword — each paused-aware, resolved here on
+        the main thread per DR-0007) so a facet's advertised count never
+        includes channels those exclusions would hide from the actual list —
+        counts and the list must agree (mirror-not-cage transparency). Closes
+        the pre-existing 3-axis gap (prefix/category/content-type) documented
+        on ``TagRepository.get_facet_value_counts`` — What's New an earlier change.
+        """
+        from streamselect.core.filter_utils import tag_query_scope
+
+        _excl_scope = tag_query_scope(self.config)  # + dead-stream floor (D42)
+        def _facet_stats(repos):
+            """Value counts AND per-facet untagged counts, in ONE worker trip.
+
+            The untagged figure is what each section's "Untagged - N" footer row
+            shows. Both are drawn from the same scope so they describe one
+            population and sum to the visible total; fetching them in separate
+            queries would let them disagree after a refresh.
+            """
+            scope = {
+                'excluded_provider_ids': list(repos.providers.get_hidden_provider_ids()),
+                **_excl_scope,
+            }
+            return (repos.tags.get_facet_value_counts(**scope),
+                    repos.tags.get_facet_untagged_counts(**scope))
+
+        self._run_query(
+            _facet_stats,
+            self._on_filter_stats_loaded,
+            token_ref=self._filter_stats_token,
+            on_error=lambda e: logger.error(f"Failed to load filter stats: {e}"),
+        )
+
+    @_phase.timed("filter-stats.applied")
+    def _on_filter_stats_loaded(self, result) -> None:
+        """Main-thread handler: apply tag-facet counts to the filter panel."""
+        tag_counts, untagged_counts = result
+        # Legacy prefix field — now always empty since we use the tag model.
+        self._filter_unmapped_prefixes = []
+        if hasattr(self, 'filter_panel'):
+            self.filter_panel.update_data(tag_counts, untagged_counts)
+            # Sections were empty, so a restored filter read "en" until now.
+            self._sync_filter_chips()
+        total = sum(sum(v.values()) for v in tag_counts.values())
+        logger.info(f"Initialized filter stats (tag model): {total:,} total tag-value occurrences")
+
+    # ---- Unified context menu infrastructure ----------------------------------
+
+    def _show_channel_menu(
+        self,
+        channel_ids: list[str],
+        surface: str,
+        gx: int,
+        gy: int,
+        entry_id: str = "", programme: "tuple | None" = None,
+    ) -> None:
+        """Gather DB context off-thread, then build and exec the menu on the main thread.
+
+        This is the single entry point for all channel context menus in the
+        MainWindow family.  Multi-select passes all ids; single-select passes
+        a one-element list.  The DB worker builds a ``ChannelMenuContext``
+        with DB-derived fields and emits ``_ctx_data_ready``; the main-thread
+        handler finishes with config-derived fields and calls ``build_channel_menu``.
+        """
+        self.executor.submit(
+            self._bg_fetch_ctx_data,
+            channel_ids, surface, gx, gy, entry_id, programme,
+        )
+
+    def _bg_fetch_ctx_data(
+        self,
+        channel_ids: list[str],
+        surface: str,
+        gx: int,
+        gy: int,
+        entry_id: str, programme: "tuple | None" = None,
+    ) -> None:
+        """Worker: gather DB fields for context menu (runs off-thread)."""
+        from streamselect.gui.channel_menu import ChannelMenuContext
+
+        if len(channel_ids) == 1:
+            cid = channel_ids[0]
+            with self.db.session_scope(commit=False) as session:
+                repos = RepositoryFactory(session)
+                channel = repos.channels.get_by_id(cid) if cid else None
+                if channel is None and surface != "retry":
+                    return
+                if channel is not None:
+                    # "Show N versions": reuse get_content_key_siblings, same
+                    # lookup as details-pane "Other Versions", hidden-scoped.
+                    content_key = getattr(channel, "content_key", "") or ""
+                    variant_options: list = []
+                    if content_key:
+                        variant_options = repos.channels.get_content_key_siblings(
+                            content_key, cid,
+                            excluded_provider_ids=repos.providers.get_hidden_provider_ids(),
+                        )
+                    ctx = ChannelMenuContext(
+                        channel_ids=channel_ids,
+                        surface=surface,
+                        media_type=channel.media_type or "",
+                        is_favorite=bool(channel.is_favorite),
+                        in_queue=repos.queue.is_queued(cid),
+                        rating=repos.ratings.get(cid) or 0,
+                        is_hidden=bool(channel.is_hidden),
+                        is_vod_watched=bool(
+                            getattr(channel, "watch_completed", False)
+                        ),
+                        channel_name=channel.name or "",
+                        # Stored field, computed at ingestion — never parsed here.
+                        detected_title=getattr(channel, "detected_title", "") or "",
+                        user_category=channel.user_category,
+                        entry_id=entry_id,
+                        channel_found=True,
+                        watch_progress=int(
+                            getattr(channel, "watch_progress", 0) or 0
+                        ),
+                        watch_completed=bool(
+                            getattr(channel, "watch_completed", False)
+                        ),
+                        content_key=content_key,
+                        variant_count=len(variant_options) + 1,
+                        variant_options=variant_options,
+                        collections=repos.tags.collection_choices_for([cid, *(o["id"] for o in variant_options)]),
+                        programme_start=programme[0] if programme else None,
+                        programme_end=programme[1] if programme else None,
+                        programme_title=programme[2] if programme else "",
+                    )
+                else:
+                    # retry surface with no matching channel row
+                    ctx = ChannelMenuContext(
+                        channel_ids=channel_ids,
+                        surface=surface,
+                        entry_id=entry_id,
+                        channel_found=False,
+                    )
+        else:
+            # Multi-select: watch state for the bulk-toggle label (all watched?).
+            from streamselect.core.database import ChannelDB as _ChannelDB
+            with self.db.session_scope(commit=False) as session:
+                watched_count = (
+                    session.query(_ChannelDB)
+                    .filter(
+                        _ChannelDB.id.in_(channel_ids),
+                        _ChannelDB.watch_completed == True,  # noqa: E712
+                    )
+                    .count()
+                )
+            all_watched = len(channel_ids) > 0 and watched_count == len(channel_ids)
+            ctx = ChannelMenuContext(
+                channel_ids=channel_ids,
+                surface=surface,
+                entry_id=entry_id,
+                is_vod_watched=all_watched,
+            )
+
+        self._ctx_data_ready.emit(ctx, gx, gy)
+
+    def _on_ctx_data_ready(self, ctx, gx: int, gy: int) -> None:
+        """Main-thread handler: finish context, build menu, exec it."""
+        from PyQt6.QtCore import QPoint
+        from streamselect.gui.channel_menu import build_channel_menu
+
+        # Finish with main-thread-only fields
+        cid = ctx.channel_id
+        if cid:
+            ctx.is_watched = cid in self.config.epg_watchlist_channels
+            ctx.epg_link_blocked = cid in (self.config.epg_link_blocklist or [])
+            _is_mon = getattr(self.config, "is_series_monitored", None)
+            ctx.is_series_monitored = bool(_is_mon(cid)) if callable(_is_mon) else False
+            _unviewed = getattr(self.config, "is_vod_match_unviewed", None)
+            ctx.has_unviewed_match = bool(_unviewed(cid)) if callable(_unviewed) else False
+        ctx.playback_resume_mode = getattr(self.config, "playback_resume_mode", "resume")
+
+        surface = ctx.surface
+        if surface == "favorites":
+            fav_section = (
+                self.sidebar_sections.get("favorites")
+                if hasattr(self, "sidebar_sections") else None
+            )
+            ctx.has_unavailable = fav_section.has_unavailable() if fav_section else False
+        elif surface == "queue":
+            queue_section = (
+                self.sidebar_sections.get("queue")
+                if hasattr(self, "sidebar_sections") else None
+            )
+            ctx.has_unavailable = queue_section.has_unavailable() if queue_section else False
+
+        handlers = self._build_handlers(ctx)
+        # "Show N versions" needs ctx.variant_options (fetched alongside the rest
+        # of the DB-pass context) and the anchor point — added here rather than
+        # in _build_handlers since gx/gy aren't part of that method's signature.
+        handlers["show_versions"] = lambda: self._show_variant_picker_menu(ctx, gx, gy)
+        handlers["exclude_collection"] = lambda: self._exclude_collection_from_menu(ctx, gx, gy)
+        menu = build_channel_menu(ctx, handlers, parent=self)
+        menu.exec(QPoint(gx, gy))
+
+    def _show_variant_picker_menu(self, ctx, gx: int, gy: int) -> None:
+        """A flat picker of *ctx*'s collapsed variants (quality · language ·
+        source) from ``ctx.variant_options``, fetched off-thread with the rest
+        of the menu context; picking one plays it through the normal path."""
+        from PyQt6.QtCore import QPoint
+        from PyQt6.QtGui import QAction
+        from PyQt6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        for opt in ctx.variant_options:
+            bits = [
+                opt.get("detected_quality") or "",
+                opt.get("detected_region") or "",
+                opt.get("provider_name") or "",
+            ]
+            label = " · ".join(b for b in bits if b) or (opt.get("name") or "Version")
+            variant_id = opt.get("id")
+            if not variant_id:
+                continue
+            act = QAction(label, menu)
+            act.triggered.connect(
+                lambda checked=False, vid=variant_id: self.play_channel_by_id(vid)
+            )
+            menu.addAction(act)
+        if not menu.actions():
+            return
+        menu.exec(QPoint(gx, gy))
+
+    def _build_handlers(self, ctx) -> dict:
+        """Build the handler dict for the given surface and context."""
+        surface = ctx.surface
+        cid = ctx.channel_id
+        ids = ctx.channel_ids
+
+        # Resolve the play handler by surface
+        if surface == "history":
+            def play_fn():
+                return self.play_from_history_id(cid)
+        elif surface == "favorites":
+            def play_fn():
+                return self.play_favorite_id(cid)
+        elif surface == "queue":
+            def play_fn():
+                return self.play_queue_item_id(cid)
+        else:
+            def play_fn():
+                return self.play_channel_by_id(cid)
+
+        # Hide handler varies by surface
+        if surface == "history":
+            def hide_fn():
+                return self._hide_channel_from_history(cid)
+        elif surface == "alerts":
+            def hide_fn():
+                return self._hide_channel_from_alerts(cid)
+        else:
+            # channel, queue, recommended
+            def hide_fn():
+                return self._hide_channel_from_recommendations(cid)
+
+        # Clear-unavailable handler varies by surface
+        fav_section = (
+            self.sidebar_sections.get("favorites")
+            if hasattr(self, "sidebar_sections") else None
+        )
+        queue_section = (
+            self.sidebar_sections.get("queue")
+            if hasattr(self, "sidebar_sections") else None
+        )
+
+        handlers: dict = {
+            "play": play_fn,
+            "play_new_window": lambda: self.play_channel_new_window_by_id(cid),
+            "play_open_ended_buffer": lambda: self.play_channel_open_ended_buffer_by_id(cid),
+            "play_deep_cache": lambda: self.play_channel_deep_cache_by_id(cid),
+            "download": lambda: self.download_channel_by_id(cid),
+            "record": lambda: self.record_channel_by_id(cid),
+            "record_window": lambda: self.record_channel_window(cid),
+            "record_programme": lambda: self.schedule_recording_from_programme(
+                cid, ctx.programme_start, ctx.programme_end, ctx.programme_title),
+            "play_from_beginning": lambda: self.play_channel_from_beginning_by_id(cid),
+            "resume_from": lambda: self.play_channel_resume_by_id(cid),
+            "favorite": lambda: self._toggle_favorite_by_id(
+                cid, not ctx.is_favorite
+            ),
+            "queue": (
+                (lambda: self._remove_from_queue(cid))
+                if ctx.in_queue
+                else (lambda: self._add_to_queue(cid))
+            ),
+            "like": lambda: self._toggle_rating(cid, 1),
+            "dislike": lambda: self._toggle_rating(cid, -1),
+            "watch": (
+                (lambda: self._unwatch_channel_from_list(cid))
+                if ctx.is_watched
+                else (lambda: self._watch_channel_from_list(cid))
+            ),
+            "browse_series": lambda: self.browse_series_by_id(cid),
+            "monitor_series": (
+                (lambda: self._unmonitor_series(cid))
+                if ctx.is_series_monitored
+                else (lambda: self._monitor_series(cid))
+            ),
+            "clear_epg_link": (
+                (lambda: self._relink_epg_channel(cid))
+                if ctx.epg_link_blocked
+                else (lambda: self._clear_epg_link(cid))
+            ),
+            "clear_alert": lambda: self._clear_vod_alert(cid),
+            "mark_watched": (
+                (lambda: self._mark_channel_unwatched(cid))
+                if ctx.is_vod_watched
+                else (lambda: self._mark_channel_watched(cid))
+            ),
+            "track": lambda: self._prompt_track_from_list(ctx.channel_name),
+            # Title actions both read ctx.title (detected_title, falling back to
+            # the raw name) — search reuses search_for_title, not search_input.
+            "search_title": lambda: self.search_for_title(ctx.title),
+            "copy_title": lambda: self._copy_title_to_clipboard(ctx.title),
+            "unhide": lambda: self._unhide_channel(cid),
+            "hide": hide_fn,
+            "remove_history": lambda: self.remove_from_history(cid),
+            "not_interested": lambda: self._not_interested(cid),
+            "show_separately": lambda: self._show_channel_separately(cid),
+            "category": lambda: self._open_category_picker([cid]),
+            "remove_retry": lambda: self.stream_retry_manager.remove(ctx.entry_id),
+            "clear_retry": self.stream_retry_manager.clear_all,
+            # Multi-select quick-picks
+            "quickpick_trash": lambda: self._quick_assign_category(
+                ids, "Trash", "dislike", True
+            ),
+            "quickpick_watch_later": lambda: self._quick_assign_category(
+                ids, "Watch Later", None, False
+            ),
+            "quickpick_explore": lambda: self._quick_assign_category(
+                ids, "Explore", "curious", False
+            ),
+            "bulk_category": lambda: self._open_category_picker(ids),
+            # Multi-select Play All — look up playable DTOs off-thread, then delegate
+            "play_all": lambda: self._trigger_play_all_channels(ids),
+            # Multi-select bulk actions
+            "bulk_mark_watched": lambda: self._bulk_mark_watched(ids),
+            "bulk_favorite": lambda: self._bulk_add_to_favorites(ids),
+            "bulk_queue": lambda: self._bulk_add_to_queue(ids),
+            "bulk_hide": lambda: self._bulk_hide_channels(ids),
+        }
+
+        # clear_unavailable's handler is surface-specific (favorites vs queue own
+        # separate lists) — never derived from which section happens to exist; a
+        # dead prior pass here always got overwritten by this one anyway.
+        if surface == "queue" and queue_section is not None:
+            handlers["clear_unavailable"] = queue_section.clearUnavailableClicked.emit
+        elif surface == "favorites" and fav_section is not None:
+            handlers["clear_unavailable"] = fav_section.clearUnavailableClicked.emit
+
+        return handlers
+
+    def _copy_title_to_clipboard(self, title: str) -> None:
+        """Put *title* on the system clipboard and confirm in the status bar.
+
+        Handler for the context menu's "Copy title".  The title is resolved by
+        ``ChannelMenuContext.title`` (stored ``detected_title``, falling back to the
+        raw channel name), so this never re-derives it.
+        """
+        from PyQt6.QtWidgets import QApplication
+
+        text = (title or "").strip()
+        if not text:
+            return
+        QApplication.clipboard().setText(text)
+        if hasattr(self, "status_bar"):
+            self.status(f"Copied '{text}' to clipboard", ms=0)
+
+    # ---- Context menu entry points (thin wrappers) ---------------------------
+
+    def _show_context_menu_for(self, channel_id: str, gx: int, gy: int,
+                               surface: str) -> None:
+        """Legacy single-channel entry point — delegates to _show_channel_menu."""
+        self._show_channel_menu([channel_id], surface, gx, gy)
+
+    # ---- QListView / ChannelListModel adapters --------------------------------
+
+    def _on_channel_double_clicked(self, index) -> None:
+        """Handle double-click on a QListView item (replaces itemDoubleClicked).
+
+        Derives the channel_id from the model index and delegates to
+        ``play_channel_by_id`` (which already handles series drill-in).  The
+        old ``play_channel(item)`` takes a ``QListWidgetItem``; since we now
+        use a ``QListView`` we extract the id here and call the by-id path.
+
+        A double-click on a grouped section header toggles its collapse state
+        instead of playing (headers carry no channel id).
+        """
+        from PyQt6.QtCore import Qt
+        from streamselect.gui.channel_list_model import ROW_KIND_ROLE
+        channel_id = index.data(Qt.ItemDataRole.UserRole)
+        if channel_id:
+            self.play_channel_by_id(channel_id)
+            return
+        # No channel id → a grouped section header: toggle its collapse state.
+        if index.data(ROW_KIND_ROLE) == "header":
+            self._on_channel_list_clicked(index)
+
+    def _on_group_by_type_toggled(self, checked: bool) -> None:
+        """Toggle the opt-in "Group by type" view; persist + re-project rows.
+
+        Grouping is a pure display transform over the already-loaded rows, so this
+        does NOT reload from the DB — it just tells the model to re-project the
+        current page set into collapsible Movies/Series/Live sections.
+        """
+        self.config.group_by_type = bool(checked)
+        _cfgsave.save_soon(self)
+        self.channel_model.set_grouped(
+            bool(checked),
+            collapsed_sections=getattr(self.config, "group_collapsed_types", None) or [],
+        )
+
+    def _on_section_mode_toggled(self, section: str, word_only: bool) -> None:
+        """Narrow one section to whole-word matches, or open it back up."""
+        if section:
+            self.channel_model.set_section_word_only(section, word_only)
+
+    def _on_channel_list_clicked(self, index) -> None:
+        """Header click toggles collapse; a channel click always shows details.
+
+        The details pane is driven by currentChanged, which does NOT fire
+        when the clicked row is already current — and on_channel_selection_
+        changed additionally returns early on _last_shown_channel_id. So a
+        row that was already selected could not be re-opened at all.
+
+        That is worst with a SINGLE result, which the list auto-selects: the one
+        row on screen is already current, so clicking it does nothing, and there
+        is no other row to click away to. User report: *"I can't single
+        click Ghostbusters in the search results to get it to populate the
+        details panel"* — the pane kept showing a different title until they
+        went and found the item on another surface.
+
+        clicked fires on every click regardless of selection state, so an
+        explicit click is treated as an explicit request and bypasses the
+        de-dupe guard (which exists to skip redundant re-renders, not to ignore
+        the user).
+        """
+        from streamselect.gui.channel_list_model import ROW_KIND_ROLE, SECTION_TYPE_ROLE
+        kind = index.data(ROW_KIND_ROLE)
+        if kind == "person":
+            person = index.data(SECTION_TYPE_ROLE)
+            if person:
+                self.channel_model.toggle_person_collapsed(person)
+            return
+        if kind != "header":
+            self._show_details_for_clicked_row(index)
+            return
+        section = index.data(SECTION_TYPE_ROLE)
+        if not section:
+            return
+        collapsed = set(getattr(self.config, "group_collapsed_types", None) or [])
+        now_collapsed = section not in collapsed
+        if now_collapsed:
+            collapsed.add(section)
+        else:
+            collapsed.discard(section)
+        self.config.group_collapsed_types = sorted(collapsed)
+        _cfgsave.save_soon(self)
+        self.channel_model.set_section_collapsed(section, now_collapsed)
+
+    def _show_details_for_clicked_row(self, index) -> None:
+        """Populate the details pane for an explicitly clicked channel row.
+
+        Args:
+            index: The clicked model index. Non-channel rows are ignored.
+        """
+        channel_id = index.data(_Qt.ItemDataRole.UserRole)
+        if not channel_id:
+            return
+        view = self.__dict__.get("channels_list")
+        if view is not None and view.press_moved_current():
+            return   # currentChanged already rendered it; see press_moved_current
+        self._last_shown_channel_id = channel_id
+        try:
+            self.show_channel_details_by_id(channel_id)
+        except Exception:
+            logger.exception("could not show details for {}", channel_id)
+
+    def _on_channel_middle_clicked(self, index) -> None:
+        """Middle-click on a channel-list row → the user-configured play action.
+
+        Resolves the row's channel id and hands it to the shared
+        :meth:`_dispatch_middle_click` seam, so the channel list and every other
+        movie surface (Discover cards, sidebar sections, Recipe / Preferences
+        result lists) route a middle-click through exactly one place.
+        """
+        from PyQt6.QtCore import Qt
+        self._dispatch_middle_click(index.data(Qt.ItemDataRole.UserRole))
+
+    def _dispatch_middle_click(self, channel_id: str) -> None:
+        """Play *channel_id* via the user-configured middle-click action.
+
+        The single chokepoint for the middle-click gesture across every movie
+        surface.  The action is chosen in Settings → Interaction and persisted to
+        ``config.middle_click_action``; this looks the key up in the shared
+        ``MIDDLE_CLICK_ACTIONS`` registry and dispatches to the mapped per-play
+        path (e.g. resume from saved position, or play with endless buffer) — no
+        parallel play path, no hardcoded behaviour.
+
+        Args:
+            channel_id: The channel id under the middle-click.  A falsy value
+                (e.g. a click on empty space or a non-channel row) is ignored.
+        """
+        from streamselect.gui.middle_click_actions import (
+            DEFAULT_MIDDLE_CLICK_ACTION,
+            middle_click_action,
+        )
+        if not channel_id:
+            return
+        key = getattr(self.config, "middle_click_action", DEFAULT_MIDDLE_CLICK_ACTION)
+        play_fn = getattr(self, middle_click_action(key).method, None)
+        if callable(play_fn):
+            play_fn(channel_id)
+
+    def _on_channel_page_requested(self, query_params: dict, offset: int, page_size: int) -> None:
+        """Handle a ``page_requested`` signal from ChannelListModel (main thread).
+
+        Captures the model's current generation so the arriving page can be
+        compared and dropped if a newer set_channels() was called in the
+        meantime.  The actual DB read runs off-thread via ``_run_query``; the
+        result is delivered to ``_on_channel_page_loaded`` on the main thread.
+        """
+        generation = self.channel_model.generation
+        self._run_query(
+            lambda repos: self._query_channels_page(repos, query_params, offset, page_size),
+            lambda result: self._on_channel_page_loaded(result, generation),
+            # No token_ref: we want ALL page results (older pages are guarded by
+            # the generation int, not by a supersede token).
+            on_error=self._on_channel_page_error,
+        )
+
+    def _on_channel_page_error(self, exc: Exception) -> None:
+        """Main-thread: clear the model's in-flight flag after a failed page fetch.
+
+        Without this, a worker exception leaves ``_fetching`` True forever (the
+        error branch of ``_run_query`` never reaches ``_on_channel_page_loaded``),
+        so ``canFetchMore()`` returns False and pagination stalls permanently.
+        Clearing the flag lets a later scroll retry.
+        """
+        logger.warning("Channel page fetch failed; clearing fetch flag to allow retry: %s", exc)
+        self.channel_model.mark_fetch_failed()
+
+    @staticmethod
+    def _query_channels_page(repos, query_params: dict, offset: int, page_size: int):
+        """Worker (off-thread): fetch one incremental page, return (dtos, has_more).
+
+        Mirrors ``_query_channels`` but is simpler — no count / adult / filtered-out
+        logic needed for subsequent pages (that info was already shown for page 1).
+        """
+
+        hidden_only = query_params.get('hidden_only', False)
+        downloaded_only = query_params.get('downloaded_only', False)
+        force_adult_ids = query_params.get('force_adult_ids', [])
+        providers_to_exclude = repos.providers.get_hidden_provider_ids()
+        _id_filter = query_params.get('context_id_filter')
+        id_filter_show_all = bool(_id_filter) and bool(query_params.get('id_filter_show_all'))
+        # Global Exclusions as page 1: skipped under any reveal (bypass, id-filter show-all,
+        # hidden_only); resolved before the query so page N elects as page 1 does.
+        apply_exclusions = not (hidden_only or downloaded_only or id_filter_show_all
+                                or query_params.get('bypass_global_exclusions'))
+        _excl_sets, _rank_excl = (_resolve_exclusions(repos, query_params)
+                                  if apply_exclusions else ((), {}))
+
+        if hidden_only:
+            # get_hidden_channels does not support offset/limit — use get_all
+            # with hidden_only=True which routes through the same SQL filter.
+            rows = repos.channels.get_all(
+                provider_id=query_params.get('provider_id'),
+                hidden_only=True,
+                include_hidden=True,
+                search_query=query_params.get('search_query'),
+                excluded_provider_ids=providers_to_exclude or None,
+                adult_mode='all',
+                limit=page_size,
+                offset=offset,
+            )
+        elif downloaded_only:
+            rows = []  # unreachable: page 1 always sets has_more=False for this scope
+        elif id_filter_show_all:
+            # Same relaxed reveal as page 1 (SOFT filters off), but provider-scoping
+            # stays applied — disabled/expired-source content is never revealed.
+            rows = repos.channels.get_all(
+                channel_ids=_id_filter,
+                media_types=None,
+                adult_mode='all',
+                include_hidden=True,
+                exclude_watched=False,
+                tag_includes=None,
+                excluded_provider_ids=providers_to_exclude or None,
+                limit=page_size,
+                offset=offset,
+            )
+        else:
+            rows = repos.channels.get_all(
+                provider_id=query_params.get('provider_id'),
+                media_types=query_params.get('media_types'),
+                language_prefixes=query_params.get('language_prefixes'),
+                region_prefixes=query_params.get('region_prefixes'),
+                quality_prefixes=query_params.get('quality_prefixes'),
+                platform_prefixes=query_params.get('platform_prefixes'),
+                genre_filters=query_params.get('genre_filters'),
+                invert_prefix_filters=query_params.get('invert_prefix_filters', False),
+                include_untagged=query_params.get('include_untagged', True),
+                include_untagged_quality=query_params.get('include_untagged_quality', True),
+                adult_mode=query_params.get('adult_mode', 'hide'),
+                force_adult_provider_ids=force_adult_ids or None,
+                include_uncategorized_content_types=True,
+                hidden_only=False,
+                include_hidden=False,
+                # Keep page N consistent with page 1: a revealed dead-stream gate
+                # (_show_dead_hidden) and the VE-1 floor must hold on every page.
+                include_dead=bool(query_params.get('bypass_dead_gate')),
+                search_query=query_params.get('search_query'),
+                strict_genre_filter=query_params.get('strict_genre_filter'),
+                person_filter=query_params.get('person_filter'),
+                context_tag_filter=query_params.get('context_tag_filter'),
+                context_category_filter=query_params.get('context_category_filter'),
+                channel_ids=query_params.get('context_id_filter'),
+                excluded_provider_ids=providers_to_exclude or None,
+                tag_includes=query_params.get('tag_includes'),
+                facets_hiding_untagged=query_params.get('facets_hiding_untagged'),
+                exclude_watched=query_params.get('hide_watched', False),
+                collapse_variants=query_params.get('collapse_variants', False),
+                excluded_keywords=(None if query_params.get('bypass_keyword_exclusions')
+                                   else (query_params.get('excluded_keywords') or None)),
+                dead_signal_streak_floor=query_params.get('dead_signal_streak_floor'),
+                limit=page_size,
+                offset=offset,
+                **_rank_excl,
+            )
+        # Raw SQL count BEFORE Python-side exclusion. has_more and the next OFFSET
+        # advance by this — never by the surviving count — so exclusions can't
+        # stall paging or cause the next page to overlap already-shown rows.
+        raw_count = len(rows)
+        has_more = raw_count >= page_size
+
+        if apply_exclusions:
+            rows = _apply_python_exclusions(rows, *_excl_sets)
+
+        dtos = rows_to_dtos(repos, rows, query_params.get('search_query'))
+        return dtos, has_more, raw_count
+
+    def _on_channel_page_loaded(self, result, generation: int) -> None:
+        """Main-thread: deliver a fetched page to the model.
+
+        ``result`` is the ``(dtos, has_more)`` tuple from ``_query_channels_page``.
+        The ``generation`` is compared inside ``channel_model.append_page`` and
+        dropped if it no longer matches the current model generation.
+        """
+        if result is None:
+            # Error already logged by _run_query; clear the fetching flag so a
+            # later scroll can retry.
+            self.channel_model.mark_fetch_failed()
+            return
+        dtos, has_more, raw_count = result
+        # Feed the freshly-paged rows to lazy TMDb enrichment (scroll = more visible).
+        self._enqueue_tmdb_enrichment([d.id for d in dtos])
+        self.channel_model.append_page(
+            dtos, has_more=has_more, raw_count=raw_count, generation=generation
+        )
+        # Reflect the grown loaded count in the "Showing N of M" label.
+        self._refresh_channel_stats_label()
+
+    # ---- Multi-select Play All -----------------------------------------------
+
+    def _trigger_play_all_channels(self, channel_ids: list[str]) -> None:
+        """Kick off a Play-All for the selected channel IDs.
+
+        Looks up each channel's playable DTO off the main thread (same pattern as
+        ``play_channel_by_id`` but batched), converts non-series channels to
+        :class:`_PlayAllItem` values in selection order, and delegates to
+        :meth:`_play_all_items`.  Series channels are skipped with a log warning —
+        they have no single stream URL and are not playable via Play All.
+
+        Args:
+            channel_ids: Ordered list of channel IDs as they appear in the
+                multi-select (selection order = play order).
+        """
+        from streamselect.gui.main_window_series_playback import _PlayAllItem
+
+        def _bg_fetch(repos) -> list:
+            """Off-thread: look up playable DTOs for channel_ids in selection order."""
+            from streamselect.core.models import MediaType
+            items: list[_PlayAllItem] = []
+            for cid in channel_ids:
+                dto = repos.channels.get_playable_dto(cid)
+                if dto is None:
+                    logger.warning(f"Play All: channel {cid!r} not found, skipping")
+                    continue
+                if dto.media_type == MediaType.SERIES:
+                    logger.info(
+                        f"Play All: skipping series channel {dto.name!r} "
+                        f"(series have no direct stream URL)"
+                    )
+                    continue
+                if not dto.stream_url:
+                    logger.warning(f"Play All: {dto.name!r} has no stream URL, skipping")
+                    continue
+                items.append(_PlayAllItem(
+                    stream_url=dto.stream_url,
+                    title=dto.name,
+                    content_id=dto.id,
+                    provider_id=dto.provider_id,
+                    media_type=dto.media_type or "live",
+                ))
+            return items
+
+        def _on_items_ready(items: list) -> None:
+            if not items:
+                self.status("No playable streams in selection", ms=0, level="warn")
+                return
+            self._play_all_items(items)
+
+        self._run_query(
+            _bg_fetch,
+            _on_items_ready,
+            on_error=lambda e: logger.error(f"Play All channel lookup failed: {e}"),
+        )

@@ -1,0 +1,513 @@
+"""Episode repository for data access"""
+
+from typing import Optional, List, Dict
+from datetime import datetime
+from sqlalchemy.orm import Session
+from loguru import logger
+
+from streamselect.core.database import EpisodeDB
+from streamselect.core.repositories.dtos import EpisodeDTO
+
+
+class EpisodeRepository:
+    """Repository for episode data access"""
+    
+    def __init__(self, session: Session):
+        self.session = session
+    
+    def get_by_id(self, episode_id: str) -> Optional[EpisodeDB]:
+        """Get episode by ID"""
+        return self.session.query(EpisodeDB).filter_by(id=episode_id).first()
+
+    def update_stream_url(self, episode_id: str, stream_url: str) -> None:
+        """Persist a URL that a play-time failover proved works, so it sticks.
+
+        Mirrors :meth:`ChannelRepository.update_stream_url` for episodes:
+        called by the episode play-time failover path
+        (``launch_player_for_episode`` in ``main_window_series_playback.py``) after
+        ``validate_and_failover_stream_url`` finds a working alternate host —
+        otherwise every subsequent play of this episode re-starts from the
+        dead host and re-pays the failover stall. Scoped to this one episode
+        row only. A no-op, not an error, if the episode no longer exists
+        (e.g. deleted mid-flight).
+
+        Args:
+            episode_id: The episode row to update.
+            stream_url: The new, already-validated stream URL to store.
+        """
+        episode = self.get_by_id(episode_id)
+        if not episode:
+            return
+        episode.stream_url = stream_url
+        self.session.commit()
+    
+    def get_by_series(self, series_id: str, provider_id: str) -> List[EpisodeDB]:
+        """Get all episodes for a series"""
+        return self.session.query(EpisodeDB).filter_by(
+            series_id=series_id,
+            provider_id=provider_id
+        ).order_by(
+            EpisodeDB.season_num,
+            EpisodeDB.episode_num
+        ).all()
+    
+    def get_by_season(self, season_id: str) -> List[EpisodeDB]:
+        """Get all episodes for a season"""
+        return self.session.query(EpisodeDB).filter_by(
+            season_id=season_id
+        ).order_by(EpisodeDB.episode_num).all()
+
+    def get_episodes_dto_by_season(self, season_id: str) -> "List[EpisodeDTO]":
+        """Return episodes as plain DTOs — thread-safe, no live session required.
+
+        ``rating``/``plot``/``air_date``/``still_url`` are read directly from
+        the stored ``EpisodeDB`` columns (populated at ingestion — Wave 4,
+        an earlier change) rather than re-parsing ``raw_data`` here on every read
+        (compute-once-at-ingestion, the project rules).
+        """
+        return [self._episode_dto(ep) for ep in self.get_by_season(season_id=season_id)]
+
+    def get_episode_dto(self, episode_id: str) -> "Optional[EpisodeDTO]":
+        """One episode as the same plain DTO the series tree holds, or None."""
+        ep = self.get_by_id(episode_id)
+        return self._episode_dto(ep) if ep is not None else None
+
+    @staticmethod
+    def _episode_dto(ep) -> "EpisodeDTO":
+        """Build the series tree's plain DTO from an ``EpisodeDB``."""
+        return EpisodeDTO(
+            id=ep.id,
+            episode_num=ep.episode_num,
+            season_num=ep.season_num,
+            title=ep.title,
+            series_name=ep.series_name,
+            stream_url=ep.stream_url,
+            duration=ep.duration,
+            is_watched=ep.is_watched,
+            rating=getattr(ep, "rating", None),
+            series_id=ep.series_id,
+            provider_id=ep.provider_id,
+            season_id=ep.season_id,
+            watch_progress=int(getattr(ep, "watch_progress", 0) or 0),
+            watch_completed=bool(getattr(ep, "watch_completed", False)),
+            watch_percent=int(getattr(ep, "watch_percent", 0) or 0),
+            last_played_via=getattr(ep, "last_played_via", None),
+            is_favorite=bool(getattr(ep, "is_favorite", False)),
+            plot=getattr(ep, "plot", None),
+            air_date=getattr(ep, "air_date", None),
+            still_url=getattr(ep, "still_url", None),
+        )
+
+    def get_playable_dto(self, episode_id: str) -> "Optional[PlayableEpisodeDTO]":
+        """Return a :class:`PlayableEpisodeDTO` for a single episode by id, or None.
+
+        Shared lookup for surfaces that only know the episode's DB id — the Watch
+        Queue and Favorites sidebar rows (Wave 2 Slice 2B) — so they can resolve a
+        play target without a live ORM object crossing the session boundary.
+        """
+        from streamselect.core.repositories.dtos import PlayableEpisodeDTO
+        ep = self.get_by_id(episode_id)
+        if ep is None:
+            return None
+        return PlayableEpisodeDTO(
+            id=ep.id,
+            title=ep.title,
+            stream_url=ep.stream_url,
+            series_id=ep.series_id,
+            provider_id=ep.provider_id,
+            season_id=ep.season_id,
+            episode_num=ep.episode_num,
+            season_num=ep.season_num,
+        )
+
+    def get_favorites_dto(
+        self,
+        hidden_provider_ids: "Optional[set]" = None,
+    ) -> "List[EpisodeFavoriteDTO]":
+        """Return favorited episodes as plain DTOs for the Favorites sidebar (Slice 2B).
+
+        Mirrors ChannelRepository.get_favorites_dto's availability annotation: an
+        episode is available when its OWN provider is not in hidden_provider_ids.
+        Favorited episodes are engaged content (like channel favorites) — kept
+        regardless of source state, just annotated so the sidebar can dim them.
+
+        Args:
+            hidden_provider_ids: If supplied, episodes whose ``provider_id`` is in
+                this set are annotated with ``available=False``.
+        """
+        from streamselect.core.repositories.dtos import EpisodeFavoriteDTO
+        hidden = hidden_provider_ids or set()
+        episodes = (
+            self.session.query(EpisodeDB)
+            .filter_by(is_favorite=True)
+            .order_by(EpisodeDB.series_name, EpisodeDB.season_num, EpisodeDB.episode_num)
+            .all()
+        )
+        result: list[EpisodeFavoriteDTO] = []
+        for ep in episodes:
+            result.append(EpisodeFavoriteDTO(
+                id=ep.id,
+                title=ep.title,
+                series_name=ep.series_name or "",
+                season_num=ep.season_num,
+                episode_num=ep.episode_num,
+                provider_id=ep.provider_id,
+                last_played=ep.last_played,
+                available=(not hidden or ep.provider_id not in hidden),
+            ))
+        return result
+    
+    def get_last_played(self, series_id: str, provider_id: str) -> Optional[EpisodeDB]:
+        """Get last played episode for a series"""
+        return self.session.query(EpisodeDB).filter(
+            EpisodeDB.series_id == series_id,
+            EpisodeDB.provider_id == provider_id,
+            EpisodeDB.last_played.isnot(None)
+        ).order_by(EpisodeDB.last_played.desc()).first()
+
+    def get_last_engaged(self, series_id: str, provider_id: str) -> Optional[EpisodeDB]:
+        """Get the most-recent episode that the user deliberately started (last_played_via='manual').
+
+        Queue-auto-advanced episodes are intentionally excluded — they don't move
+        the resume anchor.  Use this for the resume path instead of
+        :meth:`get_last_played`, which returns the furthest-touched episode
+        regardless of how it was played.
+
+        Returns None when no manually-played episode exists for the series.
+        """
+        return self.session.query(EpisodeDB).filter(
+            EpisodeDB.series_id == series_id,
+            EpisodeDB.provider_id == provider_id,
+            EpisodeDB.last_played.isnot(None),
+            EpisodeDB.last_played_via == "manual",
+        ).order_by(EpisodeDB.last_played.desc()).first()
+
+    def get_next_after(self, series_id: str, provider_id: str, season_num: int, episode_num: int) -> Optional[EpisodeDB]:
+        """Return the next episode in air order after (season_num, episode_num).
+
+        Tries the next episode_num in the same season first; if none exists,
+        returns the first episode of the next season.  Returns None when the
+        given episode is the series finale.
+        """
+        # Same-season next
+        next_ep = self.session.query(EpisodeDB).filter(
+            EpisodeDB.series_id == series_id,
+            EpisodeDB.provider_id == provider_id,
+            EpisodeDB.season_num == season_num,
+            EpisodeDB.episode_num > episode_num,
+        ).order_by(EpisodeDB.episode_num).first()
+        if next_ep:
+            return next_ep
+        # First episode of the next season
+        return self.session.query(EpisodeDB).filter(
+            EpisodeDB.series_id == series_id,
+            EpisodeDB.provider_id == provider_id,
+            EpisodeDB.season_num > season_num,
+        ).order_by(EpisodeDB.season_num, EpisodeDB.episode_num).first()
+
+    def get_resume_dto(self, series_id: str, provider_id: str) -> "Optional[PlayableEpisodeDTO]":
+        """Return a :class:`PlayableEpisodeDTO` for the smart-resume target, or ``None``.
+
+        Resume logic (see Slice 3b-4 / the project rules):
+
+        1. Find the last *engaged* (``last_played_via == 'manual'``) episode.
+        2. If none exists → fall back to :meth:`get_last_played_dto` (original behaviour).
+        3. If the engaged episode is **not completed** → resume inside it at its
+           ``watch_progress`` position.
+        4. If it **is completed** → resume at the first episode **after** it in air
+           order (queue-watched episodes beyond are ignored for the resume anchor).
+        5. If there is no episode after it (series finished) → return ``None``
+           so the caller opens the series view as usual.
+        """
+        from streamselect.core.repositories.dtos import PlayableEpisodeDTO
+
+        engaged = self.get_last_engaged(series_id=series_id, provider_id=provider_id)
+        if engaged is None:
+            # No manual play ever — fall back to old behaviour so history still works.
+            return self.get_last_played_dto(series_id=series_id, provider_id=provider_id)
+
+        if not engaged.watch_completed:
+            # Resume inside the engaged episode.
+            return PlayableEpisodeDTO(
+                id=engaged.id,
+                title=engaged.title,
+                stream_url=engaged.stream_url,
+                series_id=engaged.series_id,
+                provider_id=engaged.provider_id,
+                season_id=engaged.season_id,
+                episode_num=engaged.episode_num,
+                season_num=engaged.season_num,
+            )
+
+        # Engaged episode finished — offer the next one.
+        nxt = self.get_next_after(
+            series_id=series_id,
+            provider_id=provider_id,
+            season_num=engaged.season_num,
+            episode_num=engaged.episode_num,
+        )
+        if nxt is None:
+            return None  # series complete — let caller open series view
+
+        return PlayableEpisodeDTO(
+            id=nxt.id,
+            title=nxt.title,
+            stream_url=nxt.stream_url,
+            series_id=nxt.series_id,
+            provider_id=nxt.provider_id,
+            season_id=nxt.season_id,
+            episode_num=nxt.episode_num,
+            season_num=nxt.season_num,
+        )
+
+    def get_resume_targets_for_series(
+        self, keys: "List[tuple[str, str]]"
+    ) -> "Dict[tuple[str, str], PlayableEpisodeDTO]":
+        """Batch the History sidebar's "Play Next Episode" resolution across series rows.
+
+        For each ``(series_id, provider_id)`` key, resolves the smart-ladder resume
+        target via :meth:`get_resume_dto` — the same "last engaged → resume in place →
+        next episode → None (series complete)" ladder used elsewhere. Sibling to
+        :meth:`get_last_played_for_series` (same batched-keys shape, called
+        alongside it from :func:`~streamselect.core.repositories.dtos.build_history_dtos`),
+        but the ladder's branches (engaged lookup, then a conditional next-after query)
+        don't collapse into one SQL statement the way a flat "last played" scan does —
+        so this dedupes the requested keys first (a series repeated across multiple
+        History rows only pays for the ladder once) and calls :meth:`get_resume_dto`
+        once per unique key, rather than once per History row.
+
+        A key maps to ``None`` in effect (simply absent from the result) when there is
+        no resume target — no episodes ever played, or the series is complete — so the
+        caller (the History row) knows not to show a "Play Next Episode" button.
+        """
+        if not keys:
+            return {}
+        out: Dict[tuple[str, str], "PlayableEpisodeDTO"] = {}
+        for series_id, provider_id in dict.fromkeys(keys):  # de-dup, keep first-seen order
+            dto = self.get_resume_dto(series_id=series_id, provider_id=provider_id)
+            if dto is not None:
+                out[(series_id, provider_id)] = dto
+        return out
+
+    def mark_episodes_as_engaged(self, episode_ids: "List[str]") -> int:
+        """Flip ``last_played_via`` to ``'manual'`` for the given episode ids.
+
+        Used by the "Still here?" post-queue confirmation (Slice 3b-4) when the
+        user confirms they watched the auto-advanced episodes.  Updates
+        ``updated_at`` but leaves all other watch fields intact (they were already
+        set to completed by the queue path).
+
+        Returns the number of rows actually updated.
+        """
+        if not episode_ids:
+            return 0
+        updated = 0
+        for episode_id in episode_ids:
+            ep = self.get_by_id(episode_id)
+            if ep is None:
+                continue
+            ep.last_played_via = "manual"
+            ep.updated_at = datetime.now()
+            updated += 1
+        if updated:
+            self.session.commit()
+        logger.info(f"Promoted {updated} queue-watched episode(s) to manual engagement")
+        return updated
+
+    def get_last_played_dto(self, series_id: str, provider_id: str) -> "Optional[PlayableEpisodeDTO]":
+        """Return a PlayableEpisodeDTO for the last played episode, or None.
+
+        Must be called inside a session_scope().  No ORM object escapes — the
+        returned frozen dataclass is safe to use after the session closes.
+        """
+        from streamselect.core.repositories.dtos import PlayableEpisodeDTO
+        ep = self.get_last_played(series_id=series_id, provider_id=provider_id)
+        if ep is None:
+            return None
+        return PlayableEpisodeDTO(
+            id=ep.id,
+            title=ep.title,
+            stream_url=ep.stream_url,
+            series_id=ep.series_id,
+            provider_id=ep.provider_id,
+            season_id=ep.season_id,
+            episode_num=ep.episode_num,
+            season_num=ep.season_num,
+        )
+
+    def get_last_played_for_series(
+        self, keys: "List[tuple[str, str]]"
+    ) -> "Dict[tuple[str, str], tuple[str, str]]":
+        """Batch the per-series last-played lookup into ONE query.
+
+        For each ``(series_id, provider_id)`` key, returns ``(episode_id, code)``
+        for its most recently played episode. Replaces an N+1 of
+        ``get_last_played`` calls (one per history row). History can span
+        providers, so the key is the pair, not just the series id. Ordering desc
+        + first-seen-per-key reproduces ``get_last_played``'s single-row
+        semantics exactly.
+
+        It returned the CODE alone until the History row needed to play the
+        episode it names — the id was already on the row this walks, and
+        dropping it forced the caller to re-derive a target from the series and
+        get a different episode. Renamed with it: a method called
+        ``..._codes_...`` that hands back ids is the kind of name that stops
+        being read.
+        """
+        if not keys:
+            return {}
+        wanted = set(keys)
+        series_ids = {k[0] for k in keys}
+        provider_ids = {k[1] for k in keys}
+        rows = self.session.query(EpisodeDB).filter(
+            EpisodeDB.series_id.in_(series_ids),
+            EpisodeDB.provider_id.in_(provider_ids),
+            EpisodeDB.last_played.isnot(None),
+        ).order_by(EpisodeDB.last_played.desc()).all()
+        out: Dict[tuple[str, str], tuple[str, str]] = {}
+        for ep in rows:
+            key = (ep.series_id, ep.provider_id)
+            if key in wanted and key not in out:
+                out[key] = (ep.id, f"S{ep.season_num:02d}E{ep.episode_num:02d}")
+        return out
+    
+    def mark_played(self, episode_id: str):
+        """Mark episode as played"""
+        episode = self.get_by_id(episode_id)
+        if episode:
+            episode.last_played = datetime.now()
+            episode.play_count = (episode.play_count or 0) + 1
+            episode.updated_at = datetime.now()
+            self.session.commit()
+            logger.info(f"Marked episode as played: {episode.title}")
+    
+    def mark_watched(self, episode_id: str, watched: bool = True) -> bool:
+        """Mark episode as watched/unwatched, setting all watch fields coherently.
+
+        watched=True  → is_watched=True,  watch_completed=True,  watch_percent=100,
+                         last_played_via="manual" (manual mark = deliberate → SOLID icon).
+        watched=False → is_watched=False, watch_completed=False, watch_percent=0,
+                         watch_progress=0  (clear resume point — item is truly unwatched).
+
+        Returns True if the episode was found and updated, False if not found.
+        """
+        episode = self.get_by_id(episode_id)
+        if episode is None:
+            return False
+        if watched:
+            episode.is_watched = True
+            episode.watch_completed = True
+            episode.watch_percent = 100
+            episode.last_played_via = "manual"
+        else:
+            episode.is_watched = False
+            episode.watch_completed = False
+            episode.watch_percent = 0
+            episode.watch_progress = 0
+        episode.updated_at = datetime.now()
+        self.session.commit()
+        logger.info(f"Marked episode {episode.title} as {'watched' if watched else 'unwatched'}")
+        return True
+
+    def mark_watched_bulk(self, episode_ids: "List[str]", watched: bool = True) -> int:
+        """Mark multiple episodes as watched/unwatched atomically.
+
+        Sets all watch fields coherently (same semantics as :meth:`mark_watched`,
+        including ``last_played_via="manual"`` so manually-marked items render SOLID).
+        Commits once for the whole batch.
+
+        Returns the number of episodes actually updated.
+        """
+        if not episode_ids:
+            return 0
+        updated = 0
+        for episode_id in episode_ids:
+            episode = self.get_by_id(episode_id)
+            if episode is None:
+                continue
+            if watched:
+                episode.is_watched = True
+                episode.watch_completed = True
+                episode.watch_percent = 100
+                episode.last_played_via = "manual"
+            else:
+                episode.is_watched = False
+                episode.watch_completed = False
+                episode.watch_percent = 0
+                episode.watch_progress = 0
+                # Provenance goes with the watch: leaving a stale "manual"/"queue"
+                # here made the row disagree with the DTO the series tree builds
+                # for an unwatched episode (which has always been None), so the
+                # glyph changed the next time the tree was repopulated.
+                episode.last_played_via = None
+            episode.updated_at = datetime.now()
+            updated += 1
+        if updated:
+            self.session.commit()
+        logger.info(f"Bulk marked {updated} episode(s) as {'watched' if watched else 'unwatched'}")
+        return updated
+
+    def get_watch_state_by_season(self, season_id: str) -> "tuple[int, int]":
+        """Return (total_episodes, completed_episodes) for a season.
+
+        Used to derive the season-level watched indicator without adding a
+        SeasonDB column — the indicator is computed from its episodes.
+        """
+        episodes = self.get_by_season(season_id=season_id)
+        total = len(episodes)
+        completed = sum(1 for ep in episodes if ep.watch_completed)
+        return total, completed
+    
+    def update_progress(self, episode_id: str, progress_seconds: int):
+        """Update watch progress"""
+        episode = self.get_by_id(episode_id)
+        if episode:
+            episode.watch_progress = progress_seconds
+            episode.updated_at = datetime.now()
+            self.session.commit()
+
+    def record_watch_progress(
+        self,
+        episode_id: str,
+        position_s: float,
+        duration_s: float,
+        threshold: float = 0.9,
+        played_via: str = "manual",
+    ) -> bool:
+        """Record episode watch progress: resume point + completion.
+
+        Mirror of :meth:`ChannelRepository.record_watch_progress` for episodes:
+        sets ``watch_progress`` (resume seconds), ``last_played``, and
+        ``last_played_via``; at ``>= threshold`` marks ``is_watched`` and
+        ``watch_completed``, clearing the resume point. On a partial watch (below
+        threshold), both ``is_watched`` and ``watch_completed`` are explicitly
+        cleared so that re-watching a previously-finished episode un-completes it —
+        this restores the invariant ``watch_progress > 0 ⟺ not watch_completed``.
+        ``play_count`` is owned by ``mark_played``.
+
+        Returns True if this call marked the episode watched.
+        """
+        episode = self.get_by_id(episode_id)
+        if episode is None:
+            return False
+        completed = bool(duration_s and duration_s > 0 and (position_s / duration_s) >= threshold)
+        pct = (
+            min(100, max(0, round(position_s / duration_s * 100)))
+            if duration_s and duration_s > 0
+            else 0
+        )
+        episode.last_played = datetime.now()
+        episode.last_played_via = played_via
+        episode.watch_percent = 100 if completed else pct
+        if completed:
+            episode.is_watched = True
+            episode.watch_completed = True
+            episode.watch_progress = 0
+        else:
+            episode.is_watched = False      # re-watching a finished episode un-completes it
+            episode.watch_completed = False  # mirrors the completed branch, inverted
+            episode.watch_progress = max(0, int(position_s))
+        episode.updated_at = datetime.now()
+        self.session.commit()
+        return completed
+

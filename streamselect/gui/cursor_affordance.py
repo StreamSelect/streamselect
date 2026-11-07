@@ -1,0 +1,200 @@
+"""App-wide pointing-hand cursor affordance — one install point, no per-widget edits.
+
+StreamSelect is a native Qt app, so clickable controls don't get the web-style "hand"
+cursor on hover by default. We adopt the hand as a clickability affordance via a
+*single* application-level event filter installed once at startup
+(:func:`install`). On every widget ``Enter`` event the filter decides whether the
+hovered widget is clickable and, if so, gives it
+``Qt.CursorShape.PointingHandCursor``. There is exactly one chokepoint — adding
+the affordance to a new surface never requires touching that surface.
+
+What counts as clickable
+------------------------
+* Any :class:`~PyQt6.QtWidgets.QAbstractButton` (covers ``QPushButton`` — i.e.
+  the filter chips and the rail/action buttons), **except** ``QCheckBox`` and
+  ``QRadioButton`` (their box/circle is the affordance, a hand would mislead).
+* Any widget that opts in with the dynamic property ``clickable=True``. Custom
+  clickable ``QLabel``/``QWidget``s (poster, chips, collapse carets, clickable
+  rows) opt in with :func:`set_clickable` at their own construction site — no
+  change here is needed to support them.
+
+Always excluded: disabled widgets (``isEnabled() == False``) — a disabled
+control offers nothing to click, so it keeps the default cursor.
+
+Adding a new clickable widget
+------------------------------
+A plain ``QPushButton``/``QToolButton`` (any ``QAbstractButton``) needs nothing
+— it qualifies automatically. Every other hand-rolled clickable (a ``QLabel``
+with a ``mousePressEvent`` override, a clickable row ``QWidget``, a caret) must
+call :func:`set_clickable` once at construction (and again on any state change
+that flips its clickability, e.g. a poster that only becomes clickable once an
+image loads). Never call ``setCursor(Qt.CursorShape.PointingHandCursor)``
+directly — that hand-rolls a parallel path around this chokepoint and won't
+pick up the disabled-widget handling above. Checkboxes and radio buttons are
+excluded by convention (the box/circle is already the affordance) — don't
+route them through :func:`set_clickable`.
+"""
+
+from __future__ import annotations
+
+from PyQt6.QtCore import QEvent, QObject, QPointF, Qt
+from PyQt6.QtGui import QMouseEvent
+from PyQt6.QtWidgets import (
+    QAbstractButton,
+    QApplication,
+    QCheckBox,
+    QRadioButton,
+    QWidget,
+)
+from loguru import logger
+
+#: QAbstractButton subclasses whose own widget *is* the affordance — never get
+#: the hand even though they are buttons.
+_EXCLUDED_BUTTON_TYPES: tuple[type, ...] = (QCheckBox, QRadioButton)
+
+#: Dynamic property a custom (non-button) widget can set to opt into the hand.
+CLICKABLE_PROPERTY = "clickable"
+
+#: Dynamic property marking a clickable widget as ALSO keyboard-operable.
+#: Separate from :data:`CLICKABLE_PROPERTY`, and opt-in rather than automatic,
+#: because focusability is not free: every clickable poster, chip and row
+#: becoming a tab stop makes the tab chain unusable. A widget that is the only
+#: way to perform an action — a collapsible section header, a row that toggles —
+#: opts in; a chip that duplicates a menu item does not need to.
+KEYBOARD_PROPERTY = "keyboard_activatable"
+
+#: Keys that activate a keyboard-operable clickable, matching what a QPushButton
+#: answers to, so a hand-rolled row behaves like the button it is standing in for.
+_ACTIVATION_KEYS = (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter)
+
+
+def _is_clickable(widget: QWidget) -> bool:
+    """Return True if *widget* should show the pointing-hand cursor on hover.
+
+    A widget is clickable when it is a (non-checkbox/radio) button, or it has
+    opted in via the ``clickable=True`` dynamic property.
+    """
+    if isinstance(widget, _EXCLUDED_BUTTON_TYPES):
+        return False
+    if isinstance(widget, QAbstractButton):
+        return True
+    return bool(widget.property(CLICKABLE_PROPERTY))
+
+
+class PointingHandFilter(QObject):
+    """Application-level event filter that applies the hand cursor on hover.
+
+    Installed once on the :class:`QApplication`; it receives ``Enter`` events for
+    every widget and sets/clears the pointing-hand cursor accordingly. The filter
+    never consumes the event (always returns ``False``) so normal hover handling
+    is untouched.
+    """
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802 (Qt API)
+        if event.type() == QEvent.Type.Enter and isinstance(obj, QWidget):
+            if _is_clickable(obj):
+                if obj.isEnabled():
+                    obj.setCursor(Qt.CursorShape.PointingHandCursor)
+                else:
+                    # A control that was enabled when first hovered (cursor set)
+                    # may later be disabled; clear so it doesn't keep the hand.
+                    obj.unsetCursor()
+            return False  # never swallow the event
+
+        # Space/Enter on a focused keyboard-operable clickable acts as a click.
+        # Synthesised as a real press+release rather than calling a handler, so
+        # whatever the widget already implements — mousePressEvent,
+        # mouseReleaseEvent, a signal emitted from either — runs unchanged. A
+        # host opts in once with set_clickable(w, keyboard=True) and needs no
+        # key handling of its own.
+        if (event.type() == QEvent.Type.KeyPress
+                and isinstance(obj, QWidget)
+                and obj.isEnabled()
+                and bool(obj.property(KEYBOARD_PROPERTY))
+                and event.key() in _ACTIVATION_KEYS):
+            _synthesise_click(obj)
+            return True  # consumed: Space must not also scroll the container
+        return False  # never swallow anything else
+
+
+def _synthesise_click(widget: QWidget) -> None:
+    """Deliver a left press+release at the centre of *widget*."""
+    centre = QPointF(widget.rect().center())
+    for kind in (QEvent.Type.MouseButtonPress, QEvent.Type.MouseButtonRelease):
+        QApplication.sendEvent(widget, QMouseEvent(
+            kind, centre, widget.mapToGlobal(centre),
+            Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        ))
+
+
+def set_clickable(widget: QWidget, clickable: bool = True, *,
+                  keyboard: bool = False) -> None:
+    """Opt a non-button widget into (or out of) the pointing-hand affordance.
+
+    Sets the ``clickable`` dynamic property the installed filter checks on
+    hover (see :data:`CLICKABLE_PROPERTY`). Because the filter only reacts to
+    ``Enter`` events, this also applies or clears the cursor immediately, so a
+    widget whose clickability changes while the pointer is already over it
+    (e.g. a poster becoming clickable the instant its image finishes loading)
+    updates without waiting for the next hover.
+
+    This is the one call every hand-rolled clickable widget (a custom
+    ``QLabel``/``QWidget`` with its own ``mousePressEvent`` or ``clicked``
+    signal) should use instead of a direct
+    ``setCursor(Qt.CursorShape.PointingHandCursor)`` — buttons never need it,
+    they qualify for free via :func:`_is_clickable`.
+
+    Args:
+        widget: The widget to mark clickable (or not).
+        clickable: Whether *widget* is currently clickable. Defaults to
+            ``True`` for the common "always clickable" case; pass a live
+            boolean for widgets whose clickability toggles at runtime.
+        keyboard: Also make *widget* focusable and operable with Space/Enter.
+            Pass this when the widget is the ONLY way to perform its action —
+            a section header that collapses, a row that toggles. Off by
+            default because focusability is not free: every clickable chip and
+            poster becoming a tab stop makes the tab chain unusable.
+    """
+    widget.setProperty(CLICKABLE_PROPERTY, clickable)
+    widget.setProperty(KEYBOARD_PROPERTY, bool(clickable and keyboard))
+    if clickable and keyboard:
+        widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    if clickable and widget.isEnabled():
+        widget.setCursor(Qt.CursorShape.PointingHandCursor)
+    else:
+        widget.unsetCursor()
+
+
+def set_resizable(widget: QWidget, orientation: Qt.Orientation) -> None:
+    """Give a drag-to-resize divider the platform's resize cursor.
+
+    For a splitter handle whose primary gesture is DRAG: the pointing hand says
+    "click", and on macOS — where the resize arrows are how a divider is found —
+    a handle showing the hand was hard to grab (user report). Takes the
+    widget out of the pointing-hand filter so hover does not put the hand back.
+
+    Args:
+        widget: The divider (a ``QSplitterHandle``).
+        orientation: The SPLITTER's orientation: a horizontal splitter resizes
+            sideways, so its handles get the horizontal-split cursor.
+    """
+    widget.setProperty(CLICKABLE_PROPERTY, False)
+    widget.setCursor(Qt.CursorShape.SplitHCursor if orientation == Qt.Orientation.Horizontal
+                     else Qt.CursorShape.SplitVCursor)
+
+
+def install(app: QApplication) -> PointingHandFilter:
+    """Install the pointing-hand affordance filter on *app* (call once at startup).
+
+    Args:
+        app: The running ``QApplication`` instance.
+
+    Returns:
+        The installed :class:`PointingHandFilter`. The caller should keep a
+        reference (e.g. on the app) so it is not garbage-collected.
+    """
+    filt = PointingHandFilter(app)
+    app.installEventFilter(filt)
+    logger.debug("Pointing-hand cursor affordance installed on QApplication")
+    return filt

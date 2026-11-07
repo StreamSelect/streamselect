@@ -1,0 +1,43 @@
+name: Flatpak rolling (Linux)
+
+# Every push to main: build StreamSelect.flatpak (flatpak-build.yml) and attach it to
+# the `rolling` release beside the macOS .dmg. Separate from release.yml on
+# purpose — a Flatpak failure must never hold back the .dmg, and vice versa.
+on:
+  push:
+    branches:
+      - main
+
+# Newest push wins, as in release.yml — two main pushes racing to upload would
+# otherwise let the slower (possibly older) build overwrite the newer one.
+concurrency:
+  group: flatpak-rolling-${{ github.ref }}
+  # false: a running build always finishes and only the newest waiting one is
+  # kept. With true, merges ~5 min apart cancelled every macOS build before its
+  # runner queue + Homebrew step were over, so no .dmg shipped for 7h.
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # upload the asset to the rolling release
+
+jobs:
+  build:
+    uses: ./.github/workflows/flatpak-build.yml
+
+  publish:
+    # Attach to `rolling` only from main. The release itself (tag, title,
+    # notes) is created and moved by release.yml; this job only adds or
+    # replaces its own asset under a stable, version-free name.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4   # for scripts/upload_to_rolling.sh
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: StreamSelect-flatpak
+
+      - name: Upload StreamSelect.flatpak to the rolling release
+        run: scripts/upload_to_rolling.sh StreamSelect.flatpak
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

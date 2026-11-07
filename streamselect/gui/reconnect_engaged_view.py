@@ -1,0 +1,268 @@
+"""Reconnect Engaged Content — recover orphaned favorites/history/queue rows.
+
+When a source is deleted or expires, engaged channels (favorited, played, or
+queued — see ``ChannelRepository._engaged_channel_predicate``) are deliberately
+KEPT rather than pruned, so the user never loses a favorite/history row outright.
+But nothing re-points them at an equivalent copy a still-active source carries —
+they just sit there as orphans pointing at a source that is gone.
+
+This view lists every such orphan, proposes the best-quality live replacement
+sharing the same stored ``content_key`` (never a title heuristic — see
+``ChannelRepository.get_reconnect_candidates``), and lets the user move the
+engagement (favorite/history/resume-position/rating/queue membership) onto the
+live channel one row at a time (**Reconnect**) or all matched rows at once
+(**Reconnect All**). Nothing moves automatically — reconnecting a user's
+favorites/history is explicit-only (the project rules: user tags/ratings/favorites/
+history are sacrosanct). Rows with no available match are still listed, marked
+plainly as unmatched (mirror-not-cage: nothing is silently dropped).
+
+All data loads asynchronously via the ``MainWindow._run_query`` seam and returns
+frozen DTOs (no ORM objects cross the boundary); the reconnect mutation itself is
+a cheap single-row write run synchronously on the main thread (same pattern as
+``_toggle_favorite_by_id`` / ``_toggle_rating``).
+"""
+
+from __future__ import annotations
+
+import html as _html
+
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QScrollArea, QLabel, QPushButton, QFrame,
+)
+from loguru import logger
+
+from streamselect.core.repositories import RepositoryFactory
+from streamselect.core.repositories.dtos import ReconnectCandidateDTO
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+from streamselect.gui.tool_view import ToolView, clear_layout
+
+
+class ReconnectEngagedView(ToolView):
+    """Tools view: orphaned engaged content + one-click reconnect to a live copy.
+
+    Opening it (``on_activate``) loads the candidate list off-thread.
+    ``reload`` re-runs the load (called after a reconnect settles the counts).
+    """
+
+    def __init__(self, main_window):
+        super().__init__(main_window)
+        self._token = [0]
+        self._candidates: list[ReconnectCandidateDTO] = []
+        self._build_ui()
+
+    # ── UI scaffold ─────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        top_bar = self.build_top_bar(f"{_icon_utils.role_html('reconnect')}&nbsp; Reconnect Engaged Content")
+        self._reconnect_all_btn = QPushButton("Reconnect All")
+        _icon_utils.set_button_icon(self._reconnect_all_btn, "reconnect")
+        self._reconnect_all_btn.setToolTip(
+            "Move every matched row's engagement onto its proposed live replacement"
+        )
+        _theme.style(self._reconnect_all_btn, "LINK_BTN_SM")
+        self._reconnect_all_btn.clicked.connect(self._on_reconnect_all_clicked)
+        self._reconnect_all_btn.setEnabled(False)
+        top_bar.addWidget(self._reconnect_all_btn)
+
+        hint = QLabel(
+            f"{_icon_utils.role_html('info')}&nbsp; When a source is removed, your favorited/watched/"
+            "queued content from it is kept but stranded. These rows have a "
+            "same-title match on one of your active sources — reconnecting moves "
+            "your favorite, watch history, resume position, rating, and queue "
+            "membership onto the live copy. Nothing moves automatically."
+        )
+        _theme.style(hint, "SECTION_HINT")
+        hint.setWordWrap(True)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        self._rows_layout = QVBoxLayout(content)
+        scroll.setWidget(content)
+
+        layout.addLayout(top_bar)
+        layout.addWidget(hint)
+        layout.addWidget(scroll)
+
+    # ── Lifecycle ───────────────────────────────────────────────────────────
+
+    def on_activate(self) -> None:
+        """Show a loading state, then kick the async load."""
+        self._reconnect_all_btn.setEnabled(False)
+        self.show_loading(self._rows_layout)
+        self._load()
+
+    def on_deactivate(self) -> None:
+        """Cancel any pending load (bump the query token)."""
+        self._token[0] += 1
+
+    def reload(self) -> None:
+        """Re-run the load when visible (called after a reconnect settles)."""
+        if self.isVisible():
+            self._load()
+
+    # ── Data loading ────────────────────────────────────────────────────────
+
+    def _load(self) -> None:
+        self.main_window._run_query(
+            self._query_candidates,
+            self._on_candidates_loaded,
+            token_ref=self._token,
+            on_error=self._on_load_error,
+        )
+
+    @staticmethod
+    def _query_candidates(repos) -> list[ReconnectCandidateDTO]:
+        hidden = set(repos.providers.get_hidden_provider_ids())
+        return repos.channels.get_reconnect_candidates(hidden)
+
+    # ── Render ──────────────────────────────────────────────────────────────
+
+    def _on_candidates_loaded(self, candidates: list[ReconnectCandidateDTO]) -> None:
+        self._candidates = candidates
+        clear_layout(self._rows_layout)
+
+        matched = sum(1 for c in candidates if c.match is not None)
+        self._reconnect_all_btn.setEnabled(matched > 0)
+
+        if not candidates:
+            done = QLabel(
+                f"{_icon_utils.role_html('notification_success')}&nbsp; No orphaned engaged content — "
+                "everything you've favorited, watched, or queued is on an active source."
+            )
+            _theme.style(done, "SECTION_HINT")
+            self._rows_layout.addWidget(done)
+            return
+
+        for candidate in candidates:
+            self._rows_layout.addWidget(self._candidate_row(candidate))
+        self._rows_layout.addStretch()
+
+    def _candidate_row(self, candidate: ReconnectCandidateDTO) -> QWidget:
+        row = QFrame()
+        row_layout = QVBoxLayout(row)
+        row_layout.setContentsMargins(0, 6, 0, 10)
+
+        mtype_icon = {
+            "movie": _icon_utils.role_html('movie'), "series": _icon_utils.role_html('series'),
+        }.get(candidate.media_type or "", _icon_utils.role_html('unknown'))
+        title = candidate.detected_title or candidate.orphan_name
+        year = f" ({candidate.detected_year})" if candidate.detected_year else ""
+        header = QLabel(f"{mtype_icon}  {_html.escape(title, quote=False)}{year}  ·  was on {_html.escape(candidate.provider_name, quote=False)}")
+        _theme.style(header, "SECTION_HDR")
+        header.setWordWrap(True)
+        row_layout.addWidget(header)
+
+        engaged_line = QLabel(f"&nbsp;&nbsp;&nbsp;&nbsp;{self._engagement_summary(candidate)}")
+        _theme.style(engaged_line, "SECTION_HINT")
+        engaged_line.setWordWrap(True)
+        row_layout.addWidget(engaged_line)
+
+        action_row = QHBoxLayout()
+        if candidate.match is not None:
+            match = candidate.match
+            match_title = match.detected_title or match.name
+            quality = f" ({match.detected_quality})" if match.detected_quality else ""
+            match_label = QLabel(
+                f"&nbsp;&nbsp;&nbsp;&nbsp;{_icon_utils.role_html('notification_success')} Match: {_html.escape(match_title, quote=False)}{quality} "
+                f"on {_html.escape(match.provider_name, quote=False)}"
+            )
+            _theme.style(match_label, "SECTION_HINT")
+            match_label.setWordWrap(True)
+            action_row.addWidget(match_label, 1)
+
+            reconnect_btn = QPushButton("Reconnect")
+            _icon_utils.set_button_icon(reconnect_btn, "reconnect")
+            reconnect_btn.setToolTip("Move this row's engagement onto the matched live channel")
+            _theme.style(reconnect_btn, "PANEL_BTN")
+            orphan_id, live_id = candidate.orphan_id, match.channel_id
+            reconnect_btn.clicked.connect(
+                lambda _checked=False, o=orphan_id, l=live_id: self._on_reconnect_clicked(o, l)
+            )
+            action_row.addWidget(reconnect_btn)
+        else:
+            unmatched_label = QLabel(
+                f"&nbsp;&nbsp;&nbsp;&nbsp;{_icon_utils.role_html('warning')} No live match found on an active source"
+            )
+            _theme.style(unmatched_label, "SECTION_HINT")
+            unmatched_label.setWordWrap(True)
+            action_row.addWidget(unmatched_label, 1)
+
+        row_layout.addLayout(action_row)
+        return row
+
+    def _engagement_summary(self, candidate: ReconnectCandidateDTO) -> str:
+        """One line describing exactly what a reconnect would move for this row."""
+        parts: list[str] = []
+        if candidate.is_favorite:
+            parts.append(f"{_icon_utils.role_html('favorite')} favorited")
+        if candidate.last_played is not None:
+            parts.append(f"{_icon_utils.role_html('history')} watched")
+        if candidate.play_count:
+            parts.append(f"played {candidate.play_count}×")
+        if candidate.watch_completed:
+            parts.append(f"{_icon_utils.role_html('watched')} completed")
+        elif candidate.watch_progress:
+            parts.append(f"{candidate.watch_percent}% watched")
+        if candidate.user_rating == 1:
+            parts.append(_icon_utils.role_html('like'))
+        elif candidate.user_rating == -1:
+            parts.append(_icon_utils.role_html('dislike'))
+        if candidate.in_queue:
+            parts.append(f"{_icon_utils.role_html('queue')} queued")
+        return "Will move: " + (", ".join(parts) if parts else "engagement")
+
+    # ── Reconnect actions ───────────────────────────────────────────────────
+
+    def _on_reconnect_clicked(self, orphan_id: str, live_id: str) -> None:
+        if self._reconnect_one(orphan_id, live_id):
+            self.main_window.notification_manager.show(
+                title="Reconnected", message="Engagement moved to the live copy.",
+                type="success",
+            )
+        self._after_reconnect()
+
+    def _on_reconnect_all_clicked(self) -> None:
+        pairs = [
+            (c.orphan_id, c.match.channel_id)
+            for c in self._candidates if c.match is not None
+        ]
+        succeeded = 0
+        for orphan_id, live_id in pairs:
+            if self._reconnect_one(orphan_id, live_id):
+                succeeded += 1
+        self.main_window.notification_manager.show(
+            title="Reconnect All",
+            message=f"Reconnected {succeeded} of {len(pairs)} matched item(s).",
+            type="success" if succeeded == len(pairs) else "warning",
+        )
+        self._after_reconnect()
+
+    def _reconnect_one(self, orphan_id: str, live_id: str) -> bool:
+        """Run one reconnect in its own transaction. Returns True on success."""
+        try:
+            with self.main_window.db.session_scope() as session:
+                RepositoryFactory(session).channels.reconnect_engaged_content(orphan_id, live_id)
+            return True
+        except Exception as exc:  # noqa: BLE001 — surfaced as a toast, not a crash
+            logger.error(f"Reconnect failed ({orphan_id!r} -> {live_id!r}): {exc}")
+            self.main_window.notification_manager.show(
+                title="Reconnect Failed", message=str(exc), type="error",
+            )
+            return False
+
+    def _after_reconnect(self) -> None:
+        """Refresh this view plus the sidebar sections engagement can land in."""
+        self.reload()
+        self.main_window.load_favorites()
+        self.main_window.load_history()
+        self.main_window._refresh_queue_section()
+
+    # ── Error / cleanup ─────────────────────────────────────────────────────
+
+    def _on_load_error(self, exc: Exception) -> None:
+        self.show_panel_error(self._rows_layout, exc)

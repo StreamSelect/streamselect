@@ -1,0 +1,195 @@
+"""Behavioral tests for the configurable middle-click action + Settings Interaction tab.
+
+Covered behaviors
+-----------------
+Registry (gui.middle_click_actions):
+1. Each registered action key maps to a real MainWindow play method.
+2. The default key is the first entry and matches Config.middle_click_action.
+3. An unknown key resolves to the default action (no crash on stale config).
+
+Settings → Interaction tab (real SettingsDialog):
+4. The tab is present and the middle-click combo is populated from the registry.
+5. Load: config.middle_click_action / playback_resume_mode select the right items.
+6. Save: combo selections write both fields back to config and persist.
+
+Dispatch (_on_channel_middle_clicked):
+7. The handler resolves config.middle_click_action through the registry and calls
+   the mapped play method for the clicked channel id.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import pytest
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    from PyQt6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+# ---------------------------------------------------------------------------
+# 1–3. Registry is the single source of truth
+# ---------------------------------------------------------------------------
+
+def test_registry_keys_map_to_real_mainwindow_methods():
+    """Every registry method name must exist as a play method on MainWindow."""
+    from streamselect.gui.main_window import MainWindow
+    from streamselect.gui.middle_click_actions import MIDDLE_CLICK_ACTIONS
+
+    assert MIDDLE_CLICK_ACTIONS, "registry must not be empty"
+    for action in MIDDLE_CLICK_ACTIONS:
+        assert callable(getattr(MainWindow, action.method, None)), (
+            f"action {action.key!r} -> missing MainWindow method {action.method!r}"
+        )
+
+
+def test_registry_initial_entries_map_to_expected_methods():
+    """The two seeded actions map to the documented play paths."""
+    from streamselect.gui.middle_click_actions import middle_click_action
+
+    assert middle_click_action("playback_position").method == "play_channel_resume_by_id"
+    assert (
+        middle_click_action("endless_buffer").method
+        == "play_channel_open_ended_buffer_by_id"
+    )
+
+
+def test_registry_default_matches_config_default():
+    """The default key is the first entry AND the Config field default."""
+    from streamselect.core.config import Config
+    from streamselect.gui.middle_click_actions import (
+        DEFAULT_MIDDLE_CLICK_ACTION,
+        MIDDLE_CLICK_ACTIONS,
+    )
+
+    assert DEFAULT_MIDDLE_CLICK_ACTION == MIDDLE_CLICK_ACTIONS[0].key
+    assert Config().middle_click_action == DEFAULT_MIDDLE_CLICK_ACTION
+
+
+def test_registry_unknown_key_falls_back_to_default():
+    """A stale/unknown key resolves to the default action rather than raising."""
+    from streamselect.gui.middle_click_actions import (
+        DEFAULT_MIDDLE_CLICK_ACTION,
+        middle_click_action,
+    )
+
+    assert middle_click_action("removed_action").key == DEFAULT_MIDDLE_CLICK_ACTION
+
+
+# ---------------------------------------------------------------------------
+# 4–6. Settings → Interaction tab (real dialog round-trip)
+# ---------------------------------------------------------------------------
+
+def _FakeConfig(playback_resume_mode: str = "resume",
+                middle_click_action: str = "playback_position"):
+    """A real ``Config``, not a hand-written stub — it cannot drift from the model.
+
+    This WAS a 40-line stub listing every field the Settings dialog reads, and
+    it broke the day the dialog learned one more: ``_load_values`` touches every
+    tab, so adding a Signal-checking tab failed a test file that has nothing to
+    do with signals. The same thing happened when the Content tab gained
+    ``_adult_mode_combo`` — 37 tests across six files.
+
+    ``settings_config_double`` returns a real ``Config``. pydantic fills every
+    declared default, so a field added tomorrow is present here the same day,
+    and the autouse ``_isolate_user_config`` fixture keeps it off real user data.
+    """
+    from tests.conftest import settings_config_double
+
+    return settings_config_double(
+        playback_resume_mode=playback_resume_mode,
+        middle_click_action=middle_click_action,
+    )
+def test_interaction_tab_combo_populated_from_registry(qapp):
+    """The middle-click combo lists exactly the registry's actions, in order."""
+    from streamselect.gui.settings_dialog import SettingsDialog
+    from streamselect.gui.middle_click_actions import MIDDLE_CLICK_ACTIONS
+
+    dlg = SettingsDialog(_FakeConfig(), parent=None)
+    keys = [
+        dlg._middle_click_combo.itemData(i)
+        for i in range(dlg._middle_click_combo.count())
+    ]
+    assert keys == [a.key for a in MIDDLE_CLICK_ACTIONS]
+    dlg.close()
+
+
+def test_interaction_tab_loads_both_fields(qapp):
+    """Load: both combos reflect the config values (double-click + middle-click)."""
+    from streamselect.gui.settings_dialog import SettingsDialog
+
+    cfg = _FakeConfig(playback_resume_mode="beginning", middle_click_action="endless_buffer")
+    dlg = SettingsDialog(cfg, parent=None)
+
+    assert dlg._resume_mode_combo.currentData() == "beginning"
+    assert dlg._middle_click_combo.currentData() == "endless_buffer"
+    dlg.close()
+
+
+def test_interaction_tab_saves_both_fields(qapp, monkeypatch):
+    """Save: changing both combos writes playback_resume_mode + middle_click_action."""
+    from streamselect.gui.settings_dialog import SettingsDialog
+
+    cfg = _FakeConfig(playback_resume_mode="resume", middle_click_action="playback_position")
+
+    # Count saves without a hand-written stub attribute. The old _FakeConfig
+    # carried its own `save_calls` counter, which is exactly the kind of thing a
+    # real Config cannot have — and the reason the stub existed at all.
+    saves = []
+    monkeypatch.setattr(type(cfg), "save", lambda self: saves.append(1), raising=False)
+
+    dlg = SettingsDialog(cfg, parent=None)
+
+    dlg._resume_mode_combo.setCurrentIndex(dlg._resume_mode_combo.findData("beginning"))
+    dlg._middle_click_combo.setCurrentIndex(
+        dlg._middle_click_combo.findData("endless_buffer")
+    )
+    dlg._save_values()
+
+    assert cfg.playback_resume_mode == "beginning"
+    assert cfg.middle_click_action == "endless_buffer"
+    assert len(saves) == 1, "the dialog did not persist the change exactly once"
+    dlg.close()
+
+
+def test_interaction_tab_load_unknown_middle_click_falls_back(qapp):
+    """An unknown stored middle_click_action falls back to the default combo item."""
+    from streamselect.gui.settings_dialog import SettingsDialog
+    from streamselect.gui.middle_click_actions import DEFAULT_MIDDLE_CLICK_ACTION
+
+    dlg = SettingsDialog(_FakeConfig(middle_click_action="gone"), parent=None)
+    assert dlg._middle_click_combo.currentData() == DEFAULT_MIDDLE_CLICK_ACTION
+    dlg.close()
+
+
+# ---------------------------------------------------------------------------
+# 7. Dispatch resolves through the registry
+# ---------------------------------------------------------------------------
+
+def _index(channel_id):
+    idx = MagicMock()
+    idx.data.return_value = channel_id
+    return idx
+
+
+def _channels_host(action_key: str):
+    from streamselect.gui.main_window_channels import _ChannelListMixin
+    host = _ChannelListMixin.__new__(_ChannelListMixin)
+    host.config = MagicMock()
+    host.config.middle_click_action = action_key
+    host.play_channel_resume_by_id = MagicMock()
+    host.play_channel_open_ended_buffer_by_id = MagicMock()
+    return host
+
+
+def test_dispatch_calls_registry_mapped_method(qapp):
+    """_on_channel_middle_clicked dispatches the mapped method per the registry."""
+    from streamselect.gui.main_window_channels import _ChannelListMixin
+
+    host = _channels_host("endless_buffer")
+    _ChannelListMixin._on_channel_middle_clicked(host, _index("ch9"))
+    host.play_channel_open_ended_buffer_by_id.assert_called_once_with("ch9")
+    host.play_channel_resume_by_id.assert_not_called()

@@ -1,0 +1,986 @@
+"""The EPG group: what your watchlist patterns match in the guide.
+
+Everything from the off-thread query to the clock that keeps the rendered rows
+honest. Split from :mod:`alerts` because the section carries four independent
+groups and one file carrying all four ran past 1800 lines — well over the
+1000-line standard — with no seam telling a reader which half they were in.
+
+Mixed into ``WatchAlertsSection``; it reaches the section's widgets
+(``alerts_tree``, ``_epg_toggle``, ``_epg_hdr_container``) through ``self``,
+which ``create_content`` builds.
+"""
+
+from __future__ import annotations
+
+
+from PyQt6.QtWidgets import QTreeWidget, QTreeWidgetItem
+from PyQt6.QtCore import Qt, QSize, QTimer
+from streamselect.core import watchlist
+from streamselect.core.epg_utils import now_utc as _now_utc, is_local_today as _is_local_today, to_local as _to_local
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import icons as _icons
+from streamselect.gui.epg_widgets import _PROG_START_ROLE, _PROG_STOP_ROLE
+from streamselect.gui.relative_time import humanize_remaining, humanize_until
+from streamselect.gui.sidebar.alerts_rows import TITLE_INDENT, _AlertRow
+from streamselect.gui.sidebar.base import (
+    GroupHeading, _fmt_channel_name,
+)
+from streamselect.gui.sidebar.alerts_common import (
+    _CHILD_INDENT,
+    _Airing,
+    _prog_start,
+    _prog_stop,
+    _quality,
+    _region,
+    _started_at,
+    _when,
+    _ALERTS_TREE_AUTOEXPAND_BUDGET,
+    _ROLE_GROUP_KEY,
+)
+from streamselect.gui import deferred_config_save as _cfgsave
+from streamselect.gui.recording_indicators import indicator_for
+
+#: A group-header row (``_add_parent``) has no single channel by the shared
+#: ``Qt.ItemDataRole.UserRole`` convention — that role means "this row's own
+#: channel" to ``set_playing``/the context menu, and a bundled programme has
+#: several. REC-2's indicator refresh still needs SOME channel to check (the
+#: lead airing's, the same one ``record_clicked`` schedules), so it gets its
+#: own role rather than overloading ``UserRole`` and quietly changing what
+#: ``set_playing`` lights up on a grouped row.
+_ROLE_REC_CHANNEL = Qt.ItemDataRole.UserRole + 10
+
+
+class EpgGroupMixin:
+    #: Why the EPG group has nothing to list. The distinction earns its keep on
+    #: the first two: an unconfigured watchlist should show nothing, but a
+    #: CONFIGURED one with nothing airing must still hold its place — rendering
+    #: those two states identically is what made a working feature look broken.
+    EPG_EMPTY_NO_PATTERNS = "no_patterns"
+
+    EPG_EMPTY_NO_SOURCE   = "no_source"
+
+    EPG_EMPTY_NO_MATCHES  = "no_matches"
+
+    EPG_EMPTY_GUIDE_ENDED = "guide_ended"
+
+    #: Reasons the group hides rather than explains itself. Both mean the user
+    #: has not set this up — there is no promise outstanding, so a line saying
+    #: nothing is airing would be noise about a feature they never asked for.
+    EPG_EMPTY_SILENT = frozenset({EPG_EMPTY_NO_PATTERNS, EPG_EMPTY_NO_SOURCE})
+
+    #: How often the visible rows recompute their own time text. Cheap by
+    #: construction: no query, no network, just arithmetic against timestamps
+    #: the rows already hold.
+    TICK_MS = 30_000
+
+    def _epg_empty_notice(self, reason: str) -> tuple[str, str, str]:
+        """Icon, sentence and tooltip for an EPG group with nothing to list.
+
+        Monochrome glyphs on both: a colour emoji beside the muted row text
+        reads as an error state rather than a note.
+
+        The guide-ended case takes the warning glyph because it is actionable —
+        the alerts are fine and a guide refresh is what fixes it — while a
+        merely-quiet watchlist takes its own icon and states the count, so the
+        user can see their rules are still loaded.
+        """
+        if reason == self.EPG_EMPTY_GUIDE_ENDED:
+            return (
+                "warning",
+                "Guide data has run out",
+                "This source's guide has no programmes left to start, so no "
+                "alert can match until it is refreshed. It refreshes on its "
+                "own schedule; Settings → EPG can force it sooner.",
+            )
+        count = watchlist.count(self.config)
+        return (
+            "info",
+            f"Nothing airing from {count} alerts",
+            f"Your {count} watch alerts are loaded — none of them is on now or "
+            f"coming up in the next 24 hours.",
+        )
+
+    def _update_epg_toggle_label(self, count: int) -> None:
+        """Refresh the EPG heading's count, and remember it.
+
+        Remembering matters because a notice render draws one row that is not a
+        programme: re-deriving the count from ``topLevelItemCount()`` on the
+        next collapse would put a "1" chip next to the words "Nothing airing".
+        """
+        self._epg_count = count
+        self._epg_toggle.set_count(count or None)
+
+    def _toggle_epg(self) -> None:
+        self._epg_collapsed = not self._epg_collapsed
+        self.alerts_tree.setVisible(not self._epg_collapsed and self._epg_has_rows)
+        self._update_epg_toggle_label(self.__dict__.get("_epg_count", 0))
+
+    def budgeted_tree(self):
+        """Watch Alerts fits its top-level groups, not a flat list.
+
+        This is the section R13 names directly — 173px subdivided four ways,
+        each sub-group scrolling in about 35px.
+        """
+        return self.__dict__.get("alerts_tree")
+
+    def _on_item_double_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
+        # child (airing) rows under a group header, or direct single-channel items
+        if item.parent() or item.childCount() == 0:
+            channel_db_id = item.data(0, Qt.ItemDataRole.UserRole)
+            if channel_db_id:
+                self.alertClicked.emit(channel_db_id)
+
+    def _on_context_menu(self, pos) -> None:
+        item = self.alerts_tree.itemAt(pos)
+        if not item or not item.parent():  # skip headers
+            return
+        channel_db_id = item.data(0, Qt.ItemDataRole.UserRole)
+        if not channel_db_id:
+            return
+        gp = self.alerts_tree.viewport().mapToGlobal(pos)
+        # REC-3: a programme row (child under a group) carries its own guide
+        # window, so "record_programme" can schedule THIS airing rather than
+        # "what's on now" — the plain channel menu has no programme identity.
+        prog_start = item.data(0, _PROG_START_ROLE)
+        prog_stop = item.data(0, _PROG_STOP_ROLE)
+        if prog_start is not None and prog_stop is not None:
+            title = item.data(0, _ROLE_GROUP_KEY) or ""
+            self.programmeContextMenuRequested.emit(
+                channel_db_id, prog_start, prog_stop, title, gp.x(), gp.y())
+        else:
+            self.channelContextMenuRequested.emit(channel_db_id, gp.x(), gp.y())
+
+    def _refresh_list(self) -> QTreeWidget:
+        return self.alerts_tree
+
+    def _load_error_message(self) -> str:
+        return "Couldn't load watch alerts"
+
+    def _loading_message(self) -> str:
+        return "Loading alerts…"
+
+    def _show_tree_notice(self, tree, icon: str, message: str,
+                          tooltip: str = "") -> None:
+        """Render ONE non-selectable row in place of the EPG programme rows.
+
+        The loading, error and nothing-airing states are the same widget problem
+        — the base CollapsibleSection builds them from QListWidgetItem +
+        addItem, which QTreeWidget does not have — so they share one body
+        rather than three that drift. The count is forced to 0: a notice is not
+        a programme, and letting topLevelItemCount() speak would put a "1" chip
+        on the heading beside the words "Nothing airing".
+        """
+        self._forget_tracked_items()
+        tree.clear()
+        # *icon* is an icon role; the row draws it as the item's icon.
+        item = QTreeWidgetItem([message])
+        item.setIcon(0, _icon_utils.role_icon(icon))
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        if tooltip:
+            item.setToolTip(0, tooltip)
+        tree.addTopLevelItem(item)
+        self._reveal_epg_subsection(count=0)
+        self.set_empty(False)
+
+    def _forget_tracked_items(self) -> None:
+        """Drop references to tree items that are about to be destroyed.
+
+        ``QTreeWidget.clear()`` deletes the underlying C++ objects while any
+        Python reference we kept stays alive and dangling. Touching one raises
+        ``RuntimeError`` — not ``AttributeError`` — so an ``is None`` check
+        sails straight past it into the crash.
+
+        This lives beside the ``clear()`` that causes the problem rather than in
+        the rebuild that usually follows, because the two are not the same
+        moment. A notice render (loading, error, nothing-airing) clears and then
+        returns WITHOUT rebuilding, and the 30-second clock tick dereferenced
+        the stale heading item from there and took the app down with SIGABRT.
+        ``_populate_rows`` re-initialises the same attributes for its own path;
+        both now go through this, so a newly tracked item cannot be forgotten in
+        one place and remembered in the other.
+        """
+        self._upcoming_items = []
+        self._upcoming_heading_item = None
+        self._upcoming_next_when = None
+
+    def show_load_error(self, tree, message: str) -> None:
+        """Override for QTreeWidget: render a non-selectable error row."""
+        self._show_tree_notice(tree, "warning", message)
+
+    def show_loading(self, tree, message: str = "Loading…") -> None:
+        """Override for QTreeWidget: render a transient, non-selectable loading row."""
+        self._show_tree_notice(tree, "loading", message)
+
+    def _reveal_epg_subsection(self, count: int | None = None) -> None:
+        """Show the EPG sub-header + tree (loading / error / notice / populated).
+
+        Args:
+            count: Programmes to put on the heading chip. ``None`` counts the
+                tree's own programme rows, which is right for a populated
+                render; a notice render passes 0, because the one row it drew
+                is a sentence, not a programme.
+        """
+        # Guarded for __new__ test stubs (no full constructor → no EPG widgets),
+        # matching this file's other stub-tolerant helpers.
+        if "_epg_hdr_container" not in self.__dict__:
+            return
+        self._epg_has_rows = True
+        self._epg_hdr_container.show()
+        self.alerts_tree.setVisible(not self._epg_collapsed)
+        if count is None:
+            # PROGRAMME rows, not top-level items. The two were the same thing
+            # until the "Upcoming" heading became a top-level item of its own,
+            # and then EPG read one higher than the programmes under it — 13
+            # over 3 live and 9 upcoming. User report: "EPG 13, + UPCOMING 9, should
+            # be 12, right?" Counting what the rows ARE rather than how many
+            # entries the tree holds is also proof against the next piece of
+            # furniture someone adds.
+            tree = self.alerts_tree
+            count = sum(
+                1 for i in range(tree.topLevelItemCount())
+                if isinstance(tree.itemWidget(tree.topLevelItem(i), 0), _AlertRow)
+            )
+        self._update_epg_toggle_label(count)
+
+    def _hide_epg_subsection(self) -> None:
+        """Hide the EPG sub-header + tree, then recompute the section's empty state."""
+        self._epg_has_rows = False
+        if "_epg_hdr_container" in self.__dict__:
+            self._epg_hdr_container.hide()
+            self.alerts_tree.hide()
+            self._update_epg_toggle_label(0)
+            self._recompute_empty()
+
+    def _load_rows(self) -> dict:
+        """Worker thread — NO widget access.
+
+        Returns a plain dict with keys 'live_groups', 'upcoming_only' and
+        'empty_reason' (never None for valid-empty; None is reserved for real
+        exceptions and emitted only by the mixin's try/except wrapper).
+
+        ``empty_reason`` is what lets the main thread tell "you have not set
+        any alerts up" apart from "your alerts are fine, the guide ran out" —
+        two states that used to render identically, as nothing at all.
+        """
+        from streamselect.core.repositories.epg import EpgRepository
+        from streamselect.core.repositories import RepositoryFactory
+        from streamselect.core.database import ChannelDB
+
+        def _empty(reason: str) -> dict:
+            return {"live_groups": {}, "upcoming_only": {}, "empty_reason": reason}
+
+        patterns = watchlist.patterns(self.config)
+        if not patterns:
+            return _empty(self.EPG_EMPTY_NO_PATTERNS)
+        # WL-1: the RULE, not the bare pattern string — a rule set to Any word
+        # or All words (or carrying excludes) must match that way here too.
+        # patterns() stays above only for the empty check; as_rules() inside
+        # the repo calls would silently default a bare string to PHRASE, which
+        # is exactly the "consecutive words only" bug this fixes (Q4: one
+        # list, two surfaces — this IS the second surface).
+        rules = watchlist.rules(self.config)
+
+        with self.db.session_scope(commit=False) as session:
+            repos = RepositoryFactory(session)
+            provider_ids = repos.providers.get_epg_active_provider_ids()
+            if not provider_ids:
+                return _empty(self.EPG_EMPTY_NO_SOURCE)
+
+            excluded_ch_provider_ids = set(repos.providers.get_hidden_provider_ids())
+
+            repo = EpgRepository(session)
+            live_data     = repo.get_live_for_watchlist(
+                rules, provider_ids=provider_ids,
+                excluded_channel_provider_ids=excluded_ch_provider_ids,
+            )
+            upcoming_data = repo.get_upcoming_for_watchlist(
+                rules, hours_ahead=24, provider_ids=provider_ids,
+                excluded_channel_provider_ids=excluded_ch_provider_ids,
+            )
+
+            # Batch channel-name lookup — one IN query instead of N per-programme queries.
+            all_channel_ids: set[str] = set()
+            for progs in live_data.values():
+                for prog in progs:
+                    if prog.channel_db_id:
+                        all_channel_ids.add(prog.channel_db_id)
+            for progs in upcoming_data.values():
+                for prog in progs:
+                    if prog.channel_db_id:
+                        all_channel_ids.add(prog.channel_db_id)
+
+            channel_names: dict[str, str] = {}
+            if all_channel_ids:
+                rows = (
+                    session.query(
+                        ChannelDB.id,
+                        ChannelDB.name,
+                        ChannelDB.detected_title,
+                        ChannelDB.detected_year,
+                        ChannelDB.detected_region,
+                        ChannelDB.detected_quality,
+                    )
+                    .filter(ChannelDB.id.in_(all_channel_ids))
+                    .all()
+                )
+                # The ingestion-computed fields, not just the raw name. Watch
+                # Alerts was the one sidebar surface still rendering the
+                # provider's string verbatim, which is why a channel showed as
+                # "KANAL 4 [DNK] [HEVC]" — brackets and all — where every other
+                # list renders the bare title with the tags as tags.
+                channel_names = {
+                    r[0]: {
+                        "name": r[1], "detected_title": r[2],
+                        "detected_year": r[3], "detected_region": r[4],
+                        "detected_quality": r[5],
+                    }
+                    for r in rows
+                }
+
+            now = _now_utc()
+
+            def _title_key(title: str) -> str:
+                return " ".join(title.casefold().replace("&", "and").split())
+
+            def _channel_display(prog) -> tuple[str, str, str]:
+                """The row's channel text, its quality and its region, apart.
+
+                Both tokens are pulled OUT of the formatted name so the row can
+                chip them beside the title — each is a claim about THIS copy,
+                not part of what the channel is called. Region left inside the
+                string as "[DE]" is why the programme row could not say what
+                language its play button was about to start.
+                """
+                rec = channel_names.get(prog.channel_db_id)
+                if rec is None:
+                    return _fmt_channel_name(prog.channel_epg_id or "Unknown"), "", ""
+                return _fmt_channel_name(
+                    rec["name"],
+                    detected_title=rec["detected_title"],
+                    detected_year=rec["detected_year"],
+                    detected_region=None,        # drawn as a chip instead
+                    detected_quality=None,       # drawn as a chip instead
+                ), (rec["detected_quality"] or ""), (rec["detected_region"] or "")
+
+            # Unified per-title groups — upcoming for a live title folds under WATCH NOW,
+            # preventing the same show from appearing in both sections simultaneously.
+            # live_groups: key -> {'live': [...], 'upcoming': [...], 'title': str}
+            # upcoming_only: key -> {'airings': [...], 'title': str}
+            live_groups: dict[str, dict] = {}
+            upcoming_only: dict[str, dict] = {}
+
+            for _pattern, progs in live_data.items():
+                for prog in progs:
+                    ch_display, ch_quality, ch_region = _channel_display(prog)
+                    mins_left = max(0, int((prog.stop_time - now).total_seconds() / 60))
+                    time_str = humanize_remaining(prog.stop_time, now)
+                    key = _title_key(prog.title)
+                    if key not in live_groups:
+                        live_groups[key] = {'live': [], 'upcoming': [], 'title': prog.title}
+                    # stop_time rides along so the 30s repaint tick can recompute
+                    # this row's text without a re-query — the string above is
+                    # only ever correct for the instant it was built.
+                    live_groups[key]['live'].append(
+                        _Airing(mins_left, time_str, ch_display,
+                                prog.channel_db_id, prog.stop_time,
+                                prog.start_time, ch_quality, ch_region,
+                                prog.start_time, prog.stop_time)
+                    )
+
+            for _pattern, progs in upcoming_data.items():
+                for prog in progs:
+                    ch_display, ch_quality, ch_region = _channel_display(prog)
+                    time_str = humanize_until(
+                        prog.start_time, now,
+                        to_local=_to_local, is_local_today=_is_local_today,
+                    )
+                    key = _title_key(prog.title)
+                    ts = prog.start_time.timestamp()
+                    if key in live_groups:
+                        live_groups[key]['upcoming'].append(
+                            _Airing(ts, time_str, ch_display,
+                                    prog.channel_db_id, prog.start_time,
+                                    None, ch_quality, ch_region,
+                                    prog.start_time, prog.stop_time)
+                        )
+                    else:
+                        if key not in upcoming_only:
+                            upcoming_only[key] = {'airings': [], 'title': prog.title}
+                        upcoming_only[key]['airings'].append(
+                            _Airing(ts, time_str, ch_display,
+                                    prog.channel_db_id, prog.start_time,
+                                    None, ch_quality, ch_region,
+                                    prog.start_time, prog.stop_time)
+                        )
+
+            # Only asked when there is nothing to show, and only to explain the
+            # nothing: a matched watchlist never pays for this query.
+            reason = ""
+            if not live_groups and not upcoming_only:
+                reason = (
+                    self.EPG_EMPTY_NO_MATCHES
+                    if repo.has_future_programmes(
+                        provider_ids,
+                        excluded_channel_provider_ids=excluded_ch_provider_ids,
+                    )
+                    else self.EPG_EMPTY_GUIDE_ENDED
+                )
+
+        return {
+            "live_groups": live_groups,
+            "upcoming_only": upcoming_only,
+            "empty_reason": reason,
+        }
+
+    def _populate_rows(self, data: dict) -> None:
+        """Main thread: rebuild the alerts_tree from pre-computed plain data.
+
+        'data' is the dict returned by _load_rows (never None here — None is
+        handled by the mixin which calls show_load_error instead).
+        """
+        live_groups   = data["live_groups"]
+        upcoming_only = data["upcoming_only"]
+
+        # Dropped FIRST, before any early return. The caller has already
+        # cleared the tree, so every item still in this list is a deleted C++
+        # object and touching one raises RuntimeError — which is what would
+        # happen on the next toggle if an empty refresh took a return below
+        # without passing through the rebuild that repopulates it.
+        # One definition of "these references are now dangling" — see
+        # _forget_tracked_items. It used to be spelled out here only, which is
+        # why the notice path (which clears without rebuilding) kept its stale
+        # items and crashed the clock tick.
+        # (_upcoming_next_when is reset in there too: it is the collapsed
+        # heading's chip value, meaningless once the rows it summarised are
+        # gone, and kept as the timestamp rather than the rendered string
+        # because the text goes stale on the clock tick and the instant does
+        # not.)
+        self._forget_tracked_items()
+
+        if not live_groups and not upcoming_only:
+            # Nothing to list. The group VANISHING here is what made a working
+            # watchlist read as a broken feature: seven alerts configured, and
+            # the EPG heading simply gone — flashing into view for the loading
+            # row and back out a moment later. It disappears only when there is
+            # genuinely nothing to keep a place for; otherwise it holds its
+            # space and says which nothing this is.
+            reason = data.get("empty_reason", "")
+            # A payload with no stated reason (a direct/legacy caller) falls
+            # through to the notice — but never one that reads "Nothing airing
+            # from 0 alerts", so an unconfigured watchlist stays silent whatever
+            # the payload says.
+            if not watchlist.count(self.config):
+                reason = self.EPG_EMPTY_NO_PATTERNS
+            if reason in self.EPG_EMPTY_SILENT:
+                self._hide_epg_subsection()
+            else:
+                icon, text, tip = self._epg_empty_notice(reason)
+                self._show_tree_notice(self.alerts_tree, icon, text, tip)
+            return
+
+        def _wire_row(row: _AlertRow, channel_db_id: str, *,
+                      prog_start=None, prog_stop=None, title: str = "") -> None:
+            """Connect an _AlertRow's signals to the section's public signals."""
+            row.play_clicked.connect(
+                lambda _=False, cid=channel_db_id: self.alertClicked.emit(cid)
+            )
+            row.row_clicked.connect(
+                lambda cid=channel_db_id: self.channel_selected.emit(cid)
+            )
+            # REC-2: fires whatever the row's live/upcoming state — recording,
+            # unlike play, works on a programme that has not started yet.
+            row.record_clicked.connect(
+                lambda cid=channel_db_id, s=prog_start, e=prog_stop, t=title:
+                    self.programmeRecordRequested.emit(cid, s, e, t)
+            )
+
+        def _add_parent(title, time_str, _extra=0, when=None, live=False,
+                        started_at=None, first_source=None,
+                        first_source_name="", region="",
+                        prog_start=None, prog_stop=None,
+                        channel_db_id=None) -> "QTreeWidgetItem":
+            """The programme row that expands to its airings.
+
+            A real row widget, not a text item reading
+            "Title  ·  3m left  +2". The dot was a separator asked to do a
+            layout's job, and a text item cannot carry a chip, a progress bar
+            or the left slot every other row in this section has.
+            """
+            hdr = QTreeWidgetItem()
+            hdr.setFlags(hdr.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.alerts_tree.addTopLevelItem(hdr)
+            # No "+N" chip. The caret already says the row expands, and the
+            # count of what is behind it is the one fact you get for free by
+            # opening it — the approved render carries only the time.
+            # Built from the SAME airing its play button starts, so its
+            # progress bar is that source's progress rather than a claim about
+            # the programme in the abstract — user report: "the bundled results ...
+            # should use progress bars corresponding to the source attached to
+            # the play button."
+            row = _AlertRow(title, time_str, self.config, when=when, live=live,
+                            started_at=started_at, bar_source=first_source_name,
+                            region=region,
+                            expandable=True, expanded=hdr.isExpanded())
+
+            hdr.setData(0, _ROLE_GROUP_KEY, title)
+            # REC-2: the lead airing's channel + window, so the poll-tick
+            # indicator refresh (which reads these same roles off every
+            # top-level row) can tell whether THIS group is recording/
+            # scheduled — the same channel record_clicked above schedules.
+            # _ROLE_REC_CHANNEL, not UserRole: see its own docstring.
+            hdr.setData(0, _ROLE_REC_CHANNEL, channel_db_id)
+            hdr.setData(0, _PROG_START_ROLE, prog_start)
+            hdr.setData(0, _PROG_STOP_ROLE, prog_stop)
+
+            def _toggle(_=False, i=hdr, r=row, k=title):
+                i.setExpanded(not i.isExpanded())
+                r.set_expanded(i.isExpanded())
+                # Remember it. The tree is rebuilt on every refresh and the
+                # item's expanded state dies with it, so without this the
+                # automatic budget pass re-opens what the user just shut —
+                # user report: "they don't stay collapsed."
+                self._user_expansion[k] = i.isExpanded()
+                self.fit_to_rows(self.alerts_tree)
+
+            # The ROW opens the row — the title, the time, the marker, the empty
+            # space. This used to hang off play_clicked, so only the 18px slot
+            # responded and the row had to count as playable to open at all.
+            row.expand_clicked.connect(_toggle)
+
+            # ...and the play button plays, without making anyone open the row
+            # first. User report: "user doesn't typically care about row". Which
+            # source it picks is the first LIVE airing as the group is ordered;
+            # a real preference is roadmapped.
+            if first_source:
+                row.play_clicked.connect(
+                    lambda _=False, cid=first_source: self.alertClicked.emit(cid)
+                )
+            else:
+                row.play_clicked.connect(_toggle)
+            # REC-2: the LEAD airing's own window and channel — separate from
+            # first_source (which is only set for a live group; an all-
+            # upcoming group still has a channel to record, just nothing to
+            # play yet).
+            if channel_db_id:
+                row.record_clicked.connect(
+                    lambda _=False, cid=channel_db_id, s=prog_start,
+                    e=prog_stop, t=title: self.programmeRecordRequested.emit(
+                        cid, s, e, t)
+                )
+            hdr.setSizeHint(0, QSize(0, row.sizeHint().height()))
+            self.alerts_tree.setItemWidget(hdr, 0, row)
+            return hdr
+
+        def _add_child(parent_item, ch_name, time_str, channel_db_id, title,
+                       when=None, live=False, started_at=None,
+                       quality="", region="", prog_start=None,
+                       prog_stop=None) -> None:
+            child = QTreeWidgetItem()
+            child.setData(0, Qt.ItemDataRole.UserRole, channel_db_id)
+            # REC-3: this row's own guide window (never the padded/effective
+            # one) plus its title — _ROLE_GROUP_KEY already means "programme
+            # title" on the group header above; reused here rather than a new
+            # role, since the meaning is identical.
+            child.setData(0, _PROG_START_ROLE, prog_start)
+            child.setData(0, _PROG_STOP_ROLE, prog_stop)
+            child.setData(0, _ROLE_GROUP_KEY, title)
+            child.setToolTip(0, f"{title}\n{ch_name}")
+            parent_item.addChild(child)
+            row = _AlertRow(ch_name, time_str, self.config, when=when, live=live,
+                            started_at=started_at, quality=quality,
+                            region=region, indent=_CHILD_INDENT)
+            _wire_row(row, channel_db_id, prog_start=prog_start,
+                      prog_stop=prog_stop, title=title)
+            self.alerts_tree.setItemWidget(child, 0, row)
+
+        def _add_direct(ch_name, time_str, channel_db_id, title,
+                        when=None, live=False, started_at=None,
+                        quality="", region="",
+                        prog_start=None, prog_stop=None) -> "QTreeWidgetItem":
+            """Single-channel item: header IS the row — no expand arrow.
+            Shows the show title; channel name is the tooltip.
+
+            Returns the item so the caller can put it under a sub-group — an
+            upcoming programme is hidden and shown as a block.
+            """
+            item = QTreeWidgetItem()
+            item.setData(0, Qt.ItemDataRole.UserRole, channel_db_id)
+            item.setData(0, _PROG_START_ROLE, prog_start)
+            item.setData(0, _PROG_STOP_ROLE, prog_stop)
+            item.setToolTip(0, ch_name)
+            self.alerts_tree.addTopLevelItem(item)
+            # marker_column: a single-source programme has nothing to disclose,
+            # but it is still a TOP-LEVEL row — it reserves the column so its
+            # title starts where a bundled programme's does.
+            row = _AlertRow(title, time_str, self.config, when=when, live=live,
+                            started_at=started_at, quality=quality, region=region,
+                            bar_source=ch_name, marker_column=True)
+            _wire_row(row, channel_db_id, prog_start=prog_start,
+                      prog_stop=prog_stop, title=title)
+            self.alerts_tree.setItemWidget(item, 0, row)
+            return item
+
+        if live_groups:
+            for _key, grp in sorted(live_groups.items(),
+                                   key=lambda kv: min(a[0] for a in kv[1]['live'])):
+                title = grp['title']
+                live_items = sorted(grp['live'], key=lambda a: a[0])
+                up_items   = sorted(grp['upcoming'], key=lambda a: a[0])
+                all_items  = live_items + up_items
+                if len(all_items) == 1:
+                    a = all_items[0]
+                    _add_direct(a[2], a[1], a[3], title, _when(a),
+                                live=a in live_items, started_at=_started_at(a),
+                                quality=_quality(a), region=_region(a),
+                                prog_start=_prog_start(a), prog_stop=_prog_stop(a))
+                else:
+                    lead = live_items[0]
+                    hdr = _add_parent(
+                        title, lead[1], len(all_items) - 1,
+                        when=_when(lead), live=True, started_at=_started_at(lead),
+                        first_source=lead[3], first_source_name=lead[2],
+                        region=_region(lead),
+                        prog_start=_prog_start(lead), prog_stop=_prog_stop(lead),
+                        channel_db_id=lead[3],
+                    )
+                    for a in live_items[:10]:
+                        _add_child(hdr, a[2], a[1], a[3], title, _when(a), live=True,
+                                   started_at=_started_at(a),
+                                   quality=_quality(a), region=_region(a),
+                                   prog_start=_prog_start(a), prog_stop=_prog_stop(a))
+                    for a in up_items[:5]:
+                        _add_child(hdr, a[2], a[1], a[3], title, _when(a), live=False,
+                                   quality=_quality(a), region=_region(a),
+                                   prog_start=_prog_start(a), prog_stop=_prog_stop(a))
+
+        if upcoming_only:
+            self._add_upcoming_heading(len(upcoming_only))
+            # Soonest first, which is the order the block is built in — so the
+            # chip names the same airing as the first row under the heading.
+            self._upcoming_next_when = min(
+                (_when(a) for grp in upcoming_only.values()
+                 for a in grp["airings"] if _when(a) is not None),
+                default=None,
+            )
+            for _key, grp in sorted(upcoming_only.items(),
+                                   key=lambda kv: min(a[0] for a in kv[1]['airings'])):
+                title = grp['title']
+                airings = sorted(grp['airings'], key=lambda a: a[0])
+                if len(airings) == 1:
+                    a = airings[0]
+                    self._upcoming_items.append(_add_direct(
+                        a[2], a[1], a[3], title, _when(a), live=False,
+                        quality=_quality(a), region=_region(a),
+                        prog_start=_prog_start(a), prog_stop=_prog_stop(a)))
+                else:
+                    lead = airings[0]
+                    # No first_source: every airing here is in the FUTURE, so
+                    # the row is not live and never offers a play button. It
+                    # still has a channel to RECORD, though — channel_db_id.
+                    hdr = _add_parent(
+                        title, lead[1], len(airings) - 1, when=_when(lead),
+                        prog_start=_prog_start(lead), prog_stop=_prog_stop(lead),
+                        channel_db_id=lead[3],
+                    )
+                    self._upcoming_items.append(hdr)
+                    for a in airings[:10]:
+                        _add_child(hdr, a[2], a[1], a[3], title, _when(a), live=False,
+                                   quality=_quality(a), region=_region(a),
+                                   prog_start=_prog_start(a), prog_stop=_prog_stop(a))
+
+        self._apply_upcoming_collapse()
+        self._reveal_epg_subsection()
+        self.set_empty(False)
+        QTimer.singleShot(0, self._apply_expansion)
+        QTimer.singleShot(0, self.reapply_row_budget)
+        self._schedule_boundary(live_groups, upcoming_only)
+
+    #: Text of the sub-group that holds programmes which have not started.
+    #:
+    #: The word is the one the full EPG watchlist view already uses for the
+    #: same split ("ON NOW · n" / "UPCOMING · n", epg_watchlist_mixin.py), so
+    #: the sidebar and the view name the same thing the same way. User report: "or
+    #: whatever title we used before, it was good".
+    UPCOMING_HEADING = "Upcoming"
+
+    def _add_upcoming_heading(self, count: int) -> None:
+        """Put a foldable "UPCOMING n" heading above the not-yet-airing block.
+
+        A ``GroupHeading``, not a rule or a divider row, because that widget is
+        already the section's one sub-group heading — it exists precisely
+        because this section had grown THREE ways of drawing the same thing
+        (real headings, em-dash divider rows, a separate collapsible
+        sub-section), two of which looked identical and only one of which was
+        clickable. A ``──── UPCOMING ────`` bar would be a fourth.
+
+        No caret, for the same reason the section headers have not had one
+        since an earlier change: the heading itself is the control, and a caret beside a
+        clickable title is a second affordance for one action. What says it is
+        interactive is the pointing-hand cursor and the tooltip; what says
+        there is something inside while it is closed is the count, which
+        ``GroupHeading`` keeps visible when collapsed for exactly that reason.
+
+        There is deliberately no matching "On now" heading. What is on now sits
+        at the top where it always did, and a heading over it would spend a row
+        to label the thing you are already looking at. User report: "We don't have to
+        have a header for what's on now."
+
+        Args:
+            count: How many upcoming programmes the group holds.
+        """
+        item = QTreeWidgetItem()
+        item.setFlags(Qt.ItemFlag.NoItemFlags)      # a label, not a target
+        self.alerts_tree.addTopLevelItem(item)
+        heading = GroupHeading(
+            self.UPCOMING_HEADING, count, interactive=True,
+            # The mark fills the reserved play-slot column and the word
+            # starts exactly where the row titles do, so the heading sits IN
+            # the rows' left edge rather than at an indent of its own between
+            # EPG's and theirs.
+            indent=TITLE_INDENT,
+            leading_mark=_icons.group_mark_icon,
+            tooltip="Programmes that have not started yet — "
+                    "click to collapse or expand",
+        )
+        heading.clicked.connect(self._toggle_epg_upcoming)
+        self.alerts_tree.setItemWidget(item, 0, heading)
+        self._upcoming_heading_item = item
+
+    def _toggle_epg_upcoming(self) -> None:
+        """Fold or unfold the Upcoming block, and remember the choice."""
+        self.config.alerts_epg_upcoming_collapsed = (
+            not self.config.alerts_epg_upcoming_collapsed
+        )
+        _cfgsave.save_soon(self)
+        self._apply_upcoming_collapse()
+        self.reapply_row_budget()
+
+    def _apply_upcoming_collapse(self) -> None:
+        """Show or hide the upcoming rows to match the stored choice.
+
+        Hidden rather than removed: ``fit_to_rows`` sizes the tree from Qt's own
+        ``viewportSizeHint``, which already excludes hidden items, so the
+        section shrinks to what is left without anything here doing arithmetic.
+        """
+        collapsed = bool(self.config.alerts_epg_upcoming_collapsed)
+        for item in self.__dict__.get("_upcoming_items", ()):
+            item.setHidden(collapsed)
+        self._refresh_upcoming_tail()
+
+    def _upcoming_heading(self) -> "GroupHeading | None":
+        """The Upcoming heading widget, or None when the block is not built."""
+        item = self.__dict__.get("_upcoming_heading_item")
+        if item is None or "alerts_tree" not in self.__dict__:
+            return None
+        widget = self.alerts_tree.itemWidget(item, 0)
+        return widget if isinstance(widget, GroupHeading) else None
+
+    def _refresh_upcoming_tail(self, now=None) -> None:
+        """Put the next start time on the heading, but only while it is closed.
+
+        Through ``humanize_until`` with the same arguments the rows pass, so
+        the chip and the first row under it cannot render the same instant two
+        different ways.
+
+        Args:
+            now: The instant to render against; defaults to the current one.
+                Passed in from the clock tick so every row and this chip share
+                one reading of the time.
+        """
+        heading = self._upcoming_heading()
+        if heading is None:
+            return
+        when = self.__dict__.get("_upcoming_next_when")
+        show = bool(self.config.alerts_epg_upcoming_collapsed) and when is not None
+        heading.set_tail(
+            humanize_until(when, now or _now_utc(),
+                           to_local=_to_local, is_local_today=_is_local_today)
+            if show else ""
+        )
+
+    def _start_clock(self) -> None:
+        """Begin the 30-second repaint tick, once.
+
+        Parented to ``self`` so Qt destroys it with the section — a timer is not
+        a background pool and does not want a cleanup-registry entry, but it
+        must not outlive the widget it repaints.
+        """
+        if "_clock" in self.__dict__:
+            return
+        self._clock = QTimer(self)
+        self._clock.setInterval(self.TICK_MS)
+        self._clock.timeout.connect(self._tick)
+        self._clock.start()
+
+    def set_playing(self, channel_id: str | None) -> None:
+        """Light the play marker on whichever row is the thing now playing.
+
+        Fed by the same playback-health poll that drives
+        ``details_pane.set_playing`` (main_window_streaming._notify_details_playing),
+        so the sidebar and the details pane can never disagree about what is on —
+        one source, two readers, rather than a second thing that also tries to
+        track playback.
+
+        Args:
+            channel_id: The channel now playing, or ``None`` to clear.
+        """
+        if "alerts_tree" not in self.__dict__:
+            return
+        for item, row in self._iter_rows():
+            row.set_playing(
+                channel_id is not None
+                and item.data(0, Qt.ItemDataRole.UserRole) == channel_id
+            )
+
+    def _iter_rows(self):
+        """Every (item, _AlertRow) pair in the EPG tree, parents and children."""
+        tree = self.alerts_tree
+        for i in range(tree.topLevelItemCount()):
+            top = tree.topLevelItem(i)
+            widget = tree.itemWidget(top, 0)
+            if isinstance(widget, _AlertRow):
+                yield top, widget
+            for j in range(top.childCount()):
+                child = top.child(j)
+                w = tree.itemWidget(child, 0)
+                if isinstance(w, _AlertRow):
+                    yield child, w
+
+    def refresh_recording_indicators(self, progress_rows: list) -> None:
+        """Update every visible row's Record control to reflect ``progress_rows``.
+
+        Pushed by ``MainWindow._refresh_transfer_sections`` with the SAME
+        ``RecordingManager.progress()`` snapshot it reads for the Recordings
+        section and the EPG trees (REC-2) — one query per tick, not one per
+        consumer.
+        """
+        if "alerts_tree" not in self.__dict__:
+            return
+        now = _now_utc()
+        for item, row in self._iter_rows():
+            cid = (item.data(0, Qt.ItemDataRole.UserRole)
+                   or item.data(0, _ROLE_REC_CHANNEL))
+            state, tooltip = indicator_for(
+                cid, item.data(0, _PROG_START_ROLE),
+                item.data(0, _PROG_STOP_ROLE), progress_rows, now,
+            )
+            row.set_recording_state(state, tooltip)
+
+    def _tick(self) -> None:
+        """Refresh every visible row's time text against the current instant.
+
+        This is the half of "staying current" that needs no data: a programme's
+        remaining time and a countdown to one starting are pure functions of
+        ``now`` and a timestamp already in memory. Membership — which rows
+        belong at all — is the other half, and it is handled by
+        :meth:`_schedule_boundary` instead of by polling here.
+
+        Skipped entirely while collapsed: repainting rows nobody can see is
+        the one cost this design cannot justify.
+        """
+        # ``is_collapsed`` is an ATTRIBUTE, and read via __dict__ rather than
+        # hasattr: on a test double built with __new__ a missing Qt attribute
+        # raises RuntimeError, which hasattr does not absorb.
+        if self.__dict__.get("is_collapsed") or "alerts_tree" not in self.__dict__:
+            return
+        now = _now_utc()
+        for _item, row in self._iter_rows():
+            row.refresh_time(now)
+        # The collapsed heading's chip is a rendered time like any other and
+        # goes stale on the same schedule. Same ``now``, so it cannot drift
+        # from the rows by a tick.
+        self._refresh_upcoming_tail(now)
+
+    def _schedule_boundary(self, live_groups: dict, upcoming_only: dict) -> None:
+        """Reload once, at the next instant the LIST ITSELF changes.
+
+        A row leaves WATCH NOW when its ``stop_time`` passes and enters when its
+        ``start_time`` arrives. Both instants are already known from the rows
+        just loaded, so the correct thing is a single-shot timer aimed at the
+        earliest of them — not a poll, which either wastes queries or leaves a
+        finished programme on screen for up to a full interval. This is the bug
+        the user-reported: a row reading "in 13m" that was already playing.
+
+        Rescheduled on every populate, so the timer always points at the next
+        boundary rather than a stale one.
+        """
+        now = _now_utc()
+        boundaries = [
+            _when(a)
+            for grp in live_groups.values()
+            for a in (*grp["live"], *grp["upcoming"])
+            if _when(a) is not None
+        ] + [
+            _when(a)
+            for grp in upcoming_only.values()
+            for a in grp["airings"]
+            if _when(a) is not None
+        ]
+        future = [b for b in boundaries if b > now]
+        if "_boundary" in self.__dict__:
+            self._boundary.stop()
+        if not future:
+            return
+        secs = max(1.0, (min(future) - now).total_seconds())
+        # Qt's int millisecond ceiling is ~24.8 days; a boundary further out
+        # than that would overflow to a negative interval and fire immediately.
+        secs = min(secs, 6 * 60 * 60)
+        self._boundary = QTimer(self)
+        self._boundary.setSingleShot(True)
+        self._boundary.timeout.connect(self.refresh)
+        self._boundary.start(int(secs * 1000) + 1000)
+
+    def _sync_carets(self) -> None:
+        """Point every parent row's caret at its item's real expanded state.
+
+        Rows are built before expansion is decided (``_apply_expansion`` runs on
+        a zero-timer), so a caret drawn at construction is a guess. This makes it
+        report rather than predict — and it is called again after every
+        expansion change for the same reason.
+        """
+        tree = self.__dict__.get("alerts_tree")
+        if tree is None:
+            return
+        for i in range(tree.topLevelItemCount()):
+            item = tree.topLevelItem(i)
+            row = tree.itemWidget(item, 0)
+            if isinstance(row, _AlertRow) and item.childCount():
+                row.set_expanded(item.isExpanded())
+
+    def _apply_expansion(self) -> None:
+        """Expand every group if the fully-expanded list stays compact; else expand none.
+
+        The budget is the fixed ``_ALERTS_TREE_AUTOEXPAND_BUDGET`` (in rows via the same
+        ``sizeHintForRow(0)``/fallback-22 primitive), NOT the live ``viewport().height()``
+        — the tree's height now flexes with its stretch share of the pane, so reading the
+        viewport here would make the decision jitter with the pane size.  A fixed budget
+        keeps the "auto-expand only a short watchlist; leave a long one collapsed so it
+        scrolls compactly" behaviour stable regardless of how tall the section is dragged.
+        """
+        tree = self.alerts_tree
+        n = tree.topLevelItemCount()
+        if n == 0:
+            return
+        row_h = tree.sizeHintForRow(0)
+        if row_h <= 0:
+            row_h = 22
+        max_rows = max(1, _ALERTS_TREE_AUTOEXPAND_BUDGET // row_h)
+        total_if_expanded = sum(
+            1 + tree.topLevelItem(i).childCount()
+            for i in range(n)
+        )
+        expand_all = total_if_expanded <= max_rows
+        chosen = self.__dict__.get("_user_expansion") or {}
+        for i in range(n):
+            item = tree.topLevelItem(i)
+            if item.childCount() == 0:
+                continue  # section header — not expandable
+            # A choice the user made outranks the budget. Same rule as the
+            # sidebar's _auto_folded: automatic behaviour may only undo what
+            # automatic behaviour did.
+            key = item.data(0, _ROLE_GROUP_KEY)
+            item.setExpanded(chosen.get(key, expand_all) if key else expand_all)
+        # AFTER the loop, not before. Syncing first read the state this loop was
+        # about to change, so every caret drawn was one refresh stale — the
+        # a user's Stargate SG-1 row showed three airings under a closed caret.
+        self._sync_carets()

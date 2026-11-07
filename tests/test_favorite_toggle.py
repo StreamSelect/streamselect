@@ -1,0 +1,210 @@
+"""Characterization tests for P1-2: favorite toggle deduplication.
+
+T1-2 from REFACTOR_PLAN. Pins that both toggle_favorite() and
+toggle_favorite_by_id() flip is_favorite, persist it, and post the
+right status message. Guards the _apply_favorite_toggle() extraction.
+
+DEBT-3: _apply_favorite_toggle's write now runs through the async
+_run_query seam, so _build_mock_window wires an inline (synchronous)
+executor via tests/conftest.py's wire_inline_run_query — the handlers
+below still resolve before returning, just not on the calling thread
+in production anymore.
+"""
+
+import uuid
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from streamselect.core.database import Base, ChannelDB
+from streamselect.core.repositories.channel import ChannelRepository
+from tests.conftest import wire_status_method
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def engine():
+    e = create_engine("sqlite:///:memory:", echo=False)
+    Base.metadata.create_all(e)
+    yield e
+    e.dispose()
+
+
+@pytest.fixture()
+def db_session(engine):
+    Session = sessionmaker(bind=engine)
+    s = Session()
+    yield s
+    s.close()
+
+
+@pytest.fixture()
+def channel(db_session):
+    ch = ChannelDB(
+        id=str(uuid.uuid4()),
+        source_id="999",
+        provider_id="prov1",
+        name="Test Channel",
+        media_type="movie",
+        is_favorite=False,
+    )
+    db_session.add(ch)
+    db_session.commit()
+    return ch
+
+
+# ---------------------------------------------------------------------------
+# Repository-level pin: toggle_favorite flips the DB flag
+# ---------------------------------------------------------------------------
+
+def test_toggle_favorite_repo_flips_to_true(db_session, channel):
+    repo = ChannelRepository(db_session)
+    new_status = repo.toggle_favorite(channel.id)
+    assert new_status is True
+    refreshed = db_session.query(ChannelDB).filter_by(id=channel.id).one()
+    assert refreshed.is_favorite is True
+
+
+def test_toggle_favorite_repo_flips_back_to_false(db_session, channel):
+    repo = ChannelRepository(db_session)
+    repo.toggle_favorite(channel.id)   # True
+    new_status = repo.toggle_favorite(channel.id)  # False
+    assert new_status is False
+    refreshed = db_session.query(ChannelDB).filter_by(id=channel.id).one()
+    assert refreshed.is_favorite is False
+
+
+# ---------------------------------------------------------------------------
+# MainWindow-level pins: status message content is correct for both methods
+# ---------------------------------------------------------------------------
+
+def _build_mock_window(engine):
+    """Thin MainWindow shell with a real DB backed by the test engine."""
+    from streamselect.core.database import Database
+    from streamselect.gui import main_window as mw_module
+    from tests.conftest import attach_channel_state_bus, wire_inline_run_query
+
+    db = MagicMock(spec=Database)
+
+    # Let get_session()/session_scope() return real sessions from the test engine.
+    Session = sessionmaker(bind=engine)
+
+    def _get_session():
+        return Session()
+
+    db.get_session = _get_session
+
+    @contextmanager
+    def _session_scope(commit=True):
+        session = Session()
+        try:
+            yield session
+            session.commit() if commit else session.rollback()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    db.session_scope = _session_scope
+
+    with patch.object(mw_module.MainWindow, "__init__", lambda self: None):
+        win = mw_module.MainWindow.__new__(mw_module.MainWindow)
+
+    win.db = db
+    wire_inline_run_query(win)   # _apply_favorite_toggle's write now goes through _run_query
+    win.status_bar = MagicMock()
+    wire_status_method(win)
+    win.channels_list = MagicMock()
+    win.channel_model = MagicMock()   # virtualized model — update_favorite called by toggle
+    win.all_channels = []
+    win.favorite_icon = "★"
+    win.unfavorite_icon = "☆"
+    win.load_favorites = MagicMock()
+    win._lightbox = MagicMock()
+    win._lightbox.isVisible.return_value = False
+    win.update_details_pane_for_channel = MagicMock()
+
+    # get_media_type_icon not exercised here
+    win.get_media_type_icon = MagicMock(return_value="")
+
+    # _apply_favorite_toggle publishes to ChannelStateBus (phase 2, an earlier change) — the
+    # details pane's refresh is now the bus's tier-2 reread, not a hand-rolled
+    # update_details_pane_for_channel() call. Record the reread calls so tests
+    # can assert the bus is what drives the refresh.
+    win._reread_calls = []
+    attach_channel_state_bus(win, reread=win._reread_calls.append)
+
+    return win
+
+
+def test_toggle_favorite_posts_added_status(engine, channel):
+    win = _build_mock_window(engine)
+    item = MagicMock()
+    item.data.return_value = channel.id
+    item.text.return_value = f"☆ {channel.name}"
+
+    win.toggle_favorite(item)
+
+    call_args = win.status_bar.showMessage.call_args[0][0]
+    assert "added to" in call_args
+    assert channel.name in call_args
+
+
+def test_toggle_favorite_posts_removed_status(engine, channel):
+    win = _build_mock_window(engine)
+
+    # Toggle twice: added → removed
+    item = MagicMock()
+    item.data.return_value = channel.id
+    item.text.return_value = f"☆ {channel.name}"
+    win.toggle_favorite(item)
+    item.text.return_value = f"★ {channel.name}"
+    win.toggle_favorite(item)
+
+    last_msg = win.status_bar.showMessage.call_args[0][0]
+    assert "removed from" in last_msg
+
+
+def test_toggle_favorite_by_id_posts_added_status(engine, channel):
+    win = _build_mock_window(engine)
+    win.toggle_favorite_by_id(channel.id)
+    call_args = win.status_bar.showMessage.call_args[0][0]
+    assert "added to" in call_args
+    assert channel.name in call_args
+
+
+def test_toggle_favorite_by_id_refreshes_via_channel_state_bus(engine, channel):
+    """As of ChannelStateBus phase 2, toggle_favorite_by_id no longer
+    hand-refreshes the details pane directly — _apply_favorite_toggle publishes
+    to the bus, whose authoritative reread is what repaints the pane. This
+    replaces the old test_toggle_favorite_by_id_updates_details_pane, which
+    pinned the hand-rolled update_details_pane_for_channel() call that an earlier change
+    deleted (that call was also skipped whenever the lightbox had focus — the
+    bus's reread has no such gap).
+    """
+    win = _build_mock_window(engine)
+    win.toggle_favorite_by_id(channel.id)
+    win.update_details_pane_for_channel.assert_not_called()
+    assert win._reread_calls == [channel.id]
+
+
+def test_toggle_favorite_sidebar_refreshed(engine, channel):
+    win = _build_mock_window(engine)
+    item = MagicMock()
+    item.data.return_value = channel.id
+    item.text.return_value = f"☆ {channel.name}"
+    win.toggle_favorite(item)
+    win.load_favorites.assert_called_once()
+
+
+def test_toggle_favorite_by_id_sidebar_refreshed(engine, channel):
+    win = _build_mock_window(engine)
+    win.toggle_favorite_by_id(channel.id)
+    win.load_favorites.assert_called_once()

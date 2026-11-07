@@ -1,0 +1,450 @@
+"""Repository for the user's watch queue."""
+
+from __future__ import annotations
+
+import re
+
+from dataclasses import dataclass
+from datetime import datetime
+
+from loguru import logger
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from streamselect.core.database import WatchQueueDB, ChannelDB, EpisodeDB
+
+
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+#: (channel_id, live name) pairs already reported this process — the queue is
+#: re-read on every sidebar refresh, and eight warnings per read for the same
+#: eight rows (a user's log) is noise, not evidence.
+_drift_reported: set[tuple[str, str]] = set()
+
+
+def is_rename(stored: str, live: str) -> bool:
+    """True when the live name is the SAME title re-listed with more detail.
+
+    A provider commonly re-lists a title with a year, a region or a cast
+    suffix — ``EN - Community (2009)`` → ``EN - Community (2009) (US)`` — which
+    is not a recycled stream id and must not be reported as one. Rule: every
+    word of the queued name survives in the live name. A true reuse
+    (``|EN| Silicon Valley`` → ``|RO| FILMBOX``) replaces the words.
+    """
+    queued = set(_WORD_RE.findall(stored.lower()))
+    return bool(queued) and queued <= set(_WORD_RE.findall(live.lower()))
+
+
+def provider_id_of(channel_id: str) -> str:
+    """Return the provider id embedded in a composite ``ChannelDB.id``.
+
+    ``ChannelDB.id`` is built as ``f"{provider_id}_{stream_id}"``
+    (``providers/xtream.py``'s ``convert_to_channel``) — the provider id is
+    everything before the final ``_``. Used to scope an orphan-recovery
+    ``source_id`` lookup to the SAME provider: ``source_id`` is the
+    provider's native stream id, which every provider reuses (small
+    integers), so matching on it alone can bind to a different source's
+    channel that happens to reuse the same native id.
+    """
+    return channel_id.rsplit("_", 1)[0]
+
+
+@dataclass
+class QueueEntry:
+    """A single item in the watch queue, independent of ChannelDB join success.
+
+    Channel-grain (default): ``episode_id`` is None; ``channel_id``/``channel_name``
+    identify the queued movie/live/series channel itself.
+
+    Episode-grain (Wave 2 Slice 2B): ``episode_id`` is set; ``channel_id``/
+    ``channel_name``/``channel``/``provider_id``/``available`` all still describe
+    the PARENT SERIES (availability/orphan-recovery joins are unchanged for either
+    grain — see WatchQueueRepository.get_all), while ``season_num``/``episode_num``/
+    ``episode_title`` identify the specific queued episode.
+    """
+    queue_id:     int
+    channel_id:   str
+    channel_name: str
+    media_type:   str
+    last_played:  datetime | None   # eagerly extracted before session close
+    channel:      ChannelDB | None  # None when orphaned (channel no longer in DB)
+    provider_id:  str | None = None   # None when orphaned
+    available:    bool = True         # False when provider is inactive/expired or orphaned
+    search_title: str = ""            # detected_title or name — recovery search term
+    # Ingestion-computed display fields — read at render (never re-parse the name).
+    detected_region:  str = ""
+    detected_quality: str = ""
+    detected_year:    str = ""
+    detected_prefix:  str = ""        # audio-language token — the honest chip-row language
+    # Episode-grain fields (Wave 2 Slice 2B) — None on channel-grain entries.
+    episode_id:    str | None = None
+    season_num:    int | None = None
+    episode_num:   int | None = None
+    episode_title: str | None = None
+    # When the row was queued. Carried so the sidebar can show the newest
+    # additions first: `position` is append-only insertion order, so rendering
+    # in that order buries everything you queue today under months of older
+    # entries (measured: 611 queued, oldest dating to May).
+    added_at:      datetime | None = None
+
+    @property
+    def is_episode(self) -> bool:
+        """True when this entry queues a single EPISODE rather than a whole channel."""
+        return self.episode_id is not None
+
+
+class WatchQueueRepository:
+    """CRUD for WatchQueueDB — ordered list of channels to watch soon."""
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def _relocate_orphan(self, row: WatchQueueDB) -> ChannelDB | None:
+        """Try to relocate an orphaned queue row by provider-native stream id.
+
+        Scoped to the SAME provider (recovered from the row's own, possibly
+        stale, ``channel_id`` via :func:`provider_id_of`) — a bare
+        ``source_id`` match would happily bind to a different source's
+        channel that happens to reuse the same small native id. Returns
+        ``None`` (stays orphaned) when there's nothing to relocate to.
+        """
+        if not row.source_id:
+            return None
+        return (
+            self.session.query(ChannelDB)
+            .filter_by(
+                source_id=row.source_id,
+                provider_id=provider_id_of(row.channel_id),
+            )
+            .first()
+        )
+
+    def get_all(
+        self,
+        hidden_provider_ids: set[str] | None = None,
+    ) -> list[QueueEntry]:
+        """Return queue entries in position order.
+
+        Each entry carries a live ChannelDB reference if the channel still exists.
+        Orphaned entries (channel deleted or ID changed) are kept and logged so
+        the user never loses visibility into what they queued.
+
+        **This method NEVER drops a row.** ``hidden_provider_ids`` ANNOTATES —
+        the returned rows, and their order, are identical with or without it;
+        only the ``available`` flag differs.  The queue is a record view
+        (DR-0007 exemption): disabling a source must never silently delete the
+        user's queue out from under them, it marks those entries recoverable.
+
+        That is why the call sites legitimately differ, and the difference is
+        NOT drift: ``sidebar/queue.py`` and ``main_window_favorites.py`` pass the
+        set because they RENDER availability (dimming, the "Unavailable" group,
+        the recovery search); ``gui/trail_map_data.load_queue_ids`` consumes ids
+        only and so passes nothing.  ``tests/test_queue_scoping_contract.py``
+        pins the invariant, so a future change that made this argument filter
+        would fail there rather than silently emptying one surface.
+
+        Contrast :meth:`clear_unavailable`, which takes the same set and DELETES.
+
+        Args:
+            hidden_provider_ids: If supplied, entries whose channel belongs to one
+                of these providers are annotated with ``available=False``.  Orphaned
+                entries (no matching ChannelDB row) are always unavailable.
+        """
+        rows = (
+            self.session.query(WatchQueueDB)
+            .order_by(WatchQueueDB.position)
+            .all()
+        )
+        hidden: set[str] = hidden_provider_ids or set()
+        entries: list[QueueEntry] = []
+        for row in rows:
+            ch = self.session.get(ChannelDB, row.channel_id)
+            if not ch and row.source_id:
+                # Fallback: channel was refreshed with a new primary key but same
+                # provider-native stream ID — try to relocate it (same provider only).
+                ch = self._relocate_orphan(row)
+            if not ch:
+                logger.warning(
+                    f"Watch queue entry orphaned: channel_id={row.channel_id!r} "
+                    f"name={row.channel_name!r} — displaying stored name"
+                )
+            # Prefer stored name (orphan-safe), fall back to live channel name,
+            # then generic "Unknown" as last resort.
+            display_name = (
+                row.channel_name
+                or (ch.name if ch else "")
+                or "Unknown"
+            )
+            display_type = row.media_type or (ch.media_type if ch else "") or ""
+            # Compute availability and recovery title inside the session.
+            pid = ch.provider_id if ch else None
+            available = (
+                ch is not None and (not hidden or pid not in hidden)
+            )
+            # A recycled provider-native stream id can rebind row.channel_id to a
+            # DIFFERENT title after a refresh (reconnect-mangle). Only trust the
+            # live channel's title when its raw name still matches what the user
+            # queued; otherwise keep the stored name so display AND the recovery
+            # search (sidebar/queue.py) show what was actually queued, not a
+            # stranger's title.
+            drifted = bool(ch and row.channel_name and ch.name != row.channel_name)
+            if drifted and not is_rename(row.channel_name, ch.name):
+                if (row.channel_id, ch.name) not in _drift_reported:
+                    _drift_reported.add((row.channel_id, ch.name))
+                    logger.warning(
+                        "STREAM-ID REUSE: watch queue entry channel_id={!r} kept its "
+                        "queued title after this refresh: queued={!r} -> live={!r}",
+                        row.channel_id, row.channel_name, ch.name,
+                    )
+                search_title = row.channel_name
+            else:
+                if drifted and (row.channel_id, ch.name) not in _drift_reported:
+                    _drift_reported.add((row.channel_id, ch.name))
+                    logger.debug("watch queue entry {!r} re-listed with more detail: "
+                                 "{!r} -> {!r}", row.channel_id, row.channel_name, ch.name)
+                search_title = (ch.detected_title if ch else "") or display_name
+            # Episode-grain rows (Slice 2B): sort by the EPISODE's own last_played,
+            # not the series' — the series may have been engaged via a different
+            # episode. season_num/episode_num/episode_title are denormalized on the
+            # row itself (orphan-safe), so no EpisodeDB join is needed for those.
+            if row.episode_id:
+                ep = self.session.get(EpisodeDB, row.episode_id)
+                entry_last_played = ep.last_played if ep else None
+            else:
+                entry_last_played = ch.last_played if ch else None
+            entries.append(QueueEntry(
+                queue_id=row.id,
+                channel_id=row.channel_id,
+                channel_name=display_name,
+                media_type=display_type,
+                last_played=entry_last_played,
+                channel=ch,
+                provider_id=pid,
+                available=available,
+                search_title=search_title,
+                detected_region=(ch.detected_region if ch else "") or "",
+                detected_quality=(ch.detected_quality if ch else "") or "",
+                detected_year=(ch.detected_year if ch else "") or "",
+                detected_prefix=(ch.detected_prefix if ch else "") or "",
+                episode_id=row.episode_id,
+                season_num=row.season_num,
+                episode_num=row.episode_num,
+                episode_title=row.episode_title,
+                added_at=row.added_at,
+            ))
+        return entries
+
+    def clear_unavailable(self, hidden_provider_ids: set[str]) -> int:
+        """Delete queue rows whose channel's provider is hidden (inactive/expired)
+        or whose channel no longer exists (orphaned).
+
+        Args:
+            hidden_provider_ids: Provider IDs to treat as unavailable.
+
+        Returns:
+            Number of rows removed.
+        """
+        rows = (
+            self.session.query(WatchQueueDB)
+            .order_by(WatchQueueDB.position)
+            .all()
+        )
+        removed = 0
+        for row in rows:
+            ch = self.session.get(ChannelDB, row.channel_id)
+            if not ch and row.source_id:
+                ch = self._relocate_orphan(row)
+            # Remove orphaned entries or entries on a hidden provider.
+            if ch is None or ch.provider_id in hidden_provider_ids:
+                self.session.delete(row)
+                removed += 1
+        return removed
+
+    def add(self, channel_id: str, channel_name: str = "", media_type: str = "", source_id: str = "") -> None:
+        """Append channel_id to the end of the queue. No-op if already queued.
+
+        Channel-grain only (``episode_id IS NULL``) — see :meth:`add_episode` for
+        queuing a single episode. Scoping this way means queuing episodes of a
+        series never makes the series ROOT itself read as "in queue" (and vice
+        versa); they are independent entries.
+        """
+        if self.is_queued(channel_id):
+            return
+        # Assign a position strictly greater than any existing row so a prior
+        # non-tail remove() (which does not reindex) can never leave two rows
+        # sharing a position and making order_by(position) unstable.
+        max_pos = self.session.query(func.max(WatchQueueDB.position)).scalar()
+        self.session.add(WatchQueueDB(
+            channel_id=channel_id,
+            channel_name=channel_name,
+            media_type=media_type,
+            source_id=source_id,
+            position=(max_pos + 1) if max_pos is not None else 0,
+        ))
+
+    def remove(self, channel_id: str) -> None:
+        """Remove the channel-grain queue row for channel_id, if present.
+
+        Scoped to ``episode_id IS NULL`` — never deletes an episode-grain row
+        that happens to share this channel_id as its parent series.
+        """
+        row = (
+            self.session.query(WatchQueueDB)
+            .filter_by(channel_id=channel_id, episode_id=None)
+            .first()
+        )
+        if row:
+            self.session.delete(row)
+
+    def get_queued_ids(self) -> set[str]:
+        """Return the set of channel_ids with a CHANNEL-grain queue entry.
+
+        Scoped to ``episode_id IS NULL`` — a series with only episodes queued is
+        not included (its root channel isn't itself in the queue).
+        """
+        return {
+            row.channel_id
+            for row in self.session.query(WatchQueueDB).filter_by(episode_id=None).all()
+        }
+
+    def place_of(self, channel_id: str | None = None,
+                 episode_id: str | None = None) -> tuple[int | None, int]:
+        """Where one item sits in the queue, for showing "3 of 12".
+
+        Args:
+            channel_id: A queued movie or live channel.
+            episode_id: A queued episode; checked first.
+
+        Returns:
+            ``(1-based place or None if it is not queued, rows in the queue)``.
+        """
+        rows = (self.session.query(WatchQueueDB.channel_id, WatchQueueDB.episode_id)
+                .order_by(WatchQueueDB.position).all())
+        for place, (row_channel, row_episode) in enumerate(rows, start=1):
+            if (episode_id and row_episode == episode_id) or (
+                    not episode_id and channel_id and not row_episode
+                    and row_channel == channel_id):
+                return place, len(rows)
+        return None, len(rows)
+
+    def is_queued(self, channel_id: str) -> bool:
+        """Return True if channel_id has a CHANNEL-grain queue entry (episode_id IS NULL)."""
+        return (
+            self.session.query(WatchQueueDB)
+            .filter_by(channel_id=channel_id, episode_id=None)
+            .first()
+        ) is not None
+
+    # --- Episode-grain (Wave 2 Slice 2B) ------------------------------------
+
+    def add_episode(
+        self,
+        episode_id: str,
+        channel_id: str,
+        channel_name: str = "",
+        season_num: int = 0,
+        episode_num: int = 0,
+        episode_title: str = "",
+        source_id: str = "",
+    ) -> None:
+        """Append a single EPISODE to the end of the queue. No-op if already queued.
+
+        Args:
+            episode_id: EpisodeDB.id of the episode to queue.
+            channel_id: ChannelDB.id of the PARENT SERIES (used for provider/
+                availability joins — see WatchQueueRepository.get_all).
+            channel_name: The series' display name, denormalized (orphan-safe).
+            season_num, episode_num, episode_title: Denormalized episode identity —
+                survive an orphaned EpisodeDB row, same rationale as channel_name.
+            source_id: The series' provider-native stream id (orphan fallback lookup).
+        """
+        if self.is_episode_queued(episode_id):
+            return
+        max_pos = self.session.query(func.max(WatchQueueDB.position)).scalar()
+        self.session.add(WatchQueueDB(
+            channel_id=channel_id,
+            channel_name=channel_name,
+            media_type="series",
+            source_id=source_id,
+            episode_id=episode_id,
+            season_num=season_num,
+            episode_num=episode_num,
+            episode_title=episode_title,
+            position=(max_pos + 1) if max_pos is not None else 0,
+        ))
+
+    def remove_episode(self, episode_id: str) -> None:
+        """Remove the queue row for a single episode, if present."""
+        row = (
+            self.session.query(WatchQueueDB)
+            .filter_by(episode_id=episode_id)
+            .first()
+        )
+        if row:
+            self.session.delete(row)
+
+    def is_episode_queued(self, episode_id: str) -> bool:
+        """Return True if this episode has its own queue entry."""
+        return (
+            self.session.query(WatchQueueDB)
+            .filter_by(episode_id=episode_id)
+            .first()
+        ) is not None
+
+    def clear(self) -> None:
+        """Remove all entries from the queue (both grains)."""
+        self.session.query(WatchQueueDB).delete()
+
+    def clear_watched(self) -> int:
+        """Remove entries whose content has been genuinely finished watching.
+
+        Episode-grain rows: remove only if the episode's is_watched or
+        watch_completed is True.
+
+        Channel-grain rows with media_type="series": remove only if the series has
+        at least one stored EpisodeDB row AND all episodes have is_watched or
+        watch_completed=True. If zero episode rows exist, conservatively KEEP the
+        row (cannot prove it's finished). If no EpisodeDB exists, keep it.
+
+        All other channel-grain rows (movie/live/unknown): remove only if the
+        channel's watch_completed is True.
+
+        Returns count of rows removed.
+        """
+        rows = self.session.query(WatchQueueDB).all()
+        removed = 0
+        for row in rows:
+            if row.episode_id:
+                # Episode-grain: remove only if watched or completed
+                ep = self.session.get(EpisodeDB, row.episode_id)
+                if ep and (ep.is_watched or ep.watch_completed):
+                    self.session.delete(row)
+                    removed += 1
+                continue
+
+            ch = self.session.get(ChannelDB, row.channel_id)
+            if not ch:
+                # Channel no longer exists — it was already handled by clear_unavailable
+                continue
+
+            if ch.media_type == "series":
+                # Series: remove only if ALL episodes are watched.
+                # EpisodeDB.series_id holds the PROVIDER's series id — i.e.
+                # ChannelDB.source_id, NOT ChannelDB.id (verified against real
+                # data: episodes.series_id='45505' vs channels.id='<uuid>_45505').
+                episodes = (
+                    self.session.query(EpisodeDB)
+                    .filter_by(series_id=ch.source_id, provider_id=ch.provider_id)
+                    .all()
+                )
+                # Zero episodes = conservatively keep the row (never clear what we can't prove is finished)
+                if episodes and all(ep.is_watched or ep.watch_completed for ep in episodes):
+                    self.session.delete(row)
+                    removed += 1
+            else:
+                # Movie/live/unknown: remove only if watch_completed is True
+                if ch.watch_completed:
+                    self.session.delete(row)
+                    removed += 1
+
+        return removed

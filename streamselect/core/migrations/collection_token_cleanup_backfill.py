@@ -1,0 +1,56 @@
+"""Migration task: re-derive ``detected_collection`` to drop redundant tokens.
+
+User-reported gap (side-by-side preview): the comfy list row's
+line-2 collection chip repeats information the row already shows via its own
+line-1 chips/icon — a quality tier duplicating the quality chip (e.g. "4K"
+when ``detected_quality`` is already "4K"), a media-type word duplicating the
+media-type icon (e.g. "SERIES" on a row already showing the series icon), or
+a multi-track/sub-dub marker duplicating the subtitle-marker chip. Real
+examples: ``"MULTISUB SERIES 4K"`` (every token redundant — should render no
+chip at all) and ``"|MULTI| APPLE+ KIDS"`` (should render as
+``"APPLE+ KIDS"``). ``ChannelRepository.update_detected_prefixes()`` now runs
+every ``detected_collection`` candidate through
+``channel_name_utils.strip_collection_noise_tokens()`` at ingestion, alongside
+the other ``detected_*`` fields; new channels get it automatically. This task
+performs the one-time backfill for rows that existed before the fix shipped.
+
+Idempotency
+-----------
+``needs_run`` returns True when ``config.collection_token_cleanup_backfill_version``
+is behind ``CURRENT_VERSION``. On completion the version is bumped and saved.
+An interrupted run — including a crash inside ``run()`` — leaves the version
+unbumped (see ``MigrationManager._run_all``, which skips ``on_completed`` for
+any task whose ``run()`` raises) so the task restarts on the next launch from
+scratch; already-committed batches are durable (an earlier change crash-retry semantics).
+"""
+
+from __future__ import annotations
+
+from streamselect.core.migrations.detected_fields_reparse import DetectedFieldsReparseBase
+
+# Bump to re-run the full detected_collection noise-token cleanup for all
+# users on next launch.
+# History:
+#   1 — initial backfill: strip quality/media-type/multi-sub tokens already
+#       conveyed elsewhere on the row (quality chip, media-type icon,
+#       subtitle-marker chip) out of detected_collection for every existing
+#       row, via the same update_detected_prefixes() pass that computes the
+#       other detected_* fields.
+CURRENT_VERSION: int = 1
+
+
+class CollectionTokenCleanupBackfillTask(DetectedFieldsReparseBase):
+    """Re-derive ``detected_collection`` for every channel row.
+
+    ``needs_run`` checks ``config.collection_token_cleanup_backfill_version``
+    against ``CURRENT_VERSION``. On full completion the version is bumped and
+    config is saved; on cancellation (or a crash — see
+    ``MigrationManager._run_all``) the version is left unbumped so the next
+    launch retries from scratch. ``__init__``/``needs_run``/``on_completed``/
+    ``run`` all come from ``DetectedFieldsReparseBase``/``VersionGatedTask``.
+    """
+
+    id: str = "collection_token_cleanup_backfill"
+    label: str = "Cleaning up redundant collection tokens"
+    VERSION_FIELD: str = "collection_token_cleanup_backfill_version"
+    CURRENT_VERSION: int = CURRENT_VERSION

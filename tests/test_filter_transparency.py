@@ -1,0 +1,581 @@
+"""Behavioral tests for the per-layer filter-transparency feature (B2).
+
+A search (the alert live-search OR a normal search) that hides results now reports,
+per filter layer, exactly how many results it dropped and lets the user reveal each
+layer for THIS view only — never mutating the stored settings:
+
+  * 🔒 Global Exclusions  → ``hidden_by_exclusions`` / ``_show_exclusion_hidden``
+  * 🔎 search / Tier-1     → ``hidden_by_search``     / ``_show_filtered_results``
+
+These tests drive the real query path (``_ChannelListMixin._query_channels`` against a
+file-backed DB, per the project rules) to assert both counts, and the reveal handlers to assert
+the view-scoped bypass flags. They also cover the gold-bar breakdown renderer.
+"""
+
+from __future__ import annotations
+
+import uuid
+from unittest.mock import MagicMock
+
+import pytest
+
+from streamselect.core.database import ChannelDB, ProviderDB
+from streamselect.core.repositories import RepositoryFactory
+from streamselect.gui.main_window_channels import _ChannelListMixin
+from tests.conftest import channel_query_params
+
+
+# ---------------------------------------------------------------------------
+# Fixtures — file-backed DB (the project rules: never :memory:)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def qapp():
+    from PyQt6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture
+def session(file_db):
+    s = file_db.get_session()
+    # Seed an ACTIVE, non-expired provider so p1 channels aren't scoped out as
+    # orphaned/inactive by get_hidden_provider_ids (the canonical provider gate that
+    # _query_channels applies before the transparency layers being tested here).
+    s.add(ProviderDB(
+        id="p1", name="Test Source", type="xtream", url="http://example",
+        is_active=True, account_status="Active",
+    ))
+    s.commit()
+    yield s
+    s.close()
+
+
+def _ch(
+    session,
+    name: str,
+    *,
+    provider_id: str = "p1",
+    media_type: str = "movie",
+    detected_region: str | None = None,
+    detected_prefix: str | None = None,
+    detected_title: str | None = None,
+    user_category: str | None = None,
+) -> str:
+    """Insert a minimal visible ChannelDB and return its id."""
+    ch = ChannelDB(
+        id=str(uuid.uuid4()),
+        source_id=str(uuid.uuid4()),
+        provider_id=provider_id,
+        name=name,
+        media_type=media_type,
+        is_hidden=False,
+        detected_region=detected_region,
+        detected_prefix=detected_prefix,
+        detected_title=detected_title or name,
+        user_category=user_category,
+    )
+    session.add(ch)
+    session.flush()
+    return ch.id
+
+
+def _tag(repos, channel_id: str, *pairs: tuple[str, str]) -> None:
+    repos.tags.set_content_tags(
+        channel_id, [(t, v, "test_feeder") for t, v in pairs]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Layer 1 — Global Exclusions: hidden_by_exclusions
+# ---------------------------------------------------------------------------
+
+class TestHiddenByExclusions:
+    def test_counts_results_dropped_by_region_exclusion(self, session):
+        """3 EN + 2 AR matches, region AR excluded → 3 visible, hidden_by_exclusions == 2."""
+        repos = RepositoryFactory(session)
+        for i in range(3):
+            _ch(session, f"Odyssey EN {i}", detected_region="EN")
+        for i in range(2):
+            _ch(session, f"Odyssey AR {i}", detected_region="AR")
+        session.commit()
+
+        params = channel_query_params(search_query="Odyssey", excluded_prefixes={"AR"})
+        dtos, out = _ChannelListMixin._query_channels(repos, params)
+
+        assert len(dtos) == 3, "only the 3 non-excluded (EN) matches are visible"
+        assert out["hidden_by_exclusions"] == 2, "the 2 AR matches are counted as exclusion-hidden"
+        assert out["hidden_by_search"] == 0, "no Tier-1 filter active"
+
+    def test_language_prefix_survives_region_exclusion(self, session):
+        """Prefix-wins: an un-excluded language prefix (EN) keeps a channel even
+        when its region tag is excluded — excluding IN never hides an English
+        movie merely filed under an Indian category. A prefix-LESS channel still
+        falls back to the region check and is hidden."""
+        repos = RepositoryFactory(session)
+        # English movies whose region tag is the excluded 'IN' — must SURVIVE.
+        for i in range(3):
+            _ch(session, f"Neighborhood Watch EN {i}",
+                detected_prefix="EN", detected_region="IN")
+        # No prefix to speak for it + excluded region → hidden by the region fallback.
+        _ch(session, "Neighborhood Watch noprefix",
+            detected_prefix=None, detected_region="IN")
+        # Prefix itself excluded → hidden regardless of region.
+        _ch(session, "Neighborhood Watch AR",
+            detected_prefix="AR", detected_region="AR")
+        session.commit()
+
+        params = channel_query_params(search_query="Neighborhood Watch",
+                         excluded_prefixes={"IN", "AR"})
+        dtos, out = _ChannelListMixin._query_channels(repos, params)
+
+        assert sorted(d.detected_prefix for d in dtos) == ["EN", "EN", "EN"], \
+            "the 3 EN matches survive despite region IN being excluded"
+        assert out["hidden_by_exclusions"] == 2, \
+            "the no-prefix/IN row and the AR-prefix row are the exclusion-hidden ones"
+
+    def test_counts_results_dropped_by_user_category_exclusion(self, session):
+        """User-category exclusion is counted in the same layer."""
+        repos = RepositoryFactory(session)
+        for i in range(2):
+            _ch(session, f"Widget Keep {i}", user_category="Keep")
+        for i in range(4):
+            _ch(session, f"Widget Trash {i}", user_category="Trash")
+        session.commit()
+
+        params = channel_query_params(search_query="Widget", excluded_user_categories={"Trash"})
+        dtos, out = _ChannelListMixin._query_channels(repos, params)
+
+        assert len(dtos) == 2
+        assert out["hidden_by_exclusions"] == 4
+
+    def test_bypass_reveals_excluded_and_zeroes_count(self, session):
+        """bypass_global_exclusions=True → all matches visible, hidden_by_exclusions == 0."""
+        repos = RepositoryFactory(session)
+        for i in range(3):
+            _ch(session, f"Odyssey EN {i}", detected_region="EN")
+        for i in range(2):
+            _ch(session, f"Odyssey AR {i}", detected_region="AR")
+        session.commit()
+
+        params = channel_query_params(
+            search_query="Odyssey",
+            excluded_prefixes={"AR"},
+            bypass_global_exclusions=True,
+        )
+        dtos, out = _ChannelListMixin._query_channels(repos, params)
+
+        assert len(dtos) == 5, "bypass reveals the AR matches for this view"
+        assert out["hidden_by_exclusions"] == 0, "nothing is hidden once the layer is bypassed"
+
+
+# ---------------------------------------------------------------------------
+# Layer 2 — search / Tier-1 tag filters: hidden_by_search
+# ---------------------------------------------------------------------------
+
+class TestHiddenBySearch:
+    def test_counts_results_dropped_by_tag_filter(self, session):
+        """2 Disney+ + 3 Netflix matches, tag_includes=Disney+ → 2 visible, hidden_by_search == 3.
+
+        The rejected rows carry a DIFFERENT platform. They used to carry no
+        platform tag at all, which stopped being a rejection in an earlier change — a facet
+        can only reject a value the channel actually claims. An untagged channel
+        is covered by :meth:`test_untagged_is_not_counted_as_search_filtered`
+        below.
+        """
+        repos = RepositoryFactory(session)
+        disney = [_ch(session, f"Widget Disney {i}") for i in range(2)]
+        netflix = [_ch(session, f"Widget Netflix {i}") for i in range(3)]
+        for cid in disney:
+            _tag(repos, cid, ("platform", "Disney+"))
+        for cid in netflix:
+            _tag(repos, cid, ("platform", "Netflix"))
+        session.commit()
+
+        params = channel_query_params(
+            search_query="Widget",
+            tag_includes={"platform": {"Disney+"}},
+        )
+        dtos, out = _ChannelListMixin._query_channels(repos, params)
+
+        assert len(dtos) == 2, "only the Disney+ matches survive the Tier-1 filter"
+        assert out["hidden_by_search"] == 3, "the 3 Netflix matches are counted as search-filtered"
+        assert out["hidden_by_exclusions"] == 0
+
+    def test_hidden_by_search_counts_only_the_tag_axis(self, session):
+        """The comparison query must hold every OTHER axis equal, or the count lies.
+
+        ``hidden_by_search`` is a diff: the same query with ``tag_includes``
+        lifted, minus the visible set. The comparison query hand-copied its
+        arguments from the main one and omitted NINE axes — language, region,
+        quality and platform prefixes, ``hidden_only``, ``include_hidden``,
+        ``include_dead``, ``channel_ids`` and ``facets_hiding_untagged``. Every
+        one of them makes the comparison set WIDER than "the main query minus
+        tag_includes", so rows dropped by a prefix filter get reported as
+        dropped by the tag filter.
+
+        Here: 2 EN + 2 FR channels, one of each tagged Disney+. With
+        ``language_prefixes=["EN"]`` and the Disney+ facet, exactly one EN row
+        is visible and exactly one EN row is hidden by the tag axis. Before the
+        fix the count read 3, because the comparison query also returned both
+        FR rows, which the language filter had already removed.
+        """
+        repos = RepositoryFactory(session)
+        en_disney = _ch(session, "Widget EN Disney", detected_prefix="EN")
+        en_other = _ch(session, "Widget EN Netflix", detected_prefix="EN")
+        fr_disney = _ch(session, "Widget FR Disney", detected_prefix="FR")
+        fr_other = _ch(session, "Widget FR Netflix", detected_prefix="FR")
+        for cid in (en_disney, fr_disney):
+            _tag(repos, cid, ("platform", "Disney+"))
+        for cid in (en_other, fr_other):
+            _tag(repos, cid, ("platform", "Netflix"))
+        session.commit()
+
+        params = channel_query_params(
+            search_query="Widget",
+            language_prefixes=["EN"],
+            tag_includes={"platform": {"Disney+"}},
+        )
+        dtos, out = _ChannelListMixin._query_channels(repos, params)
+
+        assert [d.id for d in dtos] == [en_disney], \
+            "only the EN Disney+ row survives both axes"
+        assert out["hidden_by_search"] == 1, (
+            "only the EN Netflix row is hidden by the TAG axis; the two FR rows "
+            "were already removed by the language filter and must not be counted "
+            f"here (got {out['hidden_by_search']})"
+        )
+
+    def test_untagged_is_not_counted_as_search_filtered(self, session):
+        """A channel the facet cannot describe is neither hidden NOR counted.
+
+        The count and the list have to agree: if an untagged channel is visible,
+        reporting it as "hidden by search filters" would send the user to a
+        reveal button for content already on screen.
+        """
+        repos = RepositoryFactory(session)
+        disney = [_ch(session, f"Widget Disney {i}") for i in range(2)]
+        untagged = [_ch(session, f"Widget Untagged {i}") for i in range(3)]
+        for cid in disney:
+            _tag(repos, cid, ("platform", "Disney+"))
+        for cid in untagged:
+            _tag(repos, cid, ("language", "English"))   # no PLATFORM tag
+        session.commit()
+
+        params = channel_query_params(
+            search_query="Widget",
+            tag_includes={"platform": {"Disney+"}},
+        )
+        dtos, out = _ChannelListMixin._query_channels(repos, params)
+
+        assert len(dtos) == 5, "the 3 platform-less matches are visible alongside the 2 Disney+"
+        assert out["hidden_by_search"] == 0, "nothing was filtered, so nothing may be reported as filtered"
+
+    def test_bypass_tier1_shows_all_and_zeroes_count(self, session):
+        """The Tier-1 reveal sets tag_includes=None (bypassing) → all matches, hidden_by_search == 0."""
+        repos = RepositoryFactory(session)
+        disney = [_ch(session, f"Widget Disney {i}") for i in range(2)]
+        plain = [_ch(session, f"Widget Plain {i}") for i in range(3)]
+        for cid in disney:
+            _tag(repos, cid, ("platform", "Disney+"))
+        session.commit()
+
+        # _show_filtered_results sets _bypass_tier1_filters → load_channels passes
+        # tag_includes=None, so the search-filter layer imposes nothing.
+        params = channel_query_params(search_query="Widget", tag_includes=None, bypassing_tier1=True)
+        dtos, out = _ChannelListMixin._query_channels(repos, params)
+
+        assert len(dtos) == 5, "all matches visible when the Tier-1 filter is bypassed"
+        assert out["hidden_by_search"] == 0
+
+    def test_both_layers_counted_independently(self, session):
+        """A search hit by BOTH layers reports each layer's own count.
+
+        Widget matches: 2 Disney+/EN (visible), 3 Disney+/AR (region-excluded),
+        4 Netflix/EN (Tier-1-filtered).  hidden_by_exclusions counts the 3 AR;
+        hidden_by_search counts only what the tag filter removes on top of the
+        exclusion layer (the 4 Netflix/EN), never double-counting the AR rows.
+
+        The Tier-1-filtered rows carry a rival platform rather than no platform
+        tag (an earlier change: absence is no longer a rejection) — what this test pins is
+        the ACCOUNTING between the two layers, which is unchanged.
+        """
+        repos = RepositoryFactory(session)
+        vis = [_ch(session, f"Widget Vis {i}", detected_region="EN") for i in range(2)]
+        excl = [_ch(session, f"Widget Excl {i}", detected_region="AR") for i in range(3)]
+        plain = [_ch(session, f"Widget Plain {i}", detected_region="EN") for i in range(4)]
+        for cid in vis + excl:
+            _tag(repos, cid, ("platform", "Disney+"))
+        for cid in plain:
+            _tag(repos, cid, ("platform", "Netflix"))
+        session.commit()
+
+        params = channel_query_params(
+            search_query="Widget",
+            tag_includes={"platform": {"Disney+"}},
+            excluded_prefixes={"AR"},
+        )
+        dtos, out = _ChannelListMixin._query_channels(repos, params)
+
+        assert len(dtos) == 2, "only Disney+ AND non-excluded matches are visible"
+        assert out["hidden_by_exclusions"] == 3, "the 3 AR Disney+ matches"
+        assert out["hidden_by_search"] == 4, "the 4 plain/EN matches removed by the tag filter"
+
+
+# ---------------------------------------------------------------------------
+# Reveal handlers — set the view-scoped bypass flags, never the stored settings
+# ---------------------------------------------------------------------------
+
+class TestRevealHandlers:
+    def _host(self):
+        host = _ChannelListMixin()
+        host._bypass_tier1_filters = False
+        host._bypass_global_exclusions = False
+        host._details_id_filter = None
+        host.load_channels = MagicMock()
+        return host
+
+    def test_show_exclusion_hidden_sets_flag_and_reloads(self):
+        host = self._host()
+        host._show_exclusion_hidden()
+        assert host._bypass_global_exclusions is True
+        assert host._bypass_tier1_filters is False, "exclusion reveal must not touch the Tier-1 bypass"
+        host.load_channels.assert_called_once()
+
+    def test_show_filtered_results_sets_tier1_flag_and_reloads(self):
+        host = self._host()
+        host._show_filtered_results()
+        assert host._bypass_tier1_filters is True
+        assert host._bypass_global_exclusions is False, "Tier-1 reveal must not touch the exclusion bypass"
+        host.load_channels.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Gold-bar breakdown renderer — up to two segments, each shown only when > 0
+# ---------------------------------------------------------------------------
+
+class TestBreakdownRenderer:
+    def _host(self, qapp):
+        from PyQt6.QtWidgets import QWidget, QPushButton
+        host = _ChannelListMixin()
+        host._channel_filter_bar = QWidget()
+        host._channel_exclusion_btn = QPushButton()
+        host._channel_filter_btn = QPushButton()
+        return host
+
+    def test_only_exclusion_segment_when_only_exclusions_hidden(self, qapp):
+        host = self._host(qapp)
+        host._show_channel_filter_breakdown(hidden_by_exclusions=4, hidden_by_search=0)
+        assert host._channel_exclusion_btn.isVisible()
+        assert not host._channel_filter_btn.isVisible()
+        assert host._channel_filter_bar.isVisible()
+        assert "4" in host._channel_exclusion_btn.text()
+        assert "Global Exclusions" in host._channel_exclusion_btn.text()
+
+    def test_only_search_segment_when_only_search_hidden(self, qapp):
+        host = self._host(qapp)
+        host._show_channel_filter_breakdown(hidden_by_exclusions=0, hidden_by_search=7)
+        assert not host._channel_exclusion_btn.isVisible()
+        assert host._channel_filter_btn.isVisible()
+        assert "7" in host._channel_filter_btn.text()
+        assert "search filters" in host._channel_filter_btn.text().lower()
+
+    def test_both_segments_when_both_hidden(self, qapp):
+        host = self._host(qapp)
+        host._show_channel_filter_breakdown(hidden_by_exclusions=2, hidden_by_search=5)
+        assert host._channel_exclusion_btn.isVisible()
+        assert host._channel_filter_btn.isVisible()
+        assert host._channel_filter_bar.isVisible()
+
+    def test_bar_hidden_when_nothing_hidden(self, qapp):
+        host = self._host(qapp)
+        host._channel_filter_bar.setVisible(True)
+        host._show_channel_filter_breakdown(hidden_by_exclusions=0, hidden_by_search=0)
+        assert not host._channel_exclusion_btn.isVisible()
+        assert not host._channel_filter_btn.isVisible()
+        assert not host._channel_filter_bar.isVisible()
+
+
+# ---------------------------------------------------------------------------
+# Saturation — the counters at the page cap (audit objective 7)
+# ---------------------------------------------------------------------------
+
+class TestCountersAtThePageCap:
+    """A count that hit the cap must read as a floor, never as zero.
+
+    Every transparency query is capped at ``page_size``. When the visible set
+    AND its comparison both saturate, subtracting their lengths gives zero —
+    and the gold bar renders a segment only for a count above zero. So on a
+    large library the reveal button VANISHED at exactly the point where the
+    most was hidden.
+
+    The obvious fix — two uncapped ``COUNT(*)``s — is too slow for the
+    interactive path: re-measured in raw SQL on a user's many-row library,
+    the pair costs **414 ms** (215 + 198) against a load just taken from 252 ms
+    to 1.1 ms, and up to three axes are measured per keystroke. (An earlier
+    3.0 s figure for the same pair does not reproduce and its attribution to the
+    dead-stream ``NOT IN`` was wrong — that subquery costs ~17 ms. The
+    conclusion survives at the lower number; the reasoning does not.)
+
+    So the counter reports a floor and says so. The floor is a set difference,
+    not a length subtraction: ``comparison`` is a superset of ``visible``, so
+    every id present there and absent here was provably removed by the measured
+    axis. That is sound at every input, including the saturated cases where a
+    subtraction either read zero (the original bug) or invented a page-worth of
+    withholding (the fix's first version).
+    """
+
+    def test_an_unsaturated_diff_is_exact_and_not_a_floor(self):
+        from streamselect.gui.main_window_channels import _ChannelListMixin
+
+        n, is_floor = _ChannelListMixin._hidden_by_axis(
+            visible=[1, 2], comparison=[1, 2, 3, 4, 5], page_size=100)
+
+        assert (n, is_floor) == (3, False)
+
+    def test_a_saturated_pair_hiding_nothing_reports_zero(self):
+        """Two full identical pages mean the axis hid NOTHING. Say zero.
+
+        This test previously asserted 50 here — the page size — on the reasoning
+        that a saturated pair must hide "at least a page-worth". That does not
+        follow: both queries hitting the cap says nothing about the difference
+        between the underlying sets, and `comparison` is a superset of `visible`,
+        so identical contents are positive evidence that the axis removed nothing.
+        The old assertion made a spec-named test encode the fabrication it was
+        named to prevent.
+        """
+        from streamselect.gui.main_window_channels import _ChannelListMixin
+
+        full = list(range(50))
+        n, is_floor = _ChannelListMixin._hidden_by_axis(
+            visible=full, comparison=list(full), page_size=50)
+
+        assert n == 0, (
+            "identical saturated pages are evidence of NO hiding; claiming a "
+            "page-worth invents withholding and offers a reveal button that "
+            "reveals nothing"
+        )
+        assert is_floor is True, "saturated data still can't prove completeness"
+
+    def test_a_saturated_pair_reports_the_rows_it_can_prove(self):
+        """The original bug's shape: full pages that DO differ must not read zero."""
+        from streamselect.gui.main_window_channels import _ChannelListMixin
+
+        # Both pages full, but the comparison holds 10 ids the visible set lacks.
+        n, is_floor = _ChannelListMixin._hidden_by_axis(
+            visible=list(range(50)), comparison=list(range(10, 60)), page_size=50)
+
+        assert n == 10, f"the 10 ids only the comparison holds are provable, got {n}"
+        assert is_floor is True
+        assert n > 0, (
+            "zero is what hid the gold bar segment entirely — the reveal "
+            "affordance disappeared where the most was hidden"
+        )
+
+    def test_one_side_saturated_counts_the_evidence_not_the_page(self):
+        """A capped comparison still yields a provable count, not the page size."""
+        from streamselect.gui.main_window_channels import _ChannelListMixin
+
+        n, is_floor = _ChannelListMixin._hidden_by_axis(
+            visible=list(range(10)), comparison=list(range(50)), page_size=50)
+
+        assert n == 40, f"40 ids are demonstrably absent from visible, got {n}"
+        assert is_floor is True
+
+    def test_saturation_is_judged_before_the_python_exclusion_pass(self):
+        """A SQL-capped fetch trimmed by Python must still count as saturated.
+
+        The exclusion pass runs before this helper, so post-filter lengths can sit
+        under the cap while the underlying query was truncated — labelling data
+        that is demonstrably incomplete as exact.
+        """
+        from streamselect.gui.main_window_channels import _ChannelListMixin
+
+        _, is_floor = _ChannelListMixin._hidden_by_axis(
+            visible=list(range(4970)), comparison=list(range(4970)),
+            page_size=5000, raw_visible=5000, raw_comparison=5000)
+
+        assert is_floor is True, "raw saturation must win over trimmed lengths"
+
+    def test_the_count_is_membership_not_arithmetic(self):
+        """Equal lengths with different members still means rows were hidden."""
+        from streamselect.gui.main_window_channels import _ChannelListMixin
+
+        n, _ = _ChannelListMixin._hidden_by_axis(
+            visible=[1, 2, 3], comparison=[1, 2, 9], page_size=100)
+
+        assert n == 1, (
+            "a length subtraction reports 0 here; id 9 is present only in the "
+            "comparison and is provably hidden"
+        )
+
+    def test_the_label_marks_a_floor_and_leaves_an_exact_count_alone(self):
+        """"≥ many" rather than quoting many as though it were the total."""
+        from streamselect.gui.main_window_channels import _ChannelListMixin
+
+        assert _ChannelListMixin._count_label(5000, True).startswith("≥")
+        assert "5,000" in _ChannelListMixin._count_label(5000, True)
+        assert _ChannelListMixin._count_label(42, False) == "42"
+        assert "≥" not in _ChannelListMixin._count_label(42, False)
+
+
+# ── every counter reaches the label with its floor flag ─────────────────────
+#
+# The floor labels shipped for search/dead/keywords, but the breakdown call on
+# the path where results EXIST passed none of the flags — so "≥" only ever
+# appeared on the empty-results screen, which is the rarer case by far. The
+# Global-Exclusions counter had no floor concept at all: its page-local
+# subtraction is exact for the rows fetched and blind to every excluded row
+# beyond the cap, yet it rendered as a bare number beside its siblings' "≥".
+
+
+class TestEveryCounterCarriesItsFloor:
+
+    @staticmethod
+    def _breakdown_calls(src):
+        import ast
+        tree = ast.parse(src)
+        return [
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and n.func.attr == "_show_channel_filter_breakdown"
+        ]
+
+    def test_every_multi_axis_breakdown_call_passes_the_floor_flags(self):
+        """Derived: a call rendering all four axes must carry all four flags.
+
+        Single-segment calls (the dormant alert id-filter) are exempt — they
+        pass one literal count and no axis flags apply.
+        """
+        import inspect
+        from streamselect.gui import main_window_channels as mod
+
+        for call in self._breakdown_calls(inspect.getsource(mod)):
+            if len(call.args) < 4:
+                continue  # single-segment id-filter form
+            passed = {k.arg for k in call.keywords}
+            missing = {
+                "hidden_by_exclusions_is_floor",
+                "hidden_by_search_is_floor",
+                "hidden_by_dead_is_floor",
+                "hidden_by_keywords_is_floor",
+            } - passed
+            assert not missing, (
+                f"breakdown call at line {call.lineno} renders four axes but "
+                f"omits {sorted(missing)} — that count will print as exact when "
+                "it is a floor"
+            )
+
+    def test_the_exclusions_label_marks_a_floor(self, qapp):
+        """The rendered string, not just the plumbing."""
+        from streamselect.gui.main_window_channels import _ChannelListMixin
+
+        assert _ChannelListMixin._count_label(5000, True).startswith("≥")
+        assert _ChannelListMixin._count_label(5000, False) == "5,000"
+
+    def test_the_exclusions_counter_is_a_floor_only_when_the_page_saturated(self):
+        """It is exact below the cap; beyond it, excluded rows were never seen."""
+        # The flag is computed as raw_fetched >= page_size at the call site;
+        # assert that relationship directly so a change to either side is caught.
+        for raw, cap, expected in ((4999, 5000, False), (5000, 5000, True),
+                                   (12, 5000, False)):
+            assert (raw >= cap) is expected

@@ -1,0 +1,573 @@
+"""Discover view — shelf widget (header + horizontal scroll row)."""
+
+from __future__ import annotations
+
+import html as _html
+
+from typing import TYPE_CHECKING
+
+from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtWidgets import (
+    QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+)
+
+from streamselect.core.config import Config
+from streamselect.core.discovery_engine import ContentCard
+from streamselect.gui.chunked_construction import ChunkHandle, build_chunked
+from streamselect.gui.discover_card import _ContentCard, card_metrics
+from streamselect.gui.discover_workers import _RECIPE_PREFIX
+from streamselect.gui import cursor_affordance
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+
+if TYPE_CHECKING:
+    from streamselect.core.image_cache import ImageCache
+
+# Cards built per synchronous tick (PERF-17 — the chunker's second adopter;
+# see chunked_construction.py's module docstring, which names Discover as a
+# planned one). No reusable "cards per visible strip" count exists to derive
+# this from: _load_visible() checks each card's x-position against the
+# viewport rather than counting, and the viewport has no measured width yet
+# at the point a shelf's build starts — it runs before the shelf's first
+# layout pass. So this is a fixed floor, not derived geometry: 8 cards covers
+# the first screenful at the default 1.0 zoom (card_w=120 + 8px spacing ≈
+# 128px/card ≈ 1024px), and the on-done _load_visible() call below closes the
+# gap for anything still off-screen once the whole build finishes.
+_CARD_BATCH_SIZE = 8
+
+
+class _Shelf(QWidget):
+    """Header + horizontal scrollable row of content cards.
+
+    Signals emitted to DiscoverView for zone management:
+      pinRequested / unpinRequested — move to/from pinned zone
+      collapseRequested / expandRequested — move to/from collapsed zone
+      hideRequested — remove from view entirely
+      seeAllRequested — open browse drill-down
+      editRequested — a recipe shelf's ✎ click (recipe shelves only)
+    """
+
+    seeAllRequested   = pyqtSignal(str)  # shelf_key
+    pinRequested      = pyqtSignal(str)
+    unpinRequested    = pyqtSignal(str)
+    collapseRequested = pyqtSignal(str)
+    expandRequested   = pyqtSignal(str)
+    hideRequested     = pyqtSignal(str)
+    editRequested     = pyqtSignal(str)  # shelf_key — ✎ click on a recipe shelf
+
+    def __init__(self, title: str, shelf_key: str,
+                 cards: list[ContentCard], image_cache: "ImageCache",
+                 config: Config, pinned: bool = False, collapsed: bool = False,
+                 parent=None) -> None:
+        super().__init__(parent)
+        self._shelf_key = shelf_key
+        # Kept so DiscoverView's shelf filter can match on what the user SEES,
+        # not on the internal key ("collection:Apple+ Kids" vs "Apple+ Kids").
+        self._title = title
+        self._config = config
+        self._image_cache = image_cache
+        # Derived from the key's namespace (never a separate flag threaded
+        # through _ShelfData) — a recipe shelf gets an ✎ edit affordance the
+        # header never shows anyone else.
+        self._is_recipe = shelf_key.startswith(_RECIPE_PREFIX)
+        self._edit_btn: QPushButton | None = None
+        self._cards_widgets: list[_ContentCard] = []
+        self._build_handle: ChunkHandle | None = None  # in-flight chunked card build, if any (PERF-17)
+        self._pinned = pinned
+        self._collapsed = collapsed
+        self._scroll_area: QScrollArea | None = None
+        self._inner_layout = None   # set by _build_ui
+        self._inner_widget = None   # set by _build_ui
+        # List of (on_clicked, on_double_clicked, on_context_menu, on_middle_click)
+        # tuples so set_cards() can wire late-added card widgets to the same slots.
+        self._pending_wires: list[tuple] = []
+        # Loading/error placeholder shown in the card row during a lazy-expand
+        # fetch (header-only shelf with no cards yet); cleared by set_cards().
+        self._placeholder_lbl: QLabel | None = None
+
+        self._build_ui(title, cards, image_cache, config)
+        self._apply_state()
+
+    def _build_ui(self, title: str, cards: list[ContentCard],
+                  image_cache: "ImageCache", config: Config) -> None:
+        vl = QVBoxLayout(self)
+        vl.setContentsMargins(8, 4, 8, 4)
+        vl.setSpacing(4)
+
+        # --- Header row ---
+        header = QHBoxLayout()
+        header.setSpacing(2)
+
+        self._title_lbl = QLabel(f"<b>{title}</b>")
+        _theme.style_fn(self._title_lbl, lambda: f"font-size: {_theme.FONT_XL};")
+        header.addWidget(self._title_lbl)
+        header.addStretch()
+
+        btn_ss = (
+            "QPushButton { background: transparent; border: none; "
+            f"color: {_theme.COLOR_DISABLED}; font-size: {_theme.FONT_MD}; padding: 2px 4px; }}"
+            f"QPushButton:hover {{ color: {_theme.COLOR_TEXT}; }}"
+        )
+
+        self._see_all_btn = QPushButton("See all →")
+        self._see_all_btn.setFlat(True)
+        _theme.style_fn(self._see_all_btn, lambda: f"QPushButton {{ color: {_theme.COLOR_ACCENT_BLUE}; border: none; font-size: {_theme.FONT_MD}; padding: 2px 4px; }}"
+            f"QPushButton:hover {{ color: {_theme.COLOR_ACCENT_HOVER}; }}")
+        self._see_all_btn.clicked.connect(lambda: self.seeAllRequested.emit(self._shelf_key))
+        header.addWidget(self._see_all_btn)
+
+        # ✎ edit — recipe shelves only. The header itself never becomes an
+        # editable title (locked design: stays consistent with every other
+        # shelf); this is the one control that opens the recipe editor.
+        if self._is_recipe:
+            self._edit_btn = QPushButton()
+            self._edit_btn.setFixedSize(24, 22)
+            self._edit_btn.setFlat(True)
+            self._edit_btn.setStyleSheet(btn_ss)
+            _icon_utils.set_button_icon(self._edit_btn, "edit")
+            self._edit_btn.setIconSize(QSize(13, 13))
+            self._edit_btn.setToolTip("Edit this recipe")
+            self._edit_btn.clicked.connect(lambda: self.editRequested.emit(self._shelf_key))
+            header.addWidget(self._edit_btn)
+
+        self._pin_btn = QPushButton()
+        self._pin_btn.setFixedSize(24, 22)
+        self._pin_btn.setFlat(True)
+        self._pin_btn.setStyleSheet(btn_ss)
+        _icon_utils.set_button_icon(self._pin_btn, "pin")
+        self._pin_btn.setIconSize(QSize(13, 13))
+        self._pin_btn.setToolTip("Unpin" if self._pinned else "Pin to top")
+        self._pin_btn.clicked.connect(self._on_pin_clicked)
+        header.addWidget(self._pin_btn)
+
+        self._hide_btn = QPushButton()
+        self._hide_btn.setFixedSize(24, 22)
+        self._hide_btn.setFlat(True)
+        self._hide_btn.setStyleSheet(btn_ss)
+        _icon_utils.set_button_icon(self._hide_btn, "hide")
+        self._hide_btn.setIconSize(QSize(13, 13))
+        self._hide_btn.clicked.connect(lambda: self.hideRequested.emit(self._shelf_key))
+        self._hide_btn.setToolTip("Hide this shelf")
+        header.addWidget(self._hide_btn)
+
+        # collapse_btn is added LAST so it is always the rightmost control.
+        # pin_btn and hide_btn are hover-revealed to its left — this prevents the
+        # expand click target from shifting when the hover controls appear (D3).
+        self._collapse_btn = QPushButton()
+        self._collapse_btn.setFixedSize(24, 22)
+        self._collapse_btn.setFlat(True)
+        self._collapse_btn.setStyleSheet(btn_ss)
+        _icon_utils.set_button_icon(self._collapse_btn, "expand" if self._collapsed else "collapse")
+        self._collapse_btn.setIconSize(QSize(13, 13))
+        self._collapse_btn.setToolTip("Expand" if self._collapsed else "Collapse")
+        self._collapse_btn.clicked.connect(self._on_collapse_clicked)
+        header.addWidget(self._collapse_btn)
+
+        vl.addLayout(header)
+
+        # Make the title label clickable (expands when collapsed)
+        self._title_lbl.mousePressEvent = self._on_title_click
+
+        # --- Horizontal scroll area ---
+        # Height is derived from the zoomed card height so the scroll row scales
+        # with the user's zoom preference — same source-of-truth as _size_card_row().
+        _m = card_metrics(config.discover_zoom)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setFixedHeight(_m.card_h + 16)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        _theme.style(scroll, "DISCOVER_SHELF_SCROLLBAR")
+        self._scroll_area = scroll
+
+        # Paging chevrons, drawn ON the row at its left and right edges.
+        #
+        # macOS renders scrollbars as OVERLAYS: they appear while scrolling and
+        # fade out, so ScrollBarAsNeeded leaves the shelf with no visible
+        # affordance at rest and a scrollable row reads as the whole content.
+        # A real control behaves identically on every platform, which is why
+        # this is a button rather than a forced-visible scrollbar.
+        self._page_left = _icon_utils.icon_button(
+            "nav_prev", "Scroll left", style="DISCOVER_SHELF_PAGE_BTN", px=13, parent=scroll
+        )
+        self._page_right = _icon_utils.icon_button(
+            "nav_next", "Scroll right", style="DISCOVER_SHELF_PAGE_BTN", px=13, parent=scroll
+        )
+        for _btn in (self._page_left, self._page_right):
+            _btn.setFixedWidth(24)
+            _btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            cursor_affordance.set_clickable(_btn)
+            _btn.hide()
+        self._page_left.clicked.connect(lambda: self._page(-1))
+        self._page_right.clicked.connect(lambda: self._page(1))
+        scroll.horizontalScrollBar().valueChanged.connect(self._sync_page_buttons)
+        scroll.horizontalScrollBar().rangeChanged.connect(self._sync_page_buttons)
+
+        inner = QWidget()
+        inner_hl = QHBoxLayout(inner)
+        inner_hl.setContentsMargins(0, 0, 16, 0)
+        inner_hl.setSpacing(8)
+
+        # Assign refs early so _size_card_row() can be called below.
+        self._inner_layout = inner_hl
+        self._inner_widget = inner
+
+        self._size_card_row()  # zero cards yet — chrome must be usable immediately
+        scroll.setWidget(inner)
+        vl.addWidget(scroll)
+
+        scroll.horizontalScrollBar().valueChanged.connect(self._load_visible)
+
+        # Card widgets are the expensive part (DiscoverCard.__init__ — a user-
+        # sampled 3-6s stalls building a shelf's cards synchronously). Chrome
+        # above is already usable; the cards themselves go through the shared
+        # chunked-build mechanism (PERF-17) instead of a straight loop here.
+        self._build_handle = build_chunked(
+            cards,
+            lambda card: self._build_one_card(card, image_cache, config),
+            batch_size=_CARD_BATCH_SIZE,
+            on_done=self._on_cards_built,
+            parent=self,
+        )
+        if not self._collapsed:
+            QTimer.singleShot(120, self._load_visible)
+
+    def _build_one_card(self, card: ContentCard, image_cache: "ImageCache", config: Config) -> None:
+        """``build_chunked``'s per-item callback (PERF-17) — the single place a
+        card widget is built, shared by the initial construction batch and by
+        ``set_cards()``'s re-populate batches.
+
+        Wires the new card to every slot already registered via ``wire()`` —
+        so a card built after ``wire()`` has run still gets connected, without
+        the index-slicing ``set_cards()`` used to do — and keeps the row's
+        measured width in sync (``_size_card_row()``) after every card so a
+        later batch is never laid out into a still-narrower row (see
+        ``_size_card_row``'s docstring).
+        """
+        w = _ContentCard(card, image_cache, config, self._inner_widget)
+        self._inner_layout.addWidget(w)
+        self._cards_widgets.append(w)
+        for on_clicked, on_double_clicked, on_context_menu, on_middle_click in self._pending_wires:
+            w.clicked.connect(on_clicked)
+            w.doubleClicked.connect(on_double_clicked)
+            w.contextMenuRequested.connect(on_context_menu)
+            w.middleClicked.connect(on_middle_click)
+        self._size_card_row()
+
+    def _on_cards_built(self) -> None:
+        """``build_chunked``'s on-done callback: add the trailing stretch (kept
+        off the layout until every card is in, so a later batch never lands
+        AFTER it) and request images for whatever ended up on screen — the
+        single early ``_load_visible()`` call below covers the common case
+        (batch size ≥ the visible strip), this one guarantees completeness on
+        a wide window where the strip holds more than one batch.
+        """
+        self._inner_layout.addStretch()
+        self._size_card_row()
+        if not self._collapsed:
+            self._load_visible()
+
+    def cancel_pending_build(self) -> None:
+        """Stop any in-flight chunked card build (PERF-17).
+
+        Idempotent and safe to call whether or not a build is running — the
+        teardown paths that call this (DiscoverView's shelf-delete/refresh/
+        on_deactivate) may call it more than once, and a finished build has
+        nothing left to cancel.
+        """
+        handle = self.__dict__.get("_build_handle")
+        if handle is not None:
+            handle.cancel()
+
+    def _page(self, direction: int) -> None:
+        """Scroll one viewport-width left (-1) or right (+1).
+
+        A page rather than a fixed number of cards: the card width follows the
+        user's zoom, so a card count would move a different distance at each
+        zoom level while a viewport always lands the next screenful.
+
+        Args:
+            direction: -1 for left, +1 for right.
+        """
+        if self._scroll_area is None:
+            return
+        bar = self._scroll_area.horizontalScrollBar()
+        step = max(1, self._scroll_area.viewport().width() - 40)
+        bar.setValue(bar.value() + direction * step)
+
+    def _sync_page_buttons(self, *_args) -> None:
+        """Show each chevron only while there is room to move that way.
+
+        Hidden at the ends rather than disabled: a dead control on top of
+        artwork reads as part of the card, and the row's own edge already says
+        there is nothing further.
+        """
+        if self._scroll_area is None or "_page_left" not in self.__dict__:
+            return
+        bar = self._scroll_area.horizontalScrollBar()
+        scrollable = bar.maximum() > bar.minimum()
+        self._page_left.setVisible(scrollable and bar.value() > bar.minimum())
+        self._page_right.setVisible(scrollable and bar.value() < bar.maximum())
+        self._place_page_buttons()
+
+    def _place_page_buttons(self) -> None:
+        """Pin the chevrons to the row's left and right edges, vertically centred."""
+        if self._scroll_area is None or "_page_left" not in self.__dict__:
+            return
+        h = max(24, self._scroll_area.viewport().height() // 3)
+        top = (self._scroll_area.viewport().height() - h) // 2
+        self._page_left.setFixedHeight(h)
+        self._page_right.setFixedHeight(h)
+        self._page_left.move(2, top)
+        self._page_right.move(
+            self._scroll_area.viewport().width() - self._page_right.width() - 2, top
+        )
+        self._page_left.raise_()
+        self._page_right.raise_()
+
+    def resizeEvent(self, event):  # noqa: N802 - Qt naming
+        """Re-place the chevrons when the shelf width changes."""
+        super().resizeEvent(event)
+        self._sync_page_buttons()
+
+    def _size_card_row(self) -> None:
+        """Size the inner card row from the zoomed card dimensions (timing-independent).
+
+        Uses deterministic math rather than ``sizeHint()`` so the result is
+        correct whether called from the eager build path or from ``set_cards()``
+        after layout activation.  Both paths converge here and both read the
+        same ``card_metrics(config.discover_zoom)`` helper, eliminating both
+        the smoosh bug (D1) and any card/shelf divergence when zoom changes.
+        """
+        n = len(self._cards_widgets)
+        m = self._inner_layout.contentsMargins()
+        spacing = self._inner_layout.spacing()
+        metrics = card_metrics(self._config.discover_zoom)
+        width = m.left() + m.right() + n * metrics.card_w + max(0, n - 1) * spacing
+        inner_h = metrics.card_h + 4
+        self._inner_widget.setFixedHeight(inner_h)
+        self._inner_widget.resize(width, inner_h)
+
+    def _apply_state(self) -> None:
+        """Sync button icons and scroll-area visibility to current state."""
+        if self._scroll_area is None:
+            return
+        self._scroll_area.setVisible(not self._collapsed)
+        self._see_all_btn.setVisible(not self._collapsed)
+        if self._edit_btn is not None:
+            self._edit_btn.setVisible(not self._collapsed)
+
+        if self._collapsed:
+            _icon_utils.set_button_icon(self._collapse_btn, "expand", color=_theme.COLOR_DIM_2)
+            self._collapse_btn.setToolTip("Expand " + self._title_lbl.text())
+            self._pin_btn.setVisible(False)
+            self._hide_btn.setVisible(False)
+            cursor_affordance.set_clickable(self._title_lbl, True)
+            self.setStyleSheet("")
+        else:
+            _icon_utils.set_button_icon(self._collapse_btn, "collapse", color=_theme.COLOR_DISABLED)
+            self._collapse_btn.setToolTip("Collapse " + self._title_lbl.text())
+            self._pin_btn.setVisible(True)
+            self._hide_btn.setVisible(True)
+            cursor_affordance.set_clickable(self._title_lbl, False)
+            # Clear any collapsed-row hover background left over from expanding
+            # while hovered — leaveEvent's clear is guarded by _collapsed, which
+            # is already False by the time the mouse leaves, so it would stick.
+            self.setStyleSheet("")
+
+        if self._pinned:
+            _icon_utils.set_button_icon(self._pin_btn, "pin", color=_theme.COLOR_GOLD)
+            self._pin_btn.setToolTip("Unpin")
+        else:
+            _icon_utils.set_button_icon(self._pin_btn, "pin", color=_theme.COLOR_TEXT)
+            self._pin_btn.setToolTip("Pin to top")
+
+    def set_collapsed(self, collapsed: bool) -> None:
+        self._collapsed = collapsed
+        self._apply_state()
+        if not collapsed:
+            QTimer.singleShot(120, self._load_visible)
+
+    def set_pinned(self, pinned: bool) -> None:
+        self._pinned = pinned
+        self._apply_state()
+
+    def enterEvent(self, event) -> None:
+        """Reveal pin + hide buttons when hovering a collapsed row."""
+        if self._collapsed:
+            self._pin_btn.setVisible(True)
+            self._hide_btn.setVisible(True)
+            _theme.style_fn(self, lambda: f"QWidget {{ background: {_theme.OVERLAY_18}; border-radius: 4px; }}")
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if self._collapsed:
+            self._pin_btn.setVisible(False)
+            self._hide_btn.setVisible(False)
+        # Always clear the hover background — never guard this on _collapsed, or
+        # a shelf expanded mid-hover keeps the gray strip (the reported bug).
+        self.setStyleSheet("")
+        super().leaveEvent(event)
+
+    def _on_pin_clicked(self) -> None:
+        if self._pinned:
+            self.unpinRequested.emit(self._shelf_key)
+        else:
+            self.pinRequested.emit(self._shelf_key)
+
+    def _on_collapse_clicked(self) -> None:
+        if self._collapsed:
+            self.expandRequested.emit(self._shelf_key)
+        else:
+            self.collapseRequested.emit(self._shelf_key)
+
+    def _on_title_click(self, event) -> None:
+        if self._collapsed:
+            self.expandRequested.emit(self._shelf_key)
+
+    def _load_visible(self) -> None:
+        """Request images for cards currently visible in the scroll viewport."""
+        if self._collapsed or self._scroll_area is None:
+            return
+        vp_w = self._scroll_area.viewport().width()
+        if vp_w == 0:
+            QTimer.singleShot(80, self._load_visible)
+            return
+        scroll_x = self._scroll_area.horizontalScrollBar().value()
+        for card in self._cards_widgets:
+            left = card.x()
+            if left + card.width() >= scroll_x and left <= scroll_x + vp_w:
+                card.request_image()
+
+    def _clear_placeholder(self) -> None:
+        """Remove any loading/error placeholder row from the card row."""
+        if self._placeholder_lbl is not None:
+            self._inner_layout.removeWidget(self._placeholder_lbl)
+            self._placeholder_lbl.deleteLater()
+            self._placeholder_lbl = None
+
+    def set_loading(self) -> None:
+        """Show a muted "Loading…" placeholder while a lazy-expand fetch is in flight.
+
+        User-reported perf bug: expanding/pinning a header-only (not-yet-fetched)
+        shelf used to just sit empty for the 15-20s the old raw_data genre scan
+        took, with no feedback at all.  Called by DiscoverView the instant a
+        card fetch is kicked off (``_start_expand_fetch``); replaced by real
+        cards on success (``set_cards``) or an error row on failure
+        (``show_load_error``).  No-ops if cards are already present.
+        """
+        if self._cards_widgets:
+            return
+        self._clear_placeholder()
+        self._placeholder_lbl = QLabel(f"{_icon_utils.role_html('loading')}&nbsp;Loading…")
+        _theme.style(self._placeholder_lbl, "DISCOVER_SHELF_LOADING")
+        self._inner_layout.insertWidget(0, self._placeholder_lbl)
+
+    def show_load_error(self, message: str = "Couldn't load this shelf") -> None:
+        """Render a visible, non-selectable error row after a failed lazy-expand fetch.
+
+        Per the project rules's async-background-DB-reads rule, a failed background load
+        must never look like a silently-empty result — never ``clear(); return``.
+        """
+        self._clear_placeholder()
+        self._placeholder_lbl = QLabel(f"{_icon_utils.role_html('warning')}&nbsp;{_html.escape(message, quote=False)}")
+        _theme.style(self._placeholder_lbl, "DISCOVER_SHELF_ERROR")
+        self._inner_layout.insertWidget(0, self._placeholder_lbl)
+
+    def set_cards(self, cards: list, image_cache=None, config=None,
+                  replace: bool = False) -> None:
+        """Populate this shelf with *cards* after construction.
+
+        The single card-build path used by both the lazy-expand flow (on a
+        header-only shelf created empty) and the zoom-rebuild flow (``replace``).
+        The existing scroll-area inner widget is reused — cards are added before
+        the trailing stretch, the row is re-sized via ``_size_card_row()``, and
+        the new widgets are wired to any connected slots. This is a
+        re-populate path (PERF-17): card widgets build through the same
+        ``build_chunked`` mechanism as the initial construction batch (see
+        ``_build_one_card``), and any build already in flight is cancelled
+        FIRST, before this one touches the same widgets.
+
+        Args:
+            cards:       The ``ContentCard`` list fetched by ``_ShelfCardsWorker``.
+            image_cache: The ``ImageCache`` instance.  When *None* the instance
+                         stored at construction time is reused (pass it if you
+                         have it, otherwise the shelf stores it).
+            config:      The ``Config`` instance.  Same fallback.
+            replace:     When True, drop any existing card widgets first (used
+                         when re-rendering the same cards at a new zoom level).
+        """
+        if not hasattr(self, "_inner_layout") or self._inner_layout is None:
+            return  # layout not yet built (should not happen in practice)
+
+        self.cancel_pending_build()
+
+        # A successful fetch replaces any loading/error placeholder from a
+        # prior lazy-expand attempt.
+        self._clear_placeholder()
+
+        _ic  = image_cache if image_cache is not None else self._image_cache
+        _cfg = config      if config      is not None else self._config
+
+        if replace:
+            # Zoom rebuild: discard the current card widgets (the trailing
+            # stretch is removed below) before adding the re-sized ones.
+            for w in self._cards_widgets:
+                self._inner_layout.removeWidget(w)
+                w.deleteLater()
+            self._cards_widgets.clear()
+
+        # Remove the trailing stretch so batches can append before it.
+        count = self._inner_layout.count()
+        if count > 0:
+            last = self._inner_layout.itemAt(count - 1)
+            if last and last.spacerItem():
+                self._inner_layout.removeItem(last)
+
+        self._build_handle = build_chunked(
+            cards,
+            lambda card: self._build_one_card(card, _ic, _cfg),
+            batch_size=_CARD_BATCH_SIZE,
+            on_done=lambda: self._on_set_cards_done(_cfg),
+            parent=self,
+        )
+        if not self._collapsed:
+            QTimer.singleShot(120, self._load_visible)
+
+    def _on_set_cards_done(self, config: Config) -> None:
+        """``set_cards()``'s ``build_chunked`` on-done callback.
+
+        Mirrors ``_on_cards_built`` (trailing stretch + a completeness
+        ``_load_visible()`` pass) plus the zoom-rebuild-specific scroll-area
+        resize the eager construction path never needs.
+        """
+        self._inner_layout.addStretch()
+
+        # Re-size the inner widget so the scroll area reflects the true content
+        # width.  Uses the deterministic _size_card_row() helper (same math as
+        # the eager build path) instead of sizeHint() whose value is unreliable
+        # before the layout has fully settled — that was the smoosh bug (D1).
+        self._inner_layout.activate()
+        self._size_card_row()
+
+        # Keep the scroll-area height in sync with the (possibly re-zoomed) cards.
+        if self._scroll_area is not None:
+            self._scroll_area.setFixedHeight(card_metrics(config.discover_zoom).card_h + 16)
+
+        # Completeness pass: guarantees every visible card has requested its
+        # image even on a window wide enough that the visible strip spans
+        # more than one batch (the early singleShot above only covers the
+        # common case).
+        if not self._collapsed:
+            self._load_visible()
+
+    def wire(self, on_clicked, on_double_clicked, on_context_menu, on_middle_click) -> None:
+        self._pending_wires.append(
+            (on_clicked, on_double_clicked, on_context_menu, on_middle_click)
+        )
+        for w in self._cards_widgets:
+            w.clicked.connect(on_clicked)
+            w.doubleClicked.connect(on_double_clicked)
+            w.contextMenuRequested.connect(on_context_menu)
+            w.middleClicked.connect(on_middle_click)

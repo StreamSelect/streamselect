@@ -1,0 +1,630 @@
+"""WeightedTagCloud — a data-driven flow-layout tag cloud widget.
+
+Displays facet values as clickable buttons sized by catalogue weight.  Font
+size is log-bucketed across six tiers defined in theme.FONT_CLOUD_* so the
+full range of counts maps visually to a readable large-to-small gradient.
+
+Public API:
+    set_tags(items, facet_color, facet_name="") -> None
+    tag_clicked = pyqtSignal(str)   # emits the value string
+
+Layout:
+    ┌──────────────────────────────────────┐
+    │ <Facet> · N values · sized by weight │ [Weight ↔ A-Z] [Filter…]
+    ├──────────────────────────────────────┤
+    │  tag₁  tag₂  tag₃  …               │  ← flow layout, wrapping
+    │  [+ N more]                          │
+    └──────────────────────────────────────┘
+
+Top 40 tags are shown by default; "+N more" expands to show all.
+"""
+
+from __future__ import annotations
+
+import html as _html
+
+import math
+
+from loguru import logger
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+from streamselect.gui.flow_layout import FlowContainer
+from streamselect.gui.scoped_filter_box import ScopedFilterBox
+
+def _half_size(font_token: str) -> str:
+    """About half the ROW height (0.6 x the name size), floored at FONT_SM."""
+    def px(tok: str) -> int:
+        return int(str(tok).strip().removesuffix("px") or 0)
+    return f"{max(px(_theme.FONT_SM), round(px(font_token) * 0.6))}px"
+
+
+# Maximum number of tags shown before the "+N more" cap button appears.
+_CAP: int = 40
+
+# ── font-size token ladder ───────────────────────────────────────────────────────
+def _cloud_tokens() -> list[str]:
+    """Font-size token ladder, re-read fresh so a live theme switch applies."""
+    return [
+        _theme.FONT_CLOUD_1,
+        _theme.FONT_CLOUD_2,
+        _theme.FONT_CLOUD_3,
+        _theme.FONT_CLOUD_4,
+        _theme.FONT_CLOUD_5,
+        _theme.FONT_CLOUD_6,
+    ]
+
+
+def _count_to_font_token(count: int, min_count: int, max_count: int) -> str:
+    """Map *count* onto one of the six FONT_CLOUD_* tokens using log scaling.
+
+    When all counts are equal (flat distribution) every tag gets FONT_CLOUD_3
+    (the middle tier).  The log base is chosen so the full min…max spread maps
+    evenly across buckets 0–5.
+
+    Args:
+        count:     The raw catalogue count for this tag.
+        min_count: Minimum count in the current set.
+        max_count: Maximum count in the current set.
+
+    Returns:
+        One of the FONT_CLOUD_* token strings from ``streamselect.gui.theme``.
+    """
+    tokens = _cloud_tokens()
+    n = len(tokens)
+    if max_count <= min_count:
+        # Flat distribution — pick middle tier
+        return tokens[n // 2]
+    # Use log₁₀ to compress the range; clip to [0, n-1]
+    log_min = math.log10(max(1, min_count))
+    log_max = math.log10(max(1, max_count))
+    log_val = math.log10(max(1, count))
+    if log_max == log_min:
+        bucket = n // 2
+    else:
+        fraction = (log_val - log_min) / (log_max - log_min)
+        bucket = min(n - 1, int(fraction * n))
+    return tokens[bucket]
+
+
+def _fmt_count(n: int) -> str:
+    """Format a raw count compactly: 286000 → '286k', 1100 → '1.1k', 240 → '240'.
+
+    Args:
+        n: Non-negative integer count.
+
+    Returns:
+        A short string representation.
+    """
+    if n >= 1_000_000:
+        v = n / 1_000_000
+        return f"{v:.0f}m" if v == int(v) else f"{v:.1f}m"
+    if n >= 1_000:
+        v = n / 1_000
+        return f"{v:.0f}k" if v == int(v) else f"{v:.1f}k"
+    return str(n)
+
+
+# The flow primitive is shared — see flow_layout.FlowContainer. This module used
+# to carry its own copy, whose docstring said so: "the same layout primitive used
+# by discover_card._FlowLayout … We define our own copy here rather than importing
+# the private class from discover_card so this widget has no coupling to the
+# Discover subsystem." Avoiding that coupling was right; a shared module is how.
+
+class _TagButton(QPushButton):
+    """A single tag-cloud button: mark · value count.
+
+    The button is sized by ``font_token`` (one of FONT_CLOUD_1..6); the label
+    text and appearance vary by ``state``.
+
+    Attributes:
+        cloud_visible: Tracks whether this button is logically visible within
+            the cloud (passes filter + within cap).  Used instead of
+            ``isVisible()`` because headless (unshown) Qt widgets always report
+            ``isVisible() == False`` regardless of ``show()``/``hide()`` calls
+            on the child.
+    """
+
+    def __init__(
+        self,
+        value: str,
+        count: int,
+        state: str,
+        font_token: str,
+        facet_color: str,
+        facet_type: str = "",
+        parent: QWidget | None = None,
+        display: str | None = None,
+        facet_label: str = "",
+    ) -> None:
+        super().__init__(parent)
+        self._value = value               # stored identity — emitted on click, never remapped
+        self._facet_type = facet_type     # "" in single-facet mode; set in cross-facet search
+        self.cloud_visible: bool = True   # logical visibility within the cloud
+        # Display label may differ from identity (e.g. content_type slug
+        # "ai_generated" → "AI Generated"); identity stays the queried value.
+        label_value = display if display is not None else value
+
+        # Build label: [mark] value countfmt
+        mark_role = {"include": "tag_include", "exclude": "tag_exclude"}.get(state)
+        self._mark_role = mark_role
+        mark = f"{_icon_utils.role_html(mark_role)}&nbsp;" if mark_role else ""
+
+        # A single title is the common case for people, so "1" is noise; a
+        # bare name means one, and the tooltip still says so.
+        count_str = _fmt_count(count) if count > 1 else ""
+        label = f"{label_value} {count_str}".rstrip()
+        self._label_text = label
+        name_html = f"{mark}{_html.escape(label_value, quote=False)}" if mark else label_value
+        named = f"{label_value} · {facet_label}" if facet_label else label_value
+
+        # State-specific color for the mark character only isn't trivially
+        # achievable via a stylesheet; we colorize the whole button by state
+        # and let the value color dominate.
+        if state == "include":
+            color = _theme.COLOR_OK
+        elif state == "exclude":
+            color = _theme.COLOR_WARN
+        else:
+            color = facet_color
+
+        self.setStyleSheet(
+            f"QPushButton {{ font-size: {font_token}; color: {color};"
+            f" border: 1px solid {_theme.COLOR_BORDER}; border-radius: 4px;"
+            f" padding: 2px 6px; background: transparent; }}"
+            f"QPushButton:hover {{ color: {_theme.COLOR_TEXT_HI};"
+            f" border-color: {_theme.COLOR_BORDER}; background: {_theme.OVERLAY_05}; }}"
+        )
+        self.setToolTip(f"{named} — {count:,} channel{'s' if count != 1 else ''}")
+        if facet_label:
+            # A cross-facet search mixes facets that can share a colour (Cast and
+            # Directing are both blue), so the facet is captioned above the name.
+            self._build_captioned(facet_label, count_str, name_html,
+                                  font_token, color)
+        elif count_str:
+            # The count stays small at the name's top right — at the name's
+            # weighted size "Frank Welker 51" read as one giant label.
+            self._build_counted(count_str, name_html, font_token, color)
+        else:
+            self.setText(label)
+            if mark_role:
+                _icon_utils.set_button_icon(self, mark_role)
+        self.adjustSize()
+
+    def _build_captioned(self, caption: str, count_str: str, label: str,
+                         font_token: str, color: str) -> None:
+        """Lay out a small caps caption row (facet left, count right) above the name.
+
+        The count rides in the caption so it stays small; at the name's weighted
+        font size it read as part of the name.
+        """
+        box = QVBoxLayout(self)
+        box.setContentsMargins(6, 2, 6, 2)
+        box.setSpacing(0)
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        cap = QLabel(caption.upper())
+        num = QLabel(count_str)
+        name = QLabel(label)
+        _theme.style(cap, "RECIPE_ROLE_LABEL")
+        _theme.style(num, "RECIPE_ROLE_LABEL")
+        _theme.style_fn(name, lambda: f"font-size: {font_token}; color: {color};")
+        top.addWidget(cap)
+        top.addStretch()
+        top.addWidget(num)
+        box.addLayout(top)
+        box.addWidget(name)
+        for lbl in (cap, num, name):
+            lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def _build_counted(self, count_str: str, label: str, font_token: str, color: str) -> None:
+        """The name at its weighted size with a small count at its top right."""
+        row = QHBoxLayout(self)
+        row.setContentsMargins(6, 2, 6, 2)
+        row.setSpacing(4)
+        name = QLabel(label)
+        num = QLabel(count_str)
+        _theme.style_fn(name, lambda: f"font-size: {font_token}; color: {color};")
+        # About half the row height, never below the caption size — readable
+        # beside a big name, quiet beside a small one.
+        _theme.style_fn(num, lambda: _theme.RECIPE_ROLE_LABEL
+                        + f" font-size: {_half_size(font_token)};")
+        row.addWidget(name)
+        row.addWidget(num, 0, Qt.AlignmentFlag.AlignTop)
+        for lbl in (name, num):
+            lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+    def sizeHint(self):  # type: ignore[override]
+        """A captioned button sizes to its two-line layout, not its (empty) text."""
+        lay = self.layout()
+        return lay.sizeHint() if lay is not None else super().sizeHint()
+
+    def value(self) -> str:
+        return self._value
+
+    def label_text(self) -> str:
+        """The label's words (value, count), whether plain or captioned; the
+        include/exclude mark is an icon, not text."""
+        return self._label_text
+
+    def mark_role(self) -> str | None:
+        """The include/exclude mark's icon role, or None for a neutral tag."""
+        return self._mark_role
+
+    def facet_type(self) -> str:
+        return self._facet_type
+
+    def set_cloud_visible(self, visible: bool) -> None:
+        """Set both the logical cloud_visible flag and the Qt widget visibility."""
+        self.cloud_visible = visible
+        if visible:
+            self.show()
+        else:
+            self.hide()
+
+
+# ── flow container ────────────────────────────────────────────────────────────────
+
+class _CloudBody(QWidget):
+    """The flow-layout body of the cloud.
+
+    Owns a FlowContainer and reflows on every resize event.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        # cloud_visible is the button's own filtered/unfiltered state, which is
+        # a different question from Qt visibility — so it is passed as the
+        # predicate rather than renamed into the shared default.
+        self._flow = FlowContainer(
+            self, spacing=6, v_spacing=4,
+            is_visible=lambda w: getattr(w, "cloud_visible", True))
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+
+    def flow(self) -> FlowContainer:
+        return self._flow
+
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        h = self._flow.relayout(self.width())
+        self.setFixedHeight(max(1, h))
+
+    def refresh_layout(self) -> None:
+        h = self._flow.relayout(self.width())
+        self.setFixedHeight(max(1, h))
+
+
+# ── main widget ───────────────────────────────────────────────────────────────────
+
+class WeightedTagCloud(QWidget):
+    """Data-driven tag cloud with log-bucketed font sizing.
+
+    Usage:
+        cloud = WeightedTagCloud()
+        cloud.tag_clicked.connect(on_tag)
+        cloud.set_tags(
+            items=[("Action", 1200, "none"), ("Drama", 860, "include"), ...],
+            facet_color=theme.COLOR_ACCENT_TEAL,
+            facet_name="Genre",
+        )
+
+    The widget is stateless about include/exclude logic — it only renders the
+    ``state`` passed in and emits ``tag_clicked`` when a button is activated.
+    The caller is responsible for toggling state and calling ``set_tags`` again.
+
+    Attributes:
+        _tag_buttons: Live list of ``_TagButton`` instances after the last
+            ``set_tags`` call.  Exposed so tests can introspect the rendered
+            cloud without reaching into the widget hierarchy by type.
+    """
+
+    tag_clicked = pyqtSignal(str)         # single-facet mode → emits the value string
+    tag_clicked_facet = pyqtSignal(str, str)  # cross-facet mode → (facet_type, value)
+    # The Filter box's text, so the host can query names beyond the loaded top-N.
+    filter_text_changed = pyqtSignal(str)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._sort_az: bool = False          # False = weight (default), True = A-Z
+        self._filter_text: str = ""
+        # Each item: (value, count, state, color, facet_type).  In single-facet
+        # mode color is the uniform facet color and facet_type is "" (so clicks
+        # emit tag_clicked); in cross-facet search each item carries its own
+        # facet color + facet_type (so clicks emit tag_clicked_facet).
+        self._all_items: list[tuple[str, int, str, str, str]] = []
+        # Optional value → display-label override (identity is unchanged; label only).
+        # Used for content_type slugs (e.g. "ai_generated" → "AI Generated").
+        self._display_map: dict[str, str] = {}
+        # facet_type → display name, named on each button in cross-facet mode.
+        self._facet_labels: dict[str, str] = {}
+        self._facet_color: str = _theme.COLOR_TEXT
+        self._facet_name: str = ""
+        self._cap_expanded: bool = False
+
+        # Public attribute for test introspection
+        self._tag_buttons: list[_TagButton] = []
+
+        self._build_ui()
+
+    # ── public API ────────────────────────────────────────────────────────────
+
+    def set_tags(
+        self,
+        items: list[tuple[str, int, str]],
+        facet_color: str,
+        facet_name: str = "",
+        display_map: dict[str, str] | None = None,
+    ) -> None:
+        """Populate the cloud with a new set of tag items.
+
+        Args:
+            items:       List of ``(value, count, state)`` tuples where
+                         ``state`` is one of ``"none"``, ``"include"``,
+                         ``"exclude"``.
+            facet_color: A theme token value used as the text color for
+                         ``state == "none"`` tags.
+            facet_name:  Optional facet label shown in the header (e.g.
+                         ``"Genre"``).  Falls back to ``""`` when omitted.
+            display_map: Optional ``{value: display_label}`` override so a stored
+                         slug renders a friendly label (content_type
+                         ``"ai_generated"`` → ``"AI Generated"``) while the click
+                         identity stays the original value.  ``None`` → labels are
+                         the values verbatim.
+        """
+        # Normalise to the internal 5-tuple shape: every tag shares the one
+        # facet color and carries no facet_type (so clicks emit tag_clicked).
+        self._all_items = [(v, c, s, facet_color, "") for (v, c, s) in items]
+        self._display_map = display_map or {}
+        self._facet_labels = {}
+        self._facet_color = facet_color
+        self._facet_name = facet_name
+        self._cap_expanded = False   # reset on new data
+
+        self._update_header()
+        self._rebuild_cloud()
+
+    def set_multi_facet_tags(
+        self,
+        items: list[tuple[str, int, str, str, str]],
+        facet_name: str = "",
+        display_map: dict[str, str] | None = None,
+        facet_labels: dict[str, str] | None = None,
+    ) -> None:
+        """Populate the cloud with cross-facet matches, each colored by its facet.
+
+        The cross-facet sibling of :meth:`set_tags`, used by the Recipe builder's
+        Pantry search: the cloud mixes tags from many facets, so each item carries
+        its OWN color and facet_type rather than the single uniform facet color.
+
+        Clicking a tag emits :data:`tag_clicked_facet` ``(facet_type, value)`` so
+        the recipe can add the ingredient under the correct facet — reusing the
+        same include/exclude cycle as the single-facet path, never a parallel one.
+
+        Args:
+            items: List of ``(value, count, state, color, facet_type)`` tuples
+                where ``state`` is ``"none"``/``"include"``/``"exclude"`` and
+                ``color`` is the per-facet theme color token (use
+                ``recipe_view._facet_color(facet_type)``).
+            facet_name: Optional label shown in the header (e.g. the search term).
+            facet_labels: ``{facet_type: display name}`` — each button names
+                its facet, since facets can share a colour.
+        """
+        self._all_items = list(items)
+        self._display_map = display_map or {}
+        self._facet_labels = facet_labels or {}
+        self._facet_color = _theme.COLOR_TEXT   # per-item colors override this
+        self._facet_name = facet_name
+        self._cap_expanded = False   # reset on new data
+
+        self._update_header()
+        self._rebuild_cloud()
+
+    def clear_filter(self) -> None:
+        """Clear the facet-value filter text, restoring the full tag list.
+
+        Routes through ``_on_filter_changed`` → ``_apply_filter`` so the tag
+        visibility is updated in one place (no duplicate filter-apply logic).
+        """
+        self._filter_edit.setText("")
+
+    # ── private: UI construction ──────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(4)
+
+        # Header row
+        header = QWidget()
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(6)
+
+        self._header_lbl = QLabel("")
+        _theme.style(self._header_lbl, "CLOUD_HEADER_LABEL")
+        hl.addWidget(self._header_lbl)
+
+        hl.addStretch()
+
+        # Sort toggle (checkable: unchecked = Weight, checked = A-Z)
+        self._sort_btn = QPushButton("Weight")
+        _icon_utils.set_button_icon(self._sort_btn, "sort")
+        self._sort_btn.setCheckable(True)
+        self._sort_btn.setChecked(False)
+        _theme.style(self._sort_btn, "CLOUD_CTRL_BTN")
+        self._sort_btn.setToolTip(
+            "Sort by catalogue weight (descending count) — click for A-Z sort"
+        )
+        self._sort_btn.toggled.connect(self._on_sort_toggled)
+        hl.addWidget(self._sort_btn)
+
+        # Filter search box
+        self._filter_edit = ScopedFilterBox("Filter…", debounce_ms=0)
+        self._filter_edit.setFixedWidth(120)
+        self._filter_edit.setToolTip("Filter tags by name — live substring match")
+        self._filter_edit.filterChanged.connect(self._on_filter_changed)
+        hl.addWidget(self._filter_edit)
+
+        outer.addWidget(header)
+
+        # Cloud body
+        self._body = _CloudBody()
+        outer.addWidget(self._body)
+
+        # "+N more" cap button (hidden until needed)
+        self._more_btn = QPushButton("")
+        _theme.style(self._more_btn, "CLOUD_MORE_BTN")
+        self._more_btn.cloud_visible = False   # track logical visibility
+        self._more_btn.hide()
+        self._more_btn.clicked.connect(self._on_expand_more)
+        outer.addWidget(self._more_btn)
+
+        # No trailing addStretch(): the cloud now sizes to its own content — the
+        # recipe host gives it a Maximum vertical size policy instead of a tall
+        # stretch=1 slot, so there is no excess vertical space for QVBoxLayout to
+        # smear between the header and the tag body (the old dead gap), and the
+        # freed space goes to the Now-Plating grid below.
+
+    # ── private: header ───────────────────────────────────────────────────────
+
+    def _update_header(self) -> None:
+        n = len(self._all_items)
+        facet = self._facet_name or "Tags"
+        self._header_lbl.setText(
+            f"{facet} · {n} values · sized by catalogue weight"
+        )
+
+    # ── private: sort / filter ────────────────────────────────────────────────
+
+    def _on_sort_toggled(self, checked: bool) -> None:
+        self._sort_az = checked
+        self._sort_btn.setText("A-Z" if checked else "Weight")
+        self._sort_btn.setToolTip(
+            "Sort A-Z — click for weight sort"
+            if checked
+            else "Sort by catalogue weight (descending count) — click for A-Z sort"
+        )
+        self._rebuild_cloud()
+
+    def _on_filter_changed(self, text: str) -> None:
+        self._filter_text = text.strip().lower()
+        self._apply_filter()
+        self.filter_text_changed.emit(text.strip())
+
+    # ── private: cloud building ───────────────────────────────────────────────
+
+    def _sorted_items(self) -> list[tuple[str, int, str, str, str]]:
+        """Return items sorted according to the current sort mode."""
+        if self._sort_az:
+            return sorted(self._all_items, key=lambda t: t[0].lower())
+        return sorted(self._all_items, key=lambda t: t[1], reverse=True)
+
+    def _rebuild_cloud(self) -> None:
+        """Destroy all existing tag buttons and build fresh ones."""
+        self._tag_buttons = []
+        self._body.flow().clear()
+
+        items = self._sorted_items()
+        if not items:
+            self._more_btn.hide()
+            self._body.refresh_layout()
+            return
+
+        counts = [c for _, c, _, _, _ in items]
+        min_count = min(counts)
+        max_count = max(counts)
+
+        for value, count, state, color, facet_type in items:
+            token = _count_to_font_token(count, min_count, max_count)
+            btn = _TagButton(value, count, state, token, color, facet_type=facet_type,
+                             display=self._display_map.get(value),
+                             facet_label=self._facet_labels.get(facet_type, ""))
+            btn.clicked.connect(self._make_click_handler(value, facet_type))
+            self._body.flow().add(btn)
+            self._tag_buttons.append(btn)
+
+        # _apply_filter() calls _update_cap() internally — no need to call it twice.
+        self._apply_filter()
+
+    def _make_click_handler(self, value: str, facet_type: str = ""):
+        """Closure factory so each button captures its own value (+ facet_type).
+
+        A button carrying a ``facet_type`` (cross-facet search) emits
+        ``tag_clicked_facet(facet_type, value)``; a plain single-facet button
+        emits ``tag_clicked(value)``.  Both feed the SAME recipe include/exclude
+        cycle in the host — never a parallel add path.
+        """
+        def _handler() -> None:
+            logger.debug(f"WeightedTagCloud: tag clicked: {value!r} (facet={facet_type!r})")
+            if facet_type:
+                self.tag_clicked_facet.emit(facet_type, value)
+            else:
+                self.tag_clicked.emit(value)
+        return _handler
+
+    def _apply_filter(self) -> None:
+        """Show/hide tag buttons based on current filter text.
+
+        Sets ``cloud_visible`` (logical state) + calls Qt show()/hide() so
+        both headless-test assertions and real Qt layout stay in sync.
+        """
+        q = self._filter_text
+        for btn in self._tag_buttons:
+            matches = (not q) or (q in btn.value().lower())
+            btn.set_cloud_visible(matches)
+        self._update_cap()
+
+    def _update_cap(self) -> None:
+        """Apply the top-40 cap and update the '+N more' button.
+
+        Uses ``cloud_visible`` (not ``isVisible()``) so the cap works
+        correctly in both headless tests and shown windows.
+        """
+        if self._cap_expanded:
+            # Already expanded — ensure all filter-matching buttons are visible
+            self._more_btn.cloud_visible = False
+            self._more_btn.hide()
+            self._body.refresh_layout()
+            return
+
+        filter_visible = [b for b in self._tag_buttons if b.cloud_visible]
+        total_visible = len(filter_visible)
+
+        if total_visible <= _CAP:
+            self._more_btn.cloud_visible = False
+            self._more_btn.hide()
+        else:
+            # Hide overflow buttons (beyond first _CAP within filter-matches)
+            for btn in filter_visible[_CAP:]:
+                btn.set_cloud_visible(False)
+            overflow = total_visible - _CAP
+            self._more_btn.setText(f"+{overflow} more")
+            _icon_utils.set_button_icon(self._more_btn, "show_all")
+            self._more_btn.setToolTip(
+                f"Show all {total_visible} matching tags — {overflow} hidden"
+            )
+            self._more_btn.cloud_visible = True
+            self._more_btn.show()
+
+        self._body.refresh_layout()
+
+    def _on_expand_more(self) -> None:
+        """Reveal all hidden overflow tag buttons."""
+        self._cap_expanded = True
+        q = self._filter_text
+        for btn in self._tag_buttons:
+            # Re-show all buttons that match the current filter
+            if (not q) or (q in btn.value().lower()):
+                btn.set_cloud_visible(True)
+        self._more_btn.cloud_visible = False
+        self._more_btn.hide()
+        self._body.refresh_layout()

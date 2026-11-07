@@ -1,0 +1,1314 @@
+"""Streaming mixin — stream URL validation, failover, and media-launch methods.
+
+Extracted from MainWindow; mixed in via:
+    class MainWindow(_StreamingMixin, QMainWindow): ...
+
+All methods access state set in MainWindow.__init__ via ``self.*``.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+from time import monotonic
+from urllib.parse import urlparse
+
+import html as _html
+
+from loguru import logger
+from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import QApplication
+
+from streamselect.core import epg_utils as _epg
+from streamselect.core.channel_name_utils import parse_channel_name as _pcn
+from streamselect.core.repositories import RepositoryFactory
+from streamselect.core.repositories.provider import persist_url_stats
+from streamselect.gui.stale_source_offer import read_last_refresh, stale_source_offer
+from streamselect.core.stream_diagnostics import _redact, explain_stream_error, is_connection_limit_error
+from streamselect.core.stream_url_derivation import derive_channel_stream_url
+from streamselect.core.url_cycle import UrlCycler, rebase_stream_url
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import playback_start_watch as _startwatch
+from streamselect.gui import stream_capture as _stream_capture
+from streamselect.gui import stream_switch as _stream_switch
+from streamselect.gui.watch_capture import _WatchCaptureMixin
+from streamselect.core.stream_validation import validate_stream_url
+
+
+def format_playback_health(cache_duration_s, cache_speed_bytes, drop_count) -> str:
+    """Build the nav-bar playback-health string.
+
+    e.g. ``"▶ 18s buffer · 6.2 Mbps · 0 drops"``. Missing parts (None) are shown
+    as ``"—"`` but the returned string is always well-formed.
+
+    Args:
+        cache_duration_s: Demuxer cache duration in seconds (mpv
+            ``demuxer-cache-duration``), or None if unavailable.
+        cache_speed_bytes: Network download speed in bytes/sec (mpv
+            ``cache-speed``), or None if unavailable.
+        drop_count: Dropped frame count (mpv ``frame-drop-count``), or None.
+
+    Returns:
+        The composed health string, prefixed with the play glyph.
+    """
+    if cache_duration_s is None:
+        buffer_part = "—s buffer"
+    else:
+        buffer_part = f"{int(round(cache_duration_s))}s buffer"
+
+    if cache_speed_bytes is None:
+        speed_part = "— Mbps"
+    else:
+        mbps = cache_speed_bytes * 8 / 1e6
+        speed_part = f"{mbps:.1f} Mbps"
+
+    if drop_count is None:
+        drops_part = "— drops"
+    else:
+        drops_part = f"{int(drop_count)} drops"
+
+    return " · ".join((buffer_part, speed_part, drops_part))
+
+
+class _StreamingMixin(_WatchCaptureMixin):
+    """Mixin providing stream URL validation, failover, and player-launch methods."""
+
+    def validate_stream_url(self, url: str, timeout: int = 5) -> tuple[bool, str | None]:
+        """See ``core.stream_validation.validate_stream_url``."""
+        return validate_stream_url(url, timeout)
+
+    def validate_and_failover_stream_url(
+        self,
+        stream_url: str,
+        provider_id: str,
+    ) -> tuple[str, str | None]:
+        """Validate stream URL and try alternate provider URLs if needed.
+
+        Returns ``(working_url, error_message)``.
+        ``working_url`` is empty when all URLs fail; ``error_message`` is the
+        server-provided text (e.g. "This channel is not available"), the last
+        advisory error seen (e.g. "HTTP 403") so the failure toast can still
+        offer "Play Anyway", or None.
+        """
+        t0 = monotonic()
+        ok, err_msg = self.validate_stream_url(stream_url)
+        primary_ms = int((monotonic() - t0) * 1000)
+        if ok:
+            return stream_url, None
+
+        logger.warning(f"Primary URL failed validation: {stream_url}")
+
+        # A genuine server text error ("This channel is not available") is
+        # content-level — stop. Advisory auth/gating codes (401/403/511) and
+        # timeouts are HOST-level and say nothing about the next host.
+        if err_msg and not self._is_advisory_error(err_msg):
+            return "", err_msg
+
+        parsed = urlparse(stream_url)
+        original_base = f"{parsed.scheme}://{parsed.netloc}"
+
+        with self.db.session_scope(commit=False) as session:
+            repos = RepositoryFactory(session)
+            provider_db = repos.providers.get_by_id(provider_id)
+
+            if not provider_db:
+                logger.error(f"Provider not found: {provider_id}")
+                return "", None
+
+            provider_model = repos.providers.to_model(provider_db)
+
+        # A single-URL provider has nothing to fail over TO — a host-level failure
+        # proves nothing about the only address, so skip record_failure; the
+        # playback-start watch still reports a truly dead stream.
+        # has_alternate() lives inside the UrlCycler chokepoint (the ordered_urls
+        # drift guard forbids it elsewhere) and records nothing — Case 6 holds.
+        alt = UrlCycler(provider_model, "resolve_playable_url").has_alternate(original_base)
+        if not alt:
+            logger.info(f"pre-flight inconclusive on the only URL — letting mpv decide: {stream_url}")
+            return stream_url, err_msg or None
+
+        # Persisted after every attempt so a stat write survives even a later raise.
+        cycler = UrlCycler(provider_model, "resolve_playable_url")
+
+        # Recorded now that a comparison host exists — a chronically-timing-
+        # out primary used to keep health=1.00 forever (a user's log).
+        cycler.record_failure(
+            original_base, err_msg or "validation failed", response_time_ms=primary_ms
+        )
+        if cycler.dirty:
+            persist_url_stats(self.db, provider_model)
+
+        candidate_bases = [u for u in cycler.candidates() if u.rstrip('/') != original_base]
+
+        if not candidate_bases:
+            logger.warning(f"Provider {provider_model.name} has no alternate URLs configured")
+            logger.error("No working alternate URLs found")
+            return "", None
+
+        logger.info(f"Trying {len(candidate_bases)} alternate URL(s) for {provider_model.name} (reliability order)")
+
+        last_advisory_err: str | None = None
+        for alt_base in candidate_bases:
+            if self._shutting_down:
+                logger.info("Abandoning URL failover — application is shutting down")
+                return "", None
+
+            new_stream_url = self.reconstruct_stream_url(stream_url, original_base, alt_base)
+            logger.info(f"Trying: {new_stream_url}")
+
+            t0 = monotonic()
+            alt_ok, alt_err = self.validate_stream_url(new_stream_url)
+            elapsed_ms = int((monotonic() - t0) * 1000)
+            if alt_ok:
+                logger.info("Alternate URL validated successfully")
+                cycler.record_success(alt_base, response_time_ms=elapsed_ms)
+                if cycler.dirty:
+                    persist_url_stats(self.db, provider_model)
+                return new_stream_url, None
+            else:
+                cycler.record_failure(alt_base, alt_err or "validation failed", response_time_ms=elapsed_ms)
+                if cycler.dirty:
+                    persist_url_stats(self.db, provider_model)
+                # Only a genuine server text error stops the sweep. An advisory
+                # auth/gating code means "this host said no", not "this content
+                # is gone" — the next host frequently serves it.
+                if alt_err and not self._is_advisory_error(alt_err):
+                    return "", alt_err
+                if alt_err:
+                    last_advisory_err = alt_err
+
+        logger.error("No working alternate URLs found")
+        return "", last_advisory_err
+
+    def reconstruct_stream_url(self, original_url: str, old_base: str, new_base: str) -> str:
+        """Reconstruct stream URL with new base domain — see url_cycle.rebase_stream_url."""
+        return rebase_stream_url(original_url, old_base, new_base)
+
+    def play_media(
+        self,
+        channel,
+        force_new_window: bool = False,
+        open_ended_buffer: bool = False,
+        deep_buffer: bool = False,
+        start_override: int | None = None,
+    ):
+        """Play a media item (live stream or movie) in external player.
+
+        Returns immediately — validation and failover happen in a background
+        thread via ``self.executor``; ``_on_stream_ready`` (main-thread slot)
+        finishes the launch once the result arrives.
+
+        Args:
+            channel: Channel DTO / ORM object with ``stream_url``, ``name``,
+                ``provider_id``, etc.
+            force_new_window: Key by provider_id regardless of the
+                ``split_streams_by_source`` toggle — "Play in New Window".
+            open_ended_buffer: Large disk-backed cache (2 GiB / 3600s readahead)
+                instead of the configured buffer profile, to ride out an
+                unstable stream.
+            deep_buffer: VOD-only (menu-gated) — also records the raw stream
+                via ``--stream-record`` ("Buffer without limit"); wins over
+                ``open_ended_buffer`` if both set (see ``MPVPlayer.play``).
+            start_override: Forces the seek position regardless of
+                ``config.playback_resume_mode``/saved progress — ``0`` = from
+                the start, a positive int = that second, ``None`` = default.
+        """
+        channel_id = channel.id
+
+        # Prevent double-clicks while loading
+        if channel_id in self.loading_channels:
+            logger.info(f"Channel {channel_id} is already loading, ignoring double-click")
+            self.status("Already loading this channel...", ms=0)
+            return
+
+        self.loading_channels.add(channel_id)
+
+        # DB-2: derive fresh (current best host) rather than trust the stored column.
+        stream_url = derive_channel_stream_url(self.db, channel) or channel.stream_url
+        if not stream_url:
+            logger.error(f"Channel {channel.name} has no stream URL")
+            self.status(f"Error: No stream URL for {channel.name}", ms=0, level="error")
+            self.loading_channels.discard(channel_id)
+            return
+
+        if not self.player_manager.is_available():
+            logger.error("No media player available")
+            self.status("Error: No media player found. Please install mpv.", ms=0, level="error")
+            self.loading_channels.discard(channel_id)
+            return
+
+        # Show loading notification (must be main thread — creates QTimer)
+        notif_id = self.notification_manager.show(
+            title="Loading Stream", message=f"Buffering {channel.name}...",
+            type="info", auto_dismiss_ms=5000)
+
+        logger.info("=== Playing Channel ===")
+        logger.info(f"Name: {channel.name}")
+        logger.info(f"Media Type: {channel.media_type}")
+        logger.info(f"Stream URL: {stream_url}")
+        logger.info(f"Player: {self.player_manager.get_player_name()}")
+
+        # Resume position: start_override > config.playback_resume_mode > 0. Live/no-
+        # progress VOD always starts at 0. watch_completed is deliberately not checked —
+        # the write-side invariant (record_watch_progress) guarantees progress > 0 implies
+        # not completed, which also heals legacy rows stuck from before that fix.
+        from streamselect.core.models import MediaType
+        is_live = (channel.media_type == MediaType.LIVE)
+        watch_progress = int(getattr(channel, "watch_progress", 0) or 0)
+
+        if start_override is not None:
+            # Explicit per-play override wins unconditionally (but still 0 for live).
+            start_seconds = start_override if not is_live else 0
+        elif not is_live and watch_progress > 0:
+            # VOD with a saved resume position: apply the user's default mode.
+            resume_mode = getattr(self.config, "playback_resume_mode", "resume")
+            start_seconds = watch_progress if resume_mode == "resume" else 0
+        else:
+            start_seconds = 0
+
+        # Claim the source BEFORE the probe below — validate_stream_url opens a
+        # provider connection the accountant cannot see (ConnectionAccountant.
+        # PROVIDER_COOLDOWN_S has the measurements).
+        self.player_manager.claim_for_playback(channel.provider_id)
+
+        # PLAY-10: a window already running THIS provider is standing proof the
+        # source is reachable right now — see gui/stream_switch.py. Recorded on
+        # self for the watchdog (playback_start_watch) to name the real cause
+        # if a one-connection source still takes a moment to free its slot.
+        switch_key = self.player_manager.resolve_key(channel.provider_id, force_new_window)
+        switch_ctx = _stream_switch.switch_context(
+            self.player_manager, self.player_manager.connection_accountant,
+            channel.provider_id, switch_key)
+        self._switch_same_provider = switch_ctx.same_provider
+        if switch_ctx.same_provider and switch_ctx.one_connection:
+            pname = self._provider_display_name(channel.provider_id)
+            self.status(
+                f"Switching on {pname} — the source may count the previous "
+                "stream for a few seconds…", ms=0, level="warn")
+
+        # Off-load network validation + failover to the shared executor.
+        # _on_stream_ready (connected in MainWindow.__init__) fires on the main thread.
+        self.executor.submit(
+            self._bg_validate_and_play,
+            channel_id,
+            channel.name,
+            stream_url,
+            channel.provider_id,
+            notif_id,
+            force_new_window,
+            start_seconds,
+            open_ended_buffer,
+            deep_buffer, getattr(channel, "event_start_time", None),
+            switch_ctx,
+        )
+
+    # ── Auth/gating HTTP codes that are treated as uncertain (advisory, not hard) ──
+    # mpv negotiates differently from requests — a pre-flight HTTP 511 or 403 that
+    # signals a shared-account cap may still play fine in mpv.  These codes always
+    # surface "Play Anyway" rather than suppressing the stream silently.
+    _ADVISORY_HTTP_CODES: frozenset[int] = frozenset({401, 403, 511})
+
+    def _is_advisory_error(self, stream_err: str) -> bool:
+        """Return True if *stream_err* is an uncertain pre-flight error code.
+
+        Advisory errors offer "Play Anyway" in the failure toast; its one real
+        consumer is the failover sweep, which keeps trying sibling sources on
+        an advisory verdict. They are recorded like any other failure
+        (unconditional since an earlier change).
+
+        Args:
+            stream_err: The error string from ``validate_stream_url``, e.g.
+                ``"HTTP 511"`` or a server-supplied text message.
+
+        Returns:
+            ``True`` when the error is a known advisory HTTP status code.
+        """
+        if not stream_err:
+            return False
+        for code in self._ADVISORY_HTTP_CODES:
+            if stream_err == f"HTTP {code}":
+                return True
+        return False
+
+    def _reports_one_connection(self, provider_id: str) -> bool:
+        """``ProviderRepository.reports_one_connection``, off the main thread (D61)."""
+        try:
+            with self.db.session_scope(commit=False) as session:
+                return RepositoryFactory(session).providers.reports_one_connection(provider_id)
+        except Exception as e:
+            logger.warning(f"Could not read the connection limit for {provider_id}: {e}")
+            return False
+
+    def _bg_validate_and_play(
+        self,
+        channel_id: str,
+        channel_name: str,
+        stream_url: str,
+        provider_id: str,
+        notif_id: str,
+        force_new_window: bool = False,
+        start_seconds: int = 0,
+        open_ended_buffer: bool = False,
+        deep_buffer: bool = False,
+        event_start_time=None,   # the channel's event_start_time, or None
+        switch_context: "_stream_switch.SwitchContext | None" = None,
+    ) -> None:
+        """Worker: validate + failover (same-source, then cross-source siblings).
+
+        Phase 0 — a same-provider switch (PLAY-10), or any play on a
+        one-connection source (D61): the probe/failover below would only cost
+        a connection the source has not reaped yet, so both phases are skipped
+        and the URL is rewritten onto the live host when that is safer
+        (``gui.stream_switch.prefer_live_host``). Measured on one source: 5 of 36
+        probed fresh plays refused, 0 of 21 unprobed switches (ledger D61).
+        Phase 1 — same-source: validate the primary URL, else cycle the
+        provider's alternates (``validate_and_failover_stream_url``).
+        Phase 2 — cross-source siblings sharing the ``content_key``
+        (``get_content_key_siblings``), tried in ranked order; the first that
+        validates wins silently. On total failure the payload carries the
+        original URL and the sibling alternatives for the failure toast.
+        Runs in ``self.executor``; touches no widget — ``_on_stream_ready`` does.
+        """
+        # ── Phase 0: same-provider switch or one-connection source — no probe ─
+        same_provider = switch_context is not None and switch_context.same_provider
+        if same_provider or self._reports_one_connection(provider_id):
+            logger.info("same-provider switch: probe skipped" if same_provider
+                        else "one-connection source: probe skipped")
+            final_url = stream_url
+            try:
+                with self.db.session_scope(commit=False) as session:
+                    repos = RepositoryFactory(session)
+                    provider_db = repos.providers.get_by_id(provider_id)
+                    if provider_db:
+                        provider_model = repos.providers.to_model(provider_db)
+                        final_url = _stream_switch.prefer_live_host(
+                            stream_url, switch_context.live_base_url if switch_context else None,
+                            provider_model)
+            except Exception as e:
+                logger.warning(f"same-provider switch: host lookup failed: {e}")
+            self._stream_ready.emit({
+                "ok": True, "channel_id": channel_id, "channel_name": channel_name,
+                "original_url": stream_url, "final_url": final_url, "stream_err": "",
+                "notif_id": notif_id, "provider_id": provider_id,
+                "force_new_window": force_new_window, "start_seconds": start_seconds,
+                "open_ended_buffer": open_ended_buffer, "deep_buffer": deep_buffer,
+                "siblings": [], "event_start_time": event_start_time,
+                "probe_skipped": True,
+            })
+            return
+
+        # ── Phase 1: same-source validate + failover ────────────────────────
+        try:
+            final_url, stream_err = self.validate_and_failover_stream_url(
+                stream_url, provider_id
+            )
+        except Exception as e:
+            logger.error(f"Error in _bg_validate_and_play phase 1: {e}")
+            final_url, stream_err = "", str(e)
+
+        if final_url:
+            # A failover that switched hosts must stick to THIS item — otherwise every
+            # future play re-starts from the dead host and re-pays the validation stall.
+            # Only the played item's own row is touched (never provider-wide; see
+            # UrlCycler for the general "stop trying the bad host" ranking fix).
+            if final_url != stream_url:
+                try:
+                    with self.db.session_scope() as session:
+                        RepositoryFactory(session).channels.update_stream_url(channel_id, final_url)
+                    logger.info(f"Failover stuck for channel {channel_id}: {_redact(final_url)}")
+                except Exception as e:
+                    logger.warning(f"Failed to persist failover URL for channel {channel_id}: {e}")
+            self._stream_ready.emit({
+                "ok": True, "channel_id": channel_id, "channel_name": channel_name,
+                "original_url": stream_url, "final_url": final_url, "stream_err": "",
+                "notif_id": notif_id, "provider_id": provider_id,
+                "force_new_window": force_new_window, "start_seconds": start_seconds,
+                "open_ended_buffer": open_ended_buffer, "deep_buffer": deep_buffer,
+                "siblings": [], "event_start_time": event_start_time,
+            })
+            return
+
+        # ── Phase 2: cross-source sibling failover ───────────────────────────
+        siblings: list[dict] = []
+        content_key: str = ""
+        try:
+            with self.db.session_scope(commit=False) as session:
+                from streamselect.core.repositories import RepositoryFactory as _RF
+                ch = session.get(
+                    __import__("streamselect.core.database", fromlist=["ChannelDB"]).ChannelDB,
+                    channel_id,
+                )
+                if ch:
+                    content_key = ch.content_key or ""
+                if content_key:
+                    all_siblings = _RF(session).channels.get_content_key_siblings(
+                        content_key, channel_id
+                    )
+                    siblings = all_siblings   # includes inactive — failure toast shows them
+                    active_siblings = [s for s in all_siblings if s.get("is_active")]
+                    if is_connection_limit_error(stream_err):  # account full: only ANOTHER source's copy can play
+                        active_siblings = [s for s in active_siblings if s.get("provider_id") != provider_id]
+                    # Try active siblings in ranked order (up to 3 attempts)
+                    for sib in active_siblings[:3]:
+                        sib_url = sib.get("stream_url") or ""
+                        if not sib_url:
+                            continue
+                        sib_ok, _sib_err = self.validate_stream_url(sib_url)
+                        if sib_ok:
+                            # Sibling works — emit success using the sibling's provider_id
+                            self._stream_ready.emit({
+                                "ok": True, "channel_id": sib["id"],
+                                "channel_name": channel_name,   # keep user-facing name
+                                "original_url": stream_url, "final_url": sib_url,
+                                "stream_err": "", "notif_id": notif_id,
+                                "provider_id": sib["provider_id"],
+                                "force_new_window": force_new_window,
+                                "start_seconds": start_seconds,
+                                "open_ended_buffer": open_ended_buffer,
+                                "deep_buffer": deep_buffer, "siblings": [],
+                                "sibling_failover": True,   # for status-bar annotation
+                                "sibling_name": sib.get("name", ""),
+                                "event_start_time": event_start_time,
+                            })
+                            return
+        except Exception as e:
+            logger.warning(f"Error in _bg_validate_and_play phase 2 (sibling failover): {e}")
+            siblings = []
+
+        # ── Total failure — emit for the failure toast ───────────────────────
+        provider_last_refresh = read_last_refresh(self.db, provider_id)  # STALE-1, off-thread
+        self._stream_ready.emit({
+            "ok": False, "channel_id": channel_id, "channel_name": channel_name,
+            "original_url": stream_url, "final_url": "", "stream_err": stream_err or "",
+            "notif_id": notif_id, "provider_id": provider_id,
+            "force_new_window": force_new_window, "start_seconds": start_seconds,
+            "open_ended_buffer": open_ended_buffer, "deep_buffer": deep_buffer,
+            "siblings": siblings,   # list of dicts for the failure toast
+            "event_start_time": event_start_time,
+            "provider_last_refresh": provider_last_refresh,
+        })
+
+    def _on_stream_ready(self, data: dict) -> None:
+        """Main-thread slot: finish player launch or show error after validation.
+
+        Deduplication: the same channel_id can race through multiple failover
+        attempts.  We track the most-recently-shown failure notif per channel so
+        duplicate toasts are dismissed before a new one is shown (one toast only).
+        """
+        if "_stream_fail_notifs" not in self.__dict__:
+            self._stream_fail_notifs: dict[str, str] = {}  # channel_id → notif_id
+
+        channel_id = data["channel_id"]
+        channel_name = data.get("channel_name", "")
+        final_url = data.get("final_url", "")
+        original_url = data.get("original_url", "")
+        stream_err = data.get("stream_err", "")
+        notif_id = data.get("notif_id", "")
+        siblings: list[dict] = data.get("siblings", [])
+
+        if not data.get("ok"):
+            logger.error(f"All stream URLs failed validation for {channel_name}")
+            self.status(f"Error: Stream unavailable for {channel_name}", ms=0, level="error")
+            prestart = _startwatch.prestart_detail(data.get("event_start_time"), _epg.now_utc())
+            detail = (prestart or explain_stream_error(stream_err)
+                      or "All URLs failed (possibly geo-blocked)")
+            self.notification_manager.dismiss(notif_id)
+            # Dismiss any prior failure toast for this channel (deduplicate)
+            prior_fail_notif = self._stream_fail_notifs.pop(channel_id, None)
+            if prior_fail_notif:
+                self.notification_manager.dismiss(prior_fail_notif)
+
+            _p = _pcn(channel_name)
+            _display = _p.bare_name or channel_name
+
+            _pid = data.get("provider_id")
+            _hint, _refresh_action = stale_source_offer(   # STALE-1: pure, DB read was off-thread
+                self._provider_display_name, lambda p: self.refresh_provider(p), _pid,
+                data.get("provider_last_refresh", "unknown"), datetime.now())
+            if _hint:
+                detail = f"{detail}\n{_hint}"
+            # Build actions: always Copy Error; advisory → Play Anyway; siblings → extra
+            actions = []
+
+            # Play Anyway — for advisory (auth/gating) errors, and as a general
+            # escape hatch letting the user override the pre-flight check.
+            _fnw = data.get("force_new_window", False)
+            _cid = channel_id
+            actions.append((
+                "Play Anyway",
+                lambda _url=original_url, _name=channel_name, _p=_pid, _fnw=_fnw, _c=_cid:
+                    self._play_and_record(_url, _name, _p, _fnw, _c)
+            ))
+
+            # Active sibling sources — each gets an "Also on X" action (up to 3)
+            active_sibs = [s for s in siblings if s.get("is_active")]
+            for sib in active_sibs[:3]:
+                sib_name = sib.get("name", "")
+                sib_url = sib.get("stream_url") or ""
+                sib_pid = sib.get("provider_id")
+                sib_label = f"Try {sib.get('detected_prefix') or sib.get('detected_region') or sib_name}"
+                if not sib_url:
+                    continue
+                _sib_cid = sib.get("id") or ""
+                actions.append((
+                    sib_label,
+                    lambda _u=sib_url, _n=channel_name, _p=sib_pid, _fnw=_fnw, _c=_sib_cid:
+                        self._play_and_record(_u, _n, _p, _fnw, _c)
+                ))
+
+            # Inactive sibling sources (offer reactivate + play)
+            inactive_sibs = [s for s in siblings if not s.get("is_active")]
+            for sib in inactive_sibs[:2]:
+                sib_name = sib.get("name", "")
+                sib_url = sib.get("stream_url") or ""
+                sib_pid = sib.get("provider_id")
+                sib_prefix = sib.get("detected_prefix") or sib.get("detected_region") or ""
+                if not sib_url or not sib_pid:
+                    continue
+                label = f"Reactivate & play {sib_prefix or sib_name}"
+                _sib_reactivate_cid = sib.get("id") or ""
+                actions.append((
+                    label,
+                    lambda _pid=sib_pid, _u=sib_url, _n=channel_name, _fnw=_fnw,
+                           _c=_sib_reactivate_cid:
+                        self._reactivate_and_play_sibling(_pid, _u, _n, _fnw, _c)
+                ))
+
+            if _refresh_action:
+                actions.append(_refresh_action)
+            actions.append(
+                ("Copy Error", lambda n=channel_name, u=original_url, d=detail:
+                    QApplication.clipboard().setText(f"{n}\nURL: {u}\nError: {d}"))
+            )
+
+            fail_notif_id = self.notification_manager.show(
+                title="Stream Unavailable",
+                message=f"{_display}\n{detail}",
+                type="error",
+                dismissible=True,
+                auto_dismiss_seconds=None,
+                actions=actions,
+            )
+            self._stream_fail_notifs[channel_id] = fail_notif_id
+
+            # Record every failure — advisory (401/403/511) included — in the
+            # retry checker's ledger (roadmap S3, an earlier change). This deliberately
+            # revisits the prior "advisory errors never enter the ledger"
+            # exclusion: the motivating case (dead XMAS-style channels that
+            # return 511 forever) never graduated to "dead" under the old
+            # gate, since 511 is advisory and was skipped here entirely.
+            if hasattr(self, "stream_retry_manager"):
+                self.stream_retry_manager.add_failure(
+                    channel_id, channel_name, original_url, detail
+                )
+            self.loading_channels.discard(channel_id)
+            return
+
+        if data.get("sibling_failover"):
+            sib_label = data.get("sibling_name", "")
+            logger.info(f"Cross-source failover: using sibling {sib_label!r}")
+            self.status(f"Switched to alternate source for {channel_name}…", ms=0)
+        elif data.get("probe_skipped"):
+            logger.info(f"Skipped the pre-play probe for {channel_name}")
+        elif final_url != original_url:
+            logger.info(f"Using failover URL: {final_url}")
+
+        self.status(f"Loading: {channel_name}...", ms=0)
+
+        force_new_window = data.get("force_new_window", False)
+        open_ended_buffer = bool(data.get("open_ended_buffer", False))
+        deep_buffer = bool(data.get("deep_buffer", False))
+        start_seconds = int(data.get("start_seconds", 0) or 0)
+        if start_seconds:
+            logger.info(f"Resuming {channel_name} at {start_seconds}s")
+        if open_ended_buffer:
+            logger.info(f"Open-ended buffer mode for {channel_name}")
+        if deep_buffer:
+            logger.info(f"Deep-cache buffer mode for {channel_name}")
+        if self._play_checked(
+            final_url, channel_name,
+            provider_id=data.get("provider_id"),
+            force_new_window=force_new_window,
+            start_seconds=start_seconds,
+            open_ended_buffer=open_ended_buffer,
+            deep_buffer=deep_buffer,
+            channel_id=channel_id,
+        ):
+            # Playback-health readout; order load-bearing (PLAY-15): arm
+            # clears the pending record, _record_play below fills it.
+            self._start_playback_health(_startwatch.PlayAttempt(
+                channel_id, channel_name, final_url, start_seconds, data.get("event_start_time"),
+                provider_id=data.get("provider_id")))
+            # Record playback through the one helper, so this path and the
+            # escape hatches (Play Anyway, "Try <source>") cannot drift on what
+            # a play is worth recording.
+            self._record_play(channel_id, data.get("provider_id"),
+                              force_new_window)
+            _watch_key = self.player_manager.resolve_key(
+                data.get("provider_id"), force_new_window
+            )
+
+            # Update UI lists in real-time (main thread). History always changes
+            # (the play IS the new entry); Favorites/Queue only if this channel
+            # is IN them, so they are asked first — they used to rebuild every
+            # row on every play (user report: "the watch queue completely reloads when
+            # switching content not even in the watch queue"). Same grain as
+            # _remove_sidebar_row, the deletion half of the same complaint.
+            if self._sidebar_shows_channel("favorites", channel_id):
+                self.load_favorites()
+            if self._sidebar_shows_channel("queue", channel_id):
+                self._refresh_queue_section()
+
+            # Warm the source-glyph cache so the health readout can label which
+            # stream its data refers to (one trivial PK read per new source).
+            pid = data.get("provider_id")
+            if pid and pid not in self._provider_icons:
+                self._provider_icons[pid] = self._lookup_provider_icon(pid)
+        else:
+            logger.error(f"Failed to play: {channel_name}")
+            self.status(f"Error playing: {channel_name}", ms=0, level="error")
+            # Deep-cache can refuse the launch outright (cap/disk preflight) rather
+            # than falling back silently — surface that specific reason as a toast
+            # when one was set, instead of the generic "Error playing" status text.
+            if deep_buffer:
+                refusal = getattr(self.player_manager.player, "last_deep_cache_message", "")
+                if refusal:
+                    self.notification_manager.show(
+                        title="Buffer Without Limit Unavailable",
+                        message=refusal,
+                        type="warning",
+                        auto_dismiss_ms=8000,
+                    )
+
+        QTimer.singleShot(3000, lambda: self.loading_channels.discard(channel_id))
+
+    def _record_play(self, channel_id: str, provider_id: str | None,
+                      force_new_window: bool = False, record_only: bool = False) -> None:
+        """Record a play: the DB write, watch capture, and History.
+
+        ONE copy of this sequence for CHANNEL-shaped plays (any ``ChannelDB``
+        row); "Play Anyway"/"Try <source>"/reactivate-and-play route through
+        ``_play_and_record`` (never standalone). Episode playback's analogue
+        is ``_record_episode_play`` (``main_window_series_playback.py``);
+        Play-All records both, per item, via ``record_only`` below.
+
+        PLAY-15: unless ``record_only``, the write is deferred to
+        ``host._pending_play_record``, committed once the watch sees
+        progress (``on_loaded_tick``) — never counted however many retries.
+
+        Args:
+            channel_id: Channel actually launched. No-op when empty.
+            provider_id: Its provider, for resolving the player-instance key.
+            force_new_window: Whether a second window was opened.
+            record_only: D53 — Play-All owns ``_watch_tracking`` for this key
+                and records immediately (its launch confirmation IS the
+                progress signal); ``key=None`` skips per-entry tracking.
+        """
+        if not channel_id:
+            return
+        try:
+            if "_watch_tracking" not in self.__dict__:
+                self._watch_tracking = {}
+            key = self.player_manager.resolve_key(provider_id, force_new_window)
+            # The notifier _bg_mark_played emits on must exist before the
+            # worker can emit into it — arm watch-capture BEFORE submitting/
+            # deferring the write. History refreshes only after the write
+            # commits (HIST-1's _on_history_changed), never synchronously here.
+            self._start_watch_capture()
+            if record_only:
+                self.executor.submit(self._bg_mark_played, channel_id, None)
+            else:
+                self._pending_play_record = lambda: self.executor.submit(
+                    self._bg_mark_played, channel_id, key)
+            if "_playing_channels" not in self.__dict__:
+                self._playing_channels: dict[str, str] = {}
+            self._playing_channels[key] = channel_id
+            self.__dict__.get("_playing_episodes", {}).pop(key, None)   # a channel replaced it
+        except Exception:
+            # Never let bookkeeping cost the user the stream they just started.
+            logger.exception("could not record play for {}", channel_id)
+
+    def _play_and_record(
+        self, url: str, name: str, provider_id: str | None,
+        force_new_window: bool, channel_id: str,
+    ) -> bool:
+        """The escape hatches' one launch-and-record seam — none of them go
+        through ``_on_stream_ready``, so none arm the watch on their own, and
+        PLAY-15 defers ``_record_play``'s write until it does. Also gives
+        "Play Anyway" the never-started report it never had. Returns launch
+        success (same contract as ``_play_checked``).
+        """
+        ok = self._play_checked(
+            url, name, provider_id=provider_id,
+            force_new_window=force_new_window, channel_id=channel_id,
+        )
+        if ok:
+            self._start_playback_health(_startwatch.PlayAttempt(
+                channel_id, name, url, provider_id=provider_id))
+            self._record_play(channel_id, provider_id, force_new_window)
+        return ok
+
+    def _reactivate_and_play_sibling(
+        self,
+        provider_id: str,
+        stream_url: str,
+        channel_name: str,
+        force_new_window: bool = False,
+        channel_id: str = "",
+    ) -> None:
+        """Main-thread action: reactivate a disabled provider, then play its stream.
+
+        Called by the "Reactivate & play" action in the failure toast when the user
+        explicitly opts into an inactive-source variant (mirror-not-cage: we surfaced
+        the option; they chose it).  The provider is re-activated then the URL is
+        passed directly to player_manager (no extra validation — already consented).
+        PLAY-13: used to carry no ``channel_id`` — fixed via ``_play_and_record``.
+
+        Args:
+            provider_id: The inactive provider to reactivate.
+            stream_url: The sibling channel's stream URL to play immediately after.
+            channel_name: Display name for the player window.
+            force_new_window: When True, open/replace a separate per-source window.
+            channel_id: The sibling channel's DB id, for ``_play_and_record``
+                (empty is a no-op there; the caller always supplies it).
+        """
+        reactivated = False
+        try:
+            with self.db.session_scope() as session:
+                from streamselect.core.repositories import RepositoryFactory as _RF
+                provider = _RF(session).providers.get_by_id(provider_id)
+                if provider:
+                    provider.is_active = True
+                    reactivated = True
+        except Exception as exc:
+            logger.warning(f"_reactivate_and_play_sibling: failed to reactivate {provider_id}: {exc}")
+        # Canonical refresh (matches toggle_provider_active) — else the sidebar/
+        # channel list/Discover stay stale even though the stream plays.
+        if reactivated:
+            self._refresh_provider_dependent_views()
+        # Same seam as the other escape hatches — also arms the watch (PLAY-15).
+        self._play_and_record(stream_url, channel_name, provider_id, force_new_window, channel_id)
+
+    def _bg_mark_played(self, channel_id: str, key: str | None = None) -> None:
+        """Worker: write play-count + last-played to DB (off main thread).
+
+        Also registers this instance for watch-progress capture — VOD **movies**
+        only (live has no completion; episodes use their own play path). If a
+        non-movie now plays on *key*, drop any stale tracking so a previous movie
+        in the same window isn't captured against the new stream.
+        """
+        try:
+            with self.db.session_scope() as session:
+                repos = RepositoryFactory(session)
+                repos.channels.mark_played(channel_id)
+                if key is not None:
+                    ch = repos.channels.get_by_id(channel_id)
+                    if ch is not None and ch.media_type == "movie":
+                        self._watch_tracking[key] = {
+                            "content_id": channel_id,
+                            "media_type": "movie",
+                            "played_via": "manual",
+                        }
+                    else:
+                        self._watch_tracking.pop(key, None)
+            # HIST-1: emit only after the write above has committed — the
+            # notifier's _on_history_changed slot is what refreshes History
+            # and republishes the channel on channel_state_bus, never this
+            # worker directly (workers must not touch widgets).
+            notifier = self.__dict__.get("_watch_notifier")
+            if notifier is not None:
+                notifier.history_changed.emit(channel_id)
+        except Exception as e:
+            logger.error(f"Error marking channel played: {e}")
+
+    def _lookup_provider_icon(self, provider_id: str) -> str:
+        """Return a source's display glyph (trivial PK read; cached by caller).
+
+        Args:
+            provider_id: The provider whose icon to fetch.
+
+        Returns:
+            The provider's configured icon, the default provider glyph as a
+            fallback, or "" on any error.
+        """
+        try:
+            with self.db.session_scope(commit=False) as session:
+                p = RepositoryFactory(session).providers.get_by_id(provider_id)
+                if p:
+                    return getattr(p, "icon", "") or self.config.provider_icon
+        except Exception as e:
+            logger.debug(f"provider-icon lookup failed for {provider_id}: {e}")
+        return ""
+
+    def _source_icon_for_key(self, key: str | None) -> str:
+        """Return the cached source glyph for the player window keyed by *key*."""
+        pid = self.player_manager.provider_for_key(key)
+        if not pid:
+            return ""
+        return self._provider_icons.get(pid, "")
+
+    # ---- Connection-limit enforcement (single chokepoint for every play call) --
+
+    def _provider_max_connections(self, provider_id: str) -> int:
+        """Resolve a provider's stream capacity for the connection accountant.
+
+        Trivial single-row PK lookup — safe to run inline per the async-DB-
+        reads rule (the design notes). Falls
+        back to 1 (the ``ProviderDB.max_connections`` column default) on any
+        lookup failure so a missing/errored provider never silently grants
+        unlimited connections.
+
+        This is the ONE helper every play-launch call site uses to fetch
+        ``provider_max_connections`` — never re-query it per call site.
+
+        Args:
+            provider_id: The provider whose ``max_connections`` to fetch.
+
+        Returns:
+            The provider's configured max_connections, or 1 on any error.
+        """
+        try:
+            with self.db.session_scope(commit=False) as session:
+                provider = RepositoryFactory(session).providers.get_by_id(provider_id)
+                if provider is not None and provider.max_connections:
+                    return int(provider.max_connections)
+        except Exception as e:
+            logger.debug(f"provider-max-connections lookup failed for {provider_id}: {e}")
+        return 1
+
+    def _provider_display_name(self, provider_id: str) -> str:
+        """Return a provider's display name for the capacity-warning toast (trivial PK read)."""
+        try:
+            with self.db.session_scope(commit=False) as session:
+                provider = RepositoryFactory(session).providers.get_by_id(provider_id)
+                if provider is not None:
+                    return provider.name or provider_id
+        except Exception as e:
+            logger.debug(f"provider-name lookup failed for {provider_id}: {e}")
+        return provider_id
+
+    def _play_checked(
+        self,
+        url: str,
+        title: str,
+        *,
+        provider_id: str | None = None,
+        force_new_window: bool = False,
+        start_seconds: int = 0,
+        open_ended_buffer: bool = False,
+        deep_buffer: bool = False,
+        channel_id: str = "",
+    ) -> bool:
+        """Single chokepoint every play-launch call site routes through.
+
+        Resolves the provider's real ``max_connections`` via
+        ``_provider_max_connections`` (one helper, not a copy at each call
+        site), pre-flights the connection accountant via
+        ``PlayerManager.check_capacity``, and either plays immediately or
+        shows a "connection limit reached" warning with a "Play anyway
+        (replace oldest)" escape hatch instead of silently failing — this is
+        the only place today that path is reachable (force_new_window opening
+        a second window for a provider already playing in the shared window,
+        or ``player_mode == "multiple-instances"``; see
+        ``connection_accountant.py`` module docstring).
+
+        Same bool return contract as ``player_manager.play()`` — a drop-in
+        replacement at every call site.
+        """
+        max_conn = self._provider_max_connections(provider_id) if provider_id else 1
+        preview = self.player_manager.check_capacity(
+            provider_id, max_conn, force_new_window=force_new_window
+        )
+        if preview is not None and not preview.granted:
+            self._show_capacity_warning(
+                provider_id, preview, url, title, force_new_window,
+                start_seconds, open_ended_buffer, deep_buffer, channel_id,
+            )
+            return False
+
+        return self.player_manager.play(
+            url, title,
+            provider_id=provider_id,
+            provider_max_connections=max_conn,
+            force_new_window=force_new_window,
+            start_seconds=start_seconds,
+            open_ended_buffer=open_ended_buffer,
+            deep_buffer=deep_buffer,
+            channel_id=channel_id,
+        )
+
+    def play_trailer(self, url: str, title: str) -> None:
+        """Play a trailer URL in its own player window.
+
+        Args:
+            url: The trailer URL (a YouTube watch URL for all but a handful of
+                a user's many; mpv resolves it through yt-dlp).
+            title: Window title, e.g. "Dune — Trailer".
+
+        Notes:
+            ``provider_id=None`` on purpose. A trailer is not the provider's
+            stream, so it must not consume a slot in the provider's connection
+            budget or land in that provider's Split-Streams window — it still
+            goes through ``PlayerManager`` (never ``MPVPlayer`` directly), which
+            is what the keying rule actually requires.
+
+            ``force_new_window=True`` because a trailer is a side trip: watching
+            one must not stop whatever is already playing.
+        """
+        logger.info("Playing trailer: {}", title or url)
+        ok = self.player_manager.play(
+            url, title or "Trailer",
+            provider_id=None,
+            force_new_window=True,
+        )
+        if not ok:
+            # Same shape as the "Stream Unavailable" notice, and it names the
+            # recovery the right-click menu already offers rather than leaving
+            # the viewer with a button that silently did nothing.
+            self.notification_manager.show(
+                title="Trailer unavailable",
+                message=(f"{title or 'The trailer'} could not be opened.\n"
+                         "Right-click the Trailer button → Play trailer on "
+                         "YouTube."),
+                type="error",
+                dismissible=True,
+                auto_dismiss_seconds=8,
+            )
+
+    def open_trailer_in_browser(self, url: str) -> None:
+        """Open a trailer URL in the system browser.
+
+        Args:
+            url: The trailer URL.
+        """
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+
+        logger.info("Opening trailer in browser: {}", url)
+        QDesktopServices.openUrl(QUrl(url))
+
+
+    def _show_capacity_warning(
+        self,
+        provider_id: str,
+        preview,
+        url: str,
+        title: str,
+        force_new_window: bool,
+        start_seconds: int,
+        open_ended_buffer: bool,
+        deep_buffer: bool = False,
+        channel_id: str = "",
+    ) -> None:
+        """Show the "connection limit reached" toast with a replace-oldest escape hatch.
+
+        Args:
+            provider_id: The provider whose limit would be exceeded.
+            preview: The ``AcquireResult`` from ``PlayerManager.check_capacity``
+                (``granted=False``) — carries capacity + current holder keys.
+            url: The stream URL the blocked play would have used.
+            title: Display title for the blocked play.
+            force_new_window: Same meaning as in ``play()`` — re-threaded into
+                the "Play anyway" retry.
+            start_seconds: Resume position — re-threaded into the retry.
+            open_ended_buffer: Buffer mode — re-threaded into the retry.
+            deep_buffer: Deep-cache buffer mode — re-threaded into the retry.
+            channel_id: Channel id for the deep-cache recording filename —
+                re-threaded into the retry.
+        """
+        provider_name = self._provider_display_name(provider_id)
+        oldest_key = preview.holders[0] if preview.holders else None
+
+        def _replace_oldest(
+            _oldest=oldest_key, _url=url, _title=title, _pid=provider_id,
+            _fnw=force_new_window, _ss=start_seconds, _oeb=open_ended_buffer,
+            _deep=deep_buffer, _cid=channel_id,
+        ):
+            if _oldest:
+                # Frees the slot _replace_oldest's play() below needs.
+                self.player_manager.stop(key=_oldest)
+            self.player_manager.play(
+                _url, _title,
+                provider_id=_pid,
+                provider_max_connections=self._provider_max_connections(_pid),
+                force_new_window=_fnw, start_seconds=_ss, open_ended_buffer=_oeb,
+                deep_buffer=_deep, channel_id=_cid,
+            )
+
+        plural = "s" if preview.capacity != 1 else ""
+        self.notification_manager.show(
+            title="Connection Limit Reached",
+            message=(
+                f"{provider_name} allows {preview.capacity} simultaneous stream{plural}; "
+                f"{len(preview.holders)} already in use."
+            ),
+            type="warning",
+            dismissible=True,
+            auto_dismiss_seconds=None,
+            actions=[
+                ("Play anyway (replace oldest)", _replace_oldest),
+                ("Cancel", lambda: None),
+            ],
+        )
+
+    # ---- Live playback-health indicator -------------------------------------
+    # A QTimer polls mpv's IPC socket every ~2s on the shared executor (never the
+    # main thread), marshalled back via _playback_health_ready (like _stream_ready).
+    # It self-stops after an idle grace; play_media restarts it.
+
+    def _start_playback_health(self, attempt=None) -> None:
+        """Start (or resume) polling mpv — see playback_start_watch.start_polling."""
+        _startwatch.start_polling(self, attempt)
+
+    def _playback_health_tick(self) -> None:
+        """Timer tick (main thread): kick off an off-thread mpv probe.
+
+        Stops polling only when *no* instance is alive, and never lets probes
+        pile up if one is still in flight.
+
+        Liveness is decided from ``active_keys()`` (every live window), not from
+        ``is_running()`` (which checks only ``_last_key``): closing the most-
+        recent window must not blank the readout while other windows still play.
+        The probed key is always a *live* one (see ``_resolve_health_key``).
+        """
+        keys = self.player_manager.active_keys()
+        # Drop play-state entries for windows that have closed since the last tick.
+        if "_playing_channels" in self.__dict__:
+            self._playing_channels = {
+                k: v for k, v in self._playing_channels.items() if k in keys
+            }
+        if not keys:
+            # Nothing left to probe; if nothing played, it EXITED unplayed — mpv's
+            # own exit reason (log tap) says whether the STREAM ended it.
+            reason = self.player_manager.last_exit_reason(
+                self.__dict__.get("_health_querying_key"))
+            _startwatch.on_player_gone(self, exit_reason=reason)
+            self._playback_health_label.hide()
+            self._notify_details_playing(None, 0)
+            self._playback_health_timer.stop()
+            return
+
+        if getattr(self, "_health_query_inflight", False):
+            return  # a probe is still running — don't pile up
+
+        key = self._resolve_health_key(keys)
+        self._health_querying_key = key
+
+        self._health_query_inflight = True
+        self.executor.submit(self._bg_query_playback_health, key)
+
+    def _resolve_health_key(self, keys: list[str]) -> str:
+        """Pick which live player window the readout should display.
+
+        Honours a pinned view (click-to-cycle) while its window is still alive;
+        otherwise follows the most-recently-used window, falling back to the
+        first live key when that window has been closed. The returned key is
+        always currently alive, so closing one window never blanks the readout
+        for the windows still playing.
+
+        Args:
+            keys: The currently-live instance keys (non-empty).
+
+        Returns:
+            A key guaranteed to be present in *keys*.
+        """
+        view = getattr(self, "_health_view_key", None)
+        if view and view in keys:
+            return view
+        last = getattr(getattr(self.player_manager, "player", None), "_last_key", None)
+        return last if last in keys else keys[0]
+
+    def _bg_query_playback_health(self, key: str | None = None) -> None:
+        """Worker (executor — NO widget access): query mpv, marshal result back.
+
+        Always emits (even on failure) so the result slot can clear the in-flight
+        flag; emits ``(key, None)`` on any error.
+
+        Args:
+            key: Instance key to query; None targets the most-recently-used window.
+        """
+        try:
+            props = self.player_manager.get_properties(
+                ["path", "demuxer-cache-duration", "cache-speed", "frame-drop-count",
+                 "time-pos", "pause", "duration"],
+                key=key,
+            )
+        except Exception as e:
+            logger.debug(f"playback-health probe failed: {e}")
+            props = None
+        self._playback_health_ready.emit((key, props))
+
+    def _refresh_details_after_playback_stopped(self, key) -> None:
+        """Re-render the details pane if it shows the title that just stopped.
+
+        Only when the two match: re-rendering whatever the user has since
+        clicked would fight them for the pane.
+
+        Args:
+            key: Player-instance key that went idle, or None for the shared one.
+        """
+        try:
+            playing = self.__dict__.get("_playing_channels") or {}
+            channel_id = playing.get(key)
+            if channel_id is None and len(playing) == 1:
+                # Shared window: the poll can report a null key.
+                channel_id = next(iter(playing.values()))
+            if not channel_id:
+                return
+            if channel_id != self.__dict__.get("_last_shown_channel_id"):
+                return                      # the user moved on; leave them alone
+            playing.pop(key, None)          # once per stop, not every idle tick
+            self.show_channel_details_by_id(channel_id)
+        except Exception:
+            logger.exception("could not refresh details after playback stopped")
+
+    def _on_playback_health_ready(self, payload) -> None:
+        """Main-thread slot: update the nav-bar label from a probe result.
+
+        Idle detection: mpv stays running with ``--idle=yes`` even when nothing
+        is loaded, so we detect idle via the ``path`` property (null/absent when
+        idle) rather than is_running(). After a short idle grace the timer stops
+        so there's no perpetual polling.
+
+        When multiple windows are open, a position marker ``"[i/n] "`` is
+        prepended; the playback menu's Next player entry moves between windows.
+        """
+        self._health_query_inflight = False
+
+        key, props = payload
+
+        # None (probe error) or no loaded file → idle / nothing playing.
+        if not props or not props.get("path"):
+            self._playback_health_label.hide()
+            self._notify_details_playing(None, 0)
+            # The player went idle (user closed it): re-read the details pane if it
+            # still shows what was playing, so a part-watched title offers Resume
+            # now — the position is stored (_bg_capture_watch) but the pane was
+            # rendered before the watch existed (user report).
+            self._refresh_details_after_playback_stopped(key)
+            if _startwatch.on_idle_tick(self):
+                self._playback_health_timer.stop()
+            return
+
+        if _startwatch.on_playing(self) and (att := self.__dict__.get("_health_attempt")):
+            self.status(f"Playing: {att.channel_name}", ms=0)
+        cache_dur = props.get("demuxer-cache-duration")
+        _startwatch.on_loaded_tick(self, props.get("time-pos"), bool(props.get("pause")),
+                                   cache_duration=cache_dur, duration=props.get("duration"))
+        _stream_capture.on_health_tick(self, key)   # PLAYED-1: what the stream really is
+        text = format_playback_health(
+            cache_dur, props.get("cache-speed"), props.get("frame-drop-count"))
+
+        # Resolve which window this reading belongs to.
+        shown_key = key
+        if shown_key is None:
+            shown_key = getattr(
+                getattr(self.player_manager, "player", None), "_last_key", None
+            )
+
+        # Surface the live play-state to the details pane: the channel this window is
+        # playing + its current position.  The pane lights its green Play indicator
+        # only when this channel is the one currently shown.
+        playing_map = self.__dict__.get("_playing_channels", {})
+        ch_id = playing_map.get(shown_key)
+        pane = self.__dict__.get("details_pane")
+        shown_ch = getattr(pane, "current_channel", None) if pane is not None else None
+        shown_id = getattr(shown_ch, "id", None)
+        if (shown_id is not None and shown_id != ch_id
+                and shown_id in playing_map.values()):
+            # The shown title is still playing in a DIFFERENT Split-Streams window
+            # than the one just polled.  Forwarding this window's channel would make
+            # set_playing clear the shown title's indicator; instead leave the pane's
+            # self-advancing "currently playing" timer untouched so it stays lit.
+            # (Only clear the shown title when it plays in NO open window.)
+            pass
+        else:
+            self._notify_details_playing(ch_id, props.get("time-pos") or 0)
+
+        # Source glyph labels *which* stream the data refers to (shown whether one
+        # or many windows are open). The [i/n] marker (multi only) adds count +
+        # position; the glyph is what tells the two apart at a glance.
+        src_icon = self._source_icon_for_key(shown_key)
+        prefix = f"{src_icon} " if src_icon else ""
+
+        keys = self.player_manager.active_keys()
+        n = len(keys)
+        if n > 1:
+            try:
+                idx = keys.index(shown_key) + 1
+            except (ValueError, TypeError):
+                idx = 1
+            prefix = f"[{idx}/{n}] {prefix}"
+            self._playback_health_label.setToolTip(
+                f"{n} open players · buffer · download speed · dropped frames — click for settings"
+            )
+        else:
+            self._playback_health_label.setToolTip(
+                "Live playback (buffer · download speed · dropped frames) — click for settings"
+            )
+
+        # Rich text so the play mark is the one icon set; the source glyph is
+        # user data (F43) and stays text.
+        self._playback_health_label.setText(
+            f"{_html.escape(prefix, quote=False)}{_icon_utils.role_html('play')}&nbsp;{text}")
+        self._playback_health_label.show()
+
+    def _notify_details_playing(self, channel_id: str | None, position_seconds: float) -> None:
+        """Forward the live play-state to the details pane (main thread).
+
+        Thin guard around ``details_pane.set_playing`` so the playback-health poll
+        can light/clear the "currently playing" indicator without caring whether
+        the pane exists yet during early startup.
+
+        Args:
+            channel_id: The channel now playing in the polled window, or None when
+                nothing is playing (clears the indicator).
+            position_seconds: Current playback position in seconds.
+        """
+        pane = self.__dict__.get("details_pane")
+        if pane is not None:
+            pane.set_playing(channel_id, position_seconds)
+        # The sidebar reads the SAME signal rather than tracking playback
+        # itself, so its play marker and the pane's indicator cannot disagree.
+        # Reached through sidebar_sections, which is how every other caller
+        # gets at it (_refresh_vod_alerts_section) — there is no attribute.
+        sections = self.__dict__.get("sidebar_sections") or {}
+        alerts = sections.get("alerts")
+        if alerts is not None and hasattr(alerts, "set_playing"):
+            alerts.set_playing(channel_id)
+
+    def _on_health_readout_clicked(self) -> None:
+        """Playback menu's Next player: cycle the readout to the next open window.
+
+        When only one window is open this is a no-op.  Otherwise the pinned
+        ``_health_view_key`` advances to the next live key (wrapping around), and
+        an immediate off-thread probe is kicked off so the readout updates without
+        waiting for the next timer tick.
+        """
+        keys = self.player_manager.active_keys()
+        if len(keys) <= 1:
+            return  # nothing to cycle
+
+        # Determine the currently-shown key.
+        current = getattr(self, "_health_view_key", None)
+        if not (current and current in keys):
+            # Not pinned — resolve from _last_key.
+            current = getattr(
+                getattr(self.player_manager, "player", None), "_last_key", None
+            )
+        if current not in keys:
+            current = keys[0]
+
+        # Advance to the next key (wrap around).
+        try:
+            idx = keys.index(current)
+        except ValueError:
+            idx = 0
+        next_key = keys[(idx + 1) % len(keys)]
+        self._health_view_key = next_key
+
+        # Kick off an immediate probe for the newly-selected window.
+        if not getattr(self, "_health_query_inflight", False):
+            self._health_query_inflight = True
+            self._health_querying_key = next_key
+            self.executor.submit(self._bg_query_playback_health, next_key)
+

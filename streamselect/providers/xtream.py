@@ -1,0 +1,625 @@
+"""Xtream API client implementation"""
+
+import asyncio
+from time import monotonic
+from typing import List, Dict, Optional, Any, Set, Tuple
+from urllib.parse import quote
+import aiohttp
+from loguru import logger
+
+from streamselect.core.provider_probe import auth_granted
+from streamselect.core.models import Channel, Provider, MediaType, StreamQuality, ProviderURL
+from streamselect.core.connection_tracker import ConnectionTracker
+from streamselect.core.content_identity import added_from_raw, rating_from_raw, valid_tmdb_id
+from streamselect.core.discovery_engine import poster_url_from_raw
+from streamselect.core.url_cycle import UrlCycler
+from streamselect.core.time_display import date_text
+from streamselect.providers.base import ProviderPlugin
+
+
+# Headers that pass Cloudflare's bot-detection (HTTP 520 / 403 without these).
+# Single source of truth lives in streamselect.core.http_headers; re-exported here
+# under the legacy name so existing importers keep working unchanged.
+from streamselect.core.http_headers import STREAM_HTTP_HEADERS as _DEFAULT_HEADERS
+
+# Timeout for bulk catalog reads (get_*_streams / get_*_categories).
+#
+# These responses can be tens of megabytes and a slow-but-healthy server may take
+# minutes to stream one (observed: an 18 MB live list at ~227 KB/s = 81 s). A `total`
+# deadline punishes that — it conflates "the server is dead" with "the server is slow
+# but still sending" and silently drops the whole catalog, leaving the provider with 0
+# channels. We use `sock_read` instead: it fires only when *no bytes arrive* for the
+# window, so a steady trickle never trips it while a genuinely stalled connection still
+# does. Deliberately NO `total` — large catalogs on slow servers legitimately run long.
+_CONTENT_READ_TIMEOUT = aiohttp.ClientTimeout(sock_connect=15, sock_read=60)
+
+# One-per-media-type Xtream URL path segment (DB-2). Single source of truth for
+# this shape, shared by convert_to_channel (bakes the transitional
+# ChannelDB.stream_url column at ingestion) and
+# core/stream_url_derivation.py (rebuilds the same shape at play time against
+# the CURRENT best host/credentials instead of trusting that stored snapshot).
+_STREAM_PATH_SEGMENT = {MediaType.LIVE: "live", MediaType.MOVIE: "movie"}
+
+
+def build_stream_url(base_url: str, username: str, password: str, media_type: str,
+                      source_id, container_extension: str = "ts") -> str:
+    """Build an Xtream playback URL: ``{base}/{live|movie|series}/{user}/{pass}/{id}.{ext}``.
+
+    Percent-escapes each credential/id path segment so reserved characters in
+    the username/password/id don't corrupt the path. *media_type* not
+    ``LIVE``/``MOVIE`` builds the ``series`` shape (matches the provider's own
+    three-way split — anything else the API sends is a series-shaped id).
+
+    Args:
+        base_url: Provider base URL (``scheme://host[:port]``, no trailing slash).
+        username: Provider account username.
+        password: Provider account password.
+        media_type: ``MediaType.LIVE`` / ``MOVIE`` / ``SERIES``.
+        source_id: The stream/series id (``raw_data["stream_id"]`` or
+            ``["series_id"]``).
+        container_extension: File extension, e.g. ``"ts"``/``"mkv"``/``"mp4"``.
+
+    Returns:
+        The full playable URL.
+    """
+    user_seg = quote(str(username), safe='')
+    pass_seg = quote(str(password), safe='')
+    id_seg = quote(str(source_id), safe='')
+    kind = _STREAM_PATH_SEGMENT.get(media_type, "series")
+    return f"{base_url}/{kind}/{user_seg}/{pass_seg}/{id_seg}.{container_extension}"
+
+
+class XtreamAPI:
+    """Xtream Codes API client"""
+
+    def __init__(self, base_url: str, username: str, password: str):
+        self.base_url = base_url.rstrip('/')
+        self.username = username
+        self.password = password
+        self.session: Optional[aiohttp.ClientSession] = None
+
+    async def __aenter__(self):
+        self.session = aiohttp.ClientSession(headers=_DEFAULT_HEADERS)
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
+    
+    def _build_url(self, action: str, **params) -> str:
+        """Build API URL with authentication"""
+        base_params = {
+            'username': self.username,
+            'password': self.password,
+        }
+        base_params.update(params)
+        
+        # Build query string. Percent-escape every value so credentials or params
+        # containing reserved characters (& # + = space) don't corrupt the URL.
+        query_parts = [f"{k}={quote(str(v), safe='')}" for k, v in base_params.items() if v is not None]
+        query_string = "&".join(query_parts)
+        
+        return f"{self.base_url}/player_api.php?action={action}&{query_string}"
+    
+    async def test_connection(self, provider_url: Optional[ProviderURL] = None) -> tuple[bool, Optional[str]]:
+        """Test connection and authentication.
+
+        Checks the auth endpoint first to surface account-level errors (expired,
+        banned, etc.) before hitting a content endpoint.
+
+        Args:
+            provider_url: Optional ProviderURL to track statistics
+
+        Returns:
+            (success, error_message)
+        """
+        from time import time
+        from datetime import datetime
+        start_time = time()
+
+        try:
+            # Step 1: hit the auth endpoint — gives us account status + server info
+            auth_url = (
+                f"{self.base_url}/player_api.php"
+                f"?username={quote(str(self.username), safe='')}"
+                f"&password={quote(str(self.password), safe='')}"
+            )
+            async with self.session.get(auth_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                response_time_ms = int((time() - start_time) * 1000)
+
+                if response.status != 200:
+                    error_msg = f"HTTP {response.status}"
+                    if provider_url:
+                        await ConnectionTracker.record_failure(provider_url, error_msg)
+                    return False, error_msg
+
+                data = await response.json(content_type=None)
+                if not isinstance(data, dict):
+                    error_msg = "Unexpected auth response format"
+                    if provider_url:
+                        await ConnectionTracker.record_failure(provider_url, error_msg)
+                    return False, error_msg
+
+                user_info = data.get("user_info", {})
+                status = user_info.get("status", "")
+                auth = user_info.get("auth", 0)
+
+                # Servers may return auth as the *string* "0"/"false", which is
+                # truthy — normalized by the one shared definition.
+                if not auth_granted(auth):
+                    error_msg = "Authentication failed — check username and password"
+                    if provider_url:
+                        await ConnectionTracker.record_failure(provider_url, error_msg)
+                    return False, error_msg
+
+                if status and status.lower() not in ("active", ""):
+                    # Expired / Banned / Disabled — give a human-readable message
+                    exp_ts = user_info.get("exp_date")
+                    exp_str = ""
+                    if exp_ts:
+                        try:
+                            exp_str = f" (expired {date_text(datetime.fromtimestamp(int(exp_ts)))})"
+                        except (TypeError, ValueError, OSError, OverflowError):
+                            pass  # silent: junk timestamp — the status alone is still useful
+                    error_msg = f"Account {status}{exp_str}"
+                    if provider_url:
+                        await ConnectionTracker.record_failure(provider_url, error_msg)
+                    return False, error_msg
+
+            if provider_url:
+                await ConnectionTracker.record_success(provider_url, response_time_ms)
+            return True, None
+
+        except asyncio.TimeoutError:
+            error_msg = "Connection timeout"
+            if provider_url:
+                await ConnectionTracker.record_failure(provider_url, error_msg)
+            return False, error_msg
+        except aiohttp.ClientError as e:
+            error_msg = f"Connection error: {str(e)}"
+            if provider_url:
+                await ConnectionTracker.record_failure(provider_url, error_msg)
+            return False, error_msg
+        except Exception as e:
+            error_msg = f"Unexpected error: {str(e)}"
+            if provider_url:
+                await ConnectionTracker.record_failure(provider_url, error_msg)
+            return False, error_msg
+    
+    async def get_server_info(self) -> Optional[Dict[str, Any]]:
+        """Get server information"""
+        try:
+            url = (
+                f"{self.base_url}/player_api.php"
+                f"?username={quote(str(self.username), safe='')}"
+                f"&password={quote(str(self.password), safe='')}"
+            )
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    return await response.json(content_type=None)
+        except Exception as e:
+            logger.error(f"Failed to get server info: {e}")
+        return None
+
+    async def get_account_info(self) -> Optional[Dict[str, Any]]:
+        """Fetch and parse account/subscription info from the auth endpoint.
+
+        Returns a dict with keys: status, exp_date, created_at, active_cons,
+        max_connections, auth — or None on failure.
+        """
+        data = await self.get_server_info()
+        if not data or not isinstance(data, dict):
+            return None
+        user_info = data.get("user_info", {})
+        if not user_info:
+            return None
+        return {
+            "status": user_info.get("status", "Unknown"),
+            "auth": user_info.get("auth", 0),
+            "exp_date": user_info.get("exp_date"),       # Unix timestamp string
+            "created_at": user_info.get("created_at"),   # Unix timestamp string
+            "active_cons": int(user_info.get("active_cons", 0) or 0),
+            "max_connections": int(user_info.get("max_connections", 1) or 1),
+            "is_trial": user_info.get("is_trial", "0") == "1",
+            "server_info": data.get("server_info", {}),
+        }
+    
+    async def get_live_categories(self) -> List[Dict[str, Any]]:
+        """Get live TV categories"""
+        return await self._get_categories("get_live_categories")
+    
+    async def get_vod_categories(self) -> List[Dict[str, Any]]:
+        """Get VOD categories"""
+        return await self._get_categories("get_vod_categories")
+    
+    async def get_series_categories(self) -> List[Dict[str, Any]]:
+        """Get series categories"""
+        return await self._get_categories("get_series_categories")
+    
+    async def _get_categories(self, action: str) -> List[Dict[str, Any]]:
+        """Generic category fetcher. Raises aiohttp.ClientError on connection failure."""
+        url = self._build_url(action)
+        try:
+            async with self.session.get(url, timeout=_CONTENT_READ_TIMEOUT) as response:
+                if response.status == 200:
+                    data = await response.json(content_type=None)
+                    return data if isinstance(data, list) else []
+                logger.error(f"Failed to get categories ({action}): HTTP {response.status}")
+                return []
+        except (aiohttp.ClientConnectorError, aiohttp.ClientError, asyncio.TimeoutError):
+            raise
+        except Exception as e:
+            logger.error(f"Failed to get categories ({action}): {e}")
+            return []
+    
+    async def get_live_streams(self, category_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get live TV streams"""
+        return await self._get_streams("get_live_streams", category_id)
+    
+    async def get_vod_streams(self, category_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get VOD streams"""
+        return await self._get_streams("get_vod_streams", category_id)
+    
+    async def get_series(self, category_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Get series"""
+        return await self._get_streams("get_series", category_id)
+    
+    async def get_series_info(self, series_id: str) -> Optional[Dict[str, Any]]:
+        """Get detailed series information including seasons and episodes
+        
+        Args:
+            series_id: The series ID
+            
+        Returns:
+            Dictionary with 'info', 'seasons', and 'episodes' keys
+        """
+        try:
+            url = self._build_url("get_series_info", series_id=series_id)
+            logger.debug(f"Fetching series info from: {url}")
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                if response.status == 200:
+                    data = await response.json(content_type=None)
+                    logger.debug(f"Series info response type: {type(data)}")
+                    if isinstance(data, dict):
+                        logger.debug(f"Series info keys: {data.keys()}")
+                    else:
+                        logger.warning(f"Expected dict, got {type(data)}: {data[:2] if isinstance(data, list) else data}")
+                    return data
+        except Exception as e:
+            logger.error(f"Failed to get series info for {series_id}: {e}")
+        return None
+
+    async def get_vod_info(self, vod_id: str) -> Optional[Dict[str, Any]]:
+        """Get detailed movie/VOD information (carries ``info.tmdb_id``).
+
+        The provider's per-title detail endpoint returns the canonical TMDb id
+        even when the bulk ``get_vod_streams`` list row omitted it — the basis of
+        the provider-native tmdb enrichment (Phase 2).  The reused session already
+        sends the app User-Agent (``STREAM_HTTP_HEADERS``); the provider 403s /
+        returns empty without it.
+
+        Args:
+            vod_id: The movie/VOD ``stream_id``.
+
+        Returns:
+            The parsed response dict (``{'info': {...}, 'movie_data': {...}}``),
+            or ``None`` on HTTP error / non-200 / connection failure.
+        """
+        try:
+            url = self._build_url("get_vod_info", vod_id=vod_id)
+            async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as response:
+                if response.status == 200:
+                    return await response.json(content_type=None)
+                logger.debug(f"get_vod_info({vod_id}): HTTP {response.status}")
+        except Exception as e:
+            logger.debug(f"Failed to get vod info for {vod_id}: {e}")
+        return None
+
+    async def _get_streams(self, action: str, category_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Generic stream fetcher. Raises aiohttp.ClientError on connection failure."""
+        params = {}
+        if category_id:
+            params['category_id'] = category_id
+
+        url = self._build_url(action, **params)
+        try:
+            async with self.session.get(url, timeout=_CONTENT_READ_TIMEOUT) as response:
+                if response.status == 200:
+                    data = await response.json(content_type=None)
+                    return data if isinstance(data, list) else []
+                logger.error(f"Failed to get streams ({action}): HTTP {response.status}")
+                return []
+        except (aiohttp.ClientConnectorError, aiohttp.ClientError, asyncio.TimeoutError):
+            raise  # Let caller handle connection failures for URL cycling
+        except Exception as e:
+            logger.error(f"Failed to get streams ({action}): {e}")
+            return []
+    
+    def convert_to_channel(self, raw_data: Dict[str, Any], provider_id: str, media_type: str,
+                           category_map: Optional[Dict[str, str]] = None) -> Channel:
+        """Convert Xtream API data to Channel model.
+
+        ``category_map`` resolves the provider's numeric ``category_id`` to its
+        human category *name* (built per provider + media type at fetch time —
+        the streams endpoints carry only the id; the names live in
+        ``get_*_categories``). When omitted, falls back to any inline name.
+        """
+
+        stream_id = raw_data.get('stream_id') or raw_data.get('series_id')
+        extension = raw_data.get('container_extension', 'ts')
+        stream_url = build_stream_url(
+            self.base_url, self.username, self.password, media_type, stream_id, extension,
+        )
+
+        # Determine quality
+        name = raw_data.get('name', '')
+        quality = StreamQuality.UNKNOWN
+        if 'UHD' in name or '4K' in name:
+            quality = StreamQuality.UHD
+        elif 'FHD' in name or '1080' in name:
+            quality = StreamQuality.FHD
+        elif 'HD' in name or '720' in name:
+            quality = StreamQuality.HD
+        elif 'SD' in name:
+            quality = StreamQuality.SD
+        
+        # Resolve the provider's category NAME from its id via category_map (the
+        # join the streams endpoint can't do — it carries only the id). Fall back
+        # to any inline name, then empty (no regression if the categories call
+        # failed). The id is provider-/type-local, never a global key.
+        category_id = str(raw_data.get('category_id', ''))
+        category_name = (category_map or {}).get(category_id) or raw_data.get('category_name', '') or ''
+
+        return Channel(
+            id=f"{provider_id}_{stream_id}",
+            source_id=str(stream_id),
+            provider_id=provider_id,
+            name=name,
+            stream_url=stream_url,
+            category=category_name,
+            category_id=category_id,
+            # Series ship their poster in `cover`, movies in `stream_icon`.
+            # Reading one key stored a poster for 97.2% of movies and 0% of
+            # series; poster_url_from_raw knows both and normalises the URL.
+            logo_url=poster_url_from_raw(raw_data),
+            epg_channel_id=raw_data.get('epg_channel_id'),
+            media_type=media_type,
+            quality=quality,
+            raw_data=raw_data,
+            # Capture the provider's canonical TMDb id once, at ingestion (the
+            # compute-once principle). Validated by the shared valid_tmdb_id so
+            # sentinels ("", "0", "null") become None. Drives the tmdb-first
+            # content_key downstream; never re-read from raw_data at render time.
+            detected_tmdb_id=valid_tmdb_id(raw_data.get("tmdb")),
+            # Same compute-once principle (DB-4): stored so the Discover shelf
+            # queries sort/filter on an indexed column instead of json_extract()
+            # over 785k+ rows every time a shelf opens.
+            detected_rating=rating_from_raw(raw_data.get("rating")),
+            # W-1: the series payload carries no "added" key at all (only
+            # movies/live do) — it sends "last_modified" instead, confirmed
+            # against every one of a user's many series rows. Falling
+            # back to it here (rather than a media_type branch) is exact: the
+            # two keys never co-occur on the same row in a large library.
+            detected_added=added_from_raw(raw_data.get("added") or raw_data.get("last_modified")),
+        )
+
+
+class XtreamProvider(ProviderPlugin):
+    """Xtream Codes provider plugin implementation"""
+    
+    @property
+    def name(self) -> str:
+        return "Xtream Codes"
+    
+    @property
+    def provider_type(self) -> str:
+        return "xtream"
+    
+    async def test_connection(self, url: str, username: Optional[str] = None, 
+                            password: Optional[str] = None, **kwargs) -> Tuple[bool, Optional[str]]:
+        """Test connection to Xtream provider"""
+        async with XtreamAPI(url, username, password) as api:
+            return await api.test_connection()
+    
+    async def fetch_channels(self, provider: Provider,
+                           progress_callback: Optional[callable] = None,
+                           media_types: Optional[Set[str]] = None) -> List[Channel]:
+        """Fetch channels, cycling through alternate URLs on connection failure.
+
+        Args:
+            media_types: See ``ProviderPlugin.fetch_channels``. ``None``
+                fetches live+VOD+series (unchanged historical behaviour);
+                ``{"live"}`` (LIVE-1) skips the VOD/series categories and
+                streams calls entirely, so the round trip is
+                ``get_live_categories`` + ``get_live_streams`` only.
+        """
+        cycler = UrlCycler(provider, "fetch_channels")
+        urls_to_try = cycler.candidates()
+        last_error: Optional[str] = None
+
+        for idx, base_url in enumerate(urls_to_try):
+            label = f"URL {idx + 1}/{len(urls_to_try)}: {base_url}"
+            if progress_callback:
+                progress_callback(5, 100, f"Connecting ({label})…")
+            logger.info(f"Refresh attempt {label}")
+
+            try:
+                channels = await self._fetch_from_base(
+                    base_url, provider, progress_callback, media_types
+                )
+                # Deliberately unrecorded: this call downloads the provider's ENTIRE catalog,
+                # so its elapsed time is payload-dominated, not a measure of host
+                # responsiveness.  median_latency_ms() pools every attempt on a ProviderURL,
+                # so mixing a multi-minute bulk fetch with ~300ms info calls would make the
+                # median meaningless.  Latency is recorded only on small, size-comparable
+                # requests.
+                cycler.record_success(base_url)
+                return channels
+
+            except (aiohttp.ClientConnectorError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                last_error = str(e)
+                logger.warning(f"Connection failed for {base_url}: {e}")
+                cycler.record_failure(base_url, last_error, status=getattr(e, "status", None))
+                if idx < len(urls_to_try) - 1:
+                    logger.info("Trying next URL…")
+                continue
+
+        logger.error(f"All {len(urls_to_try)} URL(s) failed for provider '{provider.name}'. Last error: {last_error}")
+        return []
+
+
+    async def _fetch_from_base(self, base_url: str, provider: Provider,
+                               progress_callback: Optional[callable],
+                               media_types: Optional[Set[str]] = None) -> List[Channel]:
+        """Fetch the requested channel types from a single base URL. Raises on connection error.
+
+        Args:
+            media_types: See ``fetch_channels``. ``None`` means all three
+                (live+VOD+series) — every category/streams call below runs.
+                A restricted set (e.g. ``{"live"}``) skips the calls for the
+                excluded types entirely, not just the conversion — that is
+                the whole point of LIVE-1's fetch being a single round trip.
+        """
+        types = media_types or {MediaType.LIVE, MediaType.MOVIE, MediaType.SERIES}
+        async with XtreamAPI(base_url, provider.username, provider.password) as api:
+            channels: List[Channel] = []
+
+            # Resolve category id→name up front: the streams endpoints carry only
+            # category_id; the human names live in get_*_categories. Maps are per
+            # media type (live/vod/series ids are separate namespaces) and per
+            # provider (ids are provider-local). A failed call → empty map → the
+            # category stays blank, exactly as before (no regression).
+            def _cat_map(cats: List[Dict[str, Any]]) -> Dict[str, str]:
+                return {
+                    str(c.get('category_id', '')): c.get('category_name', '')
+                    for c in cats if c.get('category_id') is not None
+                }
+
+            if progress_callback:
+                progress_callback(8, 100, "Fetching categories…")
+            live_cats = _cat_map(await api.get_live_categories()) if MediaType.LIVE in types else {}
+            vod_cats = _cat_map(await api.get_vod_categories()) if MediaType.MOVIE in types else {}
+            series_cats = _cat_map(await api.get_series_categories()) if MediaType.SERIES in types else {}
+
+            if MediaType.LIVE in types:
+                if progress_callback:
+                    progress_callback(10, 100, "Fetching live channels…")
+                for stream in await api.get_live_streams():
+                    channels.append(api.convert_to_channel(stream, provider.id, MediaType.LIVE, live_cats))
+
+            if MediaType.MOVIE in types:
+                if progress_callback:
+                    progress_callback(40, 100, "Fetching VOD content…")
+                for stream in await api.get_vod_streams():
+                    channels.append(api.convert_to_channel(stream, provider.id, MediaType.MOVIE, vod_cats))
+
+            if MediaType.SERIES in types:
+                if progress_callback:
+                    progress_callback(70, 100, "Fetching series…")
+                for series in await api.get_series():
+                    channels.append(api.convert_to_channel(series, provider.id, MediaType.SERIES, series_cats))
+
+            if progress_callback:
+                progress_callback(100, 100, f"Loaded {len(channels):,} channels")
+
+            return channels
+    
+    async def get_categories(self, provider: Provider) -> List[Dict[str, Any]]:
+        """Get all categories, cycling through URLs on connection failure."""
+        cycler = UrlCycler(provider, "get_categories")
+        for base_url in cycler.candidates():
+            t0 = monotonic()
+            try:
+                async with XtreamAPI(base_url, provider.username, provider.password) as api:
+                    categories: List[Dict[str, Any]] = []
+                    categories.extend(await api.get_live_categories())
+                    categories.extend(await api.get_vod_categories())
+                    categories.extend(await api.get_series_categories())
+                    cycler.record_success(base_url, response_time_ms=int((monotonic() - t0) * 1000))
+                    return categories
+            except (aiohttp.ClientConnectorError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(f"get_categories: {base_url} failed: {e}, trying next…")
+                cycler.record_failure(base_url, str(e), response_time_ms=int((monotonic() - t0) * 1000),
+                                      status=getattr(e, "status", None))
+        logger.error(f"get_categories: all URLs failed for provider '{provider.name}'")
+        return []
+
+    async def fetch_series_info(self, provider: Provider, series_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch series info, cycling through URLs on connection failure."""
+        cycler = UrlCycler(provider, "fetch_series_info")
+        for base_url in cycler.candidates():
+            t0 = monotonic()
+            try:
+                async with XtreamAPI(base_url, provider.username, provider.password) as api:
+                    result = await api.get_series_info(series_id)
+                    elapsed_ms = int((monotonic() - t0) * 1000)
+                    if result is not None:
+                        cycler.record_success(base_url, response_time_ms=elapsed_ms)
+                        return result
+                    cycler.record_failure(base_url, "empty response", response_time_ms=elapsed_ms)
+            except (aiohttp.ClientConnectorError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(f"fetch_series_info: {base_url} failed: {e}, trying next…")
+                cycler.record_failure(base_url, str(e), response_time_ms=int((monotonic() - t0) * 1000),
+                                      status=getattr(e, "status", None))
+        logger.error(f"fetch_series_info: all URLs failed for provider '{provider.name}'")
+        return None
+
+    async def fetch_vod_info(self, provider: Provider, vod_id: str) -> Optional[Dict[str, Any]]:
+        """Fetch movie/VOD info, cycling through URLs on connection failure."""
+        cycler = UrlCycler(provider, "fetch_vod_info")
+        for base_url in cycler.candidates():
+            t0 = monotonic()
+            try:
+                async with XtreamAPI(base_url, provider.username, provider.password) as api:
+                    result = await api.get_vod_info(vod_id)
+                    elapsed_ms = int((monotonic() - t0) * 1000)
+                    if result is not None:
+                        cycler.record_success(base_url, response_time_ms=elapsed_ms)
+                        return result
+                    cycler.record_failure(base_url, "empty response", response_time_ms=elapsed_ms)
+            except (aiohttp.ClientConnectorError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(f"fetch_vod_info: {base_url} failed: {e}, trying next…")
+                cycler.record_failure(base_url, str(e), response_time_ms=int((monotonic() - t0) * 1000),
+                                      status=getattr(e, "status", None))
+        logger.error(f"fetch_vod_info: all URLs failed for provider '{provider.name}'")
+        return None
+
+    async def get_server_info(self, provider: Provider) -> Optional[Dict[str, Any]]:
+        """Get server info, cycling through URLs on connection failure."""
+        cycler = UrlCycler(provider, "get_server_info")
+        for base_url in cycler.candidates():
+            t0 = monotonic()
+            try:
+                async with XtreamAPI(base_url, provider.username, provider.password) as api:
+                    result = await api.get_server_info()
+                    elapsed_ms = int((monotonic() - t0) * 1000)
+                    if result is not None:
+                        cycler.record_success(base_url, response_time_ms=elapsed_ms)
+                        return result
+                    cycler.record_failure(base_url, "empty response", response_time_ms=elapsed_ms)
+            except (aiohttp.ClientConnectorError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(f"get_server_info: {base_url} failed: {e}, trying next…")
+                cycler.record_failure(base_url, str(e), response_time_ms=int((monotonic() - t0) * 1000),
+                                      status=getattr(e, "status", None))
+        logger.error(f"get_server_info: all URLs failed for provider '{provider.name}'")
+        return None
+
+    async def fetch_account_info(self, provider: Provider) -> Optional[Dict[str, Any]]:
+        """Fetch parsed account/subscription info, cycling through URLs on failure."""
+        cycler = UrlCycler(provider, "fetch_account_info")
+        for base_url in cycler.candidates():
+            t0 = monotonic()
+            try:
+                async with XtreamAPI(base_url, provider.username, provider.password) as api:
+                    result = await api.get_account_info()
+                    elapsed_ms = int((monotonic() - t0) * 1000)
+                    if result is not None:
+                        cycler.record_success(base_url, response_time_ms=elapsed_ms)
+                        return result
+                    cycler.record_failure(base_url, "empty response", response_time_ms=elapsed_ms)
+            except (aiohttp.ClientConnectorError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logger.warning(f"fetch_account_info: {base_url} failed: {e}, trying next…")
+                cycler.record_failure(base_url, str(e), response_time_ms=int((monotonic() - t0) * 1000),
+                                      status=getattr(e, "status", None))
+        logger.error(f"fetch_account_info: all URLs failed for provider '{provider.name}'")
+        return None

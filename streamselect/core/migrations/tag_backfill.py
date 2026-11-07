@@ -1,0 +1,858 @@
+"""Migration task: backfill ``content_tags`` for every channel via the decomposer.
+
+Tags Slice T3 (DR-0005).  Runs the four feeders for each channel through
+:func:`~streamselect.core.tag_decomposer.decompose` /
+:func:`~streamselect.core.tag_decomposer.decompose_name_parse`, accumulates the
+resulting ``(type, value, feeder)`` tuples, and persists them via
+:meth:`~streamselect.core.repositories.tag.TagRepository.set_content_tags`.
+
+Non-destructive contract
+------------------------
+For each channel, the task deletes **only** its ``source="generated"``
+content-tags before re-deriving.  User-curated tags (``source="user"``) are
+never touched.
+
+Idempotency
+-----------
+A completed run bumps ``config.tag_backfill_version`` to
+``CURRENT_TAG_BACKFILL_VERSION`` so the task does not re-run unless the
+constant is bumped again.  An interrupted run leaves the version unbumped:
+channels processed before the cancel retain their (committed) tags; the task
+restarts from scratch on the next launch and re-writes them (idempotent,
+because the per-channel delete-before-re-derive is non-destructive toward user
+tags).
+
+Memory safety
+-------------
+The channels table can exceed 1 M rows.  The query uses
+``yield_per(_YIELD_SIZE)`` over a column-only projection so only a few
+thousand lightweight tuples are in memory at any time — no full ORM objects,
+no JSON blobs beyond those needed for the genre feeder.
+
+Targeted vs. full scan
+-----------------------
+Most version bumps re-run every channel because a feeder's algorithm changed
+and there is no way to tell which rows it affects without re-running it.
+Version 11 (TAG-1) was the first exception: its affected population is fully
+computable in SQL (``_collect_channel_ids_genre_gap``, gated on
+``_TARGETED_GENRE_GAP_FLOOR``). Version 12 (LANG-1) is the same shape one
+version later: its population is also fully computable in SQL
+(``_collect_channel_ids_region_language``, gated on
+``_TARGETED_REGION_LANGUAGE_FLOOR`` — the version in force immediately before
+the LANG-1 bump), so ``run()`` now dispatches on THAT floor: a library already
+at version 11 gets only the narrow region-language re-tag; a library resuming
+from further behind falls back to the full-corpus scan (``_collect_channel_ids``),
+which also closes the version-11 genre gap as a side effect because it runs
+today's (already-fixed) ``_collect_tags`` — so the superseded
+``_collect_channel_ids_genre_gap``/``_TARGETED_GENRE_GAP_FLOOR`` pair is kept
+only as a directly-tested, standalone collector, not reachable from ``run()``
+any more. Either way, the actual re-decompose (``_process_batch``) is the same
+code — only the ``channel_ids`` it is given differs.
+
+Confidence
+----------
+Each ``(type, value)`` pair accumulates the feeder name(s) that independently
+produced it.  The v1 confidence formula in
+:func:`~streamselect.core.repositories.tag_content_tags._compute_confidence` sums a
+per-feeder weight (1.0 for most feeders; LANG-1's ``region_inference`` weighs
+only 0.3) and maps it to confidence: one full-weight feeder → ~0.33, two →
+~0.67, three or more → 1.0.  More independent feeders corroborating the same
+tag raises confidence; a feeder in ``_FEEDER_WEIGHTS`` raises it less.
+"""
+
+from __future__ import annotations
+
+import threading
+from collections import defaultdict
+from typing import TYPE_CHECKING, Callable
+
+from loguru import logger
+from sqlalchemy import text
+
+if TYPE_CHECKING:
+    from streamselect.core.config import Config
+    from streamselect.core.database import Database
+
+# Module-level flag: True while a TagBackfillTask is actively running.
+# _update_tags_in_thread in provider_loader checks this before tagging to avoid
+# a 3rd concurrent SQLite writer (backfill + store + per-refresh = locked DB).
+# Protected by a threading.Lock so it is safe to read/write from any thread.
+_backfill_lock = threading.Lock()
+_backfill_active: bool = False
+
+
+def is_backfill_active() -> bool:
+    """Return True if a ``TagBackfillTask`` is currently running.
+
+    Thread-safe; may be called from any thread.
+    """
+    with _backfill_lock:
+        return _backfill_active
+
+
+def _set_backfill_active(active: bool) -> None:
+    """Set the module-level backfill-active flag.  Called only by TagBackfillTask."""
+    global _backfill_active
+    with _backfill_lock:
+        _backfill_active = active
+
+
+# Bump this constant to re-run the backfill for all users on next launch.
+#
+# History:
+#   1 — initial backfill: populate content_tags from provider_category,
+#       header (source_category), name_parse, and genre feeders.
+#   2 — cross-language genre normalization: extended _GENRE_NORM in filter_utils
+#       with Arabic, Polish, Swedish, Danish/Norwegian, Dutch, Slovak, Croatian,
+#       Portuguese, Greek, Russian, Hebrew, Turkish, Romanian, and Persian
+#       mappings so foreign-language genre names fold into their canonical
+#       English equivalents before tags are stored.
+#   3 — category→genre cross-walk for movies + series: added
+#       recognized_genre() strict-allowlist predicate to filter_utils and a
+#       genre pass in _decompose_compound so provider category tokens that
+#       match a known canonical genre (e.g. "ACTION/THRILLER", "DRAME",
+#       "KOMEDIE") emit genre tags at CONF_STRONG_PRIOR.  Movies previously
+#       produced zero genre tags (no raw_data["genre"] field); ~15% of movies
+#       now gain genre tags from their provider category.  TMDb will supersede
+#       at higher confidence when integrated.
+#   4 — audio_annotation feeder: sub/dub/multi parentheticals now
+#       produce language: (union), subtitle:, dub:, and format: tags from the
+#       stored ChannelDB.detected_audio dict.  Full re-tag required so existing
+#       rows gain these facets.
+#   5 — Sport → Sports fold: _GENRE_NORM in filter_utils now maps both
+#       "sport" and "sports" to the plural canonical "Sports" (matching
+#       CONTENT_DESCRIPTOR_GROUPS and BASE_PLATFORM_GROUPS).  Existing
+#       source="generated" tags with value "Sport" (singular) must be
+#       regenerated as "Sports" to eliminate the split facet.
+#   6 — code-interpretation alignment: AR removed from Spanish/South-
+#       America/Latin-America groups (AR = Arabic, not Argentina); BS removed
+#       from English (BS = Serbian/Croatian); "PA" removed from the Indian
+#       language group (PA = Panama/Spanish) while Punjabi moved to "PB".
+#       Existing generated tags misclassified Panama channels as language:Indian
+#       and Punjabi channels under "PA"; a full re-tag re-derives the correct
+#       language/region facets.  Runs AFTER prefix_rescan (v3) so detected_prefix
+#       already reflects the PUNJABI→PB alias.  Deletes only source="generated"
+#       tags per channel — user-curated tags are untouched.
+#   7 — TV-genre fold: _GENRE_NORM in filter_utils now folds the whole
+#       fragmented "TV" family (TV program, TV programme, TV Series, Television
+#       series, Program Tv, the provider typos TV proramme/PROGRAME, and the
+#       bare program/programme) into ONE canonical "TV Show" — TMDB has no
+#       single "TV" genre so providers split it into ~15 near-duplicate labels.
+#       Existing source="generated" tags holding the old un-normalized values
+#       must be regenerated so the filter panel shows one "TV Show" entry with
+#       the summed count instead of the fragmented facets.  Deletes only
+#       source="generated" tags per channel — user-curated tags are untouched.
+#   8 — AI-provenance markers: a trailing "(AI Generated)" (AI-generated content)
+#       or "(AI)" (AI voiceover/dub) suffix now emits a content_type: tag
+#       (content_type:ai_generated / content_type:ai_voiceover) via a new
+#       name-based feeder (decompose_ai_provenance).  Full re-tag required so
+#       existing rows gain the excludable facet.  Runs AFTER
+#       detected_title_reparse (which strips the "(AI)" marker from the display
+#       title and keeps the "(AI Generated)" marker for content-key distinctness).
+#       Deletes only source="generated" tags per channel — user tags untouched.
+#   9 — genre consolidation: _GENRE_NORM in filter_utils gained 118 new
+#       folds (129 chart rows) collapsing ~500 raw genre spellings into ~40
+#       canonical genres, PLUS 10 new canonicals (Adult, Politics, Biography,
+#       Game Show, Anime, Music Show, TV Movie, and the Drama-led compounds
+#       Drama & Comedy / Drama & Crime / Drama & Romance), PLUS 6 corrections:
+#       "Soap" → "Soap Opera" (rename), "biografi" → Biography (was History),
+#       "tävling" → Game Show (was Reality), "children & family" → Family (was
+#       Kids), and removal of the "variety" / "underhållning" / Persian
+#       "اجتماعی" concept-guess mappings (now kept raw).  A full re-tag rewrites
+#       existing source="generated" genre tags so, e.g., a stored "Soap" tag
+#       becomes "Soap Opera" and a "Dram" tag becomes "Drama".  Deletes only
+#       source="generated" tags per channel — user-curated tags are untouched.
+#       Auditable mapping: the design notes
+#  10 — name_cast feeder: the credits residual a provider appends after
+#       the year ("EN - Adaptation. 4K (2002) NICOLAS CAGE") is stored in
+#       detected_name_cast at ingestion but had ZERO consumers — captured and
+#       then dropped on the floor. It now emits LOW-confidence person: tags via
+#       decompose_name_cast, so an actor a provider named in the filename is
+#       searchable and filterable. Only person-SHAPED residuals qualify: about
+#       half the real values are language/format/studio words (POLSKI 918, 4K
+#       652, DOKUMENT 531), and a wrong facet is a false statement, not a
+#       low-confidence guess. Full re-tag so existing rows gain the facet; runs
+#       AFTER prefix_rescan v4, which populates the column.
+#  11 — TAG-1: W-1 fixed filter_utils.recognized_genre()'s case-
+#       sensitivity and added its category→genre cross-walk, then re-derived
+#       ChannelDB.detected_genres for the whole library via
+#       DetectedGenreBackfillTask v3 (detected_genre_backfill.py) — but
+#       recognized_genre() is the SAME function the provider_category feeder
+#       below calls, and content_tags was never re-decomposed. Measured on the
+#       a large library: many channels carry a genre in detected_genres with
+#       no matching genre: content_tags row (many with zero genre tags at
+#       all — many movies + 34 series — plus ~88 more missing one value from
+#       an otherwise-populated genre list). Targeted, not full: a library
+#       already at version 10 (the version this gap shipped under) only needs
+#       those specific channels re-run through the existing decompose pipeline
+#       — see ``_collect_channel_ids_genre_gap``, a single indexed SQL anti-
+#       join (~1s on a user's 786k-row/338k-genre-tag library) versus the
+#       ~3m17s a full corpus pass costs. A library resuming from BELOW version
+#       10 still gets the unconditional full pass (``_collect_channel_ids``)
+#       so it also catches up on versions 4-10's other feeder fixes; that full
+#       pass runs today's (already-fixed) ``_collect_tags``, so it closes this
+#       same genre gap as a side effect — see ``_TARGETED_GENRE_GAP_FLOOR``.
+#       Relies on registration order (main_window.py registers
+#       DetectedGenreBackfillTask before TagBackfillTask, and MigrationManager
+#       runs one evaluate-then-run pass through ALL pending tasks in that
+#       order): a library still pending its OWN DetectedGenreBackfillTask v3
+#       run gets it applied — and committed — before this task's query ever
+#       reads ``detected_genres``, so the targeted anti-join always sees
+#       current data even when both migrations land on the same launch.
+#  12 — LANG-1 (confirmed): a provider's regional CATALOGUE
+#       prefix/category code (e.g. ``SE``) says only which shelf a FILM or
+#       SERIES is filed under, never what language it is spoken in — but
+#       CODE_FACETS' dual-facet entries read it as BOTH, so every one of the
+#       many titles in provider category "|SE| FILM 1900 - 2018" (English-
+#       language films such as "SE - 3 Days To Kill") was tagged
+#       language:Swedish at full CONF_DENOTED confidence. ``_collect_tags``
+#       now runs ``reattribute_region_languages`` right after
+#       ``remap_content_descriptor_facets``: for movie/series rows it demotes
+#       any language: tag a region code in the same row implies down to the
+#       ``region_inference`` feeder, which ``tag_content_tags._FEEDER_WEIGHTS``
+#       weighs at 0.3 instead of 1.0 — low enough that any feeder which
+#       actually STATES the language (audio_annotation, and TMDb original-
+#       language / observed-playback-track evidence in later slices) outranks
+#       it, while the title stays findable under "Swedish" (tag-value search
+#       matches the region tag's own "SE" value too). Live channels are
+#       unaffected (a live prefix routinely IS the broadcast language) and no
+#       subtitle inference is ever made from a region. Targeted, not full:
+#       see ``_collect_channel_ids_region_language``/
+#       ``_TARGETED_REGION_LANGUAGE_FLOOR`` below — a library already at
+#       version 11 only needs its movie/series rows carrying a region tag
+#       re-run; a library resuming from further behind still gets the
+#       unconditional full pass, which runs today's (already-fixed)
+#       ``_collect_tags`` and so closes this same gap as a side effect.
+#   13 — "SC" was in BASE_PLATFORM_GROUPS, so every "4K-SC - Title" (the
+#       Scandinavian-subtitled library, 431 titles on a large library) was
+#       tagged platform:SC. SC is a region code (REGION_FULL_NAMES["SC"]);
+#       the platform entry is gone. Targeted: only channels carrying a
+#       platform:SC tag are re-decomposed (``_collect_channel_ids_platform_sc``).
+#   14 — a country NAME leading a group label ("SWEDEN SOCCER PPV") is now a
+#       region (channel_name_utils.leading_country). many prefix-less live
+#       channels on a large library carried their country only there, so
+#       Global Exclusions could not see them. Targeted: those channels get
+#       detected_region filled and are re-decomposed
+#       (``_collect_channel_ids_country_label``).
+#   15 — "PPV" / "PAY PER VIEW" in a provider label is a content_type tag
+#       (ppv), and no longer part of a collection name ("Soccer Ppv").
+#       Targeted: channels whose category/header mentions it
+#       (``_collect_channel_ids_ppv_label``).
+CURRENT_TAG_BACKFILL_VERSION = 15
+
+#: A library already at version 14 only needs its PPV-labelled rows re-run.
+_TARGETED_PPV_LABEL_FLOOR: int = 14
+
+#: A library already at version 13 only needs its country-named labels re-run.
+_TARGETED_COUNTRY_LABEL_FLOOR: int = 13
+
+#: A library already at version 12 only needs its platform:SC rows re-run.
+_TARGETED_PLATFORM_SC_FLOOR: int = 12
+
+# The tag_backfill_version a library must already be AT (not behind) for the
+# version-12 run to use the cheap targeted region-language query instead of
+# the full corpus scan. Set to the CURRENT_TAG_BACKFILL_VERSION that was in
+# force immediately before the LANG-1 bump (same convention as
+# ``_TARGETED_GENRE_GAP_FLOOR`` below): a library already there has a full-
+# corpus pass reflecting every feeder fix through version 11 on file, so only
+# the isolated region→language gap remains. A library behind this floor
+# (catching up across several versions at once) needs the general full-corpus
+# catch-up instead — using the targeted query there would silently skip
+# versions 4-11's other fixes for every channel outside the narrow
+# region-language set. ``run()`` now gates on THIS floor, not
+# ``_TARGETED_GENRE_GAP_FLOOR``: see "Targeted vs. full scan" above.
+_TARGETED_REGION_LANGUAGE_FLOOR: int = 11
+
+# Superseded by ``_TARGETED_REGION_LANGUAGE_FLOOR`` above as of the LANG-1
+# (version 12) bump — ``run()`` no longer gates on this constant. Kept only
+# because ``_collect_channel_ids_genre_gap`` is still correct and still
+# directly unit-tested as a standalone collector (see "Targeted vs. full
+# scan" above for why it is no longer reachable from ``run()``).
+_TARGETED_GENRE_GAP_FLOOR: int = 10
+
+# Number of channel rows to stream per SQLAlchemy yield_per chunk.
+# Small enough to stay memory-safe on 1 M+ row tables; large enough for
+# reasonable throughput.
+_YIELD_SIZE: int = 2_000
+
+# Number of channels processed per DB session (commit boundary).
+# One session_scope per batch keeps the transaction short and gives
+# cooperative cancellation a chance to fire between batches.
+_BATCH_SIZE: int = 500
+
+
+class TagBackfillTask:
+    """Populate ``content_tags`` for every channel via the tag decomposer.
+
+    ``needs_run`` checks ``config.tag_backfill_version`` against
+    ``CURRENT_TAG_BACKFILL_VERSION``.  On full completion the task bumps the
+    version and saves config; on cancellation the version is left unbumped so
+    the next launch re-runs from scratch.
+    """
+
+    id: str = "tag_backfill"
+    label: str = "Building content tags from channel metadata"
+
+    def __init__(self, db: "Database", config: "Config | None" = None) -> None:
+        """
+        Args:
+            db: Database instance.
+            config: Live Config instance (provides filter groups for the
+                decomposer).  If None, a default Config is loaded lazily at
+                run time — this branch exists so the task can be driven
+                directly in tests without a full application boot.
+        """
+        self._db = db
+        self._config = config
+
+    def needs_run(self, config: "Config") -> bool:
+        """Return True when the backfill has not yet completed for this version.
+
+        Args:
+            config: The application Config instance.
+
+        Returns:
+            True when ``config.tag_backfill_version`` is behind
+            ``CURRENT_TAG_BACKFILL_VERSION``.
+        """
+        stored = getattr(config, "tag_backfill_version", 0)
+        return stored < CURRENT_TAG_BACKFILL_VERSION
+
+    def run(
+        self,
+        progress_cb: Callable[[int, int], None],
+        is_cancelled: Callable[[], bool],
+    ) -> None:
+        """Execute the tag backfill.
+
+        Runs on a **worker thread** (called by MigrationManager).  Streams
+        all channels in column-only batches, runs the decomposer over each
+        feeder, and writes the resulting tags to ``content_tags`` via
+        ``TagRepository``.
+
+        Args:
+            progress_cb: ``(done, total)`` called after each batch commit.
+            is_cancelled: Returns True when the manager has been asked to stop.
+        """
+        config = self._config
+        if config is None:
+            from streamselect.core.config import Config as _Config
+            config = _Config.load()
+
+        logger.info(
+            "TagBackfillTask: starting (version={})", CURRENT_TAG_BACKFILL_VERSION
+        )
+
+        _set_backfill_active(True)
+        try:
+            stored_version = getattr(config, "tag_backfill_version", 0)
+            country_ids = (self._collect_channel_ids_country_label(config)
+                           if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_PPV_LABEL_FLOOR
+                           else [])
+            ppv_ids = (self._collect_channel_ids_ppv_label()
+                       if stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR else [])
+            if stored_version >= _TARGETED_PPV_LABEL_FLOOR:
+                logger.info("TagBackfillTask: library at version {} — targeted "
+                            "PPV-label re-tag only", stored_version)
+                channel_ids = ppv_ids
+            elif stored_version >= _TARGETED_COUNTRY_LABEL_FLOOR:
+                logger.info("TagBackfillTask: library at version {} — targeted "
+                            "country-label re-tag only", stored_version)
+                channel_ids = sorted(set(country_ids) | set(ppv_ids))
+            elif stored_version >= _TARGETED_PLATFORM_SC_FLOOR:
+                logger.info("TagBackfillTask: library at version {} — targeted "
+                            "platform:SC re-tag only", stored_version)
+                channel_ids = sorted(set(self._collect_channel_ids_platform_sc())
+                                     | set(country_ids) | set(ppv_ids))
+            elif stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR:
+                logger.info(
+                    "TagBackfillTask: library already at version {} — targeted "
+                    "region-language re-tag only (LANG-1)",
+                    stored_version,
+                )
+                channel_ids = sorted(set(self._collect_channel_ids_region_language())
+                                     | set(self._collect_channel_ids_platform_sc())
+                                     | set(country_ids) | set(ppv_ids))
+            else:
+                logger.info(
+                    "TagBackfillTask: library at version {} — full corpus pass",
+                    stored_version,
+                )
+                channel_ids = self._collect_channel_ids()
+            total = len(channel_ids)
+
+            if total == 0:
+                logger.info("TagBackfillTask: no channels found — nothing to do")
+                progress_cb(0, 0)
+                return
+
+            logger.info("TagBackfillTask: processing {} channels", total)
+
+            done = 0
+            for batch_start in range(0, total, _BATCH_SIZE):
+                if is_cancelled():
+                    logger.info(
+                        "TagBackfillTask: cancelled after {}/{}", done, total
+                    )
+                    return
+
+                chunk = channel_ids[batch_start : batch_start + _BATCH_SIZE]
+                self._process_batch(chunk, config)
+                done = batch_start + len(chunk)
+                logger.debug(
+                    "TagBackfillTask: committed batch {}–{}", batch_start, done
+                )
+                progress_cb(done, total)
+
+            logger.info(
+                "TagBackfillTask: completed — tagged {} channels", total
+            )
+        finally:
+            _set_backfill_active(False)
+
+    def on_completed(self, config: "Config") -> None:
+        """Bump the version field so the task won't re-run on next launch.
+
+        Args:
+            config: The application Config instance.
+        """
+        config.tag_backfill_version = CURRENT_TAG_BACKFILL_VERSION
+        config.save()
+        logger.debug(
+            "TagBackfillTask: bumped tag_backfill_version={}",
+            CURRENT_TAG_BACKFILL_VERSION,
+        )
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _collect_channel_ids(self) -> list[str]:
+        """Return all channel IDs from the DB in a single read-only query.
+
+        Column-only projection — no full ORM objects.
+        """
+        from streamselect.core.database import ChannelDB
+
+        with self._db.session_scope(commit=False) as session:
+            rows = (
+                session.query(ChannelDB.id)
+                .yield_per(_YIELD_SIZE)
+                .all()
+            )
+        # rows is a list of 1-tuples; extract the id strings.
+        return [r[0] for r in rows]
+
+    def _collect_channel_ids_genre_gap(self) -> list[str]:
+        """Return channel IDs whose ``detected_genres`` disagrees with content_tags.
+
+        TAG-1 (version 11, see the module docstring): finds every channel
+        where at least one genre in the stored ``detected_genres`` JSON list
+        has no matching ``type='genre'`` row in ``content_tags`` — the gap
+        W-1 left when it re-derived ``detected_genres`` but not the tag
+        corpus. A single indexed SQLite anti-join (``json_each`` over the
+        JSON column, joined against the ``content_tags``/``tags`` composite
+        index) — no per-channel decomposition needed just to pick which rows
+        are affected; re-decomposition itself still goes through the normal
+        ``_process_batch`` pipeline once this returns.
+
+        Read-only — matches the column-only-projection contract of
+        ``_collect_channel_ids`` (no full ORM objects).
+
+        Returns:
+            List of ``ChannelDB.id`` strings needing re-decomposition.
+        """
+        with self._db.session_scope(commit=False) as session:
+            rows = session.execute(text(
+                "SELECT DISTINCT c.id "
+                "FROM channels c, json_each(c.detected_genres) je "
+                "WHERE c.detected_genres IS NOT NULL "
+                "  AND c.detected_genres NOT IN ('', '[]', 'null') "
+                "  AND NOT EXISTS ("
+                "    SELECT 1 FROM content_tags ct "
+                "    JOIN tags t ON t.id = ct.tag_id "
+                "    WHERE ct.channel_key = c.channel_key "
+                "      AND t.type = 'genre' AND t.value = je.value"
+                "  )"
+            )).all()
+        return [r[0] for r in rows]
+
+    def _collect_channel_ids_platform_sc(self) -> list[str]:
+        """Channel IDs carrying a ``platform:SC`` tag (version 13's population)."""
+        with self._db.session_scope(commit=False) as session:
+            rows = session.execute(text(
+                "SELECT DISTINCT c.id FROM channels c "
+                "JOIN content_tags ct ON ct.channel_key = c.channel_key "
+                "JOIN tags t ON t.id = ct.tag_id "
+                "WHERE t.type = 'platform' AND t.value = 'SC'"
+            )).all()
+        return [r[0] for r in rows]
+
+    def _collect_channel_ids_country_label(self, config) -> list[str]:
+        """Prefix-less channels whose group label leads with a country name
+        (version 14). Fills their empty ``detected_region`` from the label —
+        the column Global Exclusions read — and returns them for re-tagging."""
+        from streamselect.core.tag_decomposer import region_code_from_category
+        found: dict[str, str] = {}
+        with self._db.session_scope(commit=False) as session:
+            rows = session.execute(text(
+                "SELECT id, category FROM channels WHERE COALESCE(detected_prefix, '') = ''"
+                " AND COALESCE(detected_region, '') = '' AND COALESCE(category, '') != ''"
+            )).all()
+        by_label: dict[str, str | None] = {}
+        for cid, category in rows:
+            if category not in by_label:
+                by_label[category] = region_code_from_category(category, config=config)
+            if by_label[category]:
+                found[cid] = by_label[category]
+        if found:
+            with self._db.session_scope() as session:
+                session.execute(text(
+                    "UPDATE channels SET detected_region = :r WHERE id = :i"
+                    " AND COALESCE(detected_region, '') = ''"),
+                    [{"r": r, "i": i} for i, r in found.items()])
+        logger.info("TagBackfillTask: {:,} channel(s) take their region from a "
+                    "country-named label", len(found))
+        return sorted(found)
+
+    def _collect_channel_ids_ppv_label(self) -> list[str]:
+        """Channels whose provider category or header says PPV (version 15)."""
+        with self._db.session_scope(commit=False) as session:
+            rows = session.execute(text(
+                "SELECT id FROM channels WHERE upper(COALESCE(category, '')) LIKE '%PPV%'"
+                " OR upper(COALESCE(source_category, '')) LIKE '%PPV%'"
+                " OR upper(COALESCE(category, '')) LIKE '%PAY PER VIEW%'"
+                " OR upper(COALESCE(source_category, '')) LIKE '%PAY PER VIEW%'")).all()
+        return [r[0] for r in rows]
+
+    def _collect_channel_ids_region_language(self) -> list[str]:
+        """Return movie/series channel IDs carrying at least one ``region`` tag.
+
+        LANG-1 (version 12, see the module docstring): the affected population
+        is exactly every movie/series channel whose ``content_tags`` include a
+        ``region:`` row — the only rows :func:`~streamselect.core.tag_decomposer.
+        reattribute_region_languages` can change, since a channel with no
+        region tag has nothing to reattribute. A single indexed JOIN
+        (``channels`` → ``content_tags`` → ``tags`` via ``channel_key``) — no
+        per-channel decomposition needed just to pick which rows are
+        affected; re-decomposition itself still goes through the normal
+        ``_process_batch`` pipeline once this returns.
+
+        Read-only — matches the column-only-projection contract of
+        ``_collect_channel_ids`` (no full ORM objects).
+
+        Returns:
+            List of ``ChannelDB.id`` strings needing re-decomposition.
+        """
+        with self._db.session_scope(commit=False) as session:
+            rows = session.execute(text(
+                "SELECT DISTINCT c.id "
+                "FROM channels c "
+                "JOIN content_tags ct ON ct.channel_key = c.channel_key "
+                "JOIN tags t ON t.id = ct.tag_id "
+                "WHERE c.media_type IN ('movie', 'series') "
+                "  AND t.type = 'region'"
+            )).all()
+        return [r[0] for r in rows]
+
+    def _process_batch(self, channel_ids: list[str], config: "Config") -> None:
+        """Scrub-and-re-tag one batch of channels inside a single session_scope.
+
+        The session is committed at the end of the scope; cancellation between
+        batches leaves previously committed batches durable.
+
+        **Write-throughput optimization:** Instead of issuing a DELETE + an
+        INSERT/UPSERT per channel (N×2 round-trips for a 500-channel batch), this
+        method:
+
+        1. Decomposes ALL channels in the loop (pure CPU — no DB round-trips).
+        2. Performs ONE bulk DELETE of generated tags for all channel_ids.
+        3. Performs ONE bulk upsert of tag rows + content_tag links for the whole
+           batch via :meth:`~streamselect.core.repositories.tag.TagRepository.set_content_tags_bulk`.
+
+        This collapses ~1 000 DB round-trips per 500-channel batch to 3,
+        reducing wall time by ~10× on typical hardware.
+
+        Args:
+            channel_ids: Slice of channel IDs to process.
+            config: Live Config instance.
+        """
+        from streamselect.core.database import ChannelDB
+        from streamselect.core.repositories import RepositoryFactory
+
+        with self._db.session_scope() as session:
+            repos = RepositoryFactory(session)
+
+            # Load only the columns we need for the four feeders — no JSON for
+            # channels that have none.  media_type is required for content-descriptor
+            # facet routing (category: live vs genre: movie/series).
+            # detected_audio is required for the audio_annotation feeder (feeder 5).
+            # name is required for the AI-provenance feeder (decompose_ai_provenance
+            # reads the trailing "(AI Generated)" / "(AI)" marker off the raw name).
+            rows = (
+                session.query(
+                    ChannelDB.id,
+                    ChannelDB.name,
+                    ChannelDB.category,
+                    ChannelDB.source_category,
+                    ChannelDB.detected_prefix,
+                    ChannelDB.detected_quality,
+                    ChannelDB.detected_region,
+                    ChannelDB.detected_year,
+                    ChannelDB.raw_data,
+                    ChannelDB.media_type,
+                    ChannelDB.detected_audio,
+                    ChannelDB.detected_name_cast,
+                )
+                .filter(ChannelDB.id.in_(channel_ids))
+                .yield_per(_YIELD_SIZE)
+                .all()
+            )
+
+            # Phase 1: decompose all channels in Python (CPU-only, no DB I/O).
+            # Build {channel_id: [(type, value, feeder), ...]} for the whole batch.
+            tag_map: dict[str, list[tuple[str, str, str]]] = {}
+            for row in rows:
+                (
+                    channel_id,
+                    name,
+                    category,
+                    source_category,
+                    detected_prefix,
+                    detected_quality,
+                    detected_region,
+                    detected_year,
+                    raw_data,
+                    media_type,
+                    detected_audio,
+                    detected_name_cast,
+                ) = row
+
+                all_tags = _collect_tags(
+                    config=config,
+                    name=name,
+                    category=category,
+                    source_category=source_category,
+                    detected_prefix=detected_prefix,
+                    detected_quality=detected_quality,
+                    detected_region=detected_region,
+                    detected_year=detected_year,
+                    raw_data=raw_data,
+                    media_type=media_type,
+                    detected_audio=detected_audio,
+                    detected_name_cast=detected_name_cast,
+                )
+                # Include every channel (even empty) so channels with no tags
+                # still get their generated rows cleared.
+                tag_map[channel_id] = all_tags
+
+            # Phase 2: ONE bulk DELETE for all channels in the batch.
+            # Only source="generated" rows are removed; user tags survive.
+            repos.tags.delete_generated_for_channels(list(tag_map.keys()))
+
+            # Phase 3: ONE bulk upsert for all channels that have at least one tag.
+            # Channels with an empty tag list are silently skipped inside the method.
+            repos.tags.set_content_tags_bulk(tag_map, source="generated")
+
+
+# ---------------------------------------------------------------------------
+# Feeder wiring (module-level helper — pure, no DB)
+# ---------------------------------------------------------------------------
+
+def _subtitle_language_from_marker(category, detected_prefix, config) -> str | None:
+    """Language name the prefix denotes as SUBTITLES rather than audio.
+
+    Returns a value only when the provider category carries an explicit
+    ``<CODE>-SUB`` marker AND that code matches the row's own name prefix — the
+    one situation where the two feeders are talking about the same code and the
+    category is the more specific statement.
+
+    Args:
+        category: ``ChannelDB.category``.
+        detected_prefix: ``ChannelDB.detected_prefix``.
+        config: Live Config (for the prefix classification vocabulary).
+
+    Returns:
+        The language NAME (e.g. ``"Arabic"``), or None when no override applies.
+    """
+    from streamselect.core.channel_name_utils import parse_category_marker
+    from streamselect.core.region_codes import normalize_region_code
+    from streamselect.core.tag_decomposer import _classify_prefix_token
+
+    if not category or not detected_prefix:
+        return None
+    _clean, marker = parse_category_marker(category)
+    if marker is None or marker.kind != "sub":
+        return None
+    if normalize_region_code(marker.code) != normalize_region_code(detected_prefix):
+        return None
+    for tag_type, value, _conf in _classify_prefix_token(detected_prefix, config):
+        if tag_type == "language":
+            return value
+    return None
+
+
+def _collect_tags(
+    *,
+    config,
+    category: str | None,
+    source_category: str | None,
+    detected_prefix: str | None,
+    detected_quality: str | None,
+    detected_region: str | None,
+    detected_year: str | None,
+    raw_data: dict | None,
+    media_type: str | None = None,
+    detected_audio: dict | None = None,
+    name: str | None = None,
+    detected_name_cast: str | None = None,
+) -> list[tuple[str, str, str]]:
+    """Run all feeders and return a merged ``(type, value, feeder)`` list.
+
+    Each distinct ``(type, value)`` pair carries ALL feeder names that produced
+    it, deduplicated.  The TagRepository's ``set_content_tags`` uses feeder
+    count as the v1 confidence signal, so more independent feeders → higher
+    confidence automatically.
+
+    After all feeders run, content-descriptor group tags (see
+    :data:`~streamselect.core.content_labels.CONTENT_DESCRIPTOR_GROUPS` — e.g.
+    ``"Sports"``, ``"Adult"``, ``"Kids"``) are re-faceted by *media_type* via
+    :func:`~streamselect.core.tag_decomposer.remap_content_descriptor_facets`:
+    ``category:`` for live channels, ``genre:`` for movies / series / unknown.
+
+    Args:
+        config: Live Config instance.
+        category:         ``ChannelDB.category`` (provider_category feeder).
+        source_category:  ``ChannelDB.source_category`` (header feeder).
+        detected_prefix:  ``ChannelDB.detected_prefix`` (name_parse feeder).
+        detected_quality: ``ChannelDB.detected_quality`` (name_parse feeder).
+        detected_region:  ``ChannelDB.detected_region`` (name_parse feeder).
+        detected_year:    ``ChannelDB.detected_year`` (name_parse feeder).
+        raw_data:         ``ChannelDB.raw_data`` dict (genre feeder).
+        media_type:       ``ChannelDB.media_type`` — used to route content-
+                          descriptor groups to the correct facet.  ``None`` /
+                          ``"unknown"`` maps to ``genre:``.
+        detected_name_cast: ``ChannelDB.detected_name_cast`` (name_cast feeder) —
+                          the credits residual lifted from the channel name at
+                          ingestion.  Emits LOW-confidence ``person:`` tags.
+        detected_audio:   ``ChannelDB.detected_audio`` dict (audio_annotation feeder).
+                          When present, adds ``language:``, ``subtitle:``, ``dub:``,
+                          and ``format:`` tags (tasks an earlier change/an earlier change).
+        name:             ``ChannelDB.name`` (ai_provenance feeder).  When a trailing
+                          ``(AI Generated)`` / ``(AI)`` marker is present, adds a
+                          ``content_type:`` tag (``ai_generated`` / ``ai_voiceover``).
+
+    Returns:
+        List of ``(type, value, feeder)`` tuples ready for
+        :meth:`~streamselect.core.repositories.tag.TagRepository.set_content_tags`.
+    """
+    from streamselect.core.tag_decomposer import (
+        decompose,
+        decompose_ai_provenance,
+        decompose_audio,
+        decompose_name_cast,
+        decompose_name_parse,
+        reattribute_region_languages,
+        remap_content_descriptor_facets,
+    )
+
+    # key: (type, value)  →  value: set of feeder names
+    feeder_map: dict[tuple[str, str], set[str]] = defaultdict(set)
+
+    # Feeder 1: provider_category
+    if category:
+        for tag_type, tag_value, _conf in decompose(
+            "provider_category", category, config=config
+        ):
+            feeder_map[(tag_type, tag_value)].add("provider_category")
+
+    # Feeder 2: header (source_category = the ##...## label)
+    if source_category:
+        for tag_type, tag_value, _conf in decompose(
+            "header", source_category, config=config
+        ):
+            feeder_map[(tag_type, tag_value)].add("header")
+
+    # Feeder 3: name_parse (already-typed detected_* fields)
+    name_tags = decompose_name_parse(
+        detected_prefix=detected_prefix,
+        detected_quality=detected_quality,
+        detected_region=detected_region,
+        detected_year=detected_year,
+        config=config,
+    )
+    # An explicit "<CODE>-SUB" category marker OVERRIDES the name prefix's
+    # language reading for that same code. "|AR| The Lobster" under
+    # "|AR-SUB| AMAZON PRIME" is an ENGLISH film with Arabic subtitles — the
+    # prefix names the subtitle track, not the audio, and tagging it
+    # language:Arabic put an English film under Arabic in filters and fed it to
+    # recommendations that way (confirmed: "AR is in English, the
+    # subtitles are in Arabic").
+    #
+    # Narrow on purpose: only the language whose code MATCHES the marker is
+    # remapped. A row carrying a genuine second language keeps it, and a bare
+    # "|AR|" with no SUB marker still means Arabic audio — the marker is the
+    # only thing that licenses the reinterpretation.
+    _sub_language = _subtitle_language_from_marker(category, detected_prefix, config)
+    for tag_type, tag_value, _conf in name_tags:
+        if tag_type == "language" and tag_value == _sub_language:
+            feeder_map[("subtitle", tag_value)].add("name_parse")
+            continue
+        feeder_map[(tag_type, tag_value)].add("name_parse")
+
+    # Feeder 4: genre (raw_data["genre"])
+    genre_raw = (raw_data or {}).get("genre")
+    if genre_raw:
+        for tag_type, tag_value, _conf in decompose(
+            "genre", str(genre_raw), config=config
+        ):
+            feeder_map[(tag_type, tag_value)].add("genre")
+
+    # Feeder 5: audio_annotation (detected_audio — sub/dub/multi language facets)
+    # Emits language: (union), subtitle:, dub:, format: tags.
+    # The union language: from this feeder merges with any language: from name_parse
+    # (more feeders → higher confidence — intended behavior per DR-0006).
+    if detected_audio:
+        for tag_type, tag_value, _conf in decompose_audio(detected_audio):
+            feeder_map[(tag_type, tag_value)].add("audio_annotation")
+
+    # Feeder 6: ai_provenance (trailing "(AI Generated)" / "(AI)" name marker).
+    # Emits a content_type: tag (ai_generated / ai_voiceover) so users can exclude
+    # AI-generated content and/or AI voiceovers via the tag-facet query path.
+    if name:
+        for tag_type, tag_value, _conf in decompose_ai_provenance(name):
+            feeder_map[(tag_type, tag_value)].add("name_ai_marker")
+
+    # Feeder 7: name_cast (detected_name_cast — the credits residual the provider
+    # appended after the year, e.g. "NICOLAS CAGE").  Emits LOW-confidence
+    # person: tags.  Kept out of MetadataDB.cast on purpose: this is a filename
+    # guess, and real credits must stay distinguishable from one.  Because it is
+    # a single feeder, set_content_tags scores it 1/3 — visibly weaker than a
+    # fact several feeders agree on, which is exactly what it is.
+    if detected_name_cast:
+        for tag_type, tag_value, _conf in decompose_name_cast(detected_name_cast):
+            feeder_map[(tag_type, tag_value)].add("name_cast")
+
+    # Re-facet content-descriptor groups by media_type.
+    # Groups like "Sports", "Adult", "Kids" are placed in language/platform config
+    # dicts for display-grouping but they are not locales or platforms; they denote
+    # a content KIND.  Route them: category: for live, genre: for everything else.
+    remap_content_descriptor_facets(feeder_map, media_type)
+
+    # LANG-1: a region/catalogue code (e.g. "SE") is not a statement of the
+    # spoken language for a FILM or SERIES — demote any language: tag that
+    # code's own region reading implies down to the low-confidence
+    # "region_inference" feeder so real language evidence always outranks it.
+    # No-op for live (and for any language no region in this row implies).
+    reattribute_region_languages(feeder_map, media_type, config)
+
+    # Flatten: each (type, value) pair is emitted once per contributing feeder.
+    # TagRepository.set_content_tags will merge feeders on the link and compute
+    # confidence as min(1.0, sum(weight(f) for f in distinct_feeders) / 3) —
+    # 1.0 per feeder except the low weight on "region_inference" (LANG-1).
+    result: list[tuple[str, str, str]] = []
+    for (tag_type, tag_value), feeders in feeder_map.items():
+        for feeder in sorted(feeders):  # sorted for deterministic ordering
+            result.append((tag_type, tag_value, feeder))
+
+    return result

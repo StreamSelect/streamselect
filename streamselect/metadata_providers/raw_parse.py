@@ -1,0 +1,242 @@
+"""Shared parsing of Xtream VOD/series detail blobs — single source of truth.
+
+Two callers turn the same Xtream ``info`` shape into structured metadata:
+
+* :class:`~streamselect.metadata_providers.provider_metadata.ProviderMetadataProvider`
+  reads a channel's cached **list** ``raw_data`` (sparse for movies — no genre).
+* :class:`~streamselect.core.tmdb_enrichment_manager.TmdbEnrichmentManager` fetches the
+  per-title **detail** endpoint (``get_vod_info`` / ``get_series_info``), whose
+  response *does* carry the movie's genre / plot / cast / director.
+
+Keeping the genre and cast parsing here means there is exactly one genre parser
+and one cast parser in the codebase (Governing Principle: single chokepoint).
+"""
+
+from __future__ import annotations
+
+import re
+
+from typing import Any, Optional
+
+from streamselect.core.stream_info import provider_original_language, provider_stream_record
+
+
+def parse_genres(genre_str: Any) -> list[str]:
+    """Split a provider genre string into a clean list.
+
+    Some providers use ``" / "`` (common on Xtream sources), others use ``","`` — both are
+    handled.  ``"&"`` is deliberately NOT a separator (``"Action & Adventure"`` is a
+    single genre).
+
+    Args:
+        genre_str: Raw ``genre`` value from the provider blob (string or anything).
+
+    Returns:
+        List of trimmed, non-empty genre names (empty list when absent).
+    """
+    if not genre_str:
+        return []
+    return [g.strip() for g in re.split(r"\s*/\s*|,\s*", str(genre_str)) if g.strip()]
+
+
+def parse_cast_string(cast_str: Any) -> list[dict[str, Any]]:
+    """Parse a comma-separated cast string into the structured TMDb-shaped list.
+
+    Args:
+        cast_str: ``"Actor1, Actor2, Actor3"`` style string (or anything falsy).
+
+    Returns:
+        List of ``{"name", "character", "photo_url"}`` dicts (empty list when absent).
+    """
+    if not cast_str:
+        return []
+    names = [name.strip() for name in str(cast_str).split(",") if name.strip()]
+    return [{"name": name, "character": None, "photo_url": None} for name in names]
+
+
+def extract_info(raw: Any) -> dict:
+    """Return the Xtream ``info`` dict from a detail/list blob (nested or flat).
+
+    Mirrors :meth:`ProviderMetadataProvider.get_details`'s structure handling:
+    prefer a nested ``info`` dict; otherwise treat the blob itself as the info dict
+    and drop the stream-API placeholder ratings (always ``'10'`` / ``'5'``).
+
+    Args:
+        raw: The parsed detail/list response (dict, or anything defensively).
+
+    Returns:
+        The info dict, or an empty dict when *raw* is not a usable mapping.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    info = raw.get("info")
+    if isinstance(info, dict) and info:
+        return info
+    flat = dict(raw)
+    flat.pop("rating", None)
+    flat.pop("rating_5based", None)
+    return flat
+
+
+def first_or_none(value: Any) -> Optional[str]:
+    """First element of a list, the value itself if it is a string, else None.
+
+    Xtream returns ``backdrop_path`` as a LIST of urls while every other image
+    field is a bare string, so a caller that assumes either shape is wrong half
+    the time.
+    """
+    if isinstance(value, (list, tuple)):
+        return value[0] if value else None
+    return value if isinstance(value, str) and value else None
+
+
+def extract_artwork(info: dict) -> tuple[Optional[str], Optional[str]]:
+    """``(poster_url, backdrop_url)`` from an Xtream ``info`` dict.
+
+    The ONE place the artwork keys and their precedence are written down.
+    ``cover`` before ``movie_image`` because a detail blob that carries both
+    puts the poster in ``cover`` and a smaller list-grade image in
+    ``movie_image``.
+
+    No fallback to the channel's own ``logo_url`` here — that is a decision
+    about a CHANNEL, not about a detail blob, and it belongs to the caller that
+    has one (see ``ProviderMetadataProvider.get_details``).
+
+    Args:
+        info: The blob's info dict (see :func:`extract_info`).
+
+    Returns:
+        ``(poster, backdrop)``, either of which may be ``None``.
+    """
+    poster = info.get("cover") or info.get("movie_image")
+    return (poster if isinstance(poster, str) and poster else None,
+            first_or_none(info.get("backdrop_path")))
+
+
+#: The keys :func:`harvest_detail_metadata` returns, owned by the function that
+#: PRODUCES them rather than by the writer that consumes them — so adding a
+#: field is one edit here, and no consumer can drift from the contract.
+#: ``genres`` leads because ``apply_metadata_harvest`` counts only that one.
+HARVEST_FIELDS = ("genres", "plot", "poster_url", "backdrop_url", "original_language")
+
+
+def _alt_titles(info: dict) -> list:
+    """Every title the detail blob names (``o_name``, ``name``), year stripped.
+
+    Not compared with each other: on some panels BOTH are the regional title
+    ("Oskyldigt blod" for Innocent Blood). The writer drops whichever equal the
+    channel's own title — the comparison only it can make.
+    """
+    out = []
+    for key in ("o_name", "name"):
+        title = re.sub(r"\s*\((?:19|20)\d{2}\)\s*$", "", str(info.get(key) or "")).strip()
+        if title and title.casefold() not in {t.casefold() for t in out}:
+            out.append(title)
+    return out
+
+
+def harvest_detail_metadata(data: Any) -> dict:
+    """Pull genre/plot/cast/director/ARTWORK out of a ``get_vod_info`` /
+    ``get_series_info`` blob.
+
+    Used by the enrichment sweep to salvage the metadata the sparse list
+    ``raw_data`` omits for movies.  Every field comes back empty (``[]`` /
+    ``None``) when absent, so a caller can safely fill-only-empty without a
+    presence check per field.
+
+    **Artwork was missing from this harvest earlier**, and its absence
+    had teeth. The bulk catalog frequently carries ``stream_icon: null``, so for
+    those titles the ONLY place a poster ever appears is this blob — yet the
+    sweep read the blob, took four fields, and dropped the image on the floor.
+    When the pre-an earlier change cache clobber then emptied a stored ``poster_url``, there
+    was nothing left in the tree that could put it back: 60 of a user's 70
+    damaged rows were unrecoverable for exactly this reason.
+
+    Args:
+        data: The parsed detail-endpoint response (dict, ``None``, or anything).
+
+    Returns:
+        ``{"genres": list[str], "plot": str|None, "cast": list[dict],
+        "director": str|None, "poster_url": str|None,
+        "backdrop_url": str|None}``.
+    """
+    info = extract_info(data)
+    poster, backdrop = extract_artwork(info)
+    return {
+        "genres": parse_genres(info.get("genre", "")),
+        "plot": info.get("plot") or info.get("description"),
+        "cast": parse_cast_string(info.get("cast", "")),
+        "director": info.get("director"),
+        "poster_url": poster,
+        "backdrop_url": backdrop,
+        # The same response carries TMDb's original language and the provider's
+        # own ffprobe of the file — free, so kept (LANG-2 / PLAYED-5).
+        "original_language": provider_original_language(info),
+        # o_name: the title as this source's catalog files it ("Oskyldigt blod"
+        # for Innocent Blood on a Swedish panel) — kept so it is searchable.
+        "alt_titles": _alt_titles(info),
+        "stream": provider_stream_record(info),
+    }
+
+
+#: A bare YouTube video id: exactly 11 characters of the base64url alphabet.
+#: many of a user's many trailers arrive in this form — an id, not a URL.
+_YOUTUBE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+
+#: The keys a trailer arrives under, in precedence order. ``trailer`` is the
+#: top-level Xtream VOD key and the one that carries essentially all of them;
+#: ``youtube_trailer`` is the nested-``info`` spelling that was the only key read.
+_TRAILER_KEYS = ("youtube_trailer", "trailer", "trailer_url")
+
+
+def extract_trailer(info: dict) -> Optional[str]:
+    """Return a playable trailer URL from a provider payload, or None.
+
+    Sibling of :func:`extract_artwork`: the one place that knows where a trailer
+    lives and what shape it arrives in, so no caller re-derives it.
+
+    ``metadata_from_raw`` read ``info.get('youtube_trailer')`` alone. Measured on
+    a large library, **many movies carry a trailer** and many metadata
+    rows had one stored — the ~many difference is the top-level ``trailer``
+    key, which is where Xtream VOD rows actually put it.
+
+    Shapes seen in real data, all normalised to a watch URL:
+
+    ===============================  ============================================
+    ``AklEaZVdm3c``                  a bare id — many rows
+    ``qYU_1Q8uc4A?si=PCziQRV4T2s``   an id with a share-tracking query — 4 rows
+    ``watch?v=aYNwBsXWNVM``          a relative watch path — 1 row
+    ``https://youtu.be/c3dukvXxtsc`` a full URL — 3 rows
+    ``https://dai.ly/x92o7oa``       not YouTube at all — 2 rows
+    ===============================  ============================================
+
+    A full URL is returned untouched, whatever the host: the field means "a
+    trailer lives here", and rejecting Dailymotion would drop a working link for
+    no reason. Only the bare-id forms are expanded, and only when they look like
+    a YouTube id — an unrecognised fragment yields None rather than a guess.
+
+    Args:
+        info: The resolved info dict (nested ``raw_data['info']`` when present,
+            otherwise the flat ``raw_data`` itself, exactly as
+            ``metadata_from_raw`` resolves it).
+
+    Returns:
+        A playable URL, or None when the payload carries no usable trailer.
+    """
+    for key in _TRAILER_KEYS:
+        value = info.get(key)
+        if not value or not isinstance(value, str):
+            continue
+        value = value.strip()
+        if not value:
+            continue
+        if value.startswith(("http://", "https://")):
+            return value
+        # "watch?v=ID" — a relative path off youtube.com.
+        if value.startswith("watch?v="):
+            value = value[len("watch?v="):]
+        # "ID?si=..." — a share link's tracking query, arriving without its host.
+        value = value.split("?", 1)[0].split("&", 1)[0]
+        if _YOUTUBE_ID_RE.match(value):
+            return f"https://www.youtube.com/watch?v={value}"
+    return None

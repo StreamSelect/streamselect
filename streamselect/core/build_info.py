@@ -1,0 +1,127 @@
+"""Runtime build/checkout identity for the window title.
+
+Single source of truth for "which code is this?" — the short commit, whether the
+tree is dirty, and (when launched via ``run.sh <PR#>``) the PR number. Kept free
+of Qt so the main window can call it at startup.
+
+The PR number is never handed to the process (``run.sh`` strips it and sets no
+env var); the only reliable signal is the checkout's directory basename, which
+``run.sh <PR#>`` sets to ``<repo>-pr-<PR#>``.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+
+from streamselect.core.child_process import NO_WINDOW
+
+
+def repo_dir() -> Path:
+    """Root of the *running* checkout (the worktree, not the user's CWD).
+
+    ``__file__`` is ``<repo>/streamselect/core/build_info.py`` → ``parents[2]`` is the
+    repo root. Under ``run.sh <PR#>`` this is ``<repo>-pr-<PR#>``, whose basename
+    encodes the PR number.
+    """
+    return Path(__file__).resolve().parents[2]
+
+
+def git(*args: str, timeout: float = 5) -> str:
+    """Run a git command in the running checkout; return stdout or "" on failure."""
+    try:
+        result = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+            cwd=str(repo_dir()),
+            **NO_WINDOW,
+        )
+        return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""  # silent: no git, or not a checkout — the packaged app is the normal case
+
+
+def _pr_number() -> str:
+    """PR number from the ``run.sh`` worktree dir name (``…-pr-<N>``), else ""."""
+    match = re.search(r"-pr-(\d+)$", repo_dir().name)
+    return match.group(1) if match else ""
+
+
+def build_id() -> str:
+    """Return the stamped build identifier, or "" when this isn't a CI build.
+
+    The release workflow writes ``streamselect/_build_id.py`` just before PyInstaller
+    runs, so a packaged app can say exactly which code it is. That matters more
+    under rolling releases than it did under version tags: "0.25.0" no longer
+    distinguishes two builds a week apart, but ``0.25.0+20260803.a3e7a28``
+    does — and a bug report naming it can be checked out directly.
+
+    A development checkout has no such file and falls back to git, which is
+    strictly better information when it's available.
+    """
+    try:
+        from streamselect import _build_id  # type: ignore[attr-defined]
+
+        return str(getattr(_build_id, "BUILD_ID", "") or "")
+    except ImportError:
+        return ""  # silent: _build_id is generated per build and absent in a checkout
+
+
+def compose_title(
+    sha: str,
+    dirty: bool,
+    pr: str,
+    branch: str,
+    version: str | None = None,
+) -> str:
+    """Build the window title from git facts (pure — the unit-testable core).
+
+    Args:
+        sha: Short commit hash, or "" when git info is unavailable.
+        dirty: True when the working tree has uncommitted changes.
+        pr: PR number as a string, or "" when not running a PR checkout.
+        branch: Current branch name; "HEAD" when detached.
+        version: Release version (used as fallback when sha is empty).
+            Defaults to streamselect.__version__ if not provided.
+
+    Returns:
+        - ``"StreamSelect <version>"`` when *sha* is empty (no git).
+        - ``"StreamSelect (<sha>[*] PR#<pr>)"`` when a PR number is known.
+        - ``"StreamSelect (<branch> <sha>[*])"`` on a named branch with no PR.
+        - ``"StreamSelect (<sha>[*])"`` when detached with no PR.
+    """
+    if not sha:
+        # No git — this is a packaged app. Prefer the stamped build id, which
+        # identifies the exact commit; fall back to the bare version only when
+        # nothing stamped it (a local PyInstaller run, say).
+        if version is None:
+            version = build_id()
+        if not version:
+            import streamselect
+
+            version = streamselect.__version__
+        return f"StreamSelect {version}"
+    commit = f"{sha}*" if dirty else sha
+    if pr:
+        return f"StreamSelect ({commit} PR#{pr})"
+    if branch and branch != "HEAD":
+        return f"StreamSelect ({branch} {commit})"
+    return f"StreamSelect ({commit})"
+
+
+def window_title() -> str:
+    """Compose the main-window title from the running checkout's git identity.
+
+    Computed once at startup; a testing/debug session doesn't commit mid-run.
+    """
+    sha = git("rev-parse", "--short", "HEAD")
+    # Only tracked-file modifications count as "dirty" — untracked noise (a borrowed
+    # venv symlink, logs, scratch files) must not falsely flag the pristine commit.
+    dirty = bool(git("status", "--porcelain", "--untracked-files=no"))
+    pr = _pr_number()
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    return compose_title(sha, dirty, pr, branch)

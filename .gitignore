@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+/venv
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Config & Data
+config/user_*.yaml
+data/cache/
+data/metadata/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Distribution
+*.spec
+# ...but the committed PyInstaller build spec is tracked.
+!packaging/streamselect.spec
+
+# User config and data (contains personal settings and database)
+config.json
+*.db
+streamselect.db
+
+# Local scratch / personal files
+flsp_*.txt
+*_watchlist.txt
+json
+
+# Stray mpv screenshots
+mpv-shot*.jpg
+
+
+# Local scratch / personal notes accidentally committed once in #128.
+# LEADING SLASH IS LOAD-BEARING: a bare "design/" matches a directory of that
+# name at ANY depth, so it also swallowed docs/design/ — the two V3 design
+# artifacts were "added" and committed with git reporting success and staging
+# nothing. Anchor scratch-dir ignores to the root.
+/design/
+open issues notes
+
+# Generated per build by the release workflow (see build_info.build_id)
+streamselect/_build_id.py

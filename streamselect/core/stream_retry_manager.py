@@ -1,0 +1,227 @@
+"""Background manager for checking failed streams on a backoff schedule."""
+from __future__ import annotations
+
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from datetime import datetime
+from typing import TYPE_CHECKING, Callable
+
+from loguru import logger
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+
+from streamselect.core.repositories.stream_retry import StreamRetryRepository
+
+if TYPE_CHECKING:
+    from streamselect.core.database import Database
+
+
+@dataclass
+class StreamRetryEntry:
+    """Plain-data snapshot of a StreamRetryDB row — safe to use after session closes."""
+    id: str
+    channel_id: str
+    channel_name: str
+    stream_url: str
+    status: str
+    attempt_count: int
+    last_error: str | None
+    next_check_at: datetime | None
+
+
+class StreamRetryManager(QObject):
+    """Periodically re-validates streams that previously failed.
+
+    Emits ``stream_online`` when a stream comes back, and ``retry_list_changed``
+    whenever the pending list changes so the sidebar can refresh.
+    """
+
+    stream_online      = pyqtSignal(str, str, str)   # channel_id, channel_name, stream_url
+    retry_list_changed = pyqtSignal()
+
+    # Poll interval — only fires when there's at least one pending entry due
+    _POLL_MS = 2 * 60 * 1000  # 2 minutes
+
+    def __init__(
+        self,
+        db: "Database",
+        validate_fn: Callable[[str], tuple[bool, str | None]],
+        parent: QObject | None = None,
+        player_is_running: Callable[[], bool] | None = None,
+        enabled: Callable[[], bool] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._db = db
+        self._validate_fn = validate_fn
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="stream_retry")
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._check_due)
+        self._busy = False
+        # The probe below is a REAL stream connection (validate_fn); on a
+        # one-connection source it is the second connection the panel
+        # then refuses the user's own stream for. So it never runs while a
+        # player window is open — check_all_now (the user's explicit "check
+        # now") is NOT gated, since that click is the user asking for it now.
+        self._player_is_running = player_is_running
+        # Settings → Playback "Re-check streams that failed" (off by default).
+        # Read per tick, so turning it on or off takes effect without a restart.
+        self._enabled = enabled or (lambda: True)
+        self._deferring = False      # last logged playback state (log transitions only)
+
+    def start(self) -> None:
+        self._timer.start(self._POLL_MS)
+        logger.debug("StreamRetryManager started")
+
+    def stop(self) -> None:
+        self._timer.stop()
+
+    # ------------------------------------------------------------------ #
+    # Public API                                                           #
+    # ------------------------------------------------------------------ #
+
+    def _write(self, label: str, apply) -> None:
+        """Run one mutation on the worker thread and never raise into the caller.
+
+        EVERY method below used to commit on the MAIN thread, and that crashed
+        the app. A play preflight failure calls add_failure() from
+        _on_stream_ready; when a background writer held SQLite's single write
+        lock, the commit raised OperationalError straight into the Qt event
+        loop, which cannot propagate a Python exception — the process died with
+        SIGABRT while the user was simply trying to watch something.
+
+        Two things were wrong and both are fixed here. The write is off the UI
+        thread, so a held lock costs nothing visible instead of blocking for the
+        full busy_timeout. And the failure is CONTAINED: recording that a stream
+        failed is bookkeeping, and losing that bookkeeping must never take the
+        application with it.
+
+        `retry_list_changed` is emitted from the worker; a Qt signal crossing
+        threads is delivered as a queued connection, so the receiving slot still
+        runs on the main thread.
+        """
+        def _run() -> None:
+            try:
+                # DB-10: always runs on self._executor's single worker thread —
+                # never on the caller's (main) thread, which is the whole point
+                # of this method (see its docstring).
+                with self._db.session_scope(background=True) as session:
+                    apply(StreamRetryRepository(session))
+            except Exception:
+                logger.exception("stream retry: {} failed", label)
+                return
+            self.retry_list_changed.emit()
+
+        try:
+            self._executor.submit(_run)
+        except RuntimeError:
+            # Executor already shut down (app is closing). Dropping a retry
+            # record during teardown is correct; raising here would turn a
+            # normal quit into a crash.
+            logger.debug("stream retry: {} skipped, shutting down", label)
+
+    def add_failure(self, channel_id: str, channel_name: str, stream_url: str, error: str) -> None:
+        """Record a stream failure. Returns immediately; the write is off-thread."""
+        self._write(
+            "add_failure",
+            lambda repo: repo.add(channel_id, channel_name, stream_url, error))
+
+    def remove(self, entry_id: str) -> None:
+        self._write("remove", lambda repo: repo.remove(entry_id))
+
+    def remove_by_channel(self, channel_id: str) -> None:
+        self._write("remove_by_channel",
+                    lambda repo: repo.remove_by_channel(channel_id))
+
+    def clear_all(self) -> None:
+        self._write("clear_all", lambda repo: repo.clear_all())
+
+    def get_all_pending(self) -> list[StreamRetryEntry]:
+        with self._db.session_scope() as session:
+            rows = StreamRetryRepository(session).get_all_pending()
+            return self._to_entries(rows)
+
+    def get_all_display(self) -> list[StreamRetryEntry]:
+        """Pending + online rows for the sidebar — see StreamRetryRepository.get_all_display.
+
+        Empty while re-checking is off: the list promises re-checks, so it
+        shows nothing rather than entries nobody is checking.
+
+        The checker (``_run_checks``/``check_all_now``) must keep using
+        ``get_all_pending`` so a recovered "online" row is never re-probed;
+        this method is for the UI display path only.
+        """
+        if not self._enabled():
+            return []
+        with self._db.session_scope() as session:
+            rows = StreamRetryRepository(session).get_all_display()
+            return self._to_entries(rows)
+
+    @staticmethod
+    def _to_entries(rows) -> list[StreamRetryEntry]:
+        return [
+            StreamRetryEntry(
+                id=r.id,
+                channel_id=r.channel_id,
+                channel_name=r.channel_name,
+                stream_url=r.stream_url,
+                status=r.status,
+                attempt_count=r.attempt_count or 0,
+                last_error=r.last_error,
+                next_check_at=r.next_check_at,
+            )
+            for r in rows
+        ]
+
+    def check_all_now(self) -> None:
+        """Force-check all pending entries regardless of schedule (e.g. after source refresh)."""
+        if not self._enabled():
+            return
+        if not self._busy:
+            self._executor.submit(self._run_checks, force_all=True)
+
+    # ------------------------------------------------------------------ #
+    # Background checking                                                  #
+    # ------------------------------------------------------------------ #
+
+    def _check_due(self) -> None:
+        if self._busy or not self._enabled():
+            return
+        playing = self._player_is_running is not None and self._player_is_running()
+        if playing != self._deferring:
+            # Log the transition, not every tick: an evening of watching was
+            # ~100 identical lines.
+            logger.debug("StreamRetry: {}", "playback active — probes deferred" if playing
+                         else "playback idle — probes resume")
+            self._deferring = playing
+        if playing:
+            return
+        self._busy = True
+        self._executor.submit(self._run_checks, force_all=False)
+
+    def _run_checks(self, force_all: bool) -> None:
+        try:
+            # DB-10: submitted to self._executor by _check_due()/check_all_now()
+            # only — never called on the main thread.
+            with self._db.session_scope(background=True) as session:
+                repo = StreamRetryRepository(session)
+                entries = repo.get_all_pending() if force_all else repo.get_due()
+                if not entries:
+                    return
+
+                changed = False
+                for entry in entries:
+                    try:
+                        ok, err = self._validate_fn(entry.stream_url)
+                        repo.mark_checked(entry, ok, err)
+                        changed = True
+                        if ok:
+                            logger.info(f"StreamRetry: {entry.channel_name} is back online")
+                            self.stream_online.emit(entry.channel_id, entry.channel_name, entry.stream_url)
+                    except Exception as exc:
+                        logger.warning(f"StreamRetry check error for {entry.channel_name}: {exc}")
+                        repo.mark_checked(entry, False, str(exc))
+                        changed = True
+
+                if changed:
+                    self.retry_list_changed.emit()
+        finally:
+            self._busy = False

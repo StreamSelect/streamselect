@@ -1,0 +1,107 @@
+"""Runtime environment helpers — which OS, and frozen (PyInstaller/.app) vs source.
+
+Single source of truth for the questions asked in more than one place:
+
+* "Which operating system is this?" (``is_windows``, ``is_macos``,
+  ``os_description``) — the ONLY place the app reads ``sys.platform``. Each
+  platform difference is then handled once, in the module that owns that
+  concern (``app_paths`` folders, ``players/mpv_ipc`` socket vs pipe,
+  ``child_process`` console windows, ``config_storage`` file replace,
+  ``time_display.local_strftime`` time text), so callers get the same answer on
+  every platform. Guard: ``tests/test_platform_checks_have_one_home.py``.
+* "Are we running inside a bundled application?" (``is_frozen``)
+* "Where does a bundled resource live?" (``bundle_resource_path``)
+
+Shared by the mpv-binary resolver (``core/players/mpv.py``) and the in-app
+update checker (``core/update_checker.py``).  Keeping both here means the
+frozen-vs-dev branching logic exists once, not copy-pasted per consumer.
+"""
+
+from __future__ import annotations
+
+import os
+import platform
+import sys
+from pathlib import Path
+
+
+def is_windows() -> bool:
+    """True on Windows. Read at call time so a test can patch it."""
+    return sys.platform == "win32"
+
+
+def is_macos() -> bool:
+    """True on macOS."""
+    return sys.platform == "darwin"
+
+
+def os_description(*, detailed: bool = False) -> str:
+    """The OS name and release for an About box, e.g. ``"Linux 6.9.1"``.
+
+    ``detailed=True`` is the support form — architecture and libc too, e.g.
+    ``"Linux-6.9.1-x86_64-with-glibc2.41"`` — for the log viewer's header. One
+    function, so the two can never describe different machines (ledger D66).
+    """
+    return platform.platform() if detailed else f"{platform.system()} {platform.release()}"
+
+
+def is_frozen() -> bool:
+    """Return ``True`` when running from a PyInstaller (or similar) bundle.
+
+    PyInstaller sets ``sys.frozen = True`` on the interpreter it embeds; a
+    normal source checkout leaves the attribute absent.
+    """
+    return bool(getattr(sys, "frozen", False))
+
+
+def flatpak_app_id() -> "str | None":
+    """The Flatpak app id when running inside one, else ``None``.
+
+    Flatpak sets ``FLATPAK_ID`` in every sandboxed process. Inside the sandbox
+    the app updates through Flatpak, not the in-app ``.dmg`` updater, and its
+    windows must name the exported desktop file so Wayland shows the right icon.
+    """
+    return os.environ.get("FLATPAK_ID") or None
+
+
+def bundle_resource_path(rel: str) -> Path:
+    """Resolve *rel* to an absolute path to a bundled resource.
+
+    **Frozen** (``.app`` / one-dir bundle): resources may live either where
+    PyInstaller extracts them (``sys._MEIPASS``) or, for a macOS ``.app``, in
+    ``Contents/Resources`` (a sibling of the ``Contents/MacOS`` executable dir).
+    We probe, in order, ``_MEIPASS/<rel>`` → ``<exe_dir>/<rel>`` →
+    ``<exe_dir>/../Resources/<rel>`` and return the first that exists, falling
+    back to the first candidate as a best guess.
+
+    **Source checkout**: resolves *rel* against the repository root (two levels
+    up from ``streamselect/core/runtime_env.py``).
+
+    Args:
+        rel: Bundle-relative resource path, e.g. ``"mpv/mpv"``.
+
+    Returns:
+        An absolute :class:`~pathlib.Path` (existence not guaranteed — callers
+        that care should check ``.exists()``).
+    """
+    rel_path = Path(rel)
+
+    if is_frozen():
+        candidates: list[Path] = []
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / rel_path)
+        try:
+            exe_dir = Path(sys.executable).resolve().parent
+            candidates.append(exe_dir / rel_path)
+            candidates.append(exe_dir.parent / "Resources" / rel_path)
+        except (OSError, ValueError):  # pragma: no cover — sys.executable is set
+            pass  # silent: this path is one candidate of several; the loop tries the rest
+        for cand in candidates:
+            if cand.exists():
+                return cand
+        return candidates[0] if candidates else rel_path.resolve()
+
+    # Source checkout: repo root is two parents up from this package file.
+    repo_root = Path(__file__).resolve().parents[2]
+    return repo_root / rel_path

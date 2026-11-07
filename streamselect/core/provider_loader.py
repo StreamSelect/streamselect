@@ -1,0 +1,1322 @@
+"""Provider data loading and management"""
+
+import asyncio
+import re
+import time
+from datetime import datetime
+from PyQt6.QtCore import QThread, pyqtSignal
+from loguru import logger
+from sqlalchemy import or_
+
+from streamselect.core.models import Provider
+from streamselect.core.database import (
+    Database, ChannelDB, SeasonDB, EpisodeDB, ProviderDB, UserRatingDB, WatchQueueDB,
+)
+from streamselect.core.episode_metadata_extract import extract_episode_metadata_fields
+from streamselect.core.repositories.stream_info import StreamInfoRepository
+from streamselect.core.repositories.provider import persist_url_stats
+from streamselect.core.repositories.channel_change_detection import (
+    diff_batch_for_upsert, force_recompute_for_changed_ids)
+from streamselect.core.repositories.channel_upsert import flush_channel_batch
+from streamselect.core.db_lock import retry_on_lock
+from streamselect.core.sql_batching import fetch_in_chunks
+from streamselect.providers.factory import get_provider
+
+# Columns written by the catalog loader on every channel upsert.
+# On conflict (same `id`), ONLY these columns are updated — derived fields
+# (detected_*, is_favorite, is_hidden, play_count, user_category, etc.) are
+# left untouched so user data is preserved across provider refreshes.
+#
+# ``detected_tmdb_id``/``detected_rating``/``detected_added`` are the deliberate
+# exceptions among the ``detected_*`` names: none is name-derived — they are
+# provider facts captured from ``raw_data`` at ingestion (DB-4: rating/added can
+# change over time, same as the tmdb id) — so they belong with the catalog
+# columns and refresh alongside ``raw_data`` on every upsert, rather than being
+# preserved like the name-derived detected_* fields.
+_CATALOG_COLS: tuple[str, ...] = (
+    "id",
+    "source_id",
+    "provider_id",
+    "name",
+    "stream_url",
+    "category",
+    "category_id",
+    "logo_url",
+    # The provider has parsed this since forever (xtream.py:357) and this list
+    # dropped it, so it was NULL on all many rows in a large library
+    # while many live channels carried a real one in raw_data. EPG tier-1
+    # matching — the "highest confidence" path — could therefore never fire.
+    # See test_catalog_columns_cover_the_channel.py: the list is now checked
+    # against what the Channel model actually provides, so the next field
+    # someone adds cannot be silently discarded here.
+    "epg_channel_id",
+    "media_type",
+    "quality",
+    "is_adult",
+    "raw_data",
+    "detected_tmdb_id",
+    "detected_rating",
+    "detected_added",
+    "source_num",
+    "source_category",
+    "source_quality_flags",
+)
+
+# The same set minus `id` — on conflict we update all catalog fields except the PK.
+_CATALOG_UPDATE_COLS: tuple[str, ...] = tuple(c for c in _CATALOG_COLS if c != "id")
+
+# Batch size for bulk upsert VALUES lists. SQLite ≥3.32 caps
+# SQLITE_MAX_VARIABLE_NUMBER at 32766 (older builds: 999); ~15 catalog cols ×
+# 500 rows = 7 500 params — well inside either limit, far fewer commits than every-100.
+_STORE_BATCH = 500
+
+# ---------------------------------------------------------------------------
+# Progress bar phase bands
+#
+# Each tuple is (band_start_pct, band_end_pct) — inclusive on both ends.
+# The bands are the SINGLE SOURCE OF TRUTH for all emit sites; update these
+# constants to re-weight the bar, never the emit call sites.
+#
+# Rationale: the per-channel phases (categorize/prefix/tags) dominate
+# wall-clock on large sources (tags alone ~10 min); fetch is network-bound
+# and fast by comparison. Weighting reflects real time, not phase count.
+#
+# Sequence (non-decreasing): fetch → store → categorize → prefix → tags → stats → done(100)
+# ---------------------------------------------------------------------------
+_BAND_FETCH      = (0,   15)   # network fetch (fast, variable)
+_BAND_STORE      = (15,  22)   # bulk DB upsert
+_BAND_CATEGORIZE = (22,  38)   # special-content classification
+_BAND_PREFIX     = (38,  60)   # channel-prefix detection
+_BAND_TAGS       = (60,  97)   # content-tag decomposer (largest wall-clock phase)
+_BAND_STATS      = (97, 100)   # prefix-stat aggregation
+
+# A ##...## category header: 2+ leading hashes, a label, 2+ closing hashes.
+# The closing run is NOT anchored to end-of-string — some providers append a
+# trailing token after it (e.g. "#### BAMBINI HD/4K ##### · UHD"), which the
+# old end-anchored pattern missed, leaking those headers in as channels.
+_HASH_HEADER_RE = re.compile(r'^#{2,}\s*(.*?)\s*#{2,}\s*(.*)$')
+
+# Superscript quality markers embedded in ## category headers ##
+_SUPERSCRIPT_QUALITY: list[tuple[str, str]] = [
+    ("ᴴᴰ",   "HD"),
+    ("ᵁᴴᴰ",  "UHD"),
+    ("ᴿᴬᵂ",  "RAW"),
+    ("⁶⁰ᶠᵖˢ", "60FPS"),
+    ("⁵⁰ᶠᵖˢ", "50FPS"),
+]
+
+
+def _parse_hash_header(name: str) -> tuple[str, str] | None:
+    """Return (clean_label, quality_flags) if *name* is a ##...## header, else None.
+
+    quality_flags is a comma-separated string of decoded markers (may be empty).
+    """
+    m = _HASH_HEADER_RE.match(name)
+    if not m:
+        return None
+    label = m.group(1)
+    flags: list[str] = []
+    for superscript, flag in _SUPERSCRIPT_QUALITY:
+        if superscript in label:
+            label = label.replace(superscript, "").strip()
+            flags.append(flag)
+    return label.strip(), ",".join(flags)
+
+
+class ProviderLoadThread(QThread):
+    """Background thread for loading provider data into database"""
+
+    finished = pyqtSignal(bool, str)  # success, message
+    progress = pyqtSignal(int, int, str)  # current, total, message
+
+    def __init__(self, provider: Provider, db: Database,
+                 separators: list[str] | None = None,
+                 language_groups: dict | None = None,
+                 quality_groups: dict | None = None,
+                 platform_groups: dict | None = None,
+                 regional_groups: dict | None = None,
+                 kind: str = "full"):
+        """
+        Args:
+            kind: "full" (default) fetches live+VOD+series, the historical
+                behaviour. "live_only" (LIVE-1) fetches ONLY
+                ``get_live_streams`` — the same chunked upsert and ingestion
+                hooks (categorize/prefix/tag) run over just those rows, and
+                the vanished-channel prune is skipped so VOD/series rows this
+                pass never touched are not mistaken for gone (see
+                :meth:`load_provider`).
+        """
+        super().__init__()
+        self.provider = provider
+        self.db = db
+        self._separators = separators
+        self._language_groups = language_groups or {}
+        self._quality_groups = quality_groups or {}
+        self._platform_groups = platform_groups or {}
+        self._regional_groups = regional_groups or {}
+        self.kind = kind
+        self.prefix_stats: dict | None = None  # populated after run; read by main thread
+        self._changed_detected_ids: set[str] = set()  # DERIVE-1: set by _store_channels
+    
+    def run(self):
+        """Load provider data"""
+        try:
+            asyncio.run(self.load_provider())
+        except Exception as e:
+            logger.error(f"Provider load error: {e}")
+            self.finished.emit(False, str(e))
+    
+    async def load_provider(self):
+        """Load provider data using provider plugin"""
+        _t_start = time.monotonic()
+        provider_plugin = get_provider(self.provider.type)
+        if not provider_plugin:
+            self.finished.emit(False, f"Unknown provider type: {self.provider.type}")
+            return
+
+        def on_progress(current, total, message):
+            # Scale fetch progress into _BAND_FETCH so the bar never overshoots
+            # the store/parse phases — keeps the overall refresh bar monotonic.
+            _fs, _fe = _BAND_FETCH
+            pct = int(current / total * (_fe - _fs)) if total else _fs
+            self.progress.emit(pct, 100, message)
+
+        # LIVE-1: kind="live_only" restricts the fetch to get_live_streams —
+        # measured on a user's two sources, that single call returns the
+        # COMPLETE live catalog (many/5.0MB/1.6s; many/18.7MB/3.9s),
+        # byte-identical to the live half of a full refresh.
+        media_types = {"live"} if self.kind == "live_only" else None
+        channels = await provider_plugin.fetch_channels(
+            self.provider, progress_callback=on_progress, media_types=media_types
+        )
+        _t_fetched = time.monotonic()
+
+        # Deduplicate by channel ID: some providers return the same stream_id in multiple
+        # category responses, producing duplicate channel.id values. Under no_autoflush the
+        # pending INSERT is not visible to merge()'s SELECT, causing UNIQUE constraint errors.
+        # Keep the last occurrence per ID (same result as repeated merge/UPDATE calls).
+        seen: dict[str, object] = {}
+        for ch in channels:
+            seen[ch.id] = ch
+        if len(seen) < len(channels):
+            logger.warning(
+                f"{self.provider.name}: dropped {len(channels) - len(seen):,} duplicate "
+                f"channel IDs (same stream_id in multiple categories)"
+            )
+        channels = list(seen.values())
+
+        total = len(channels)
+        logger.info(f"Loaded {total:,} items from {self.provider.name}")
+
+        # Refresh account info in the background while channels are being stored
+        await self._refresh_account_info(provider_plugin)
+
+        # Persist updated URL success/failure counts (+ timestamps) back to the
+        # DB — the in-memory ProviderURL objects were updated by UrlCycler
+        # during fetch_channels()/_refresh_account_info() above.
+        persist_url_stats(self.db, self.provider)
+        
+        # Store in database
+        session = self.db.get_session()
+
+        try:
+            self._changed_detected_ids = self._store_channels(session, channels, total)
+            self._reset_epg_unnamed_refetch_marker(session)
+            self.progress.emit(_BAND_STORE[1], 100, f"Stored {total:,} channels")
+
+            # Only now that the whole catalog stored cleanly: drop the rows this
+            # source has stopped listing. Inside the try and AFTER the store, so a
+            # fetch that raised takes the rollback path and deletes nothing —
+            # a partial list must never be read as "everything else is gone".
+            #
+            # `total` is the belt to that braces: a source answering with an empty
+            # list is a failure wearing a success's clothes, and pruning on it
+            # would erase the catalog. prune_vanished_channels applies a further
+            # ceiling for the truncated-but-non-empty case.
+            #
+            # LIVE-1: a live_only pass never fetched VOD/series at all, so a
+            # prune here would read every untouched VOD/series row as "the
+            # source stopped listing it" and delete the catalog out from under
+            # itself. Skipped entirely for this kind — rows simply are not
+            # last_seen-restamped by this pass (existing aging semantics; no
+            # deletes), and a later FULL refresh prunes normally.
+            if total and self.kind == "full":
+                from streamselect.core.repositories.channel import ChannelRepository
+                pruned = ChannelRepository(session).prune_vanished_channels(
+                    self.provider.id, self._seen_at)
+                if pruned["channels"]:
+                    logger.info(
+                        "{}: pruned {:,} channel(s) the source no longer lists "
+                        "(+{:,} metadata, {:,} tags, {:,} EPG rows)",
+                        self.provider.name, pruned["channels"],
+                        pruned["metadata"], pruned["content_tags"],
+                        pruned["epg_by_channel"])
+
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Database error during provider load: {e}")
+            raise
+        finally:
+            session.close()
+
+        _t_stored = time.monotonic()
+
+        # Phase: categorize special content (PPV / Events / Sports)
+        self.progress.emit(_BAND_CATEGORIZE[0], 100, "Categorizing content (PPV/Events/Sports)…")
+        self._categorize_special_content()
+        _t_categorized = time.monotonic()
+
+        # Phase: detect channel prefixes
+        self.progress.emit(_BAND_PREFIX[0], 100, "Detecting channel prefixes…")
+        self._update_prefixes_in_thread()
+        _t_prefixed = time.monotonic()
+
+        # Phase: compute content tags (decomposer) for just-loaded channels
+        self.progress.emit(_BAND_TAGS[0], 100, "Computing content tags…")
+        self._update_tags_in_thread()
+        _t_tagged = time.monotonic()
+
+        # Phase: compute prefix stats for the filter bar
+        self.progress.emit(_BAND_STATS[0], 100, "Updating filter statistics…")
+        self._compute_prefix_stats_in_thread()
+        _t_statted = time.monotonic()
+
+        # Total + per-phase wall-clock for this refresh — debug visibility into
+        # where the time goes (the content-tagging phase dominates large sources).
+        def _fmt(secs: float) -> str:
+            return f"{int(secs // 60)}m{secs % 60:04.1f}s" if secs >= 60 else f"{secs:.1f}s"
+        logger.info(
+            f"Refreshed {self.provider.name}: {total:,} channels in {_fmt(_t_statted - _t_start)} "
+            f"[fetch {_fmt(_t_fetched - _t_start)} · store {_fmt(_t_stored - _t_fetched)} · "
+            f"categorize {_fmt(_t_categorized - _t_stored)} · prefixes {_fmt(_t_prefixed - _t_categorized)} · "
+            f"tags {_fmt(_t_tagged - _t_prefixed)} · stats {_fmt(_t_statted - _t_tagged)}]"
+        )
+
+        _kind_label = "live channels" if self.kind == "live_only" else "channels"
+        self.progress.emit(100, 100, f"Loaded {total:,} {_kind_label}")
+
+        # If we loaded 0 channels, report as failure — this may indicate a timeout,
+        # rate limit, network error, or an empty provider. The user needs visibility.
+        if total == 0:
+            self.finished.emit(False,
+                f"Connected to {self.provider.name}, but received 0 {_kind_label} — the server may be slow, "
+                f"rate-limited, or returned no content. Check the logs and try again.")
+        else:
+            self.finished.emit(True, f"Loaded {total:,} {_kind_label} successfully")
+
+    def _store_channels(self, session, channels: list, total: int) -> set[str]:
+        """Bulk-upsert *channels* into the DB using SQLite's INSERT OR REPLACE semantics.
+
+        Replaces the old per-row ``session.merge()`` + commit-every-100 approach.
+        Key properties preserved:
+
+        * **Order is maintained** — the per-channel loop runs in list order, so the
+          stateful ``##...##`` hash-header logic (source_category/quality) stays correct.
+        * **User/derived columns are preserved** — ``ON CONFLICT DO UPDATE`` only
+          touches ``_CATALOG_UPDATE_COLS``; ``is_favorite``, ``play_count``,
+          ``detected_*``, ``user_category``, etc. are untouched on existing rows.
+        * **Short transaction windows** — ``autoflush=False`` (``no_autoflush``) holds
+          the write lock only during each ``commit()``, letting concurrent provider-load
+          threads interleave writes and avoid SQLITE_BUSY errors.
+        * **Batch size** — ``_STORE_BATCH`` rows × 15 columns ≈ 7 500 SQL parameters,
+          well within SQLite's 32 766 limit (and the legacy 999 limit too).
+        * **DB-7 change gate** — an unchanged row skips the upsert and only
+          gets ``last_seen_at`` touched (see ``_flush_batch``).
+
+        Returns:
+            DERIVE-1 — ids whose stored name/category/raw_data differed from the
+            incoming row (see :func:`~streamselect.core.repositories.channel_change_detection.diff_batch_for_upsert`);
+            never includes brand-new inserts.
+        """
+        batch: list[dict] = []
+        processed = 0
+        current_source_category: str | None = None
+        header_group: str | None = None   # the provider group the ##…## row sits in
+        current_source_quality: str | None = None
+        changed_ids: set[str] = set()
+
+        # Snapshot BEFORE any upsert runs in this refresh. _flush_batch below
+        # overwrites `name` (and every other catalog column) in place via
+        # ON CONFLICT DO UPDATE, so the pre-refresh title only exists here —
+        # taken after this point it would already read the NEW name and the
+        # reuse comparison would always see "unchanged".
+        engaged_before = self._snapshot_engaged_names(session)
+
+        # ONE instant for the whole refresh, taken before the first write. Every
+        # row this pass touches gets exactly this value, so "older than this" is
+        # an unambiguous test for "the source stopped listing it" — a per-batch
+        # now() would make the boundary drift across the run and leave the last
+        # batch looking newer than the first.
+        self._seen_at = datetime.utcnow()
+
+        # DB-7: diff each batch against its stored rows before flushing it (gated).
+        def _diff_and_flush(b: list[dict]) -> None:
+            nonlocal changed_ids
+            b_changed, b_unchanged = diff_batch_for_upsert(session, b, _CATALOG_UPDATE_COLS)
+            changed_ids |= b_changed
+            self._flush_batch(session, b, seen_at=self._seen_at, unchanged_ids=b_unchanged)
+
+        # Disable autoflush so writes only happen at each explicit commit().
+        # Without this, ORM operations would trigger an autoflush before internal
+        # SELECTs, holding the SQLite write lock across up to 100 items.  With
+        # no_autoflush the write transaction only opens at commit() and closes
+        # immediately, giving other providers interleave windows.
+        with session.no_autoflush:
+            for channel in channels:
+                raw = channel.raw_data or {}
+                is_adult = bool(raw.get("is_adult") in (1, "1", True))
+                source_num = raw.get("num")
+                if source_num is not None:
+                    try:
+                        source_num = int(source_num)
+                    except (ValueError, TypeError):
+                        source_num = None
+
+                # Detect ##...## positional category headers (live only).
+                # This is stateful — the header applies to all subsequent live
+                # channels until the next header.  Processing must stay in order.
+                if channel.media_type == "live":
+                    parsed = _parse_hash_header(channel.name)
+                    if parsed is not None:
+                        current_source_category = parsed[0] or None
+                        current_source_quality = parsed[1] or None
+                        header_group = channel.category
+                        # The ##...## header is a positional *marker* labelling the
+                        # channels that follow it — not real content (its "stream"
+                        # is a bumper / few-second loop). Its label is already
+                        # captured above, so skip storing it as a browsable channel.
+                        processed += 1
+                        continue
+
+                # A header covers its own group and later groups that carry its
+                # words ("SOCCER PPV" over "US| SOCCER PPV", "FR| SOCCER PPV");
+                # the first unrelated group ends it. It never reset before, so
+                # one header ran over 833 groups (many channels) on one source.
+                if (channel.media_type == "live" and current_source_category
+                        and channel.category != header_group
+                        and current_source_category.upper() not in (channel.category or "").upper()):
+                    current_source_category = current_source_quality = None
+
+                batch.append({
+                    "id": channel.id,
+                    "source_id": channel.source_id,
+                    "provider_id": channel.provider_id,
+                    "name": channel.name,
+                    "stream_url": channel.stream_url,
+                    "category": channel.category,
+                    "category_id": channel.category_id,
+                    "logo_url": channel.logo_url,
+                    "epg_channel_id": channel.epg_channel_id,
+                    "media_type": channel.media_type,
+                    "quality": channel.quality.value,
+                    "is_adult": is_adult,
+                    "raw_data": channel.raw_data,
+                    "detected_tmdb_id": channel.detected_tmdb_id,
+                    "detected_rating": channel.detected_rating,
+                    "detected_added": channel.detected_added,
+                    # Provenance marker for the enrichment funnel: 'list' means the id
+                    # came straight from the provider's list row (Phase-1 harvest).  Set
+                    # on INSERT only — it is NOT in _CATALOG_UPDATE_COLS, so a later
+                    # 'fetched' / 'propagated' / 'none' marker survives every refresh.
+                    "tmdb_enrich_state": "list" if channel.detected_tmdb_id else None,
+                    "source_num": source_num,
+                    "source_category": current_source_category if channel.media_type == "live" else None,
+                    "source_quality_flags": current_source_quality if channel.media_type == "live" else None,
+                })
+
+                processed += 1
+                if len(batch) >= _STORE_BATCH:
+                    _diff_and_flush(batch)
+                    batch.clear()
+                    _ss, _se = _BAND_STORE
+                    percent = int(_ss + (processed / total) * (_se - _ss)) if total else _se
+                    self.progress.emit(percent, 100, f"Storing channels ({processed:,}/{total:,})...")
+
+            # Flush the final partial batch
+            if batch:
+                _diff_and_flush(batch)
+                batch.clear()
+
+        # Report after the last flush so the comparison sees committed
+        # post-upsert names.
+        self._report_recycled_ids(session, engaged_before)
+        return changed_ids
+
+    def _snapshot_engaged_names(self, session) -> dict[str, str]:
+        """Return ``{channel_id: name}`` for this provider's engaged channels.
+
+        "Engaged" = the user has done something to it: favorited, hidden,
+        suppressed, played, completed, rated, or queued it. Bounded by how much
+        the user has touched (hundreds), never by catalog size — this runs on
+        every refresh of a 240k-row catalog.
+
+        Args:
+            session: An active database session.
+
+        Returns:
+            Mapping of channel id to the name stored BEFORE this refresh's upsert.
+        """
+        rated = session.query(UserRatingDB.channel_id)
+        queued = session.query(WatchQueueDB.channel_id)
+        rows = (
+            session.query(ChannelDB.id, ChannelDB.name)
+            .filter(
+                ChannelDB.provider_id == self.provider.id,
+                or_(
+                    ChannelDB.is_favorite.is_(True),
+                    ChannelDB.is_hidden.is_(True),
+                    ChannelDB.is_rec_suppressed.is_(True),
+                    ChannelDB.play_count > 0,
+                    ChannelDB.last_played.isnot(None),
+                    ChannelDB.watch_completed.is_(True),
+                    ChannelDB.id.in_(rated),
+                    ChannelDB.id.in_(queued),
+                ),
+            )
+            .all()
+        )
+        return dict(rows)
+
+    def _report_recycled_ids(self, session, before: dict[str, str]) -> None:
+        """Warn for every engaged channel whose title changed during this refresh.
+
+        A changed name on a preserved id means the provider recycled that
+        ``stream_id`` for different content, so the user's favorite / queue entry
+        / rating now points at something they never chose. This only reports —
+        deciding what to DO about it is a separate, deliberate change.
+
+        Args:
+            session: An active database session.
+            before: The pre-refresh snapshot from :meth:`_snapshot_engaged_names`.
+        """
+        if not before:
+            return
+
+        ids = list(before.keys())
+        # Chunked through the shared IN(...) chokepoint (F16, the design notes)
+        # rather than a private loop — same 500-per-chunk default as
+        # sql_batching.CHUNK_SIZE, which this used to duplicate verbatim.
+        after_rows = fetch_in_chunks(
+            lambda chunk: session.query(ChannelDB.id, ChannelDB.name)
+                                  .filter(ChannelDB.id.in_(chunk))
+                                  .all(),
+            ids,
+        )
+        after: dict[str, str] = dict(after_rows)
+
+        changed: list[tuple[str, str, str]] = []
+        for cid, old in before.items():
+            new = after.get(cid)
+            if new is not None and new != old:
+                changed.append((cid, old, new))
+
+        for cid, old, new in changed:
+            logger.warning(
+                "STREAM-ID REUSE: provider={!r} channel_id={!r} kept its user state "
+                "(favorite/queue/rating/history) but its title CHANGED on this "
+                "refresh: {!r} -> {!r}",
+                self.provider.name, cid, old, new,
+            )
+
+        if changed:
+            logger.warning(
+                "STREAM-ID REUSE: {} engaged channel(s) on provider={!r} now point at "
+                "different content after this refresh.",
+                len(changed), self.provider.name,
+            )
+
+    def _reset_epg_unnamed_refetch_marker(self, session) -> None:
+        """Clear this provider's persistent EPG "unnamed re-fetch attempted" marker.
+
+        Content was just (re)ingested, so a feed that improved gets one more chance
+        at the one-time re-fetch driven by ``EpgManager.refresh_all_if_needed`` (which
+        re-sets the marker if still nameless, capping it to one attempt per refresh).
+        Generated/system state only; a bulk UPDATE (no ORM load) keeps it cheap.
+        """
+        session.query(ProviderDB).filter_by(id=self.provider.id).update(
+            {"epg_unnamed_refetch_attempted": False}
+        )
+        session.commit()
+
+    @staticmethod
+    def _flush_batch(
+        session, batch: list[dict], *, seen_at=None,
+        unchanged_ids: frozenset[str] | set[str] = frozenset(),
+    ) -> None:
+        """See ``channel_upsert.flush_channel_batch``. One batch is one upsert plus
+        its commit, so after a rollback it re-runs cleanly on a lock (D17)."""
+        retry_on_lock("catalogue batch", lambda: flush_channel_batch(
+            session, batch, _CATALOG_UPDATE_COLS, seen_at=seen_at,
+            unchanged_ids=unchanged_ids), before_retry=session.rollback)
+
+    def _categorize_special_content(self) -> None:
+        """Categorize PPV / Events / Sports for uncategorized channels from this provider.
+
+        Only processes channels where special_view IS NULL so subsequent refreshes
+        of the same provider are fast.  All providers are always included in the
+        queries — this scopes to the just-loaded provider to bound the work.
+
+        Channels are processed in ID-based batches (mirroring update_detected_prefixes)
+        so at most _CATEGORIZE_BATCH full ORM objects reside in memory at once instead
+        of the entire provider channel set (up to ~300k rows).
+        """
+        from streamselect.core.special_content import update_channel_special_content
+
+        _CATEGORIZE_BATCH = 2000
+
+        session = self.db.get_session()
+        try:
+            # Fetch only IDs first — avoids loading raw_data for all channels upfront.
+            ids = [
+                row[0]
+                for row in session.query(ChannelDB.id).filter(
+                    ChannelDB.provider_id == self.provider.id,
+                    ChannelDB.special_view.is_(None),
+                ).all()
+            ]
+
+            if not ids:
+                return
+
+            n = len(ids)
+            logger.info(
+                f"Categorizing special content for {n:,} uncategorized "
+                f"channels from '{self.provider.name}'"
+            )
+
+            updated = 0
+            processed = 0
+
+            for batch_start in range(0, n, _CATEGORIZE_BATCH):
+                chunk_ids = ids[batch_start : batch_start + _CATEGORIZE_BATCH]
+                channels = session.query(ChannelDB).filter(
+                    ChannelDB.id.in_(chunk_ids),
+                ).all()
+
+                for channel in channels:
+                    if update_channel_special_content(channel):
+                        updated += 1
+                    processed += 1
+
+                is_last_batch = (batch_start + _CATEGORIZE_BATCH) >= n
+                session.commit()
+                if not is_last_batch:
+                    session.expunge_all()
+
+                _cs, _ce = _BAND_CATEGORIZE
+                pct = int(_cs + (processed / n) * (_ce - _cs))
+                self.progress.emit(
+                    pct, 100,
+                    f"Categorizing content ({processed:,}/{n:,})…",
+                )
+
+            logger.info(
+                f"Special content: {updated:,} channels categorized "
+                f"(PPV/Events/Sports) for '{self.provider.name}'"
+            )
+        except Exception as e:
+            session.rollback()
+            logger.error(f"Failed to categorize special content: {e}")
+        finally:
+            session.close()
+
+    def _try_emit_progress(self, cur: int, tot: int, msg: str) -> None:
+        """Emit progress, swallowing the RuntimeError raised when the QThread
+        super().__init__() was not called (unit-test ``__new__`` construction path).
+        """
+        try:
+            self.progress.emit(cur, tot, msg)
+        except RuntimeError:
+            pass  # test-only: QObject.__init__ not called via ProviderLoadThread.__new__
+
+    def _update_prefixes_in_thread(self) -> None:
+        """Run update_detected_prefixes in the worker thread (never the main thread).
+
+        Emits per-batch progress in the 87–93 band so the active notification bar
+        advances continuously through the prefix-detection phase instead of sitting
+        frozen at 87%. Also force-recomputes detected_* for the ids _store_channels
+        flagged as changed this refresh (DERIVE-1).
+        """
+        from streamselect.core.repositories import RepositoryFactory
+
+        _BAND_START, _BAND_END = _BAND_PREFIX
+
+        def _progress_cb(done: int, total: int) -> None:
+            if total > 0:
+                band_pct = int(_BAND_START + (done / total) * (_BAND_END - _BAND_START))
+                self._try_emit_progress(
+                    band_pct, 100,
+                    f"Detecting prefixes ({done:,} / {total:,} channels)…",
+                )
+
+        session = self.db.get_session()
+        try:
+            repos = RepositoryFactory(session)
+            updated = repos.channels.update_detected_prefixes(
+                provider_id=self.provider.id,
+                separators=self._separators,
+                progress_cb=_progress_cb,
+            )
+            logger.info(f"Prefix detection: updated {updated:,} channels")
+
+            force_recompute_for_changed_ids(
+                repos.channels, self.provider.id, self._separators, self._changed_detected_ids)
+
+            # Content refreshed → clear the provider-native tmdb enrichment marker
+            # for this source so the next background pass re-attempts its idless
+            # rows against the (possibly changed) catalog. Only the generated
+            # marker is touched. See tmdb_enrichment_manager.py.
+            reset = repos.channels.reset_tmdb_enrich_state(self.provider.id)
+            if reset:
+                logger.info(f"tmdb_enrich: reset attempt marker for {reset:,} rows")
+        except Exception as e:
+            logger.error(f"Prefix detection failed: {e}")
+        finally:
+            session.close()
+
+    def _update_tags_in_thread(self) -> None:
+        """Run the tag decomposer over this provider's channels and persist content_tags.
+
+        Incremental via ``tag_fingerprint``
+        ------------------------------------
+        A fingerprint (short SHA-256 hex) of the eight decomposer feeder fields is
+        stored on each ``ChannelDB`` row after a successful tag pass.  On subsequent
+        refreshes, channels whose feeder fields have not changed (fingerprint matches)
+        are skipped entirely — no delete/re-tag.  Only new rows (NULL fingerprint) or
+        channels with changed fields are processed.
+
+        The first refresh after this code is deployed re-tags all rows (populating
+        fingerprints); every refresh after touches only the delta.
+
+        Defer during migration
+        ----------------------
+        If a ``TagBackfillTask`` is currently running, this hook returns immediately.
+        The backfill is already re-tagging every channel — adding a concurrent writer
+        risks ``database is locked`` errors and is redundant work.
+
+        Mirrors the batching strategy of ``TagBackfillTask._process_batch``:
+        - Fetches only channel IDs for this provider first (no full ORM materialisation).
+        - Processes channels in ``_TAG_BATCH`` chunks, each inside its own
+          ``session_scope`` so the write transaction is short-lived.
+        - Within each chunk queries only the columns needed by ``_collect_tags`` plus
+          ``tag_fingerprint`` (column-only projection, no JSON blobs for channels that
+          have none).
+        - Calls ``repos.tags.delete_generated_for_channel`` before re-deriving, matching
+          the backfill's non-destructive contract (user tags survive).
+
+        This means every source refresh keeps ``content_tags`` current without waiting
+        for a version-bumped re-backfill.
+        """
+        import hashlib
+
+        from streamselect.core.config import Config as _Config
+        from streamselect.core.database import ChannelDB
+        from streamselect.core.migrations.tag_backfill import _collect_tags, is_backfill_active
+        from streamselect.core.repositories import RepositoryFactory
+        from sqlalchemy import text as _text
+
+        _TAG_BATCH: int = 500
+        _YIELD_SIZE: int = 2_000
+
+        # Defer entirely while the one-time backfill migration is running.
+        # The backfill re-tags every channel, so per-refresh tagging is redundant
+        # and a third concurrent SQLite writer risks locking errors.
+        if is_backfill_active():
+            logger.info(
+                "_update_tags_in_thread: TagBackfillTask is running — deferring "
+                "per-refresh tagging for '{}' (backfill will cover all channels)",
+                self.provider.name,
+            )
+            return
+
+        try:
+            # Config.load() returns (Config, migrated_bool) — take the Config only.
+            config, _ = _Config.load()
+        except Exception as e:
+            logger.warning("_update_tags_in_thread: could not load config — skipping: {}", e)
+            return
+
+        # Step 1: collect IDs for just-loaded provider (column-only, no ORM objects).
+        try:
+            with self.db.session_scope(commit=False) as session:
+                id_rows = (
+                    session.query(ChannelDB.id)
+                    .filter(ChannelDB.provider_id == self.provider.id)
+                    .yield_per(_YIELD_SIZE)
+                    .all()
+                )
+            channel_ids: list[str] = [r[0] for r in id_rows]
+        except Exception as e:
+            logger.error("_update_tags_in_thread: ID fetch failed: {}", e)
+            return
+
+        total = len(channel_ids)
+        if total == 0:
+            return
+
+        logger.info(
+            "_update_tags_in_thread: computing tags for {:,} channels from '{}'",
+            total,
+            self.provider.name,
+        )
+
+        def _compute_fingerprint(
+            name: str | None,
+            category: str | None,
+            source_category: str | None,
+            detected_prefix: str | None,
+            detected_quality: str | None,
+            detected_region: str | None,
+            detected_year: str | None,
+            genre: str | None,
+        ) -> str:
+            """Return a short SHA-256 hex digest of the decomposer feeder fields."""
+            key = "|".join([
+                name or "",
+                category or "",
+                source_category or "",
+                detected_prefix or "",
+                detected_quality or "",
+                detected_region or "",
+                detected_year or "",
+                genre or "",
+            ])
+            return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+        done = 0
+        skipped = 0
+        for batch_start in range(0, total, _TAG_BATCH):
+            chunk = channel_ids[batch_start : batch_start + _TAG_BATCH]
+            try:
+                with self.db.session_scope() as session:
+                    repos = RepositoryFactory(session)
+
+                    # Column-only projection — includes tag_fingerprint for skip logic
+                    # and name for the fingerprint computation (ingestion may change name).
+                    # media_type is required for content-descriptor facet routing.
+                    # detected_audio is required for the audio_annotation feeder (feeder 5).
+                    rows = (
+                        session.query(
+                            ChannelDB.id,
+                            ChannelDB.name,
+                            ChannelDB.category,
+                            ChannelDB.source_category,
+                            ChannelDB.detected_prefix,
+                            ChannelDB.detected_quality,
+                            ChannelDB.detected_region,
+                            ChannelDB.detected_year,
+                            ChannelDB.raw_data,
+                            ChannelDB.tag_fingerprint,
+                            ChannelDB.media_type,
+                            ChannelDB.detected_audio,
+                            ChannelDB.detected_name_cast,
+                        )
+                        .filter(ChannelDB.id.in_(chunk))
+                        .yield_per(_YIELD_SIZE)
+                        .all()
+                    )
+
+                    # Collected across the batch, written in three statements
+                    # after the loop rather than three per channel.
+                    fingerprint_updates: list[tuple[str, str]] = []
+                    retag_ids: list[str] = []
+                    tag_map: dict[str, list] = {}
+
+                    for row in rows:
+                        (
+                            channel_id,
+                            name,
+                            category,
+                            source_category,
+                            detected_prefix,
+                            detected_quality,
+                            detected_region,
+                            detected_year,
+                            raw_data,
+                            stored_fingerprint,
+                            media_type,
+                            detected_audio,
+                            detected_name_cast,
+                        ) = row
+
+                        genre = (raw_data or {}).get("genre") if raw_data else None
+                        current_fp = _compute_fingerprint(
+                            name,
+                            category,
+                            source_category,
+                            detected_prefix,
+                            detected_quality,
+                            detected_region,
+                            detected_year,
+                            genre,
+                        )
+
+                        if current_fp == stored_fingerprint:
+                            # Feeder fields unchanged — skip re-tagging.
+                            skipped += 1
+                            continue
+
+                        # Non-destructive: scrub only generated tags; user tags
+                        # survive. Collected for ONE bulk DELETE after the loop.
+                        retag_ids.append(channel_id)
+
+                        all_tags = _collect_tags(
+                            config=config,
+                            name=name,
+                            category=category,
+                            source_category=source_category,
+                            detected_prefix=detected_prefix,
+                            detected_quality=detected_quality,
+                            detected_region=detected_region,
+                            detected_year=detected_year,
+                            raw_data=raw_data,
+                            media_type=media_type,
+                            detected_audio=detected_audio,
+                            detected_name_cast=detected_name_cast,
+                        )
+
+                        if all_tags:
+                            tag_map[channel_id] = all_tags
+
+                        fingerprint_updates.append((channel_id, current_fp))
+
+                    # Three statements per BATCH, not per channel — this used
+                    # to be ~many round-trips per 500 channels, on every source
+                    # refresh. Order holds: each channel's generated links are
+                    # only touched by its own delete, and all deletes precede
+                    # all writes. Measured in tests/test_tag_write_batching.py.
+                    if retag_ids:
+                        repos.tags.delete_generated_for_channels(retag_ids)
+                    if tag_map:
+                        repos.tags.set_content_tags_bulk(tag_map, source="generated")
+                    if fingerprint_updates:
+                        session.execute(
+                            _text(
+                                "UPDATE channels SET tag_fingerprint = :fp WHERE id = :id"
+                            ),
+                            [{"fp": fp, "id": cid} for cid, fp in fingerprint_updates],
+                        )
+
+            except Exception as e:
+                logger.error(
+                    "_update_tags_in_thread: batch {}-{} failed: {}",
+                    batch_start,
+                    batch_start + len(chunk),
+                    e,
+                )
+                continue
+
+            done = batch_start + len(chunk)
+            logger.debug(
+                "_update_tags_in_thread: committed tags for channels {}-{}",
+                batch_start,
+                done,
+            )
+
+            # Emit per-batch progress in the _BAND_TAGS range so the active
+            # notification bar creeps forward during the long tagging phase
+            # (largest wall-clock phase for big providers).
+            _TAG_BAND_START, _TAG_BAND_END = _BAND_TAGS
+            band_pct = int(_TAG_BAND_START + (done / total) * (_TAG_BAND_END - _TAG_BAND_START))
+            self._try_emit_progress(
+                band_pct, 100,
+                f"Tagging {done:,} / {total:,} channels…",
+            )
+
+        tagged = total - skipped
+        logger.info(
+            "_update_tags_in_thread: tagged {:,} channels ({:,} skipped, unchanged) for '{}'",
+            tagged,
+            skipped,
+            self.provider.name,
+        )
+
+    def _compute_prefix_stats_in_thread(self) -> None:
+        """Compute prefix stats and store on self.prefix_stats for the main thread."""
+        from streamselect.core.repositories import RepositoryFactory
+        session = self.db.get_session()
+        try:
+            repos = RepositoryFactory(session)
+            self.prefix_stats = repos.channels.get_prefix_stats(
+                provider_id=None,
+                language_groups=self._language_groups,
+                quality_groups=self._quality_groups,
+                platform_groups=self._platform_groups,
+                regional_groups=self._regional_groups,
+            )
+        except Exception as e:
+            logger.error(f"Prefix stats failed: {e}")
+            self.prefix_stats = None
+        finally:
+            session.close()
+
+    async def _refresh_account_info(self, provider_plugin) -> None:
+        """Fetch and store fresh account/subscription info after a channel load."""
+        if not hasattr(provider_plugin, "fetch_account_info"):
+            return
+        try:
+            info = await provider_plugin.fetch_account_info(self.provider)
+            if not info:
+                return
+            from streamselect.core.database import ProviderDB
+            acct_session = self.db.get_session()
+            try:
+                db_prov = acct_session.query(ProviderDB).filter_by(id=self.provider.id).first()
+                if db_prov:
+                    from streamselect.core.repositories.provider import apply_account_info
+                    apply_account_info(db_prov, info)
+                    acct_session.commit()
+                    logger.info(
+                        f"Account info refreshed for '{self.provider.name}': "
+                        f"status={info.get('status')} exp={db_prov.account_exp_date}"
+                    )
+            except Exception as e:
+                acct_session.rollback()
+                logger.warning(f"Failed to store account info: {e}")
+            finally:
+                acct_session.close()
+        except Exception as e:
+            logger.warning(f"Failed to fetch account info during load: {e}")
+
+
+class ProviderTestThread(QThread):
+    """Background thread for testing provider connection"""
+    
+    result = pyqtSignal(bool, str)  # success, message
+    progress = pyqtSignal(str)  # status message
+    
+    def __init__(self, provider_type: str, url: str, username: str, password: str):
+        super().__init__()
+        self.provider_type = provider_type
+        self.url = url
+        self.username = username
+        self.password = password
+    
+    def run(self):
+        """Run connection test"""
+        try:
+            asyncio.run(self.test_provider())
+        except Exception as e:
+            logger.error(f"Connection test error: {e}")
+            self.result.emit(False, str(e))
+    
+    async def test_provider(self):
+        """Test provider connection using provider plugin"""
+        self.progress.emit("Testing connection...")
+        
+        # Get provider plugin
+        provider_plugin = get_provider(self.provider_type)
+        if not provider_plugin:
+            self.result.emit(False, f"Unknown provider type: {self.provider_type}")
+            return
+        
+        # Test connection
+        self.progress.emit("Checking DNS and connectivity...")
+        success, error = await provider_plugin.test_connection(self.url, self.username, self.password)
+        
+        if not success:
+            self.result.emit(False, f"Connection failed: {error}")
+            return
+        
+        self.result.emit(True, "Connection successful!")
+
+
+class SeriesLoadThread(QThread):
+    """Background thread for loading series details (seasons and episodes)"""
+    
+    finished = pyqtSignal(bool, str, object)  # success, message, series_data
+    progress = pyqtSignal(str)  # status message
+    
+    def __init__(self, provider: Provider, series_id: str, series_name: str, db: Database):
+        super().__init__()
+        self.provider = provider
+        self.series_id = series_id
+        self.series_name = series_name
+        self.db = db
+    
+    def run(self):
+        """Load series details"""
+        try:
+            asyncio.run(self.load_series())
+        except Exception as e:
+            logger.error(f"Series load error: {e}")
+            self.finished.emit(False, str(e), None)
+    
+    async def load_series(self):
+        """Load series details using provider plugin"""
+        self.progress.emit(f"Fetching series information for {self.series_name}...")
+        
+        # Get provider plugin
+        provider_plugin = get_provider(self.provider.type)
+        if not provider_plugin:
+            self.finished.emit(False, f"Unknown provider type: {self.provider.type}", None)
+            return
+        
+        # Fetch series information
+        series_data = await provider_plugin.fetch_series_info(self.provider, self.series_id)
+
+        # Persist the URL success/failure stats UrlCycler recorded on
+        # self.provider.urls during the cycling above — this thread has its
+        # own Database handle and never goes through ProviderLoadThread's
+        # write-back, so nothing else would ever make these durable.
+        persist_url_stats(self.db, self.provider)
+
+        if not series_data:
+            self.finished.emit(False, "Could not fetch series information", None)
+            return
+        
+        # Handle case where API returns unexpected format
+        if not isinstance(series_data, dict):
+            logger.error(f"Expected dict from fetch_series_info, got {type(series_data)}")
+            self.finished.emit(False, f"Unexpected API response format: {type(series_data)}", None)
+            return
+        
+        self.progress.emit("Storing seasons and episodes...")
+
+        # Store in database
+        session = self.db.get_session()
+        try:
+            # Parse and store seasons
+            seasons = series_data.get("seasons", [])
+            episodes_data = series_data.get("episodes", {})
+            
+            # Handle both dict and list formats for episodes
+            if isinstance(episodes_data, dict):
+                # Episodes keyed by season number
+                episodes_by_season = episodes_data
+            elif isinstance(episodes_data, list):
+                # Check if this is a list of lists (nested structure)
+                # or a flat list of episode dicts
+                episodes_by_season = {}
+                
+                # Flatten nested lists if needed
+                flat_episodes = []
+                for item in episodes_data:
+                    if isinstance(item, list):
+                        # Nested list - flatten it
+                        flat_episodes.extend(item)
+                    elif isinstance(item, dict):
+                        # Already flat
+                        flat_episodes.append(item)
+                    else:
+                        logger.error(f"Unexpected episode item type: {type(item)}")
+                
+                # Group episodes by season number
+                for ep in flat_episodes:
+                    if not isinstance(ep, dict):
+                        logger.error(f"Episode is not a dict: {type(ep)}")
+                        continue
+                    season_num = str(ep.get("season", 0))
+                    if season_num not in episodes_by_season:
+                        episodes_by_season[season_num] = []
+                    episodes_by_season[season_num].append(ep)
+            else:
+                logger.error(f"Unexpected episodes data type: {type(episodes_data)}")
+                episodes_by_season = {}
+            
+            season_count = len(seasons)
+            total_episodes = sum(len(eps) for eps in episodes_by_season.values())
+
+            logger.info(f"Found {season_count} seasons and {total_episodes} episodes for {self.series_name}")
+
+            # Surface episode-group keys we can't map to a numeric season. Both the
+            # synthetic-season path and the gap-fill path below key on ``isdigit()``,
+            # so a provider grouping under a non-numeric key (e.g. "Temporada N")
+            # would have those episodes silently dropped. Logging makes the quirk
+            # diagnosable instead of an invisible season gap later.
+            _nonnumeric_keys = [k for k in episodes_by_season.keys() if not str(k).isdigit()]
+            if _nonnumeric_keys:
+                logger.warning(
+                    f"{self.series_name}: {len(_nonnumeric_keys)} episode-group key(s) "
+                    f"are non-numeric and will NOT become seasons (their episodes are "
+                    f"dropped) — provider may group seasons differently: {_nonnumeric_keys}"
+                )
+
+            # Handle case where there are episodes but no seasons metadata
+            # Create a default season so episodes can be stored and displayed
+            if season_count == 0 and total_episodes > 0:
+                logger.info(f"No seasons metadata but {total_episodes} episodes found - creating default season")
+                # Find which season numbers have episodes
+                season_nums = [int(s) for s in episodes_by_season.keys() if s.isdigit()]
+                if not season_nums:
+                    season_nums = [1]  # Default to season 1
+
+                # Create a season entry for each season number that has episodes
+                seasons = []
+                for season_num in sorted(season_nums):
+                    season_key = str(season_num)
+                    episode_count = len(episodes_by_season.get(season_key, []))
+                    seasons.append({
+                        "season_number": season_num,
+                        "name": f"Season {season_num}",
+                        "cover": "",
+                        "episodes": episode_count
+                    })
+                    logger.debug(f"Created default season {season_num} with {episode_count} episodes")
+
+                season_count = len(seasons)
+            else:
+                # Seasons metadata exists but may not cover all episode groups.
+                # Some providers return season metadata for season 1 only
+                # but split episodes across groups "1" and "2". Append synthetic season
+                # entries for any episode groups not already represented.
+                covered = {str(s.get("season_number", 0)) for s in seasons if isinstance(s, dict)}
+                for season_key in sorted(episodes_by_season.keys()):
+                    if season_key.isdigit() and season_key not in covered:
+                        season_num = int(season_key)
+                        episode_count = len(episodes_by_season[season_key])
+                        seasons.append({
+                            "season_number": season_num,
+                            "name": f"Season {season_num}",
+                            "cover": "",
+                            "episodes": episode_count
+                        })
+                        logger.info(
+                            f"Episode group '{season_key}' has no season metadata entry — "
+                            f"created synthetic Season {season_num} with {episode_count} episodes"
+                        )
+                season_count = len(seasons)
+            
+            provider_streams: list = []   # (episode id, info) — see upsert_provider_records
+            for season_data in seasons:
+                
+                # Handle case where season_data might be a list instead of dict
+                if isinstance(season_data, list):
+                    logger.error(f"Season data is a list, expected dict: {season_data}")
+                    continue
+                
+                season_num = season_data.get("season_number", 0)
+                # Provider-scope the season PK (mirror the episode key built below).
+                # Without the provider prefix two sources that host the same series under
+                # the same Xtream source_id (small per-provider integers — collisions are
+                # common) would write seasons under the SAME id; the second source's load
+                # would hit the first's row in the UPDATE branch and silently keep the
+                # first provider's provider_id, so the provider-scoped read
+                # (get_by_series) returns nothing for the second source.
+                season_id = f"{self.provider.id}_{self.series_id}_s{season_num}"
+
+                # Self-heal pre-fix rows: a season stored under the old non-scoped
+                # "{series_id}_s{n}" key that belongs to THIS provider would otherwise
+                # coexist with the new scoped row and double up in get_by_series. Drop it;
+                # its episodes re-link to the scoped id via the episode upsert below.
+                legacy_season_id = f"{self.series_id}_s{season_num}"
+                if legacy_season_id != season_id:
+                    legacy_season = session.query(SeasonDB).filter_by(
+                        id=legacy_season_id, provider_id=self.provider.id
+                    ).first()
+                    if legacy_season is not None:
+                        session.delete(legacy_season)
+                        session.flush()
+
+                # Check if season exists
+                existing_season = session.query(SeasonDB).filter_by(id=season_id).first()
+                
+                season_episodes = episodes_by_season.get(str(season_num), [])
+                
+                if existing_season:
+                    # Update existing
+                    existing_season.name = season_data.get("name", f"Season {season_num}")
+                    existing_season.cover_url = season_data.get("cover", "")
+                    existing_season.episode_count = len(season_episodes)
+                    existing_season.raw_data = season_data
+                else:
+                    # Create new
+                    season = SeasonDB(
+                        id=season_id,
+                        series_id=self.series_id,
+                        provider_id=self.provider.id,
+                        season_number=season_num,
+                        name=season_data.get("name", f"Season {season_num}"),
+                        cover_url=season_data.get("cover", ""),
+                        episode_count=len(season_episodes),
+                        series_name=self.series_name,
+                        raw_data=season_data
+                    )
+                    session.add(season)
+                
+                # Store episodes for this season
+                for episode_data in season_episodes:
+                    if not isinstance(episode_data, dict):
+                        logger.error(f"Episode data is not a dict in season {season_num}: {type(episode_data)}, value: {episode_data}")
+                        continue
+                    
+                    episode_id = episode_data.get("id", "")
+                    episode_num = int(episode_data.get("episode_num", 0))
+                    
+                    db_episode_id = f"{self.provider.id}_{episode_id}"
+                    
+                    # Check if episode exists
+                    existing_episode = session.query(EpisodeDB).filter_by(id=db_episode_id).first()
+                    
+                    # Build stream URL (strip trailing slash to avoid double-slash)
+                    container = episode_data.get("container_extension", "mp4")
+                    base = self.provider.url.rstrip("/")
+                    stream_url = f"{base}/series/{self.provider.username}/{self.provider.password}/{episode_id}.{container}"
+                    
+                    info_raw = episode_data.get("info", {})
+                    if not isinstance(info_raw, dict):
+                        logger.debug(
+                            f"Episode 'info' field is {type(info_raw).__name__}, not dict "
+                            f"(episode_id={episode_id}, season={season_num}) — treating as empty"
+                        )
+                        info_raw = {}
+                    info = info_raw
+                    provider_streams.append((db_episode_id, info))
+                    duration = info.get("duration", "") or episode_data.get("duration", "")
+
+                    # Episode-grain metadata (plot/air_date/rating/still_url) — lifted
+                    # once here at ingestion via the shared chokepoint so render code
+                    # never re-parses raw_data (Wave 4 — an earlier change, the project rules ingestion rule).
+                    ep_fields = extract_episode_metadata_fields(episode_data)
+
+                    if existing_episode:
+                        # Update existing
+                        existing_episode.title = episode_data.get("title", f"Episode {episode_num}")
+                        existing_episode.duration = duration
+                        existing_episode.stream_url = stream_url
+                        existing_episode.cover_url = info.get("movie_image", "")
+                        existing_episode.container_extension = container
+                        existing_episode.raw_data = episode_data
+                        existing_episode.plot = ep_fields["plot"]
+                        existing_episode.air_date = ep_fields["air_date"]
+                        existing_episode.rating = ep_fields["rating"]
+                        existing_episode.still_url = ep_fields["still_url"]
+                        # Re-link to the (now provider-scoped) season id so episodes stored
+                        # under a pre-fix non-scoped season key follow the season on reload.
+                        existing_episode.season_id = season_id
+                    else:
+                        # Create new
+                        episode = EpisodeDB(
+                            id=db_episode_id,
+                            season_id=season_id,
+                            series_id=self.series_id,
+                            provider_id=self.provider.id,
+                            episode_id=episode_id,
+                            episode_num=episode_num,
+                            season_num=season_num,
+                            title=episode_data.get("title", f"Episode {episode_num}"),
+                            duration=duration,
+                            container_extension=container,
+                            stream_url=stream_url,
+                            cover_url=info.get("movie_image", ""),
+                            series_name=self.series_name,
+                            raw_data=episode_data,
+                            plot=ep_fields["plot"],
+                            air_date=ep_fields["air_date"],
+                            rating=ep_fields["rating"],
+                            still_url=ep_fields["still_url"],
+                        )
+                        session.add(episode)
+
+            # Each episode's info carries the provider's own ffprobe (PLAYED-5).
+            session.flush()
+            StreamInfoRepository(session).upsert_provider_records(provider_streams)
+            session.commit()
+            logger.info(f"Stored {season_count} seasons and {total_episodes} episodes for {self.series_name}")
+        finally:
+            session.close()
+
+        # Message is shown by on_series_loaded as "Loaded {message}" — don't repeat
+        # the word here (was producing "Loaded Loaded N seasons").
+        self.finished.emit(True, f"{season_count} seasons", series_data)
+

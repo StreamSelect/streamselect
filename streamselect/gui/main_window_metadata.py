@@ -1,0 +1,953 @@
+"""Metadata mixin — channel details loading, versions, similar titles, action states.
+
+Extracted from MainWindow; mixed in via:
+    class MainWindow(_MetadataMixin, ..., QMainWindow): ...
+
+All methods access state set in MainWindow.__init__ via ``self.*``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+import time
+from types import SimpleNamespace
+
+from loguru import logger
+from PyQt6.QtCore import QTimer
+
+from streamselect.core.repositories import RepositoryFactory
+from streamselect.core.repositories.channel_live_copy import resolve_live_copy
+from streamselect.core.repositories.provider import parse_provider_urls
+from streamselect.gui.details_actions import ChannelActionState
+from streamselect.gui.details_versions import ChannelVersion
+from streamselect.gui import deferred_config_save as _cfgsave
+
+# A user's log: one selection produced two full render+fetch
+# cycles for the same channel 185ms apart. an earlier change fixed the LIST's own
+# click/selection double; this debounce covers every OTHER path into
+# update_details_pane_for_channel (sidebar sections, version_selected,
+# programmatic calls) that had no dedupe of its own. 300ms, not id-gating:
+# gating on the id alone breaks click-again-to-refresh, the deliberate escape
+# hatch an earlier change's record relies on — a human re-click is seconds apart, the
+# measured accidental double was 185ms, so 300ms catches the double without
+# touching the escape hatch.
+#
+# UI-11 (a user's log): the SAME channel id re-rendered
+# twelve times in 100s — the pairs landed 350-500ms apart (two surfaces
+# firing for one gesture), past the 300ms window. Raised to 2.0s. This is
+# now reachable only while metadata for the shown id is STILL LOADING: once
+# metadata lands, the _details_shown same-title no-op below short-circuits a
+# repeat outright with no timer involved, so widening this constant does not
+# reopen the click-again-to-refresh escape hatch on an already-settled title
+# — a human re-click is comfortably "seconds", not 2.
+_RERENDER_DEBOUNCE_S = 2.0
+
+
+def _source_notice_text(live_copy, details_pane) -> "str | None":
+    """The dim line under the details pane's Source chip (VERS-1) — describes
+    a redirect away from a dead source, or that the shown copy is dead with
+    nothing to redirect to. None when the shown copy was already live.
+
+    ``details_pane`` supplies the live copy's display name via its own
+    provider map (``DetailsPaneWidget.provider_name`` — the SAME lookup the
+    "Source:" chip itself reads), so this never re-derives provider naming.
+    """
+    if live_copy.dead_source_name is None:
+        return None
+    state = live_copy.dead_source_state or "unavailable"
+    if live_copy.redirected_from is not None:
+        live_name = details_pane.provider_name(live_copy.dto.provider_id)
+        return (
+            f"Shown from {live_name} — your {live_copy.dead_source_name} "
+            f"copy is {state}"
+        )
+    return (
+        f"{live_copy.dead_source_name} is {state} — no other source "
+        "carries this title"
+    )
+
+
+def _tmdb_recommended_keys(session, channel_id: str, tmdb_settings) -> list[str]:
+    """TMDb's recommendations for a channel, as content keys ("Similar Content").
+
+    Only a tmdb-keyed channel (``content_key`` = ``tmdb:{id}|{kind}``) can be
+    asked about; anything else, or no API key, yields an empty list.
+    """
+    from streamselect.core.database import ChannelDB
+    from streamselect.metadata_providers.tmdb import TMDbProvider
+
+    key = session.query(ChannelDB.content_key).filter(ChannelDB.id == channel_id).scalar() or ""
+    if not key.startswith("tmdb:") or tmdb_settings is None:
+        return []
+    tmdb_id, _, kind = key[5:].partition("|")
+    return asyncio.run(TMDbProvider(tmdb_settings).recommended_content_keys(tmdb_id, kind or "movie"))
+
+
+def _similar_content_keys(session, channel_id: str, tmdb_settings, config) -> list[str]:
+    """"Similar Content": TMDb's recommendations when a TMDb key is set, else
+    StreamSelect's own — the recommendation scorer (and its exclusion scope, via
+    ``recommendation_scope``) seeded with THIS title's genres, director and
+    cast instead of the user's taste. Returned as content keys, best first.
+    """
+    keys = _tmdb_recommended_keys(session, channel_id, tmdb_settings)
+    if keys:
+        return keys
+    from streamselect.core.database import ChannelDB, MetadataDB
+    from streamselect.core.preference_engine import (
+        AttributeWeights, recommendation_scope, score_candidates,
+    )
+    ch = session.get(ChannelDB, channel_id)
+    md = session.get(MetadataDB, ch.metadata_id) if ch is not None and ch.metadata_id else None
+    if md is None:
+        return []
+    from streamselect.core.credits import credits_for
+    people = credits_for(session, [channel_id]).get(channel_id)
+    cast = people.cast_names()[:6] if people else []
+    weights = AttributeWeights(
+        genres=dict.fromkeys(md.genres or [], 1.0),
+        directors=dict.fromkeys(people.directors if people else [], 1.5),
+        actors=dict.fromkeys(cast, 1.0),
+    )
+    if not (weights.genres or weights.directors or weights.actors):
+        return []
+    scored = score_candidates(session, weights, limit=40, **recommendation_scope(session, config))
+    ids = [sc.channel_id for sc in scored if sc.channel_id != channel_id]
+    by_id = dict(session.query(ChannelDB.id, ChannelDB.content_key)
+                 .filter(ChannelDB.id.in_(ids)).all())
+    return list(dict.fromkeys(by_id[i] for i in ids if by_id.get(i)))
+
+
+class _MetadataMixin:
+    """Mixin: details pane data loading, versions, similar titles, action states."""
+
+    # ── Channel tags (provenance + confidence display — DR-0006) ────────────
+
+    def _on_channel_tags_requested(self, channel_id: str) -> None:
+        """Kick off an off-thread tag load for the given channel_id."""
+        self._run_query(
+            lambda repos: repos.tags.get_channel_tags_dto(channel_id),
+            lambda tags: self._on_channel_tags_loaded(channel_id, tags),
+            token_ref=self._channel_tags_token,
+            on_error=lambda e: logger.warning(f"Tag load failed for {channel_id}: {e}"),
+        )
+
+    def _on_channel_tags_loaded(self, channel_id: str, tags: list) -> None:
+        """Main-thread slot: deliver loaded tags to the details pane."""
+        self.details_pane.apply_channel_tags(channel_id, tags or [])
+        self._load_stream_info(channel_id)
+
+    # ── Stream measurements (PLAYED-1: what the stream really contains) ─────
+
+    def _load_stream_info(self, channel_id: str) -> None:
+        """Read the channel's stored stream record off-thread and hand it to
+        the details pane. The one refresh path for a fresh measurement too —
+        stream capture calls it after storing, and so will a manual probe."""
+        self._run_query(
+            lambda repos: repos.stream_info.get(channel_id),
+            lambda record: self._on_stream_info_loaded(channel_id, record),
+            on_error=lambda e: logger.warning(f"Stream info load failed for {channel_id}: {e}"),
+        )
+
+    def _on_stream_info_loaded(self, channel_id: str, record) -> None:
+        self.details_pane.apply_stream_info(channel_id, record)
+        # Ask the provider once when there is nothing measured OR the title's
+        # provider-only facts (original language, alternate titles) were never
+        # fetched — a played movie still needs those.
+        if record is None or not self.details_pane.has_original_language():
+            self._fetch_provider_details(channel_id)
+
+    def _fetch_provider_details(self, channel_id: str) -> None:
+        """Ask a title's provider once (Xtream ``get_vod_info`` for a movie,
+        ``get_series_info`` for a series — one small call carrying the provider's
+        ffprobe, TMDb's original language, alternate titles and credits) and
+        store it the way the enrichment sweep does. Once per title per session.
+        """
+        done = self.__dict__.setdefault("_provider_details_fetched", set())
+        if channel_id in done:
+            return
+        done.add(channel_id)
+
+        def query(repos):
+            from streamselect.core.database import ChannelDB
+            from streamselect.metadata_providers.raw_parse import harvest_detail_metadata
+            from streamselect.providers.factory import get_provider
+            ch = repos.session.get(ChannelDB, channel_id)
+            if ch is None or ch.media_type not in ("movie", "series"):
+                return None
+            provider_db = repos.providers.get_by_id(ch.provider_id)
+            if provider_db is None or provider_db.type != "xtream":
+                return None
+            plugin = get_provider("xtream")
+            if plugin is None:
+                return None
+            fetch = plugin.fetch_vod_info if ch.media_type == "movie" else plugin.fetch_series_info
+            data = asyncio.run(fetch(repos.providers.to_model(provider_db), ch.source_id))
+            harvest = harvest_detail_metadata(data) if data else None
+            useful = [k for k, v in (harvest or {}).items() if v]
+            logger.info(f"Provider details for {ch.name!r} ({ch.media_type}): {useful or 'nothing new'}")
+            if not useful:
+                return None
+            repos.channels.apply_metadata_harvest({channel_id: harvest})
+            return harvest.get("original_language") or ""
+
+        def stored(lang) -> None:
+            if lang is None:
+                return
+            if lang:
+                self.details_pane.apply_original_language(channel_id, lang)
+            self._on_channel_tags_requested(channel_id)   # alternate titles / credits arrived as tags
+            self._run_query(lambda repos: repos.stream_info.get(channel_id),
+                            lambda rec: self.details_pane.apply_stream_info(channel_id, rec),
+                            on_error=lambda e: logger.warning(f"Stream info reload failed: {e}"))
+
+        self._run_query(query, stored, commit=True,
+                        on_error=lambda e: logger.debug(f"provider details for {channel_id}: {e}"))
+
+    # ── Taste weights (the ▲/▼ preference markers beside cast + director) ───
+
+    def _on_weights_requested(self, channel_id: str) -> None:
+        """Kick off an off-thread taste-weight read for the pane's people markers.
+
+        ``compute_weights`` walks every rating, batch-loads the rated channels
+        and loads every favourite WITH its metadata. The pane used to call it
+        inline from its render path; a user's main-thread watchdog caught a
+        28,731 ms freeze doing exactly that. Same seam as every other pane read
+        — by the time this lands the pane has long since painted un-annotated.
+        """
+        from streamselect.core.preference_engine import RecScoringSettings, compute_weights
+
+        settings = RecScoringSettings.from_config(self.config)
+
+        def _query(repos):
+            weights = compute_weights(repos.session, settings=settings)
+            # AttributeWeights is plain data (dicts + counters), never ORM, so it
+            # crosses the thread boundary as-is. None = no taste signal yet.
+            return None if weights.is_empty() else weights
+
+        self._run_query(
+            _query,
+            lambda weights: self._on_weights_loaded(channel_id, weights),
+            token_ref=self._details_weights_token,
+            on_error=lambda e: logger.warning(
+                f"Taste weights unavailable for {channel_id}: {e}"
+            ),
+        )
+
+    def _on_weights_loaded(self, channel_id: str, weights) -> None:
+        """Main-thread slot: hand the weights to the pane, which drops stale ones."""
+        self.details_pane.apply_taste_weights(channel_id, weights)
+
+    # ── Action state (is_queued / rating / suppressed / hidden) ────────────
+
+    def _on_action_state_requested(self, channel_id: str) -> None:
+        self.executor.submit(self._bg_fetch_action_state, channel_id)
+
+    def _bg_fetch_action_state(self, channel_id: str) -> None:
+        try:
+            with self.db.session_scope() as session:
+                repos = RepositoryFactory(session)
+                state = ChannelActionState(
+                    channel_id=channel_id,
+                    in_queue=repos.queue.is_queued(channel_id),
+                    rating=repos.ratings.get(channel_id) or 0,
+                )
+                ch = repos.channels.get_by_id(channel_id)
+                if ch:
+                    state.is_suppressed = bool(ch.is_rec_suppressed)
+                    state.is_hidden = bool(ch.is_hidden)
+                    state.is_favorite = bool(ch.is_favorite)
+                    state.media_type = str(getattr(ch.media_type, "value", ch.media_type) or "")
+                    state.watch_progress = int(ch.watch_progress or 0)
+                    state.watch_completed = bool(ch.watch_completed)
+                state.epg_link_blocked = channel_id in (self.config.epg_link_blocklist or [])
+        except Exception:
+            logger.exception("Failed to fetch action state for %s", channel_id)
+            return
+        self._action_state_loaded.emit(state)
+
+    def _on_action_state_loaded(self, state) -> None:
+        self.details_pane.apply_action_state(state)
+
+    # ── Episode action state (Wave 2 Slice 2B — episode-mode queue/favorite) ──
+
+    def _on_episode_action_state_requested(self, episode_id: str) -> None:
+        self.executor.submit(self._bg_fetch_episode_action_state, episode_id)
+
+    def _bg_fetch_episode_action_state(self, episode_id: str) -> None:
+        from streamselect.core.database import EpisodeDB
+        try:
+            with self.db.session_scope() as session:
+                repos = RepositoryFactory(session)
+                in_queue = repos.queue.is_episode_queued(episode_id)
+                ep = session.get(EpisodeDB, episode_id)
+                is_favorite = bool(ep.is_favorite) if ep else False
+                watch_progress = int(ep.watch_progress or 0) if ep else 0
+                watch_completed = bool(ep.watch_completed) if ep else False
+        except Exception:
+            logger.exception(f"Failed to fetch episode action state for {episode_id}")
+            return
+        self._episode_action_state_loaded.emit(episode_id, in_queue, is_favorite, watch_progress, watch_completed)
+
+    def _on_episode_action_state_loaded(
+        self, episode_id: str, in_queue: bool, is_favorite: bool, watch_progress: int = 0, watch_completed: bool = False
+    ) -> None:
+        self.details_pane.apply_episode_action_state(episode_id, in_queue, is_favorite, watch_progress, watch_completed)
+
+    # ── Other Versions / Other Sources ─────────────────────────────────────
+
+    def _fetch_channel_versions(self, channel_id: str) -> None:
+        self.executor.submit(self._bg_fetch_versions, channel_id)
+
+    def _bg_fetch_versions(self, channel_id: str) -> None:
+        from streamselect.core.database import ChannelDB, ProviderDB
+        from streamselect.core.content_dedup import normalize_title
+        from streamselect.core.preference_engine import version_score as _version_score
+        from streamselect.gui.main_window import _version_years_compatible
+
+        versions = []
+        try:
+            with self.db.session_scope() as session:
+                channel = session.get(ChannelDB, channel_id)
+                if not channel:
+                    return
+
+                repos = RepositoryFactory(session)
+                queue_ids = repos.queue.get_queued_ids()
+                provider_names = {p.id: p.name for p in session.query(ProviderDB).all()}
+                hidden_provider_ids = set(repos.providers.get_hidden_provider_ids())
+                # DETAILS-3c: disabled sources never appear here at all — not
+                # dimmed, not counted, not reachable — the absolute gate
+                # CRITICAL_RULES already states for every forward-looking view.
+                # "Offline" (is_inactive below) then means an ENABLED source
+                # whose account has merely expired. inactive_provider_ids is
+                # the user's own toggle; the orphaned remainder (a deleted
+                # source's leftover channels, hidden_provider_ids minus
+                # inactive minus expired) can never be reactivated either, so
+                # it is disabled too rather than shown as a false "offline".
+                inactive_provider_ids = set(repos.providers.get_inactive_provider_ids())
+                expired_provider_ids = set(repos.providers.get_expired_provider_ids())
+                orphaned_provider_ids = (
+                    hidden_provider_ids - inactive_provider_ids - expired_provider_ids
+                )
+                disabled_provider_ids = inactive_provider_ids | orphaned_provider_ids
+                from streamselect.core.filter_utils import global_exclusion_set, is_channel_excluded
+                from streamselect.core.tag_exclusions import excluded_tag_content_types
+                _filter_paused = self.config.global_filter_paused
+                # Canonical Global-Exclusion set (paused-aware, group→leaf-expanded).
+                all_excluded = global_exclusion_set(self.config)
+                blocked_prefixes = set() if _filter_paused else set(self.config.global_filter_excluded_prefixes)
+                # Content-provenance layer (paused-aware): channel-id set carrying a
+                # globally-excluded content_type tag (AI Generated / AI Voiceover).  A
+                # matching variant is greyed out here too, matching the channel list.
+                _ct_slugs = excluded_tag_content_types(self.config)
+                excluded_ct_ids = (
+                    repos.tags.channel_ids_for_content_types(_ct_slugs) if _ct_slugs else set()
+                )
+
+                # Measured audio contradicting an excluded prefix outranks it.
+                heard_keep = repos.stream_info.prefix_exempt_ids(all_excluded)
+
+                def _is_filtered(ch: ChannelDB) -> bool:
+                    # Shared predicate: prefix wins, region is the no-prefix fallback —
+                    # so a prefix-less variant filed under an excluded region is greyed
+                    # out here too, matching the channel list exactly (P1-6).  The
+                    # content_type layer (id-set membership) greys out AI variants too.
+                    if (ch.id not in heard_keep
+                            and is_channel_excluded(ch.detected_prefix, ch.detected_region, all_excluded)):
+                        return True
+                    return ch.id in excluded_ct_ids
+
+                def _is_hidden_category(ch: ChannelDB) -> bool:
+                    return bool(ch.detected_prefix and ch.detected_prefix in blocked_prefixes)
+
+                def _first_significant_word(text: str) -> str:
+                    for w in text.split():
+                        if len(w) >= 3:
+                            return w
+                    return text.split()[0] if text.split() else ""
+
+                is_live = channel.media_type == "live"
+                ck = channel.content_key if not is_live else None  # content_key not used for live
+
+                if is_live:
+                    # Live channels: always use normalize_title matching (no content_key path).
+                    # Include ALL providers (active and inactive) — inactive are marked so
+                    # the source-picker chip can display them dimmed with a reactivate affordance.
+                    norm = normalize_title(channel.name, channel.detected_prefix)
+                    if not norm:
+                        self._versions_loaded.emit(channel_id, [])
+                        return
+                    first_word = _first_significant_word(norm)
+                    candidates = (
+                        session.query(ChannelDB)
+                        .filter(
+                            ChannelDB.media_type == "live",
+                            ChannelDB.id != channel_id,
+                            ChannelDB.name.ilike(f"%{first_word}%"),
+                        )
+                        .all()
+                    )
+                    versions_raw = [
+                        ch for ch in candidates
+                        if normalize_title(ch.name, ch.detected_prefix) == norm
+                    ]
+                elif ck:
+                    # VOD/series — primary path: group by stored content_key (indexed).
+                    # Include ALL providers (active and inactive) for the source-picker chips;
+                    # inactive ones are marked is_inactive so the chip renders them dimmed.
+                    versions_raw = (
+                        session.query(ChannelDB)
+                        .filter(
+                            ChannelDB.content_key == ck,
+                            ChannelDB.id != channel_id,
+                        )
+                        .all()
+                    )
+                else:
+                    # VOD/series fallback: content_key not yet populated (pre-backfill row);
+                    # fall back to normalize_title matching with _version_years_compatible guard.
+                    current_norm = normalize_title(channel.name, channel.detected_prefix)
+                    if not current_norm:
+                        self._versions_loaded.emit(channel_id, [])
+                        return
+                    first_word = _first_significant_word(current_norm)
+                    if not first_word:
+                        self._versions_loaded.emit(channel_id, [])
+                        return
+                    candidates = (
+                        session.query(ChannelDB)
+                        .filter(
+                            ChannelDB.media_type == channel.media_type,
+                            ChannelDB.id != channel_id,
+                            ChannelDB.name.ilike(f"%{first_word}%"),
+                        )
+                        .all()
+                    )
+                    versions_raw = [
+                        ch for ch in candidates
+                        if normalize_title(ch.name, ch.detected_prefix) == current_norm
+                        and _version_years_compatible(ch.name, channel.name)
+                    ]
+
+                # DETAILS-3c absolute gate: a disabled source's copies are
+                # dropped here, before anything downstream can count, score,
+                # or render them — never merely dimmed like the (still
+                # enabled) expired-source "offline" bucket below.
+                versions_raw = [
+                    ch for ch in versions_raw if ch.provider_id not in disabled_provider_ids
+                ]
+                # How each source files its copy — the stored collection tag,
+                # computed at ingestion; never re-decomposed here.
+                collections = repos.tags.collections_for([ch.id for ch in versions_raw])
+                # What each copy's stream really is, where it has been measured
+                # (played or probed) — PLAYED-3 puts it on the copy chips.
+                from streamselect.core.stream_info import summarize
+                measured = {cid: summarize(rec) for cid, rec in
+                            repos.stream_info.get_many([ch.id for ch in versions_raw]).items()}
+
+                # Score only active-source versions for preferred selection (inactive
+                # sources can't be "preferred" — they're off by user choice)
+                current_score = _version_score(channel, self.config)
+                best_score = current_score
+                best_ch = None
+                for ch in versions_raw:
+                    if ch.provider_id in hidden_provider_ids:
+                        continue
+                    s = _version_score(ch, self.config)
+                    if s > best_score:
+                        best_score = s
+                        best_ch = ch
+
+                versions = [
+                    ChannelVersion(
+                        channel_id=ch.id,
+                        name=ch.name,
+                        in_queue=ch.id in queue_ids,
+                        detected_prefix=ch.detected_prefix,
+                        detected_title=ch.detected_title,
+                        detected_year=ch.detected_year,
+                        detected_quality=ch.detected_quality,
+                        detected_region=ch.detected_region,
+                        is_preferred=(ch is best_ch),
+                        is_filtered=_is_filtered(ch) if not ch.is_hidden else False,
+                        is_hidden=bool(ch.is_hidden),
+                        is_hidden_category=_is_hidden_category(ch),
+                        is_favorite=bool(ch.is_favorite),
+                        in_history=bool(ch.play_count),
+                        provider_name=provider_names.get(ch.provider_id),
+                        provider_id=ch.provider_id,
+                        is_inactive=ch.provider_id in hidden_provider_ids,
+                        collection=collections.get(ch.id),
+                        measured=measured.get(ch.id),
+                    )
+                    for ch in versions_raw
+                ]
+                versions.sort(key=lambda v: (
+                    v.is_inactive,          # active providers first
+                    v.is_hidden,
+                    v.is_filtered,
+                    -_version_score(
+                        next(c for c in versions_raw if c.id == v.channel_id), self.config
+                    ),
+                    v.name,
+                ))
+                versions = versions[:20]
+
+        except Exception:
+            logger.exception("Error fetching channel versions for %s", channel_id)
+            versions = []
+
+        self._versions_loaded.emit(channel_id, versions)
+
+    def _on_versions_loaded(self, channel_id: str, versions: list) -> None:
+        if (self.details_pane.current_channel
+                and self.details_pane.current_channel.id == channel_id):
+            self.details_pane.set_versions(versions)
+        # Feed the anchor + any sibling variants to lazy TMDb enrichment — an idless
+        # row a user is looking at is exactly one whose id a provider detail lookup
+        # could resolve so it collapses onto the rest.  The anchor is ALWAYS enqueued,
+        # even when the row is a content_key singleton with no "Other Versions": a
+        # corrupted/idless title (e.g. the mojibake "|ES| Alita: …ngel de combate",
+        # whose content_key groups with nothing) would otherwise never be attempted
+        # by viewing its details, so it stays unmarked and never surfaces in the
+        # "Missing TMDb" diagnostic.  enqueue() is idempotent and filters
+        # non-candidates off-thread, so a redundant id here is harmless.
+        self._enqueue_tmdb_enrichment(
+            [channel_id] + [v.channel_id for v in versions]
+        )
+
+    def _on_prefix_name_saved(self, prefix: str, name: str) -> None:
+        if name:
+            self.config.category_name_overrides[prefix] = name
+        else:
+            self.config.category_name_overrides.pop(prefix, None)
+        _cfgsave.save_soon(self)
+        if self.details_pane.current_channel:
+            self._fetch_channel_versions(self.details_pane.current_channel.id)
+
+    # ── Similar Titles ──────────────────────────────────────────────────────
+
+    def _fetch_similar_titles(self, channel_id: str) -> None:
+        # Mode and TMDb settings are read HERE (config is main-thread only).
+        mode = getattr(self.config, "details_similar_mode", "titles")
+        tmdb = SimpleNamespace(
+            metadata_tmdb_api_key=getattr(self.config, "metadata_tmdb_api_key", ""),
+            metadata_tmdb_language=getattr(self.config, "metadata_tmdb_language", "en-US"),
+            metadata_tmdb_include_adult=False,
+        )
+        self.executor.submit(self._bg_fetch_similar_titles, channel_id, mode, tmdb)
+
+    def _bg_fetch_similar_titles(self, channel_id: str, mode: str = "titles",
+                                 tmdb_settings=None) -> None:
+        from streamselect.core.database import UserRatingDB
+
+        similar = []
+        try:
+            with self.db.session_scope() as session:
+                repos = RepositoryFactory(session)
+                # Canonical similar-titles chokepoint: owns the candidate selection,
+                # content_key dedup, AND the visibility gate (is_hidden + inactive/
+                # expired/orphaned provider exclusion). We shape best-per-group
+                # ChannelVersion DTOs (queue/ratings/favorite/history) from its rows.
+                excluded = set(repos.providers.get_hidden_provider_ids())
+                content_keys = (_similar_content_keys(session, channel_id, tmdb_settings,
+                                                      self.config)
+                                if mode == "content" else None)
+                rows = repos.channels.get_similar_channels(
+                    channel_id,
+                    excluded_provider_ids=excluded,
+                    limit=20,
+                    config=self.config,
+                    content_keys=content_keys,
+                )
+                if not rows:
+                    self._similar_titles_loaded.emit(channel_id, [])
+                    return
+
+                queue_ids = repos.queue.get_queued_ids()
+                ratings = {r.channel_id: r.rating for r in session.query(UserRatingDB).all()}
+                similar = [
+                    ChannelVersion(
+                        channel_id=ch.id,
+                        name=ch.name,
+                        in_queue=ch.id in queue_ids,
+                        detected_prefix=ch.detected_prefix,
+                        detected_title=ch.detected_title,
+                        detected_year=ch.detected_year,
+                        is_favorite=bool(ch.is_favorite),
+                        in_history=bool(ch.play_count),
+                        media_type=ch.media_type or "",
+                        user_rating=ratings.get(ch.id, 0),
+                        is_rec_suppressed=bool(ch.is_rec_suppressed),
+                        watch_completed=bool(ch.watch_completed),
+                    )
+                    for ch in rows
+                ]
+        except Exception:
+            logger.exception("Error fetching similar titles for %s", channel_id)
+            similar = []
+
+        self._similar_titles_loaded.emit(channel_id, similar)
+
+    def _on_similar_titles_loaded(self, channel_id: str, titles: list) -> None:
+        if (self.details_pane.current_channel
+                and self.details_pane.current_channel.id == channel_id):
+            self.details_pane.set_similar_titles(titles)
+
+    # ── Recommendations suppression ─────────────────────────────────────────
+
+    def _hide_channel_from_recommendations(self, channel_id: str) -> None:
+        with self.db.session_scope() as session:
+            RepositoryFactory(session).channels.set_hidden(channel_id, True)
+        self.preferences_view.refresh()
+        self._refresh_recommended_section()
+        self.load_channels()
+        self.channel_state_bus.publish(channel_id, is_hidden=True)
+
+    def _bulk_hide_channels(self, channel_ids: list[str]) -> None:
+        """Hide multiple channels from the channel list in one pass then refresh.
+
+        BUS-2: previously a hand-picked refresh tail with no ``channel_state_bus``
+        publish at all — the exact class of bug an earlier change the bus exists to prevent,
+        reopened for the bulk path (self-documented as a known gap in
+        ``channel_state_bus.py``). DEBT-3: the write runs off the UI thread via
+        ``_run_query``; each channel's own delta publishes only once the whole
+        batch has committed. The list-membership refreshes below are a
+        different grain (the project rules) and stay as one call, not one per channel.
+
+        Args:
+            channel_ids: IDs of the channels to hide.
+        """
+        def _write(repos):
+            for cid in channel_ids:
+                repos.channels.set_hidden(cid, True)
+            return list(channel_ids)
+        def _on_result(ids):
+            self.preferences_view.refresh()
+            self._refresh_recommended_section()
+            self.load_channels()
+            for cid in ids:
+                self.channel_state_bus.publish(cid, is_hidden=True)
+        self._run_query(
+            _write, _on_result, commit=True,
+            on_error=lambda e: self._write_failed("hiding these channels"),
+        )
+
+    def _unhide_channel(self, channel_id: str) -> None:
+        def _bg() -> None:
+            with self.db.session_scope() as session:
+                RepositoryFactory(session).channels.set_hidden(channel_id, False)
+        self.executor.submit(_bg)
+
+        def _after() -> None:
+            self.load_channels()
+            self.channel_state_bus.publish(channel_id, is_hidden=False)
+
+        QTimer.singleShot(150, _after)
+
+    def _on_rec_sidebar_selected(self, channel_id: str, reason: str) -> None:
+        # UI-11: show_channel_details_by_id is now async (the DTO read runs
+        # off the main thread) — set_recommendation_reason must land AFTER
+        # show_channel actually renders, since show_channel clears the same
+        # meta section the reason label lives in. on_shown fires in the
+        # main-thread result slot, right after the render, preserving the
+        # old synchronous ordering.
+        self.show_channel_details_by_id(
+            channel_id,
+            on_shown=lambda: self.details_pane.set_recommendation_reason(reason),
+        )
+
+    def _refresh_recommended_section(self) -> None:
+        section = self.sidebar_sections.get("recommended")
+        if section:
+            section.refresh()
+
+    def _show_channel_separately(self, channel_id: str) -> None:
+        """Handler for the registry's ``show_separately`` menu action.
+
+        Both consuming views (Preferences dashboard, sidebar Recommended rail)
+        already own an idempotent ``show_separately(channel_id)`` — mutates the
+        shared ``config.rec_dedupe_overrides`` and refreshes with scroll
+        preserved — so this delegates to both rather than re-deriving a third
+        copy of the same config write (same shape as ``_not_interested``,
+        which also refreshes both regardless of which one triggered it).
+        """
+        self.preferences_view.show_separately(channel_id)
+        section = self.sidebar_sections.get("recommended")
+        if section:
+            section.show_separately(channel_id)
+
+    # ── Channel details pane ────────────────────────────────────────────────
+
+    def show_channel_details_by_id(self, channel_id: str, on_shown=None) -> None:
+        """Show channel details in details pane (for sidebar selections).
+
+        VERS-1: routes through ``resolve_live_copy()``
+        (``core/repositories/channel_live_copy.py``) rather than a bare
+        ``repos.channels.get_playable_dto()`` — an engaged view (History /
+        Favorites / Queue / Alerts) may legitimately hand this a channel id
+        whose source has since gone inactive/expired/orphaned, and the pane
+        must show a LIVE copy as primary when one exists rather than the
+        dead one it was asked for (user report: a "President Curtis" copy
+        on an expired source rendered as primary — Play, poster, Source chip
+        — while the only playable copy sat collapsed under "Also
+        Available"). ``resolve_live_copy()`` still calls
+        ``get_playable_dto()`` internally for both the shown copy and (on a
+        redirect) the originally-requested one, so no ORM object crosses the
+        session boundary — only ``PlayableChannelDTO``s, same as before.
+
+        UI-11: the read still runs off-thread through the ``_run_query``
+        seam — this call is fire-and-forget; the pane updates whenever the
+        result lands, not before this returns.
+
+        Args:
+            channel_id: Channel to display.
+            on_shown: Optional callback invoked on the main thread right
+                after ``update_details_pane_for_channel`` returns for this
+                id — for state that must land AFTER the render (e.g. the
+                recommendation-reason label, which ``show_channel`` would
+                otherwise clear if set beforehand). Not called when the
+                channel no longer exists.
+        """
+        # self.__dict__.get, not self.config directly: a stripped test host
+        # (e.g. test_session_scope_migration.py's _MetaHost) may carry no
+        # config attribute at all. resolve_live_copy() treats a missing
+        # config as "don't rank siblings by version preference" (still
+        # correct, just unranked) rather than raising off the main thread.
+        config = self.__dict__.get("config")
+        self._run_query(
+            lambda repos: resolve_live_copy(repos, channel_id, config=config),
+            lambda live_copy: self._on_details_live_copy_loaded(live_copy, on_shown),
+            token_ref=self._details_channel_token,
+            on_error=self._on_details_load_failed,
+        )
+
+    def _on_details_live_copy_loaded(self, live_copy, on_shown=None) -> None:
+        """Main-thread slot for show_channel_details_by_id (VERS-1): render the
+        resolved live copy — never the dead one an engaged view may have asked
+        for — and set the pane's source notice describing any redirect.
+
+        The notice is set on EVERY call (including ``None`` to clear it), so a
+        redirect notice from one title never lingers onto the next.
+        """
+        if live_copy is None or live_copy.dto is None:
+            return
+        self._on_details_channel_loaded(live_copy.dto, on_shown)
+        self.details_pane.set_source_notice(_source_notice_text(live_copy, self.details_pane))
+
+    def _on_details_channel_loaded(self, channel, on_shown=None) -> None:
+        """Main-thread slot: render the DTO loaded by show_channel_details_by_id
+        / on_channel_selection_changed, then fire any deferred on_shown callback."""
+        if channel:
+            self.update_details_pane_for_channel(channel)
+            if on_shown:
+                on_shown()
+
+    def _on_details_load_failed(self, exc: Exception) -> None:
+        """A raised details-pane read must say so, not silently leave whatever
+        channel was shown before the click on screen."""
+        logger.warning(f"Channel details load failed: {exc}")
+        self.status("Couldn't load channel details — try again", ms=0, level="error")
+
+    def on_channel_selection_changed(self, current, previous):
+        """Handle channel selection change — update details pane."""
+        if not current:
+            return
+        from PyQt6.QtCore import Qt
+        channel_id = current.data(Qt.ItemDataRole.UserRole)
+        if not channel_id or channel_id == self._last_shown_channel_id:
+            return
+        self._last_shown_channel_id = channel_id
+
+        # UI-11: DTO read moved off the main thread (see show_channel_details_by_id).
+        self._run_query(
+            lambda repos: repos.channels.get_playable_dto(channel_id),
+            self._on_details_channel_loaded,
+            token_ref=self._details_channel_token,
+            on_error=self._on_details_load_failed,
+        )
+
+    def update_details_pane_for_channel(self, channel, force: bool = False) -> None:
+        """Update details pane with channel metadata (async).
+
+        Args:
+            channel: A PlayableChannelDTO (or channel-shaped test double).
+            force: Bypass the same-title no-op AND the time debounce below —
+                for a caller that explicitly wants a hard refresh of a title
+                already shown. Grepped for an existing "refresh metadata"/
+                force-refresh caller at UI-11 time: none exists, so nothing
+                currently passes this — the kwarg is here so one can be
+                wired later without touching this chokepoint again.
+        """
+        from streamselect.core.models import MediaType
+
+        # Deliberate diagnostics (; extended UI-11): names
+        # the caller AND the surface that reached IT, so a user's next
+        # "double render" log can name which pair of surfaces fired it without
+        # another round of instrumentation.
+        caller = sys._getframe(1).f_code.co_name
+        try:
+            surface = sys._getframe(2).f_code.co_name
+        except ValueError:
+            surface = "<top>"
+        logger.debug(
+            "details pane: render request for {} via {} <- {}",
+            channel.id, caller, surface,
+        )
+
+        if not force:
+            # UI-11 same-title no-op: the pane already shows this exact id
+            # WITH its metadata applied — a repeat request (two surfaces
+            # firing for one gesture, 350-500ms apart per a user's log)
+            # renders nothing and fetches nothing. Read via self.__dict__.get,
+            # never getattr/hasattr — a skeleton test double built with
+            # QObject.__new__ raises RuntimeError, not AttributeError, on an
+            # attribute probe.
+            shown = self.__dict__.get("_details_shown")
+            if shown is not None and shown[0] == channel.id and shown[1]:
+                logger.debug(
+                    "details pane: already showing {id} with metadata — skipped",
+                    id=channel.id,
+                )
+                return
+
+            # Debounce: this is the ONE chokepoint every path funnels through
+            # (show_channel_details_by_id, on_channel_selection_changed,
+            # version_selected, programmatic sidebar calls). Reachable here
+            # only while metadata for this id is STILL LOADING — the no-op
+            # above already caught the "metadata applied" case — so this stays
+            # time-gated rather than id-gated (see _RERENDER_DEBOUNCE_S above).
+            now = time.monotonic()
+            last = self.__dict__.get("_details_last_render")
+            if (
+                last is not None
+                and last[0] == channel.id
+                and (now - last[1]) < _RERENDER_DEBOUNCE_S
+            ):
+                logger.debug(
+                    "details pane: suppressed duplicate render of {id} ({ms:.0f}ms after the last)",
+                    id=channel.id, ms=(now - last[1]) * 1000,
+                )
+                return
+            self._details_last_render = (channel.id, now)
+        else:
+            self._details_last_render = (channel.id, time.monotonic())
+
+        if getattr(channel, "media_type", None) == MediaType.LIVE:
+            self.details_pane.set_provider_urls([])
+            self.details_pane.show_channel(channel, metadata=None)
+            self._details_shown = (channel.id, False)
+            return
+
+        # UI-11: render basic info immediately; the provider-URL failover list
+        # — previously a synchronous session_scope() + get_by_id() on the MAIN
+        # thread here (2,259ms in a user's sample) — now loads
+        # off the executor through the _run_query seam and lands whenever
+        # it's ready. The basic-info render never waits for it.
+        self.details_pane.show_channel(channel, metadata=None)
+        self._details_shown = (channel.id, False)
+        logger.debug(f"Showing basic info for: {channel.name}")
+
+        channel_id = channel.id
+        provider_id = channel.provider_id
+
+        def _fetch_provider_urls(repos):
+            provider_db = repos.providers.get_by_id(provider_id)
+            if not provider_db or not provider_db.urls:
+                return []
+            urls_data = parse_provider_urls(provider_db.urls)
+            return [
+                u.get('url') for u in urls_data
+                if u.get('is_active', True) and u.get('url')
+            ]
+
+        def _apply_provider_urls(urls) -> None:
+            cur = self.details_pane.current_channel
+            if cur and cur.id == channel_id:
+                self.details_pane.set_provider_urls(urls)
+            logger.debug(f"Provider URLs for failover: {urls}")
+
+        def _on_provider_urls_failed(exc: Exception) -> None:
+            logger.warning(f"Could not fetch provider URLs: {exc}")
+            cur = self.details_pane.current_channel
+            if cur and cur.id == channel_id:
+                self.details_pane.set_provider_urls([])
+
+        self._run_query(
+            _fetch_provider_urls,
+            _apply_provider_urls,
+            token_ref=self._details_urls_token,
+            on_error=_on_provider_urls_failed,
+        )
+
+        # metadata_auto_fetch (Settings → Metadata & API Keys) gates ONLY this
+        # automatic on-select fetch — basic info from the channel row above always
+        # shows. A manual "Refresh metadata" action is unaffected by this switch.
+        if not getattr(self.config, "metadata_auto_fetch", True):
+            logger.debug(f"metadata_auto_fetch=False — skipping fetch for {channel.name}")
+            return
+
+        def fetch_metadata():
+            logger.debug(f"=== fetch_metadata() thread started for {channel.name}")
+            try:
+                logger.debug("Creating event loop...")
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                logger.debug(f"Fetching metadata for: {channel.name} (id={channel.id})")
+                logger.debug(f"Calling metadata_manager.get_metadata({channel.id})...")
+                metadata = loop.run_until_complete(
+                    self.metadata_manager.get_metadata(channel.id)
+                )
+                logger.debug(f"get_metadata returned: {metadata}")
+                loop.close()
+                if metadata:
+                    logger.info(f"Metadata fetched for {channel.name}: plot={bool(metadata.plot)}, cast={len(metadata.cast)}, poster={bool(metadata.poster_url)}")
+                else:
+                    logger.warning(f"No metadata returned for {channel.name}")
+                return metadata
+            except Exception as e:
+                logger.error(f"Failed to load metadata for {channel.name}: {e}", exc_info=True)
+                return None
+
+        def on_metadata_loaded(future):
+            if self._shutting_down:
+                logger.debug("Metadata fetch completed after shutdown — discarding result")
+                return
+            try:
+                metadata = future.result()
+                logger.debug(f"on_metadata_loaded called, metadata={metadata is not None}")
+                if metadata:
+                    logger.debug(f"Emitting metadata_loaded signal for {channel.name}")
+                    self.metadata_loaded.emit(channel, metadata)
+                else:
+                    logger.warning(f"on_metadata_loaded: No metadata returned for {channel.name}")
+            except Exception as e:
+                logger.error(f"Error in on_metadata_loaded: {e}", exc_info=True)
+
+        future = self.executor.submit(fetch_metadata)
+        future.add_done_callback(on_metadata_loaded)
+
+    def _update_details_with_metadata(self, channel, metadata):
+        """Update details pane with metadata (called on main thread via signal)."""
+        try:
+            logger.debug(f"_update_details_with_metadata called for {channel.name}")
+            # Guard against a stale metadata fetch: if the pane has since moved to
+            # a different channel, dropping this update prevents a slow fetch for
+            # channel A from flipping the pane back from B to A (mirrors the
+            # current-channel guard in _on_versions_loaded).
+            cur = self.details_pane.current_channel
+            if not (cur and cur.id == channel.id):
+                logger.debug(
+                    f"Ignoring stale metadata for superseded channel {channel.name}"
+                )
+                return
+            logger.debug(f"Metadata has plot: {bool(metadata.plot)}, cast: {len(metadata.cast) if metadata.cast else 0}")
+            self.details_pane.show_channel(channel, metadata=metadata)
+            # UI-11: marks this id "fully shown" for the same-title no-op gate
+            # in update_details_pane_for_channel — a repeat request for this
+            # id now short-circuits instead of re-rendering + re-fetching.
+            self._details_shown = (channel.id, True)
+            logger.debug(f"Details pane updated with metadata for {channel.name}")
+        except Exception as e:
+            logger.error(f"Error updating details pane: {e}", exc_info=True)

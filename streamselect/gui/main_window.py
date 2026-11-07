@@ -1,0 +1,2387 @@
+"""Main application window"""
+
+import base64
+import re
+import time
+
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QStatusBar, QSplitter,
+    QTreeWidget, QCheckBox
+)
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from loguru import logger
+
+from streamselect.gui.row_activation import connect_row_activation
+from concurrent.futures import ThreadPoolExecutor
+from streamselect.gui import deferred_config_save as _cfgsave
+from streamselect.gui import stream_probe_action as _stream_probe_action
+from streamselect.core import watchlist
+from streamselect.core.build_info import window_title
+from streamselect.core.config import Config
+from streamselect.core.update_checker import UpdateChecker
+from streamselect.core.runtime_env import is_frozen
+from streamselect.core import profile_store
+from streamselect.gui.watchlist_write_notifier import install_watchlist_writes
+from streamselect.gui.time_display_settings import apply_time_display
+from streamselect.gui.main_window_streaming import _StreamingMixin
+from streamselect.gui.queue_end_prompt import _QueueEndPromptMixin
+from streamselect.gui.main_window_overlays import _OverlaysMixin
+from streamselect.gui.main_window_nav import _NavMixin
+from streamselect.gui.main_window_metadata import _MetadataMixin
+from streamselect.gui.main_window_exclusions import _ExclusionActionsMixin
+from streamselect.gui.main_window_downloads import _DownloadsMixin
+from streamselect.gui.main_window_favorites import _FavoritesMixin
+from streamselect.gui.main_window_history import _HistoryMixin
+from streamselect.gui.main_window_async import _AsyncMixin
+from streamselect.gui.main_window_source_add import _SourceAddMixin
+from streamselect.gui.main_window_empty_state import _EmptyStateMixin
+from streamselect.gui.just_in_time_tips import offer_explore_tip
+from streamselect.gui.main_window_providers import _ProviderMixin
+from streamselect.gui.main_window_provider_connectivity import _ProviderConnectivityMixin
+from streamselect.gui.main_window_series import _SeriesMixin
+from streamselect.gui.main_window_series_playback import _SeriesPlaybackMixin
+from streamselect.gui.main_window_channels import _ChannelListMixin
+from streamselect.gui.main_window_updates import _UpdatesMixin
+from streamselect.gui.app_header import _AppHeaderMixin
+from streamselect.gui.filter_chip_host import _FilterChipHostMixin
+from streamselect.gui.search_posters import _SearchPostersMixin
+from streamselect.gui.menu_bar_reveal import _MenuBarRevealMixin
+from streamselect.gui.main_window_menu_actions import _MenuActionsMixin
+from streamselect.gui.main_window_alerts import _AlertsMixin
+from streamselect.gui.main_window_style_menu import _StyleMenuMixin
+from streamselect.gui.main_window_status import _StatusMixin
+from streamselect.core.database import Database
+from streamselect.core.notifications import NotificationManager
+from streamselect.core.player_manager import PlayerManager
+from streamselect.gui.notification_widget import NotificationWidget
+from streamselect.gui.provider_editor import ProviderEditorView
+from streamselect.gui.sidebar_sections import (
+    WatchAlertsSection,
+    HistorySection, FavoritesSection,
+    RecommendedSection, WatchQueueSection,
+)
+from streamselect.gui.sidebar.downloads import DownloadsSection
+from streamselect.gui.sidebar.recordings import RecordingsSection
+from streamselect.gui.sidebar.sources_strip import SourcesStatusStrip
+from streamselect.gui.sources_manager_view import SourcesManagerView
+from streamselect.gui import settings_apply as _settings_apply
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+from streamselect.gui.collapsible_splitter import CollapsibleSplitter
+from streamselect.gui.channel_state_bus import ChannelStateBus
+from streamselect.gui.details_pane import DetailsPaneWidget
+from streamselect.gui.discover_view import DiscoverView
+from streamselect.gui.epg_view import EpgView
+from streamselect.gui.preferences_view import PreferencesView
+from streamselect.gui.recipe_view import RecipeView
+from streamselect.core.epg_manager import EpgManager
+from streamselect.core.series_monitor import SeriesMonitorManager
+from streamselect.core.vod_watch_alert_manager import VodWatchAlertManager
+from streamselect.core.migration_manager import MigrationManager
+from streamselect.core.image_cache import ImageCache
+from streamselect.core.metadata_manager import MetadataManager, MetadataProviderRegistry
+from streamselect.metadata_providers.provider_metadata import ProviderMetadataProvider
+from streamselect.metadata_providers.tmdb import TMDbProvider
+from streamselect.metadata_providers.omdb import OMDbProvider
+from streamselect.gui.migration_progress_widget import MigrationProgressWidget
+from streamselect.gui.refresh_queue_manager import RefreshQueueManager
+from streamselect.gui.catalog_refresh_tick import _CatalogRefreshTickMixin
+
+import streamselect.whats_new as _whats_new
+
+#: Delay before the first watchlist pass, so it does not land on the play the
+#: user opened the app to make. A pass is one get_series_info per monitored
+#: series per mirror; on a one-connection account that IS the playback slot.
+#: Three minutes clears the launch burst (sources tested, filters restored,
+#: migrations queued) and still runs long before anyone notices it did not.
+_WATCHLIST_STARTUP_DELAY_MS = 3 * 60 * 1000
+# Background passes nobody waits for start after launch settles: at 0-3 s they
+# competed with the channel list, sidebar and filters for the GIL (~30 s of
+# stutter in a user's log).
+_BACKGROUND_SETTLE_MS = 60 * 1000
+
+#: Padding above every view in the content column (px). Structural spacing, so
+#: a literal rather than a token — the theme scale's SPACE_* are stylesheet
+#: strings and a layout margin needs an int.
+CONTENT_TOP_PAD = 2
+
+from streamselect.core.config import dev_mode_enabled as _dev_mode_enabled
+
+_YEAR_IN_NAME = re.compile(r'\b(19[5-9]\d|20[0-2]\d)\b')
+
+
+def _name_year(name: str) -> int | None:
+    """Year explicitly in the channel name (not from metadata)."""
+    m = _YEAR_IN_NAME.search(name)
+    return int(m.group(1)) if m else None
+
+
+def _version_years_compatible(name_a: str, name_b: str) -> bool:
+    """Return False only when BOTH names carry explicit, differing years.
+
+    If either name lacks a year the match is accepted — a no-year channel is
+    assumed to be the same production. Only when both names have distinct years
+    (e.g. (1979) vs (1985)) are they treated as different productions.
+    """
+    yr_a = _name_year(name_a)
+    yr_b = _name_year(name_b)
+    return yr_a is None or yr_b is None or yr_a == yr_b
+
+
+def _tab_btn_sheet(extra: str) -> str:
+    """Shared body of the All/Downloaded/Hidden scope-tab sheets.
+
+    Reads ``_theme`` fresh each call — wrap in ``theme.style_fn`` so a theme
+    switch re-composes it. *extra* is the per-button corner/border override.
+    """
+    return (
+        f"QPushButton {{ font-size: {_theme.FONT_MD}; padding: 3px 10px; border: 1px solid {_theme.COLOR_BORDER};"
+        f" background: {_theme.COLOR_LINE_DARK}; color: {_theme.COLOR_DISABLED}; }}"
+        f"QPushButton:checked {{ background: {_theme.COLOR_BORDER}; color: {_theme.COLOR_TEXT_HI}; font-weight: bold; }}"
+        f"QPushButton:hover:!checked {{ background: {_theme.COLOR_LINE}; }}"
+    ) + extra
+
+
+#: How long ``closeEvent`` waits for in-flight background work before closing
+#: the database under it. Sized ABOVE the slowest single query a worker runs —
+#: a channel-list load with variant collapsing is ~6 s on a large library — so
+#: the wait ends because the work finished, not because the budget expired.
+#: Queued work is cancelled first, so this only ever covers what already began.
+_SHUTDOWN_POOL_WAIT_S = 8.0
+
+
+class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixin, _ProviderConnectivityMixin, _SeriesMixin, _SeriesPlaybackMixin, _ChannelListMixin, _StreamingMixin, _QueueEndPromptMixin, _OverlaysMixin, _NavMixin, _MetadataMixin, _ExclusionActionsMixin, _FavoritesMixin, _DownloadsMixin, _UpdatesMixin, _StyleMenuMixin, _StatusMixin, _AsyncMixin, _AppHeaderMixin, _FilterChipHostMixin, _SearchPostersMixin, _MenuBarRevealMixin, _MenuActionsMixin, _AlertsMixin, _CatalogRefreshTickMixin,
+                 QMainWindow):
+    """Main application window"""
+    
+    # Signal for thread-safe metadata updates (channel_id, metadata)
+    metadata_loaded = pyqtSignal(object, object)
+    # bool: True when the assignment changed which rows BELONG in the list (the
+    # category was added to Global Exclusions). False for a plain assignment,
+    # which changes only user_category/category_mood — neither of which
+    # ChannelListDTO carries, so nothing the row renders changes.
+    _category_assigned = pyqtSignal(bool)
+    _versions_loaded = pyqtSignal(str, list)         # (channel_id, list[ChannelVersion]) — versions worker → main thread
+    _similar_titles_loaded = pyqtSignal(str, list)   # (channel_id, list[ChannelVersion]) — similar titles worker → main thread
+    _action_state_loaded = pyqtSignal(object)        # ChannelActionState — action state worker → main thread
+    # episode_id, in_queue, is_favorite, watch_progress, watch_completed — episode-mode action state worker → main thread (Slice 2B)
+    _episode_action_state_loaded = pyqtSignal(str, bool, bool, int, bool)
+    # Episode preflight results — emitted from done callback, connected to main-thread slots.
+    # QTimer.singleShot from a non-main thread is unreliable; signals are always safe.
+    # notif_id, url, title, queue_episodes, provider_id, start_seconds, episode_id, series_id, media_type
+    # PLAY-13: episode_id/series_id ride along so a play is only recorded (mark_played +
+    # watch-tracking) once THIS signal fires — i.e. after preflight validated and mpv
+    # actually launched — never before, which is what let a failed preflight still land
+    # in History.
+    # D53: media_type rides along too — empty for the regular play_episode() path
+    # (preserves that exact behaviour), non-empty for a Play-All launch, telling
+    # _do_launch_episode whether to record via _record_episode_play (media_type
+    # "episode") or _record_play (a channel-shaped "live"/"movie" item) instead of
+    # silently skipping recording the way Play-All always used to.
+    _episode_ready  = pyqtSignal(str, str, str, object, str, int, str, str, str)
+    # notif_id, title, detail, stream_url, queue_episodes, provider_id, start_seconds, episode_id, series_id, media_type
+    _episode_failed = pyqtSignal(str, str, str, str, object, str, int, str, str, str)
+    # Context menu async fetch: (ChannelMenuContext, gx, gy)
+    _ctx_data_ready = pyqtSignal(object, int, int)
+    # Stream validation result: emitted from background thread after validate_and_failover
+    _stream_ready = pyqtSignal(object)  # dict with final_url, stream_err, channel state
+    # Generic async-read seam (_AsyncMixin): worker emits this; _on_query_result dispatches
+    _query_result = pyqtSignal(object)
+    # Playback-health probe result: worker (executor) emits the mpv props dict (or None);
+    # _on_playback_health_ready updates the nav-bar label on the main thread.
+    _playback_health_ready = pyqtSignal(object)
+    # Queue-end detected from off-thread: list of episode ids that were auto-advanced
+    # (last_played_via='queue'). Emitted only when >0 episodes were queue-watched so
+    # the main thread can show the "Still here?" confirmation prompt.
+    _queue_end_detected = pyqtSignal(object)  # list[str] — auto-advanced episode ids
+    # Episode watch state written OFF the main thread (the queue's auto-mark as the
+    # playlist advances, and either answer to the "Still watching?" prompt).  Carries
+    # the episode ids so the open series tree can re-read exactly those rows through
+    # refresh_episode_watch_state — the one refresh path for episode watch state.
+    # Without it those writes landed silently behind an already-drawn tree.
+    _episode_watch_state_changed = pyqtSignal(object)  # list[str] — episode ids
+    # Whole-library title-sibling propagation re-sweep result: the worker emits the
+    # count of idless rows that adopted a sibling's tmdb id; the main-thread slot
+    # refreshes the provider-dependent views (so newly-collapsed cards settle) when
+    # the count is positive.
+    _propagation_finished = pyqtSignal(int)
+    # Provider-delete purge result (worker → main thread): (provider_id, success,
+    # error).  The purge runs OFF the UI thread; this marshals the outcome back so
+    # the editor reset + canonical view refresh happen on the main thread.
+    _provider_delete_finished = pyqtSignal(str, bool, str)
+    _provider_delete_progress = pyqtSignal(str, int)  # provider_id, stage index
+
+    def __init__(self, config: Config, config_recovered: bool = False):
+        super().__init__()
+        # Set True by closeEvent before any teardown runs. Background callbacks
+        # read this (a plain Python attribute — safe on a wrapper whose C++ object
+        # is already gone; only Qt calls raise) to abandon work instead of
+        # emitting into a destroyed window or querying a closed database.
+        self._shutting_down = False
+        self.config = config
+        self.notification_manager = NotificationManager(
+            max_visible=config.max_stacked_notifications
+        )
+
+        # Show notification if config was recovered from backup
+        if config_recovered:
+            self.notification_manager.show(
+                "Config was empty/corrupt, restored from backup",
+                duration_ms=5000
+            )
+        
+        # Store active threads to prevent garbage collection
+        self.active_threads = []
+        
+        # Track selected provider for filtering
+        self.selected_provider_id = None
+        self._in_provider_edit_mode = False
+        
+        # Store channel data for display
+        # all_channels is kept as a parallel list for legacy callers (filter_channels,
+        # favorites toggle in all_channels cache).  With the virtualized model it is
+        # no longer the primary data source; channel_model is.
+        self.all_channels = []  # List of (display_text, ChannelListDTO)
+        # Page size for the virtualized model's initial SQL fetch and incremental pages.
+        # Chosen to be small enough to land quickly and large enough that the user
+        # rarely triggers a second page for average-sized categories.
+        self._search_page_size = 1_000   # First page / subsequent pages
+
+        # When True, Tier 1 filters (language/quality/platform) are bypassed for one
+        # load — so the user can see what exists in filtered categories without having
+        # to open the filter bar and change settings. Cleared on next filter change.
+        self._bypass_tier1_filters: bool = False
+        self._currently_bypassing: bool = False  # set after load completes, read by filter_channels
+        # When True, the Python-side Global Exclusions (excluded prefixes / user
+        # categories) are skipped for one load — so the user can see exactly what
+        # their exclusions are hiding for THIS view without disabling the global
+        # setting. View-scoped: cleared on the next search / filter change.
+        self._bypass_global_exclusions: bool = False
+        self._currently_bypassing_exclusions: bool = False  # set after load, read by filter_channels
+        # When True, the dead-stream gate (StreamRetryDB.reliability_state == "dead")
+        # is lifted for one load — so the user can see channels hidden by repeated
+        # play failures for THIS view without changing anything. View-scoped:
+        # cleared on the next search / filter change, same as the exclusions reveal.
+        self._bypass_dead_gate: bool = False
+        self._currently_bypassing_dead: bool = False  # set after load, read by filter_channels
+        # When True, the Global Exclusions keyword axis (excluded_keywords) is
+        # skipped for one load — so the user can see exactly what their keyword
+        # list is hiding for THIS view without editing the global setting.
+        # View-scoped: cleared on the next search / filter change, same as the
+        # other reveal flags above.
+        self._bypass_keyword_exclusions: bool = False
+        self._currently_bypassing_keywords: bool = False  # set after load, read by filter_channels
+
+        # Details-pane context filters — set when user clicks a genre/person/tag chip.
+        # At most one is active at a time; all are cleared by the chip's dismiss button.
+        self._details_genre_filter: str | None = None
+        self._details_person_filter: str | None = None
+        # Tag-chip context filter: (facet_type, value) for an exact non-collection tag.
+        self._details_tag_filter: tuple[str, str] | None = None
+        # Collection-chip context filter: the curated provider category (ChannelDB.category).
+        self._details_category_filter: str | None = None
+        # Alert "show matches" id-filter: the stored matched channel ids of a watch-for
+        # rule.  Ephemeral (cleared on any normal search/filter change), not persisted.
+        self._details_id_filter: set[str] | None = None
+        # When True (set by the gold-bar click in id-filter mode), reveal the ENTIRE
+        # matched set with visibility filters relaxed (record/engaged view, DR-0007).
+        self._id_filter_show_all: bool = False
+
+        # Debounce timer for search input → avoids a DB query per keystroke
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(200)
+        self._search_debounce.timeout.connect(self.load_channels)
+
+        # Debounce timer for splitter-drag persistence → a single drag emits
+        # splitterMoved on every pixel; without this each one rewrote (and backed
+        # up) the entire config file dozens of times per second.  Coalesce the
+        # whole burst into ONE config write ~500ms after the drag settles.
+        self._layout_save_debounce = QTimer(self)
+        self._layout_save_debounce.setSingleShot(True)
+        self._layout_save_debounce.setInterval(500)
+        self._layout_save_debounce.timeout.connect(self._persist_layout_now)
+
+        # Filter state
+        self.current_filter_state = None
+        
+        # Cleanup registry — callables called in closeEvent; register new managers here
+        # so additions can't be silently forgotten (see the project rules "closeEvent cleanup").
+        self._cleanables: list[tuple[str, callable]] = []
+
+        # Player management
+        self.player_manager = PlayerManager(config)
+        self._register_cleanable("player_manager", self.player_manager.cleanup)
+        self.loading_channels = set()  # Track channels being loaded
+
+        # Playback-health readout state: None = follow the most-recently-used window;
+        # set to a provider_id key to pin the readout to a specific open player window.
+        self._health_view_key: str | None = None
+        # provider_id → source glyph, warmed at play time so the readout can label
+        # which stream its data refers to without per-tick DB reads.
+        self._provider_icons: dict[str, str] = {}
+        self.refreshing_providers = set()  # Track providers being refreshed
+        
+        # Navigation state for series browsing
+        self.view_mode = "list"  # "list" or "series"
+        self.current_series = None  # Current series being viewed (channel object)
+        self.series_data = None  # Loaded series data (seasons/episodes)
+        
+        self.db = Database(config.database_url)
+        self.db.create_tables()
+        config.attach_profile_store(self.db)
+        # Text size lives in the database profile, so it applies here — after
+        # attach, before any widget exists (theme is the one owner of sizes).
+        _theme.set_text_scale(getattr(config, "ui_text_scale", 1.0))
+        apply_time_display(config)  # same reason: the time/date style is a profile key
+        self._register_cleanable("profile_store", profile_store.shutdown)
+        # Watch list -> database, written off-thread; see core/watchlist.py.
+        self._watchlist_notifier = install_watchlist_writes(self)
+        watchlist.migrate_from_config(config)
+        self._setup_downloads()
+
+        # Initialize metadata system
+        self.image_cache = ImageCache(
+            cache_dir=config.image_cache_dir,
+            max_size_mb=config.image_cache_max_size_mb
+        )
+        self._register_cleanable("image_cache", self.image_cache.shutdown)
+
+        # Initialize metadata provider registry — config-aware so metadata_enabled/
+        # metadata_enabled_providers/metadata_provider_priority (Settings → Metadata
+        # & API Keys) are enforced at the one chokepoint (get_enabled()).
+        self.metadata_registry = MetadataProviderRegistry(config)
+
+        # Register provider metadata plugin (extracts from raw_data) — free, already
+        # cached, always tried first (priority=1).
+        provider_metadata = ProviderMetadataProvider(self.db)
+        self.metadata_registry.register(provider_metadata)
+
+        # Register the external API providers. Each is a no-op (is_enabled() False)
+        # until its API key is set in Settings — see metadata_providers/tmdb.py,omdb.py.
+        self.metadata_registry.register(TMDbProvider(config, self.db))
+        self.metadata_registry.register(OMDbProvider(config, self.db))
+
+        # Initialize metadata manager
+        self.metadata_manager = MetadataManager(self.metadata_registry, self.db)
+
+        # Stream retry manager — must exist before setup_ui() which wires sidebar signals
+        from streamselect.core.stream_retry_manager import StreamRetryManager
+        self.stream_retry_manager = StreamRetryManager(
+            self.db, self.validate_stream_url, parent=self,
+            player_is_running=self.player_manager.is_playing,
+            enabled=lambda: bool(getattr(self.config, "stream_retry_checks_enabled", False)))
+        self._register_cleanable("stream_retry_manager", self.stream_retry_manager.stop)
+
+        # Series monitor — checks monitored series for new episodes after each provider refresh
+        # and on startup.  Constructed before setup_ui() so the sidebar section can connect.
+        self.series_monitor = SeriesMonitorManager(
+            self.db, self.config, notifications=None,  # injected below
+            connection_accountant=self.player_manager.connection_accountant,
+            parent=self,
+        )
+        self._register_cleanable("series_monitor", self.series_monitor.shutdown)
+
+        # VOD watch-alert manager — checks keyword/title rules against the channel corpus.
+        # Constructed before setup_ui() so the alerts sidebar section can connect signals.
+        self.vod_watch_alert_manager = VodWatchAlertManager(
+            self.db, self.config,
+            notifications=None,  # injected after NotificationManager is set up
+            parent=self,
+        )
+        self._register_cleanable(
+            "vod_watch_alert_manager", self.vod_watch_alert_manager.shutdown
+        )
+
+        # Migration manager — runs one-time background migrations sequentially.
+        # Registered for clean cancellation on closeEvent before the pool drains.
+        # Constructed BEFORE tmdb_enrichment_manager (below) so the enrichment
+        # manager can be handed a live reference and poll `.is_running` to defer
+        # its own bulk writes while a migration pass is active (see
+        # TmdbEnrichmentManager._defer_for_migration) — same lock-contention
+        # hazard as the migration's own bulk commits, just a different writer.
+        self.migration_manager = MigrationManager(self.config, self.db, parent=self)
+
+        # Lazy provider-native TMDb enrichment — backfills detected_tmdb_id for the
+        # idless VOD rows the user is actually viewing (result surfaces feed
+        # enqueue()) via the provider's own detail endpoint, so cross-language/quality
+        # variants collapse on demand. Background + resumable + throttled; no startup
+        # sweep. When a batch produces new collapses it refreshes the content-derived
+        # views through the single canonical chokepoint (never a partial per-view one).
+        from streamselect.core.tmdb_enrichment_manager import TmdbEnrichmentManager
+        self.tmdb_enrichment_manager = TmdbEnrichmentManager(
+            self.db, self.config, parent=self,
+            migration_manager=self.migration_manager,
+            connection_accountant=self.player_manager.connection_accountant,
+        )
+        # Coalesced (REC-LAG) — see gui/refresh_coalescer.py for why.
+        from streamselect.gui.refresh_coalescer import RefreshCoalescer
+        self._enrich_coalescer = RefreshCoalescer(self, self._refresh_provider_dependent_views)
+        self.tmdb_enrichment_manager.collapses_found.connect(self._enrich_coalescer.on_collapse)
+        self.tmdb_enrichment_manager.enrichment_settled.connect(self._enrich_coalescer.on_settled)
+        # Coalesced per-source "Updating N titles from {name}…" toast (main thread).
+        self._tmdb_enrich_notifs: dict[str, str] = {}
+        self.tmdb_enrichment_manager.enrichment_progress.connect(
+            self._on_tmdb_enrichment_progress
+        )
+        self._register_cleanable(
+            "tmdb_enrichment_manager", self.tmdb_enrichment_manager.shutdown
+        )
+
+        # Background metadata enrichment queue (roadmap an earlier change) — proactively fills
+        # in missing/stale MetadataResult rows (poster/plot/cast/rating, driven
+        # through the existing self.metadata_manager, not a parallel fetcher) for
+        # the whole library, engaged (favorited/queued/played) channels first.
+        # Same migration-defer contract as tmdb_enrichment_manager above.
+        from streamselect.core.metadata_enrichment_queue import MetadataEnrichmentQueue
+        self.metadata_enrichment_queue = MetadataEnrichmentQueue(
+            self.db, self.config, self.metadata_manager, parent=self,
+            migration_manager=self.migration_manager,
+        )
+        self._register_cleanable(
+            "metadata_enrichment_queue", self.metadata_enrichment_queue.shutdown
+        )
+
+        # Every startup task, in run order: core/migrations/registry.py (F29).
+        from streamselect.core.migrations.registry import build_tasks
+        for task in build_tasks(self.db, metadata_manager=self.metadata_manager,
+                                config=self.config):
+            self.migration_manager.register(task)
+        self._register_cleanable("migration_manager", self.migration_manager.shutdown)
+
+        # Notices when the UI thread stops answering, and says so in the log.
+        # Registered like any other background object so it stops on close.
+        from streamselect.gui.main_thread_watchdog import MainThreadWatchdog
+
+        self._main_thread_watchdog = MainThreadWatchdog(self)
+        self._main_thread_watchdog.start()
+        self._register_cleanable(
+            "main_thread_watchdog", self._main_thread_watchdog.stop
+        )
+
+        # PyQt6 leaks a reference on None per call; after days of uptime None
+        # turns mortal and every thread fails at once. Reset it on a timer.
+        from streamselect.core import immortal_refcount_guard as _irg
+
+        self._immortal_guard = _irg.ImmortalRefcountGuard()
+        if self._immortal_guard.active:
+            self._immortal_guard_timer = QTimer(self)
+            self._immortal_guard_timer.timeout.connect(self._immortal_guard.check)
+            self._immortal_guard_timer.start(_irg.CHECK_INTERVAL_MS)
+            self._register_cleanable(
+                "immortal_guard_timer", self._immortal_guard_timer.stop
+            )
+
+        # The deferred filter reload must not fire into a closing window.
+        self._register_cleanable(
+            "filter_reload_timer", self.stop_filter_reload_timer
+        )
+
+        # Serial refresh queue — must be created BEFORE setup_ui() because
+        # setup_ui() wires sidebar signals that trigger refresh_provider().
+        # The NotificationManager is already initialised above.
+        self.refresh_queue_manager = RefreshQueueManager(
+            self.db, self.config, self.notification_manager, parent=self
+        )
+        self._register_cleanable("refresh_queue_manager", self.refresh_queue_manager.shutdown)
+
+        # In-app update checker — polls GitHub Releases off-thread; the result and
+        # any download are surfaced through main-thread slots (_UpdatesMixin).
+        self.update_checker = UpdateChecker(self.config, parent=self)
+        self._register_cleanable("update_checker", self.update_checker.shutdown)
+        self.update_checker.update_available.connect(self._on_update_available)
+        self.update_checker.no_update.connect(self._on_update_none)
+        self.update_checker.download_completed.connect(self._on_update_downloaded)
+
+        self.setup_ui()
+        self.setup_notifications()
+
+        # Initialize before load_channels() which uses these
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        # cancel_futures drops work that has not started, which is what makes
+        # the join in _await_background_pools short: only genuinely in-flight
+        # work is waited for. The shutdown lives HERE, at the registration
+        # point, and the waiter below only joins — calling shutdown twice would
+        # be two owners for one pool.
+        self._register_cleanable(
+            "executor", lambda: self.executor.shutdown(wait=False, cancel_futures=True)
+        )
+        self._load_channels_token: list[int] = [0]
+        self._epg_count_token: list[int] = [0]
+        self._filter_stats_token: list[int] = [0]
+        self._channel_tags_token: list[int] = [0]
+        self._details_weights_token: list[int] = [0]
+        self._details_channel_token: list[int] = [0]
+        self._details_urls_token: list[int] = [0]
+        self._hidden_mode: bool = False
+        #: "all" | "downloaded" | "hidden"; _hidden_mode above stays in sync.
+        self._list_scope: str = "all"
+        self._last_shown_channel_id: str | None = None
+        self.metadata_loaded.connect(self._update_details_with_metadata)
+        self._category_assigned.connect(self._on_category_assigned)
+        self._episode_ready.connect(self._do_launch_episode)
+        self._episode_failed.connect(self._on_episode_stream_unavailable)
+        self._ctx_data_ready.connect(self._on_ctx_data_ready)
+        self._stream_ready.connect(self._on_stream_ready)
+        self._query_result.connect(self._on_query_result)
+        self._playback_health_ready.connect(self._on_playback_health_ready)
+        self._queue_end_detected.connect(self._on_queue_end_detected)
+        self._episode_watch_state_changed.connect(self.refresh_episode_watch_state)
+        self._propagation_finished.connect(self._on_propagation_finished)
+        # Provider-delete: off-thread purge worker → main-thread finished slot.
+        self._provider_delete_notifs: dict[str, str] = {}
+        self._provider_delete_finished.connect(self._on_provider_delete_finished)
+        self._provider_delete_progress.connect(self._on_provider_delete_progress)
+
+        self.stream_retry_manager.stream_online.connect(self._on_stream_back_online)
+        self.stream_retry_manager.retry_list_changed.connect(self._refresh_alerts_retry_section)
+        self.stream_retry_manager.start()
+        self._refresh_alerts_retry_section()  # restore persisted entries on startup
+
+        # Wire the serial refresh queue manager signals
+        self.refresh_queue_manager.refresh_finished.connect(self._on_queue_refresh_finished)
+        self.refresh_queue_manager._request_epg_wire.connect(self._on_queue_epg_wire_requested)
+        # When the whole refresh queue drains, re-run the no-network whole-library
+        # title-sibling propagation so idless rows that only just became adoptable
+        # (a later source brought in the id-bearing variant) fold onto one card.
+        self.refresh_queue_manager.all_refreshes_finished.connect(
+            self._on_all_refreshes_finished
+        )
+        self._init_catalog_refresh_tick()  # SPORT-7 hourly tick
+
+        self.load_providers()
+        self.load_favorites()
+        self.load_history()
+        self._refresh_queue_section()
+        self._refresh_recommended_section()
+
+        # Auto-load channels from all active providers on startup.
+        # restore_search_state() handles the load if a saved state exists; otherwise fall back.
+        if not self.restore_search_state():
+            self.load_channels()
+
+        # Initialize filter statistics
+        self.initialize_filter_stats()
+
+        # Test provider connections in background
+        self.test_all_providers()
+
+        # MigrationManager: run any pending one-time background migrations.
+        # Deferred 1 s so channels load and the UI paints before the worker starts.
+        QTimer.singleShot(1000, self.migration_manager.run_pending)
+
+        # No TMDb *id* enrichment sweep at launch: it is now lazy/on-demand — result
+        # surfaces feed tmdb_enrichment_manager.enqueue() with the rows they load
+        # (see _enqueue_tmdb_enrichment), so we only fetch what the user is viewing.
+        #
+        # Genre backfill IS proactive: movies get a metadata row (on view) but empty
+        # genres (the list raw_data omits them), and a genreless movie scores 0 in the
+        # genre-driven recommender — so it never appears. This fills those genres from
+        # each movie's get_vod_info detail blob. Off-thread, batched, capped per launch,
+        # resumable; a safe no-op once drained. Deferred until launch settles so it never competes with
+        # the initial channel load / paint or blocks launch.
+        self._after_settle(self.tmdb_enrichment_manager.backfill_missing_genres)
+
+        # Background metadata enrichment (roadmap an earlier change) — opt-in only
+        # (config.metadata_background_refresh defaults False); manual start from
+        # the Tools view works regardless of this toggle. Deferred so it never
+        # competes with the initial channel load / paint or blocks launch.
+        if self.config.metadata_background_refresh:
+            QTimer.singleShot(4000, self.metadata_enrichment_queue.start)
+
+        # Show What's New dialog after the window paints (deferred, idempotent)
+        self._whats_new_checked: bool = False
+        QTimer.singleShot(0, self.maybe_show_whats_new)
+
+        # Dev-only QA checklist — lazy instance, only when STREAMSELECT_DEV is set
+        self._qa_checklist_window: object | None = None
+        if _dev_mode_enabled():
+            QTimer.singleShot(0, self._maybe_show_qa_checklist)
+
+        # Series monitor / VOD watch-alert / EPG auto-refresh startup checks —
+        # each is a bulk DB writer with no lock-retry of its own, so gate them
+        # behind any pending Migration Center run (see _gate_startup_fetches):
+        # racing them against a heavy migration's batched commits produced the
+        # / "database is locked" crash-loops. When
+        # nothing is pending they fire on the same deferred schedule as before.
+        self._gate_startup_fetches()
+        # Recurring background recheck (config.series_monitor_interval_minutes,
+        # default 60; 0 = off) — keeps long-running sessions current without
+        # requiring a provider refresh or app restart. Independent of the
+        # startup-kickoff gate above (it only affects the first, one-time poke).
+        self.series_monitor.start_scheduler()
+
+        # Automatic update check — bundled (.app) builds only, so a source-run
+        # developer is never nagged. The manual "Check for updates now" button
+        # (Settings → Interface → Updates) always works regardless of this gate.
+        # Deferred 3 s so startup work and the first paint finish first.
+        if is_frozen() and getattr(self.config, "update_check_enabled", True):
+            QTimer.singleShot(3000, self.update_checker.check_async)
+
+        logger.info("Main window initialized")
+
+    def _after_settle(self, callback) -> None:
+        """Run *callback* once launch has settled (``_BACKGROUND_SETTLE_MS``).
+
+        A timer OWNED by the window, not ``QTimer.singleShot``: a bare
+        single-shot outlives the window that scheduled it, and a minute is long
+        enough for it to fire into a deleted manager (a test-suite segfault).
+        """
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.timeout.connect(callback)
+        timer.timeout.connect(timer.deleteLater)
+        timer.start(_BACKGROUND_SETTLE_MS)
+
+    def _gate_startup_fetches(self) -> None:
+        """Sequence the startup bulk-write kickoffs behind any pending migration.
+
+        ``series_monitor.check_all``, ``vod_watch_alert_manager.check_all``, and
+        ``epg_manager.refresh_all_if_needed`` are all bulk DB writers with no
+        lock-retry of their own. Firing them unconditionally (the old
+        behavior) let them race a heavy Migration Center run's batched commits
+        (e.g. ``detected_title_reparse``'s 2000-row batches) — the cause of
+        the / "database is locked" crash-loops.
+
+        Probes off the main thread via ``evaluate_pending_async()`` (a blocking
+        ``has_pending_tasks()`` here was a sampled 2.0s stall); ``pending_evaluated`` gates it.
+        """
+        def _on_pending_evaluated(pending: bool) -> None:
+            self.migration_manager.pending_evaluated.disconnect(_on_pending_evaluated)
+            if pending:
+                def _on_migrations_done() -> None:
+                    self.migration_manager.all_finished.disconnect(_on_migrations_done)
+                    self._start_deferred_fetches()
+                self.migration_manager.all_finished.connect(_on_migrations_done)
+            else:
+                self._start_deferred_fetches()
+        self.migration_manager.pending_evaluated.connect(_on_pending_evaluated)
+        self.migration_manager.evaluate_pending_async()
+
+    def _start_deferred_fetches(self) -> None:
+        """Fire the series-monitor / VOD-alert / EPG-refresh startup checks.
+
+        Deferred via ``QTimer.singleShot`` so the event loop settles (channel
+        list loaded, UI painted) before each starts — timings unchanged from
+        before the migration gate. Called either immediately at startup (no
+        migrations pending) or once via ``_gate_startup_fetches`` after
+        migrations finish.
+        """
+        # Series monitor startup check — runs after channels are loaded
+        # (deferred 0ms yields to the event loop so channel load and UI paint
+        # happen first).
+        # NOT at 0ms. This is a full watchlist pass and firing it at launch put
+        # it exactly where the user's first play lands — a user's logs show
+        # the pass at 03:14:31 with play pressed at 03:15:09, and the pass at
+        # 03:58:06-09 with play at 03:58:12. Same slot, one connection.
+        #
+        # The interval setting NOW GOVERNS THIS TOO. It used to govern only the
+        # recurring timer, so a user who set the interval to Never still got a
+        # full pass on every launch — the comment above said so and the
+        # behaviour stayed. a user hit exactly that: "it's also still
+        # fetching series data even though it's set NEVER (0 minutes)".
+        #
+        # One pass is 234 get_series_info calls on their library (11 watched
+        # shows, 234 mirrors) — 3.9 to 39 minutes of provider time against the
+        # ~34 seconds a whole source refresh costs. Off unless asked for.
+        if int(getattr(self.config, "series_monitor_interval_minutes", 0) or 0) > 0:
+            QTimer.singleShot(_WATCHLIST_STARTUP_DELAY_MS,
+                              self.series_monitor.check_all)
+        else:
+            logger.debug(
+                "series_monitor: startup check skipped — recurring recheck is off")
+
+        # VOD watch-alert startup check — after launch settles (_BACKGROUND_SETTLE_MS).
+        self._after_settle(self.vod_watch_alert_manager.check_all)
+
+        # EPG startup refresh check — run after the event loop settles (2 s) so
+        # the channel list is loaded and the match map can be built correctly.
+        # The per-provider needs_refresh() throttle handles all gating; this is
+        # the first poke so the app honors the configured interval from launch
+        # without requiring the user to open the EPG view.
+        QTimer.singleShot(2000, self.epg_manager.refresh_all_if_needed)
+
+        # SPORT-7 — the one-time "On App Launch" catalog-refresh check.
+        QTimer.singleShot(2500, lambda: self._maybe_auto_refresh_catalogs(at_launch=True))
+
+    def setup_ui(self):
+        """Set up the user interface"""
+        self.setWindowTitle(window_title())
+
+        # Restore saved geometry, or fall back to a sensible default
+        restored = False
+        saved_geom = getattr(self.config, 'window_geometry', '')
+        if saved_geom:
+            try:
+                from PyQt6.QtCore import QByteArray
+                geom_bytes = QByteArray(base64.b64decode(saved_geom))
+                restored = self.restoreGeometry(geom_bytes)
+            except Exception as e:
+                logger.warning(f"Could not restore window geometry: {e}")
+        if not restored:
+            self.setGeometry(100, 100, 1400, 900)
+        
+        # Create menu bar
+        self.create_menu_bar()
+        
+        # Create central widget
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # Main layout
+        main_layout = QVBoxLayout(central_widget)
+        
+        # Create collapsible splitter for sidebar, content, and details pane
+        self.main_splitter = CollapsibleSplitter(Qt.Orientation.Horizontal)
+        
+        # Left sidebar
+        sidebar = self.create_sidebar()
+        sidebar.setMinimumWidth(200)
+        self.main_splitter.addWidget(sidebar)
+
+        # Poster lightbox — full-res image overlay, hidden by default. Created HERE,
+        # BEFORE create_content_area(), because an Explore view's embedded
+        # trail-map (built lazily on first open) wires its poster_expand_requested
+        # to _poster_lightbox.show_pixmap via _connect_trail_map_signals, and the
+        # Similar-titles lightbox does the same from _ensure_similar_lightbox
+        # (main_window_overlays.py) — both need _poster_lightbox to already exist
+        # whenever they are built. PosterLightbox(self) needs only the window as
+        # parent, so early construction here is safe.
+        from streamselect.gui.poster_lightbox import PosterLightbox
+        self._poster_lightbox = PosterLightbox(self)
+
+        # Main content area
+        content = self.create_content_area()
+        content.setMinimumWidth(400)
+        self.main_splitter.addWidget(content)
+
+        # Right details pane
+        self.details_pane = DetailsPaneWidget(self.config, self.image_cache, self.db)
+        # The explicit details-pane Play button always starts from the beginning
+        # (its sibling Resume always resumes); only the bare double-click default is
+        # governed by config.playback_resume_mode.  Routing play_requested through the
+        # from-beginning path decouples the button from that setting.
+        self.details_pane.play_requested.connect(self.play_channel_from_beginning_by_id)
+        self.details_pane.play_episode_requested.connect(self._on_details_play_episode)
+        self.details_pane.resume_episode_requested.connect(self._on_details_resume_episode)
+        self.details_pane.resume_requested.connect(self.play_channel_resume_by_id)
+        self.details_pane.play_version_requested.connect(self.play_channel_by_id)
+        self.details_pane.download_requested.connect(self.download_channel_by_id)
+        self.details_pane.trailer_requested.connect(self.play_trailer)
+        self.details_pane.trailer_youtube_requested.connect(
+            self.open_trailer_in_browser)
+        self.details_pane.favorite_toggled.connect(self.toggle_favorite_by_id)
+        self.details_pane.queue_toggled.connect(self._on_details_queue_toggle)
+        self.details_pane.episode_favorite_toggled.connect(self._on_details_episode_favorite_toggle)
+        self.details_pane.episode_queue_toggled.connect(self._on_details_episode_queue_toggle)
+        self.details_pane.watchlist_changed.connect(self._refresh_watch_alerts)   # D60
+        self.details_pane.rating_requested.connect(self._toggle_rating)
+        self.details_pane.suppression_requested.connect(self._on_suppression_requested)
+        self.details_pane.hide_requested.connect(self._on_hide_from_details_pane)
+        self.details_pane.monitor_toggled.connect(self._on_details_monitor_toggled)
+        self.details_pane.unhide_requested.connect(self._unhide_channel)
+        self.details_pane.clear_epg_link_requested.connect(self._on_details_clear_epg_link)
+        self.details_pane.watched_toggled.connect(self._on_details_watched_toggled)
+        self.details_pane.channel_versions_requested.connect(self._fetch_channel_versions)
+        self.details_pane.version_selected.connect(self.show_channel_details_by_id)
+        self.details_pane.prefix_block_requested.connect(self._on_prefix_block)
+        self.details_pane.prefix_unblock_requested.connect(self._on_prefix_unblock)
+        self.details_pane.collection_exclude_requested.connect(self._on_collection_exclude)
+        self.details_pane.collection_include_requested.connect(self._on_collection_include)
+        self.details_pane.set_collection_excluded_check(self.is_collection_excluded)
+        self.details_pane.prefix_name_saved.connect(self._on_prefix_name_saved)
+        self.details_pane.manage_filters_requested.connect(self.manage_filters)
+        self.details_pane.genre_filter_requested.connect(self._on_genre_filter_requested)
+        self.details_pane.person_filter_requested.connect(self._on_person_filter_requested)
+        self.details_pane.tag_filter_requested.connect(self._on_tag_filter_requested)
+        self.details_pane.tag_discover_requested.connect(self._on_tag_discover_requested)
+        # Title block's source chip: the existing scoped load, same as the Sources
+        # sidebar's provider selection — no new filtering path.
+        self.details_pane.status_message.connect(lambda msg: self.status(msg, ms=0))
+        self.details_pane.similar_titles_requested.connect(self._fetch_similar_titles)
+        self.details_pane.similar_preview_requested.connect(self._show_similar_lightbox)
+        self.details_pane.action_state_requested.connect(self._on_action_state_requested)
+        self.details_pane.episode_action_state_requested.connect(self._on_episode_action_state_requested)
+        self.details_pane.channel_tags_requested.connect(self._on_channel_tags_requested)
+        self.details_pane.stream_probe_requested.connect(
+            lambda: _stream_probe_action.request_probe(self))
+        self.details_pane.weights_requested.connect(self._on_weights_requested)
+        self._versions_loaded.connect(self._on_versions_loaded)
+        self._similar_titles_loaded.connect(self._on_similar_titles_loaded)
+        self._action_state_loaded.connect(self._on_action_state_loaded)
+        self._episode_action_state_loaded.connect(self._on_episode_action_state_loaded)
+
+        # One publish point for "this channel's user-state changed" (rating,
+        # favorite, suppressed, ...) — see channel_state_bus.py's module
+        # docstring for why this replaces per-mutation-handler refresh lists.
+        # reread=self._on_action_state_requested reuses the existing off-thread
+        # action-state fetch (details_pane.action_state_requested's handler)
+        # as the bus's tier-2 authoritative re-read.
+        self.channel_state_bus = ChannelStateBus(reread=self._on_action_state_requested)
+        self.channel_state_bus.subscribe(self._on_channel_state_echo)
+        self.channel_state_bus.subscribe(self.details_pane.on_channel_state)   # D60: Similar / versions rows
+        # Discover is built earlier, in setup_ui — before this bus exists.
+        self.channel_state_bus.subscribe(self.discover_view.on_channel_state)   # D60: card badges
+
+        self.main_splitter.addWidget(self.details_pane)
+
+        # Similar-titles lightbox and Explore trail-map are overlay child
+        # widgets, hidden by default, and are now built LAZILY (PERF-16) — see
+        # main_window_overlays.py's _ensure_similar_lightbox/_ensure_trail_map.
+        # Poster lightbox is constructed earlier (before create_content_area);
+        # connect its one feeder that needs neither overlay, now that
+        # details_pane exists.
+        self.details_pane.poster_enlarged.connect(self._poster_lightbox.show_pixmap)
+
+        # Center panel gets all extra space when window is resized
+        self.main_splitter.setStretchFactor(0, 0)  # sidebar: fixed
+        self.main_splitter.setStretchFactor(1, 1)  # center: stretches
+        self.main_splitter.setStretchFactor(2, 0)  # details: fixed
+
+        # Set initial sizes: sidebar | content | details
+        sidebar_width = getattr(self.config, 'sidebar_width', 340)
+        details_width = getattr(self.config, 'details_pane_width', 400)
+        total_width = self.width()
+        content_width = max(400, total_width - sidebar_width - details_width)
+
+        self.main_splitter.setSizes([sidebar_width, content_width, details_width])
+        
+        # Initially collapse details pane if not visible in config
+        if not getattr(self.config, 'details_pane_visible', False):
+            self.main_splitter.collapse_panel(2)  # Collapse right panel
+        if not getattr(self.config, 'sidebar_pane_visible', True):
+            self.main_splitter.collapse_panel(0)
+        
+        # Connect splitter moved signal to save widths (debounced — see
+        # _schedule_layout_save; the raw splitterMoved fires per drag pixel).
+        self.main_splitter.splitterMoved.connect(self._schedule_layout_save)
+        self.main_splitter.panels_toggled.connect(self._schedule_layout_save)
+        
+        main_layout.insertWidget(0, self._create_header())
+        main_layout.addWidget(self.main_splitter, 1)
+
+        # Create status bar
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status("Ready", ms=0)
+    
+    def create_sidebar(self) -> QWidget:
+        """Create modular sidebar with resizable sections"""
+        self.sidebar_splitter = QSplitter(Qt.Orientation.Vertical)
+        # The gap BETWEEN section cards: cards that touch read as one long panel
+        # with lines drawn on it. Doubles as the drag target, still draggable at
+        # this width — allocation stays the user's to override.
+        self.sidebar_splitter.setHandleWidth(_theme.space_px(_theme.SPACE_SM))
+        self.sidebar_sections = {}
+
+        # Determine full ordered list: saved order first, then any new sections not yet in it
+        # "sources" is deliberately NOT here (Wave 6) — it lives in the always-visible
+        # status strip + Sources manager view below, not the reorderable section stack.
+        _known = ["alerts", "recommended", "queue", "favorites", "history"]
+        ordered = list(self.config.sidebar_sections or _known)
+        for sid in _known:
+            if sid not in ordered:
+                ordered.append(sid)
+
+        visible_ids = set(self.config.sidebar_visible_sections or ordered)
+
+        # Create ALL sections (visible and hidden) so live reordering works
+        for section_id in ordered:
+            section = self.create_section(section_id)
+            if section:
+                self.sidebar_sections[section_id] = section
+                # One wiring site for every section's way into Explore (its
+                # count): open the matching view, and explain it once (tip).
+                if getattr(section, "EXPLORE_KEY", None):
+                    section.exploreClicked.connect(
+                        lambda key=section.EXPLORE_KEY: self.switch_to_explore_view(key)
+                    )
+                    section.headerStatusChanged.connect(
+                        lambda s=section: offer_explore_tip(self, s))
+                self._wire_sidebar_section_menu(section, section_id)
+                self.sidebar_splitter.addWidget(section)
+                section.setVisible(section_id in visible_ids)
+                section.restore_state()
+
+        # Register executor shutdown for every section that owns a thread pool
+        for sid, section in self.sidebar_sections.items():
+            if hasattr(section, "_executor"):
+                self._register_cleanable(
+                    f"sidebar_{sid}_executor",
+                    lambda ex=section._executor: ex.shutdown(wait=False),
+                )
+
+        # Restore section sizes from config
+        if self.config.sidebar_section_sizes:
+            self.sidebar_splitter.setSizes(self.config.sidebar_section_sizes)
+        
+        # Connect splitter moved signal to save sizes
+        self.sidebar_splitter.splitterMoved.connect(self._schedule_layout_save)
+        # ...and to record the height as the USER's choice. splitterMoved is the
+        # one signal that means a person dragged this; automatic redistribution
+        # does not emit it, and must stay subject to the content cap.
+        self.sidebar_splitter.splitterMoved.connect(self._note_sidebar_user_sizes)
+
+        # Wrap in outer widget so the Sources strip + a Settings button can live
+        # at the bottom, below the reorderable section stack.
+        outer = QWidget()
+        outer_layout = QVBoxLayout(outer)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+        outer_layout.addWidget(self.sidebar_splitter, 1)  # stretch=1: bounded to outer height
+
+        # Sources status strip (Wave 6) — always-visible summary, NOT a
+        # CollapsibleSection and not part of the reorderable `ordered` list above.
+        # Clicking it opens the Sources manager view; Refresh All reuses the exact
+        # same queue chokepoint the old sidebar section's header button used.
+        self.sources_strip = SourcesStatusStrip(self.config, self.db, self)
+        self.sources_strip.clicked.connect(self.on_sources_manager_toggle)
+        self.sources_strip.refreshAllClicked.connect(self.refresh_all_providers)
+        # Busy state mirrors whether the serial refresh queue currently has work.
+        self.refresh_queue_manager.queue_changed.connect(
+            lambda queue: self.sources_strip.set_busy(bool(queue))
+        )
+        outer_layout.addWidget(self.sources_strip)
+
+        self._settings_btn = QPushButton("Settings")
+        _icon_utils.set_button_icon(self._settings_btn, "settings")
+        self._settings_btn.setFlat(True)
+        self._settings_btn.setToolTip("Open application settings (Ctrl+,)")
+        _theme.style(self._settings_btn, "FLAT_NAV_BTN")
+        self._settings_btn.clicked.connect(self.open_settings)
+        outer_layout.addWidget(self._settings_btn)
+
+        return outer
+
+    def create_section(self, section_id: str):
+        """Create a sidebar section by ID"""
+        if section_id == "alerts":
+            section = WatchAlertsSection(self.config, self.db, self)
+            section.alertClicked.connect(self._on_alert_clicked)
+            section.channel_selected.connect(self._on_alert_channel_details)
+            section.channelContextMenuRequested.connect(self._on_alert_channel_context_menu)
+            section.programmeContextMenuRequested.connect(
+                self._on_alert_programme_context_menu)
+            section.programmeRecordRequested.connect(self.schedule_recording_from_programme)
+            section.retryPlayRequested.connect(self._on_retry_play_requested)
+            section.retryContextMenuRequested.connect(self._on_retry_context_menu_requested)
+            # VOD watch-for wiring
+            section.addWatchForClicked.connect(self._on_add_watch_for)
+            section.manageWatchForClicked.connect(self._open_vod_alerts_dialog)
+            section.vodRuleShowMatchesRequested.connect(self._on_vod_rule_show_matches)
+            section.vodRuleRemoveRequested.connect(self._on_vod_rule_remove)
+            section.clearAllAlertsClicked.connect(self._clear_all_alerts)
+            section.vodRuleClearAlertRequested.connect(self._clear_vod_rule_alert)
+            # Monitored-series wiring (folded in from the retired New Episodes section)
+            section.seriesClicked.connect(self.show_channel_details_by_id)
+            # seriesActivated (double-click / "Open series" menu action) drills into
+            # the series — the SAME chokepoint the Watch Queue / Alerts Matched
+            # matched_series row double-click uses, never a parallel
+            # details-only path. User-reported bug fix (wave5).
+            section.seriesActivated.connect(self.play_queue_item_id)
+            section.seriesMarkSeenRequested.connect(self._on_mark_series_seen)
+            section.seriesStopRequested.connect(self._unmonitor_series)
+            self.vod_watch_alert_manager.new_matches_found.connect(
+                self._refresh_alert_visibility
+            )
+            # A newly-detected episode recolors/pins the series row in Movies & Series.
+            # unseen_new going above 0 is exactly what the Watch Queue's
+            # matched-series group filters on, so this needs the composite
+            # refresh, not the Alerts-section-only one.
+            self.series_monitor.new_episodes_found.connect(
+                lambda _cid, _n: self._refresh_alert_visibility()
+            )
+            # Subtle "checking…" hint on the Movies & Series header while a monitor
+            # check (startup / recurring timer / post-refresh) is in flight.
+            self.series_monitor.checking_started.connect(
+                lambda: section.set_series_checking(True)
+            )
+            self.series_monitor.checking_finished.connect(
+                lambda: section.set_series_checking(False)
+            )
+            # Populate rules + series on startup; backfill any missing cleaned titles
+            # first (bounded off-thread lookup), then render (rules are synchronous).
+            QTimer.singleShot(0, self._backfill_series_display_titles)
+            return section
+        
+        elif section_id == "history":
+            section = HistorySection(self.config, self.db, self)
+            section.historyItemClicked.connect(self.play_from_history_id)
+            section.itemSelected.connect(self.show_channel_details_by_id)
+            section.clearHistoryClicked.connect(self.clear_history)
+            section.clearOldHistoryClicked.connect(self.clear_history_older_than)
+            section.clearHistoryGroupClicked.connect(self.clear_history_group)
+            # "Play Next Episode" >> button (Wave 5) — routes through the existing
+            # play_episode_by_id chokepoint (same as Watch Queue / Favorites episode rows).
+            section.playNextClicked.connect(self.play_episode_by_id)
+            # "Explore →" is wired once for every section in create_sidebar().
+            # Connect context menu handler
+            section.history_list.customContextMenuRequested.connect(
+                lambda pos: self.show_history_context_menu(pos, section.history_list)
+            )
+            return section
+        
+        elif section_id == "favorites":
+            section = FavoritesSection(self.config, self.db, self)
+            section.favoriteClicked.connect(self.play_favorite_id)
+            section.episodeFavoriteClicked.connect(self.play_episode_by_id)
+            section.itemSelected.connect(self.show_channel_details_by_id)
+            section.channelMiddleClicked.connect(self._dispatch_middle_click)
+            section.searchRequested.connect(self.search_for_title)
+            section.clearUnavailableClicked.connect(
+                lambda: self._clear_unavailable_favorites(section)
+            )
+            # Connect context menu handler
+            section.favorites_list.customContextMenuRequested.connect(
+                lambda pos: self.show_favorites_context_menu(pos, section.favorites_list)
+            )
+            return section
+
+        elif section_id == "recommended":
+            section = RecommendedSection(self.config, self.db, self)
+            section.itemSelected.connect(self._on_rec_sidebar_selected)
+            section.itemDoubleClicked.connect(self.play_channel_by_id)
+            section.channelMiddleClicked.connect(self._dispatch_middle_click)
+            section.channelContextMenuRequested.connect(self._on_rec_channel_context_menu)
+            return section
+
+        elif section_id == "downloads":
+            section = DownloadsSection(self.config, self.db, self)
+            section.itemSelected.connect(self.show_channel_details_by_id)
+            section.openLibraryFolderClicked.connect(self._open_downloads_folder)
+            section.playRequested.connect(self.play_downloaded)
+            section.clearHistoryGroupClicked.connect(self._clear_download_history_group)
+            section.clearDownloadHistoryClicked.connect(self._clear_download_history)
+            section.downloads_list.customContextMenuRequested.connect(
+                self.show_downloads_context_menu)
+            return section
+
+        elif section_id == "recordings":
+            section = RecordingsSection(self.config, self.db, self)
+            section.itemSelected.connect(self.show_channel_details_by_id)
+            section.openLibraryFolderClicked.connect(self._open_recordings_folder)
+            section.recordings_list.customContextMenuRequested.connect(
+                self.show_recordings_context_menu)
+            return section
+
+        elif section_id == "queue":
+            section = WatchQueueSection(self.config, self.db, self)
+            section.itemSelected.connect(self.show_channel_details_by_id)
+            section.itemDoubleClicked.connect(self.play_queue_item_id)
+            section.episodeActivated.connect(self.play_episode_by_id)
+            section.channelMiddleClicked.connect(self._dispatch_middle_click)
+            section.channelContextMenuRequested.connect(self._on_queue_channel_context_menu)
+            section.clearQueueClicked.connect(self._clear_queue)
+            section.clearWatchedClicked.connect(self._clear_watched_queue)
+            section.newMatchesClicked.connect(self._on_queue_new_matches_clicked)
+            section.searchRequested.connect(self.search_for_title)
+            section.clearUnavailableClicked.connect(
+                lambda: self._clear_unavailable_queue(section)
+            )
+            # Alerts Matched (topmost group) — SINGLE click: a channel row opens
+            # details AND acks the match; a series row just opens details.
+            # DOUBLE click (Wave 3 click-semantics fix): both kinds route through
+            # the section's own ``itemDoubleClicked`` (wired above to
+            # play_queue_item_id) to navigate into a series or play a movie/live
+            # leaf — the section resolves that branch itself, so no separate
+            # wiring is needed here for the double-click path.
+            section.alertsMatchedClicked.connect(self._on_alerts_matched_clicked)
+            section.alertsMatchedSeriesClicked.connect(self.show_channel_details_by_id)
+            section.alertsMatchedSeriesMarkSeenRequested.connect(self._on_mark_series_seen)
+            return section
+
+        return None
+    
+    def _watch_channel_from_list(self, channel_id: str) -> None:
+        if channel_id not in self.config.epg_watchlist_channels:
+            self.config.epg_watchlist_channels.append(channel_id)
+            _cfgsave.save_soon(self)
+            self._refresh_watch_alerts()
+
+    def _unwatch_channel_from_list(self, channel_id: str) -> None:
+        if channel_id in self.config.epg_watchlist_channels:
+            self.config.epg_watchlist_channels.remove(channel_id)
+            _cfgsave.save_soon(self)
+            self._refresh_watch_alerts()
+
+    def _relink_epg_channel(self, channel_id: str) -> None:
+        """Re-allow EPG matching for a previously-blocked channel ("Re-link EPG data").
+
+        Handler for the channel-menu toggle's blocked state. Delegates to
+        ``EpgManager.relink_channel_epg`` — removes the channel from the block
+        list and triggers an immediate ``relink_all()`` pass.
+        """
+        self.epg_manager.relink_channel_epg(channel_id)
+
+    # ------------------------------------------------------------------
+    # Series monitor helpers
+    # ------------------------------------------------------------------
+
+    def browse_series_by_id(self, channel_id: str) -> None:
+        """Open a series' seasons and episodes, from a channel id.
+
+        Every existing caller of ``drill_into_series`` already had the channel
+        object; a context menu has only the id, so this is the one-line fetch
+        they all do inline — kept here rather than as a tenth copy of it.
+        """
+        from streamselect.core.repositories import RepositoryFactory   # local, as elsewhere here
+
+        with self.db.session_scope() as session:
+            channel = RepositoryFactory(session).channels.get_playable_dto(channel_id)
+        if channel is not None:
+            self.drill_into_series(channel)
+
+    def _unmonitor_series(self, channel_id: str) -> None:
+        """Stop the new-episode alert for a series, clearing its matched rows too.
+
+        Composite chokepoint for the same reason as ``_on_vod_rule_remove``: the
+        Watch Queue's matched-series group is built from
+        ``config.get_monitored_series()``, so the narrow refresh left a stopped
+        series still listed there with its unseen badge.
+        """
+        self.config.remove_monitored_series(channel_id)
+        self._refresh_alert_visibility()
+
+    # ------------------------------------------------------------------
+    # VOD watch-alert helpers
+    # ------------------------------------------------------------------
+
+    def _note_sidebar_user_sizes(self, *_args) -> None:
+        """Tell each section the height the user just dragged it to.
+
+        The content cap is a real ``setMaximumHeight``, so without this a
+        section simply refuses to grow past what its rows fill: the splitter
+        updates ``sizes()`` and the widgets ignore it. On a sparse library every
+        section caps just above its header and vertical resize appears dead.
+
+        Every visible section is told, not just the two either side of the
+        handle — a drag redistributes across the whole stack, and a section that
+        shrank has chosen its new height just as deliberately.
+        """
+        splitter = self.__dict__.get("sidebar_splitter")
+        if splitter is None:
+            return
+        for i in range(splitter.count()):
+            widget = splitter.widget(i)
+            note = getattr(widget, "note_user_height", None)
+            if callable(note) and widget.isVisible() and not widget.is_collapsed:
+                note(widget.height())
+
+
+    def _resolve_vod_rule(self, rule_created: str) -> tuple[str, str]:
+        """Return ``(text, match_type)`` for a watch-for rule id, or ``('', 'any')``."""
+        for r in self.config.get_vod_watch_alerts():
+            if r.get("created") == rule_created:
+                return r.get("text", ""), r.get("match_type", "any")
+        return "", "any"
+
+    def _filter_available_ids(self, ids: set[str]) -> set[str]:
+        """Re-validate stored match ids against LIVE source state (one bounded query).
+
+        Disabled/expired sources (``get_hidden_provider_ids``) and user-hidden
+        channels are a top-level gate — their content is never shown or counted, so
+        a stored match on such a source is dropped here before it reaches the list.
+        """
+        if not ids:
+            return set()
+        from streamselect.core.repositories import RepositoryFactory
+        with self.db.session_scope(commit=False) as session:
+            repos = RepositoryFactory(session)
+            excluded = set(repos.providers.get_hidden_provider_ids())
+            return repos.channels.filter_available_ids(ids, excluded)
+
+    def _on_vod_rule_show_matches(self, rule_created: str) -> None:
+        """Show a watch-for rule's matches as a live, editable keyword search.
+
+        The alert seeds the search box with the rule's keyword and runs a NORMAL
+        live search — a transparent, editable view whose visible search config is
+        what produces the results (mirror-not-cage), not an opaque frozen id-set.
+        Global exclusions apply and are surfaced via the gold bar; the user can
+        widen/narrow from there.
+
+        The stored-id path (``_details_id_filter`` / the ``channel_ids`` query
+        branch / the "show all" reveal, added in an earlier change) is retained but no longer
+        driven from here — kept dormant rather than deleted.
+        """
+        text, match_type = self._resolve_vod_rule(rule_created)
+        if not text:
+            return
+        # Drop any dormant alert id-filter/chip left from a prior click so the
+        # keyword search isn't silently constrained by a stale id-set.
+        if hasattr(self, "_clear_id_filter"):
+            self._clear_id_filter()
+        self._on_vod_rule_view_matches(text, match_type)
+
+    def _on_vod_rule_remove(self, rule_created: str) -> None:
+        """Remove a VOD watch-for rule and clear every surface showing its matches.
+
+        Deleting a rule deletes its ``alerted_ids`` with it, so the composite
+        ``_refresh_alert_visibility`` chokepoint is required, not the narrower
+        ``_refresh_vod_alerts_section``: the removed rule's matches are also on
+        the Watch Queue's "Alerts Matched" rows and pinned count, the
+        channel-list row badges, and the details-pane Alert button. Refreshing
+        only the Alerts section left the rule gone but its matches still
+        showing everywhere else (user report).
+        """
+        self.config.remove_vod_watch_alert(rule_created)
+        _cfgsave.save_soon(self)
+        logger.info("Removed VOD watch-for rule via sidebar context menu: {}", rule_created)
+        self._refresh_alert_visibility()
+
+    def _prompt_track_from_list(self, channel_name: str) -> None:
+        from PyQt6.QtWidgets import QInputDialog
+        text, ok = QInputDialog.getText(
+            self, "Track keyword",
+            "Add watchlist pattern — edit to a keyword for broader matching:",
+            text=channel_name,
+        )
+        if ok and text.strip():
+            watchlist.add(self.config, text)
+            self._refresh_watch_alerts()
+
+    def on_diagnose_clicked(self) -> None:
+        """Diagnose the currently-selected channel's stream (nav-bar action)."""
+        channel = getattr(self.details_pane, "current_channel", None)
+        if channel is None:
+            self.notification_manager.show(
+                title="No channel selected",
+                message="Select a channel to diagnose its stream.",
+                type="info",
+                dismissible=True,
+                auto_dismiss_seconds=5,
+            )
+            return
+        self.diagnose_channel_by_id(channel.id)
+
+    def on_split_toggle_clicked(self, checked: bool) -> None:
+        """Toggle the split-streams feature from the nav-bar button.
+
+        Persists the new state to config and shows a brief status-bar message.
+        """
+        self.config.split_streams_by_source = checked
+        _cfgsave.save_soon(self)
+        msg = (
+            "Split streams: on — one window per source"
+            if checked
+            else "Split streams: off — shared window"
+        )
+        self.status(msg, ms=4000)
+
+    def create_content_area(self) -> QWidget:
+        """Create main content area"""
+        content = QWidget()
+        self.content_layout = QVBoxLayout(content)
+        # The top margin is shared by EVERY view — the splitter holding all of
+        # them is a child of this layout — so whatever it is, it is the first
+        # thing you see in all of them. Qt's platform default put ~9px above
+        # every view, which read as a band once the empty nav bar below it
+        # stopped adding a row of its own. User report: "every view had some top
+        # padding of the exact same amount. make that padding about 1/4 of what
+        # it is currently."
+        #
+        # Only the TOP is pinned. Left, right and bottom keep the platform's
+        # own value: they separate the content from the sidebar, the window
+        # edge and the stats bar, none of which was reported, and hardcoding
+        # them would change macOS to match this machine.
+        _margins = self.content_layout.contentsMargins()
+        self.content_layout.setContentsMargins(
+            _margins.left(), CONTENT_TOP_PAD, _margins.right(), _margins.bottom()
+        )
+        
+        # Series navigation bar. THE BAR ITSELF is hidden outside series view,
+        # not just its contents — it held an invisible Back button and an empty
+        # label, and an empty QWidget in a QVBoxLayout is still a row: it and
+        # the layout spacing under it were the blank band above "Search:" in
+        # every other view. User report: "in the search view, there just seems to be
+        # dead space above Search: All Hidden."
+        self._series_nav_bar = QWidget()
+        nav_layout = QHBoxLayout(self._series_nav_bar)
+        nav_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.back_button = QPushButton("← Back")
+        self.back_button.clicked.connect(self.navigate_back)
+        nav_layout.addWidget(self.back_button)
+
+        self.breadcrumb_label = QLabel("")
+        nav_layout.addWidget(self.breadcrumb_label)
+        nav_layout.addStretch()
+
+        self.content_layout.addWidget(self._series_nav_bar)
+        self.show_series_nav(None)
+        
+        # Search and filter controls
+        self.search_controls = QWidget()
+        controls_layout = QHBoxLayout(self.search_controls)
+        controls_layout.addWidget(QLabel("Search:"))
+        
+        # All / Downloaded / Hidden scope tabs (DL-5). Downloaded sits in the
+        # MIDDLE so All/Hidden keep their edge positions (muscle memory).
+        _radius_l = "QPushButton { border-right: none; border-top-left-radius: 4px; border-bottom-left-radius: 4px; }"
+        _radius_r = "QPushButton { border-top-right-radius: 4px; border-bottom-right-radius: 4px; }"
+        self._tab_all_btn = QPushButton("All")
+        self._tab_all_btn.setCheckable(True)
+        self._tab_all_btn.setChecked(True)
+        _theme.style_fn(self._tab_all_btn, lambda: _tab_btn_sheet(_radius_l))
+        self._tab_all_btn.setToolTip("Show all channels")
+        self._tab_all_btn.clicked.connect(lambda: self._set_list_scope("all"))
+        controls_layout.addWidget(self._tab_all_btn)
+
+        self._tab_downloaded_btn = QPushButton("Downloaded")
+        _icon_utils.set_button_icon(self._tab_downloaded_btn, "download")
+        self._tab_downloaded_btn.setCheckable(True)
+        self._tab_downloaded_btn.setChecked(False)
+        _theme.style_fn(self._tab_downloaded_btn,
+                        lambda: _tab_btn_sheet("QPushButton { border-right: none; }"))
+        self._tab_downloaded_btn.setToolTip("Show titles you have downloaded — available even when their source is off")
+        self._tab_downloaded_btn.clicked.connect(lambda: self._set_list_scope("downloaded"))
+        controls_layout.addWidget(self._tab_downloaded_btn)
+
+        self._tab_hidden_btn = QPushButton("Hidden")
+        _icon_utils.set_button_icon(self._tab_hidden_btn, "hide")
+        self._tab_hidden_btn.setCheckable(True)
+        self._tab_hidden_btn.setChecked(False)
+        _theme.style_fn(self._tab_hidden_btn, lambda: _tab_btn_sheet(_radius_r))
+        self._tab_hidden_btn.setToolTip(
+            "Show channels hidden via right-click or assigned to an excluded category"
+        )
+        self._tab_hidden_btn.clicked.connect(lambda: self._set_list_scope("hidden"))
+        controls_layout.addWidget(self._tab_hidden_btn)
+
+        # Context filter chip — hidden until a details-pane genre/person filter is active
+        self._context_filter_chip = QWidget()
+        self._context_filter_chip.hide()
+        _theme.style(self._context_filter_chip, "CONTEXT_FILTER_CHIP")
+        _cfc_layout = QHBoxLayout(self._context_filter_chip)
+        _cfc_layout.setContentsMargins(6, 2, 6, 2)
+        _cfc_layout.setSpacing(4)
+        self._context_filter_label = QLabel()
+        _theme.style(self._context_filter_label, "CONTEXT_FILTER_CHIP_LABEL")
+        _cfc_layout.addWidget(self._context_filter_label)
+        self._context_filter_dismiss_btn = _icon_utils.icon_button(
+            "close", "Clear filter", style="CONTEXT_FILTER_CHIP_BTN", px=12
+        )
+        self._context_filter_dismiss_btn.setFixedSize(16, 16)
+        self._context_filter_dismiss_btn.clicked.connect(self._clear_context_filter)
+        _cfc_layout.addWidget(self._context_filter_dismiss_btn)
+        controls_layout.addWidget(self._context_filter_chip)
+
+        # Nothing else in this row stretches, so this keeps the All/Hidden pair
+        # their natural size and pins the right-hand controls to the right.
+        controls_layout.addStretch(1)
+        self._build_search_posters_controls(controls_layout)
+
+        # Opt-in "Group by type": collapsible Movies / Series / Live sections.
+        self._group_by_type_check = QCheckBox("Group by type")
+        self._group_by_type_check.setToolTip(
+            "Group the results into collapsible Movies / Series / Live sections"
+        )
+        self._group_by_type_check.blockSignals(True)
+        self._group_by_type_check.setChecked(bool(getattr(self.config, "group_by_type", False)))
+        self._group_by_type_check.blockSignals(False)
+        self._group_by_type_check.toggled.connect(self._on_group_by_type_toggled)
+        controls_layout.addWidget(self._group_by_type_check)
+
+        self.content_layout.addWidget(self.search_controls)
+
+        # ── Filter panel + inner splitter ─────────────────────────────────────
+        from streamselect.gui.filter_panel import FilterPanel
+        self.filter_panel = FilterPanel(self.config)
+        self.filter_panel.filter_changed.connect(self.on_filter_changed)
+        self._filter_unmapped_prefixes: list[str] = []
+
+        # list_area: holds banner + all content views (right side of inner splitter)
+        list_area = QWidget()
+        self._list_layout = QVBoxLayout(list_area)
+        self._list_layout.setContentsMargins(0, 0, 0, 0)
+        self._list_layout.setSpacing(0)
+
+        # Active-filter chips — the first thing above the results, because they
+        # describe the results. Built before the banners so it sits above them:
+        # a banner is about one transient event, the chip line is about what the
+        # whole list is.
+        self._list_layout.addWidget(self._create_filter_chip_bar())
+
+        # Hidden-mode banner
+        self._hidden_banner = QWidget()
+        _hb_layout = QHBoxLayout(self._hidden_banner)
+        _hb_layout.setContentsMargins(8, 4, 8, 4)
+        _hb_layout.setSpacing(8)
+        self._hidden_banner_lbl = QLabel(
+            f"{_icon_utils.role_html('hide')}&nbsp; Showing hidden and excluded channels — right-click to unhide"
+        )
+        self._hidden_banner_lbl.setTextFormat(Qt.TextFormat.RichText)
+        _theme.style_fn(self._hidden_banner_lbl, lambda: f"color: {_theme.COLOR_ACCENT_BROWN}; font-size: {_theme.FONT_MD};")
+        _hb_layout.addWidget(self._hidden_banner_lbl)
+        _hb_layout.addStretch()
+        self._manage_cats_btn = QPushButton("📁 Manage Categories")
+        self._manage_cats_btn.setFlat(True)
+        _theme.style_fn(self._manage_cats_btn, lambda: f"QPushButton {{ font-size: {_theme.FONT_MD}; color: {_theme.COLOR_ACCENT_BLUE}; padding: 2px 8px;"
+            f" border: 1px solid {_theme.OVERLAY_BLUE_25}; border-radius: 4px; }}"
+            f"QPushButton:hover {{ color: {_theme.COLOR_ACCENT_BLUE_2}; border-color: {_theme.OVERLAY_BLUE_LT_25}; }}")
+        self._manage_cats_btn.setToolTip("Browse and manage your user-defined categories")
+        self._manage_cats_btn.clicked.connect(self._open_categories_dialog)
+        _hb_layout.addWidget(self._manage_cats_btn)
+        _theme.style_fn(self._hidden_banner, lambda: f"background: {_theme.OVERLAY_BROWN_08}; border-radius: 4px;")
+        self._hidden_banner.hide()
+        self._list_layout.addWidget(self._hidden_banner)
+
+        # Why the content area is empty (no source, first load, no results…) —
+        # one panel above every view; main_window_empty_state decides it.
+        self._build_empty_state_panel()
+
+        # Banner strip — shown above the channel list for transient states:
+        # loading placeholder, "N filtered" actionable button, bypass banner.
+        # Hidden by default; _ChannelListMixin shows/hides it as needed.
+        self._channel_banner = QLabel()
+        self._channel_banner.setVisible(False)
+        self._channel_banner.setWordWrap(True)
+        _theme.style_fn(self._channel_banner, lambda: f"QLabel {{ color: {_theme.COLOR_TEXT}; padding: 4px 8px;"
+            f" font-size: {_theme.FONT_MD}; }}")
+        self._list_layout.addWidget(self._channel_banner)
+
+        # Filter-transparency bar: up to three clickable "N hidden by <layer> — show"
+        # segments, one per filter layer (Global Exclusions / search filters /
+        # dead-stream gate).  Each segment is a QPushButton (keyboard-focusable,
+        # theme pointer cursor); the bar shows only the segments whose hidden-count
+        # is > 0.  Reveals are view-scoped — clicking never changes the user's
+        # stored settings.  Hidden by default; _ChannelListMixin shows/hides it via
+        # _show_channel_filter_breakdown.
+        from PyQt6.QtWidgets import QWidget as _QWidget, QHBoxLayout as _QHBoxLayout
+        self._channel_filter_bar = _QWidget()
+        self._channel_filter_bar.setVisible(False)
+        _cfb_layout = _QHBoxLayout(self._channel_filter_bar)
+        _cfb_layout.setContentsMargins(0, 0, 0, 0)
+        _cfb_layout.setSpacing(6)
+        # One descriptor per axis, in streamselect/gui/channel_transparency.py. This
+        # was five near-identical blocks; see that module's docstring for why an
+        # enumeration here was the bug rather than merely the verbosity.
+        from streamselect.gui import channel_transparency as _transparency
+
+        _transparency.build_segments(self, _cfb_layout)
+        _cfb_layout.addStretch(1)
+        self._list_layout.addWidget(self._channel_filter_bar)
+
+        # Virtualized channel list — ChannelListView (QListView + middle_clicked)
+        # backed by ChannelListModel
+        from streamselect.gui.channel_list_model import ChannelListModel
+        from streamselect.gui.channel_list_view import ChannelListView
+        from streamselect.gui.channel_list_delegate import ChannelRowDelegate
+        from streamselect.gui.channel_list_thumbnails import ChannelThumbnailHydrator
+        from PyQt6.QtWidgets import QAbstractItemView
+        self.channel_model = ChannelListModel(self)
+        # Restore the persisted "Group by type" state + per-section collapse state.
+        self.channel_model.set_grouped(
+            bool(getattr(self.config, "group_by_type", False)),
+            collapsed_sections=getattr(self.config, "group_collapsed_types", None) or [],
+        )
+        # Wire page requests from the model through the async seam.
+        # The lambda captures self (MainWindow) so it can call _run_query.
+        self.channel_model.page_requested.connect(self._on_channel_page_requested)
+        self.channels_list = ChannelListView()
+        self.channels_list.setModel(self.channel_model)
+        # Rich-text delegate so the playback-state separator glyph (·/▶/✓) can be
+        # coloured (Resume-orange / watched-green) as reinforcement.  Also owns
+        # the compact/comfy/comfy_plus row density AND the comfy/comfy_plus
+        # poster thumbnail (both Settings → Interface → Channel List).
+        self._channel_row_delegate = ChannelRowDelegate(
+            self.channels_list, image_cache=self.image_cache
+        )
+        self._channel_row_delegate.set_density(
+            getattr(self.config, "channel_list_density", "comfy")
+        )
+        self._channel_row_delegate.set_thumbnails_enabled(
+            getattr(self.config, "channel_list_thumbnails", True)
+        )
+        self._channel_row_delegate.set_platform_name_style(
+            getattr(self.config, "platform_name_style", "auto")
+        )
+        self.channels_list.setItemDelegate(self._channel_row_delegate)
+        # Viewport-only thumbnail hydration: requests a poster download ONLY
+        # for rows currently on screen (never the whole virtualized list) —
+        # see channel_list_thumbnails.py. Shares the same ImageCache the
+        # delegate reads from at paint time (cache-hit only, no I/O there).
+        self._channel_thumbnail_hydrator = ChannelThumbnailHydrator(
+            self.channel_model, self.image_cache, parent=self
+        )
+        self._channel_thumbnail_hydrator.set_enabled(
+            getattr(self.config, "channel_list_thumbnails", True)
+        )
+        self._register_cleanable(
+            "channel_thumbnail_hydrator", self._channel_thumbnail_hydrator.shutdown
+        )
+        self.channels_list.set_thumbnail_hydrator(self._channel_thumbnail_hydrator)
+        self.channels_list.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.channels_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.channels_list.customContextMenuRequested.connect(self.show_channel_context_menu)
+        self.channels_list.doubleClicked.connect(self._on_channel_double_clicked)
+        # Single-click on a grouped section header toggles its collapse state.
+        self.channels_list.clicked.connect(self._on_channel_list_clicked)
+        # Middle-click plays the OPPOSITE of the bare double-click default.
+        self.channels_list.middle_clicked.connect(self._on_channel_middle_clicked)
+        self.channels_list.chip_clicked.connect(self._on_row_chip_clicked)
+        self.channels_list.section_mode_toggled.connect(
+            self._on_section_mode_toggled)
+        self.channels_list.selectionModel().currentChanged.connect(
+            self.on_channel_selection_changed
+        )
+        _theme.apply_list_selection(self.channels_list)
+        self._list_layout.addWidget(self.channels_list)
+
+        # Series tree view (hidden by default)
+        self.series_tree = QTreeWidget()
+        self.series_tree.setHeaderLabels(["Title", "Episode", "Runtime", "Rating"])
+        self.series_tree.setColumnWidth(0, 400)
+        self.series_tree.setColumnWidth(1, 80)
+        self.series_tree.setColumnWidth(2, 80)
+        self.series_tree.setColumnWidth(3, 80)
+        self.series_tree.setExpandsOnDoubleClick(False)
+        # ExtendedSelection enables Shift+click / Ctrl+click multi-select for batch
+        # Mark-as-Watched operations (context menu acts on all selected episodes).
+        self.series_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.series_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.series_tree.customContextMenuRequested.connect(self.show_series_context_menu)
+        self.series_tree.itemDoubleClicked.connect(self.play_series_item)
+        # Single-click / keyboard selection fills the details pane (episode → episode
+        # details; season/root → series details).  Connected ONCE here at creation, not
+        # per switch_to_series_view, so it never double-fires.  Double-click still plays.
+        connect_row_activation(self.series_tree, self._on_series_tree_selection)
+        self.series_tree.setVisible(False)
+        _theme.apply_list_selection(self.series_tree)
+        self._list_layout.addWidget(self.series_tree)
+
+        # EPG manager + view (hidden by default)
+        self.epg_manager = EpgManager(self.db, self.config, self.notification_manager, parent=self)
+        self._register_cleanable("epg_manager", self.epg_manager.shutdown)
+
+        # Inject the now-constructed notification_manager into series_monitor and
+        # vod_watch_alert_manager (both constructed before setup_ui/notifications).
+        self.series_monitor.notifications = self.notification_manager
+        self.vod_watch_alert_manager.notifications = self.notification_manager
+        # Provider IDs that should get a one-time EPG fetch once their channel load
+        # completes — populated by _on_provider_added when the new source has EPG on.
+        self._epg_fetch_after_add: set[str] = set()
+        self.epg_view = EpgView(self.config, self.db, self.epg_manager, self)
+        # EPG "play this channel" routes through the one rich play chokepoint
+        # (play_media) — same as the channel list — so it gets URL failover, the
+        # buffering notification, live list refreshes, and the playback-health
+        # readout. There is nothing special about a "special event" stream; the
+        # old play_special_event was a stripped-down duplicate that silently
+        # dropped all of the above (most visibly the live stats readout).
+        self.epg_view.play_channel_requested.connect(self.play_media)
+        self.epg_view.status_message.connect(lambda msg: self.status(msg, ms=0))
+        self.epg_view.channel_selected.connect(self._on_view_channel_selected)
+        self.epg_view.watchlist_changed.connect(self._refresh_watch_alerts)
+        # EPG source-freshness status is rendered on the stats line (epg_status_label),
+        # not inside the EPG view — the view emits its computed status text + tooltip.
+        self.epg_view.epg_status_changed.connect(self._on_epg_status_changed)
+        # Watchlist card "Show all in Search" — same seam sidebar Queue/Favorites
+        # sections use (searchRequested → search_for_title).
+        self.epg_view.search_requested.connect(self.search_for_title)
+        self.epg_view.setVisible(False)
+        self._list_layout.addWidget(self.epg_view)
+
+        # Preferences view (hidden by default)
+        self.preferences_view = PreferencesView(self.db, self.config, self)
+        self.preferences_view.playRequested.connect(self.play_channel_by_id)
+        self.preferences_view.channelSelected.connect(self.show_channel_details_by_id)
+        self.preferences_view.ratingRequested.connect(self._toggle_rating)
+        self.preferences_view.notInterestedRequested.connect(self._not_interested)
+        self.preferences_view.channelMiddleClicked.connect(self._dispatch_middle_click)
+        self.preferences_view.channelContextMenuRequested.connect(self._on_rec_channel_context_menu)
+        self.preferences_view.setVisible(False)
+        self._list_layout.addWidget(self.preferences_view)
+
+        # Discover view (hidden by default)
+        self.discover_view = DiscoverView(self.db, self.config, self.image_cache, self)
+        self.discover_view.playRequested.connect(self.play_channel_by_id)
+        self.discover_view.channelSelected.connect(self.show_channel_details_by_id)
+        self.discover_view.channelMiddleClicked.connect(self._dispatch_middle_click)
+        self.discover_view.channelContextMenuRequested.connect(self._on_rec_channel_context_menu)
+        self.discover_view.tmdbEnrichRequested.connect(self._enqueue_tmdb_enrichment)
+        self.discover_view.recipeEditRequested.connect(self._on_discover_recipe_edit_requested)
+        self.discover_view.setVisible(False)
+        self._list_layout.addWidget(self.discover_view)
+
+        # Recipe view (hidden by default) — task an earlier change slice 3
+        self.recipe_view = RecipeView(
+            self.db, self.config, self._run_query, self.image_cache, self
+        )
+        # Result cards delegate selection/playback to the host (same seam as
+        # DiscoverView) so provider_id threading + the canonical play path are reused.
+        self.recipe_view.channelSelected.connect(self.show_channel_details_by_id)
+        self.recipe_view.playRequested.connect(self.play_channel_by_id)
+        self.recipe_view.channelMiddleClicked.connect(self._dispatch_middle_click)
+        # Route right-click on Now-Plating / Show-All cards through the unified
+        # channel menu (same seam as DiscoverView and Recommendations).
+        self.recipe_view.channelContextMenuRequested.connect(self._on_rec_channel_context_menu)
+        self.recipe_view.tmdbEnrichRequested.connect(self._enqueue_tmdb_enrichment)
+        # an earlier change: a save/rename/delete/toggle re-feeds Discover's recipe shelves;
+        # reload() carries an earlier change's dirty-while-inactive guard, so a closed
+        # Discover only marks itself stale.
+        self.recipe_view.savedRecipesChanged.connect(self.discover_view.reload)
+        self.recipe_view.savedSearchOpenRequested.connect(self._open_saved_search)
+        self.recipe_view.setVisible(False)
+        self._list_layout.addWidget(self.recipe_view)
+
+        # Explore views (History / Favorites / Watch Queue / Recommended) — ONE
+        # embedded trail-map component per sidebar entry point, each seeded from that
+        # section's contents.  Built lazily by _ensure_explore_view on first open (a
+        # trail-map owns a worker pool, so four eager instances would cost four idle
+        # pools for a surface most sessions never open).
+        self.explore_views: dict = {}
+
+        self.epg_manager.start_notification_timer()
+        # Periodic scheduler: poke refresh_all_if_needed every hour so long-running
+        # sessions honor the configured interval without requiring the EPG view to open.
+        # needs_refresh() does the real per-provider gating; this is just the clock tick.
+        self.epg_manager.start_scheduler()
+        self.epg_manager.refresh_finished.connect(self._refresh_watch_alerts)
+        # REC-5: a scheduled recording's window follows the guide if it moves.
+        self.epg_manager.refresh_finished.connect(
+            self._on_epg_refreshed_resync_recordings)
+        # Recolor the sidebar EPG indicator (and clear its spinner) when a fetch ends.
+        self.epg_manager.refresh_finished.connect(self._on_provider_epg_refreshed)
+        self.epg_manager.refresh_error.connect(self._on_provider_epg_refreshed)
+        self._refresh_watch_alerts()
+
+        # Provider editor — embedded inside the Sources manager view's center pane
+        # (below), never added to the content stack directly. Constructed here
+        # (unparented) so its existing save/delete/refresh/account-info plumbing
+        # stays exactly as-is; SourcesManagerView.__init__ reparents it.
+        self.provider_editor = ProviderEditorView(self.db, self.config, self.epg_manager,
+                                                  run_query=self._run_query)
+        # Analytics tab "Browse them": the source's only-here titles as a strict
+        # context filter, through the one chokepoint every chip uses.
+        self.provider_editor.browse_ids_requested.connect(
+            lambda label, ids: self._activate_context_filter(label, _details_id_filter=set(ids)))
+        self.provider_editor.done.connect(self.exit_provider_edit_mode)
+        self.provider_editor.provider_saved.connect(self._on_provider_saved)
+        self.provider_editor.provider_added.connect(self._on_provider_added)
+        self.provider_editor.provider_delete_requested.connect(self._on_provider_delete_requested)
+        self.provider_editor.refresh_requested.connect(self.refresh_provider)
+        self.provider_editor.account_info_updated.connect(self._on_account_info_updated)
+        self.provider_editor.setVisible(False)
+
+        # Sources manager view (Wave 6, hidden by default) — LEFT: every provider as
+        # a selectable source chip; CENTER: the provider_editor above. Opened
+        # (and, Wave 7, toggled closed) from the sidebar status strip
+        # (on_sources_manager_toggle → switch_to_sources_manager/switch_to_list_view).
+        self.sources_manager_view = SourcesManagerView(
+            self.config, self.db, self.provider_editor, self
+        )
+        self.sources_manager_view.providerToggleClicked.connect(self.toggle_provider_active)
+        self.sources_manager_view.providerEpgRefreshClicked.connect(self._on_provider_epg_refresh)
+        self.sources_manager_view.addProviderClicked.connect(self.add_provider)
+        self.sources_manager_view.setVisible(False)
+        self._list_layout.addWidget(self.sources_manager_view)
+
+        # Missing TMDb data diagnostic view (hidden by default; Tools menu).
+        from streamselect.gui.missing_tmdb_view import MissingTmdbView
+        self.missing_tmdb_view = MissingTmdbView(self)
+        self.missing_tmdb_view.done.connect(self.exit_missing_tmdb_mode)
+        self.missing_tmdb_view.setVisible(False)
+        self._list_layout.addWidget(self.missing_tmdb_view)
+
+        # Reconnect Engaged Content view (hidden by default; Tools menu) — recover
+        # orphaned favorites/history/queue rows onto a live same-content_key copy.
+        from streamselect.gui.reconnect_engaged_view import ReconnectEngagedView
+        self.reconnect_engaged_view = ReconnectEngagedView(self)
+        self.reconnect_engaged_view.done.connect(self.exit_reconnect_engaged_mode)
+        self.reconnect_engaged_view.setVisible(False)
+        self._list_layout.addWidget(self.reconnect_engaged_view)
+        # Background metadata enrichment queue progress view (hidden by default;
+        # Tools menu). See metadata_enrichment_queue.py + roadmap an earlier change.
+        from streamselect.gui.metadata_enrichment_view import MetadataEnrichmentView
+        self.metadata_enrichment_view = MetadataEnrichmentView(self)
+        self.metadata_enrichment_view.done.connect(self.exit_metadata_enrichment_mode)
+        self.metadata_enrichment_view.setVisible(False)
+        self._list_layout.addWidget(self.metadata_enrichment_view)
+
+        # Inner splitter: filter panel (left) | list area (right)
+        self._inner_splitter = CollapsibleSplitter(Qt.Orientation.Horizontal)
+        self._inner_splitter.addWidget(self.filter_panel)
+        self._inner_splitter.addWidget(list_area)
+        self._inner_splitter.setStretchFactor(0, 0)  # filter panel: fixed width
+        self._inner_splitter.setStretchFactor(1, 1)  # list area: takes remaining space
+        panel_w = getattr(self.config, 'filter_panel_width', 220)
+        self._inner_splitter.setSizes([panel_w, max(300, 800 - panel_w)])
+        self._inner_splitter.splitterMoved.connect(self._schedule_layout_save)
+        self._inner_splitter.panels_toggled.connect(self._on_filter_handle_toggled)
+        self.content_layout.addWidget(self._inner_splitter, 1)
+        # One call decides which filter UI is up. In chip mode the column starts
+        # shut — "+ Add filter" is the way in — and the chip line reports what,
+        # if anything, is filtering.
+        self._apply_filter_ui_mode()
+
+        # Stats label below the splitter
+        stats_container = QWidget()
+        stats_layout = QHBoxLayout(stats_container)
+        stats_layout.setContentsMargins(10, 5, 10, 5)
+        self.stats_label = QLabel("Showing 0 of 0 channels")
+        _theme.style_fn(self.stats_label, lambda: f"color: {_theme.COLOR_MUTED_2}; font-size: {_theme.FONT_LG};")
+        stats_layout.addWidget(self.stats_label)
+        stats_layout.addStretch()
+
+        # EPG-only trailing controls, right-aligned on the SAME line as the
+        # "###,### EPG programmes" count (stats_label): source-freshness status
+        # then Refresh, so status + count + Refresh read as one strip. Both are
+        # shown only while the EPG view is active (switch_to_epg_view) and hidden
+        # by _hide_all_content_views. epg_view already exists (built above), so the
+        # Refresh button wires straight to its force-refresh seam.
+        self.epg_status_label = QLabel("")
+        _theme.style(self.epg_status_label, "CHANNEL_NAME_DIM")
+        self.epg_status_label.setVisible(False)
+        stats_layout.addWidget(self.epg_status_label)
+
+        self.epg_refresh_btn = QPushButton("Refresh")
+        _icon_utils.set_button_icon(self.epg_refresh_btn, "refresh")
+        self.epg_refresh_btn.setToolTip("Refresh EPG data from all providers")
+        self.epg_refresh_btn.clicked.connect(self.epg_view._on_force_refresh)
+        self.epg_refresh_btn.setVisible(False)
+        stats_layout.addWidget(self.epg_refresh_btn)
+
+        self.content_layout.addWidget(stats_container)
+
+        return content
+    
+    def get_media_type_icon(self, media_type: str) -> str:
+        """Get icon for media type"""
+        from streamselect.core.models import MediaType
+        
+        # An icon ROLE (icons.VECTOR_KEYS), not a glyph: one icon set.
+        if media_type == MediaType.LIVE:
+            return "live"
+        elif media_type == MediaType.MOVIE:
+            return "movie"
+        elif media_type == MediaType.SERIES:
+            return "series"
+        else:
+            return "unknown"
+    
+    def _enqueue_tmdb_enrichment(self, channel_ids) -> None:
+        """Single seam every result surface calls to feed lazy TMDb enrichment.
+
+        Discover shelves, Recipe "Matching Content", the channel list, search, and
+        details "Other Versions" all route the ids they just loaded through here so
+        there is ONE chokepoint into ``TmdbEnrichmentManager.enqueue`` (which filters
+        to idless/unattempted rows off-thread).  A no-op when the manager isn't up
+        yet (early startup) or the id list is empty.
+
+        Args:
+            channel_ids: The channel ids a surface just rendered (the loaded batch).
+        """
+        if not channel_ids:
+            return
+        # __dict__.get (not getattr) — the seam is called from render slots that
+        # tests drive on a MainWindow built via __new__ (no __init__), where a
+        # normal attribute access on the QObject would raise before the manager
+        # exists. Dict lookup stays a clean no-op until construction wires it up.
+        mgr = self.__dict__.get("tmdb_enrichment_manager")
+        if mgr is not None:
+            mgr.enqueue(channel_ids)
+
+    def _on_tmdb_enrichment_progress(self, provider_id: str, provider_name: str, count: int) -> None:
+        """Render the coalesced per-source enrichment toast (main-thread slot).
+
+        Driven by ``TmdbEnrichmentManager.enrichment_progress`` (a queued signal, so
+        this always runs on the main thread — the worker never touches the
+        NotificationManager, which makes a main-thread QTimer).  One toast per source:
+        ``count > 0`` shows/updates "Updating N titles from {name}…"; ``count == 0``
+        clears it when that source drains.
+
+        Args:
+            provider_id: The source being enriched (toast key).
+            provider_name: Human-readable source name for the message.
+            count: Live in-flight title count for this source (0 = drained → dismiss).
+        """
+        from streamselect.core.notifications import NotificationType
+
+        existing = self._tmdb_enrich_notifs.get(provider_id)
+        if count <= 0:
+            if existing is not None:
+                self.notification_manager.dismiss(existing)
+                self._tmdb_enrich_notifs.pop(provider_id, None)
+            return
+
+        noun = "title" if count == 1 else "titles"
+        message = f"Updating {count} {noun} from {provider_name}…"
+        if existing is None:
+            notif_id = self.notification_manager.show(
+                title="Matching TMDb data",
+                message=message,
+                type=NotificationType.INFO,
+                dismissible=False,
+            )
+            self._tmdb_enrich_notifs[provider_id] = notif_id
+        else:
+            self.notification_manager.update(existing, message=message)
+
+    def setup_notifications(self):
+        """Set up notification system"""
+        # Create notification widget (as child of central widget)
+        self.notification_widget = NotificationWidget(
+            self.notification_manager, self.config, self.centralWidget()
+        )
+
+        # Migration progress overlay — same overlay lane as notifications.
+        # Connect MigrationManager's public signals (already on main thread).
+        self.migration_progress_widget = MigrationProgressWidget(self.centralWidget())
+        self.migration_manager.task_started.connect(
+            self.migration_progress_widget.on_task_started
+        )
+        self.migration_manager.task_progress.connect(
+            self.migration_progress_widget.on_task_progress
+        )
+        self.migration_manager.task_finished.connect(
+            self.migration_progress_widget.on_task_finished
+        )
+        self.migration_manager.all_finished.connect(
+            self.migration_progress_widget.on_all_finished
+        )
+        # When migrations finish, refresh everything derived from the corpus, not
+        # just the channel list. A migration can rewrite content_key (cross-source
+        # dedup) — a corpus mutation — so it must route through the one canonical
+        # chokepoint that also reloads Discover, Recipe, filter-facet counts and
+        # preferences. (_refresh_provider_dependent_views calls load_channels
+        # internally, so there is no double-load.)
+        self.migration_manager.all_finished.connect(
+            self._refresh_provider_dependent_views
+        )
+
+        # Listen for notification changes
+        self.notification_manager.add_listener(self.update_notifications)
+
+    def update_notifications(self, notifications):
+        """Update notification widget"""
+        self.notification_widget.update_notifications(notifications)
+    
+    def resizeEvent(self, event):
+        """Handle window resize to reposition notifications and lightbox."""
+        super().resizeEvent(event)
+        if hasattr(self, 'notification_widget'):
+            self.notification_widget.reposition()
+        if hasattr(self, 'migration_progress_widget') and self.migration_progress_widget.isVisible():
+            self.migration_progress_widget.reposition()
+        # __dict__.get, not hasattr: both overlays are built lazily on first
+        # open (PERF-16), so neither key exists in self.__dict__ until then —
+        # the resize handler must no-op rather than build them just to resize.
+        lightbox = self.__dict__.get('_lightbox')
+        if lightbox is not None and lightbox.isVisible():
+            lightbox.resize(self.size())
+        if hasattr(self, '_poster_lightbox') and self._poster_lightbox.isVisible():
+            self._poster_lightbox.resize(self.size())
+        trail_map = self.__dict__.get('_trail_map')
+        if trail_map is not None and trail_map.isVisible():
+            trail_map.resize(self.size())
+
+    def _ensure_explore_view(self, key: str):
+        """Return the Explore view for *key*, building + wiring it on first use.
+
+        The single construction seam for every Explore entry point: one component
+        (:class:`~streamselect.gui.explore_view.ExploreView`) parameterized by its
+        :data:`~streamselect.gui.explore_view.EXPLORE_SOURCES` entry.  Per-title intents
+        route through the SAME shared trail-map handlers as the lightbox Explore
+        overlay; ✕ / Esc (via ``close_requested``) returns to Browse instead of
+        leaving a blank pane.
+
+        Args:
+            key: An ``EXPLORE_SOURCES`` key (history | favorites | queue | recommended).
+
+        Returns:
+            The cached-or-new ``ExploreView``.
+        """
+        from streamselect.gui.explore_view import EXPLORE_SOURCES, ExploreView
+
+        view = self.explore_views.get(key)
+        if view is not None:
+            return view
+        view = ExploreView(
+            self, self.config, self.image_cache, self.db,
+            self.metadata_manager, self._run_query,
+            source=EXPLORE_SOURCES[key],
+        )
+        self._connect_trail_map_signals(view.trail_map)
+        view.trail_map.close_requested.connect(self.switch_to_list_view)
+        view.setVisible(False)
+        self._list_layout.addWidget(view)
+        self._register_cleanable(f"explore_view_{key}", view.shutdown)
+        self.explore_views[key] = view
+        return view
+
+    def _on_trail_open_details(self, channel_id: str) -> None:
+        """"Open in details" from the trail-map — dismiss the overlays, jump the pane."""
+        # __dict__.get, not hasattr: the lightbox may never have been built —
+        # this handler is also reached from an Explore view's OWN embedded
+        # trail-map (_ensure_explore_view), which does not require the
+        # lightbox to exist at all.
+        lightbox = self.__dict__.get('_lightbox')
+        if lightbox is not None and lightbox.isVisible():
+            lightbox.hide()
+        self.show_channel_details_by_id(channel_id)
+
+    # Action handlers
+    def refresh_channels(self):
+        """Refresh channel list"""
+        self.status("Refreshing channels...", ms=0)
+        logger.info("Refreshing channels")
+        # Route through the canonical refresh so the main channel list is actually
+        # reloaded (load_providers() alone only refreshes the sidebar sources +
+        # provider map, leaving the channel list stale).
+        self._refresh_provider_dependent_views()
+
+    def manage_filters(self):
+        """Open Global Exclusions — the real surface, not a log line.
+
+        This was a stub that logged and returned, which made TWO entry points
+        inert: the Tools item, and the details pane's context action, which
+        emits ``manage_filters_requested`` into this slot. Either click did
+        nothing, with no error to explain it.
+
+        Delegates rather than reimplements — ``_open_global_filter_dialog`` also
+        runs the refresh tail every dependent view needs, and a second opener
+        would be a copy of that tail.
+        """
+        self._open_global_filter_dialog()
+
+    def _restart_series_monitor_scheduler(self) -> None:
+        """Re-arm the watchlist recheck timer after a settings change.
+
+        ``start_scheduler`` stops any existing timer and re-reads
+        ``series_monitor_interval_minutes``, so this both applies a new interval
+        and honours 0 (switch the recurring check off).
+        """
+        self.series_monitor.start_scheduler()
+
+    def _refresh_recommendation_views(self) -> None:
+        """Re-score every recommendation surface after the scoring dials change.
+
+        One seam for both consumers of ``RecScoringSettings`` — the sidebar
+        section (via the canonical ``_refresh_recommended_section``) and the
+        Recommendations dashboard, which is only refreshed while it is active so
+        an off-screen view doesn't burn a background query.
+        """
+        self._refresh_recommended_section()
+        view = getattr(self, "preferences_view", None)
+        if view is not None and getattr(view, "_active", False):
+            view.refresh()
+
+    def apply_configured_theme(self) -> None:
+        """Apply ``self.config.theme_name`` live, no restart needed.
+
+        This is the app's ONE entry point into ``theme.apply_theme()`` — the
+        Style menu and Settings→OK both land here. It used to be a
+        hand-maintained sweep of every widget that had cached a stylesheet at
+        construction, forwarding into twenty-one more ``refresh_theme()``
+        overrides. That could never work: an enumeration only reaches what
+        somebody remembered to add, and there were ~838 ``setStyleSheet`` call
+        sites behind 22 sweep methods. ``theme.style``/``theme.style_fn``
+        register each widget as it is built, and ``apply_theme`` re-applies
+        every live registration, so nothing has to be listed here (THEME-1).
+
+        The one thing left is the channel list: its row delegate reads
+        ``theme.COLOR_*`` fresh inside ``paint()``, so it needs a repaint
+        rather than a restyle.
+        """
+        scaled = _theme.set_text_scale(getattr(self.config, "ui_text_scale", 1.0))
+        if not _theme.apply_theme(self.config.theme_name) and not scaled:
+            return
+        if hasattr(self, "channels_list"):
+            self.channels_list.viewport().update()
+
+    def _apply_time_display_setting(self) -> None:
+        """Settings → Appearance → Time / Date, applied live.
+
+        Every time and date on screen is formatted at render through
+        ``core/time_display``, so a new style needs the views re-rendered —
+        through the one canonical refresh, and only when the style changed.
+        """
+        if apply_time_display(self.config):
+            self._refresh_provider_dependent_views()
+
+    # Panel index in ``main_splitter``: [sidebar | content | details].
+    _SIDEBAR_PANEL = 0
+    _DETAILS_PANEL = 2
+
+    def _sync_layout_menu(self) -> None:
+        """Tick each entry from the LIVE panel state, not a remembered flag.
+
+        A panel can also be collapsed by dragging its splitter handle or by an
+        Explore view auto-collapsing it, neither of which goes through this
+        menu. Reading the splitter on open is what keeps the ticks honest;
+        caching a flag here is how a menu starts lying about the screen.
+        """
+        splitter = self.__dict__.get("main_splitter")
+        if splitter is not None:
+            for action, index in (
+                (self._sidebar_visible_action, self._SIDEBAR_PANEL),
+                (self._details_visible_action, self._DETAILS_PANEL),
+            ):
+                action.setChecked(not splitter.is_panel_collapsed(index))
+        self._filters_visible_action.setChecked(
+            bool(getattr(self.config, "filter_section_visible", True))
+        )
+        chips_action = self.__dict__.get("_filter_chips_action")
+        if chips_action is not None:
+            chips_action.setChecked(self.filter_ui_mode() == "chips")
+
+    def _apply_channel_list_density(self) -> None:
+        """Re-apply the channel-list row density, thumbnail toggle, AND
+        platform-name style (Settings → Interface → Channel List) live.
+
+        Wired to ``SettingsDialog.settings_applied`` so a change takes effect
+        immediately, no restart needed. ``sizeHint()`` changes per row (density
+        and/or the thumbnail's reserved height), so ``viewport().update()``
+        alone isn't enough — ``layoutChanged`` tells the view to re-query row
+        heights, not just repaint the same geometry. The platform-name style
+        never changes row height, but it rides the same live-apply seam since
+        it's in the same Settings group.
+        """
+        density = getattr(self.config, "channel_list_density", "comfy")
+        self._channel_row_delegate.set_density(density)
+        thumbnails_enabled = getattr(self.config, "channel_list_thumbnails", True)
+        self._channel_row_delegate.set_thumbnails_enabled(thumbnails_enabled)
+        self._channel_row_delegate.set_platform_name_style(
+            getattr(self.config, "platform_name_style", "auto")
+        )
+        hydrator = getattr(self, "_channel_thumbnail_hydrator", None)
+        if hydrator is not None:
+            hydrator.set_enabled(thumbnails_enabled)
+        self.channel_model.layoutChanged.emit()
+        if thumbnails_enabled and hasattr(self, "channels_list"):
+            self.channels_list.request_visible_hydration()
+        # The Style menu shows the same values as radio ticks. Its actions were
+        # checked once at construction and never re-read, so a change made in
+        # Settings left the menu asserting the OLD value — and then picking the
+        # value Settings had actually set hit the "already that" early-return in
+        # _set_density_from_menu and did nothing, which reads as a dead menu.
+        self._sync_style_menu_state()
+
+    def _apply_discover_reload_setting(self) -> None:
+        """Settings OK: rebuild the Discover shelves.
+
+        THE Discover reload seam, not one axis's: the VE-1 dead-signal floor,
+        the PLAT-1 platform-shelf threshold and anything else a shelf query
+        resolves at build time all need exactly this, so they share it. Naming
+        it after the first axis to want it is how a second axis ends up with a
+        second near-identical handler that does the same work twice.
+
+        The channel list is reloaded once by ``settings_apply.run`` itself;
+        Discover's shelves re-resolve everything on their next build, so ask for
+        one. ``__dict__`` probe, never ``hasattr`` (a skeleton host raises).
+        """
+        view = self.__dict__.get("discover_view")
+        if view is not None:
+            view.reload()
+
+    def _apply_adult_mode_setting(self) -> None:
+        """Reload the channel list after a Settings → Content adult-mode change.
+
+        ``load_channels()``, the same reload chokepoint
+        ``_apply_collapse_variants_setting`` uses: this changes the row SET,
+        not row painting.
+        """
+        _settings_apply.request_channel_reload(self)
+
+    def _apply_collapse_variants_setting(self) -> None:
+        """Re-query the channel list after the collapse-variants checkbox changes.
+
+        Unlike density/thumbnails (``_apply_channel_list_density``), this
+        setting changes the actual ROW SET ``ChannelRepository.get_all()``
+        returns (one row per content_key group vs. every variant), not just
+        row painting — a ``layoutChanged`` repaint isn't enough, it needs a
+        genuine DB requery. ``load_channels()`` is the narrow "reload the
+        channel list with current filters" chokepoint (same one every filter
+        chip handler calls, e.g. ``on_filter_changed``) — not the broader
+        ``_refresh_provider_dependent_views`` (that's for provider/corpus
+        mutations, not a display-setting toggle). Wired to
+        ``SettingsDialog.settings_applied`` so it fires on every Apply/OK,
+        matching the sibling density/thumbnails and recommendation-scoring
+        hooks in this same connect block (they also re-apply unconditionally).
+        """
+        _settings_apply.request_channel_reload(self)
+
+    def _apply_sidebar_row_density(self) -> None:
+        """Rebuild every sidebar section after a row-density change.
+
+        Wired to ``SettingsDialog.settings_applied`` so the choice takes effect
+        without a restart. A rebuild rather than a repaint: the two densities
+        are different widget TREES (chips beside the title vs a second line
+        below it) and every row's ``sizeHint`` changes with them, so there is
+        nothing for a repaint to reuse.
+
+        Every section, unconditionally — the density is one setting for the
+        whole rail, and refreshing only the sections that happen to be expanded
+        would leave a collapsed one holding the old shape for whenever it is
+        opened.
+        """
+        for section in self.sidebar_sections.values():
+            section.refresh()
+
+    def _apply_sidebar_visibility(self) -> None:
+        """Reorder and show/hide sidebar sections immediately from config."""
+        ordered_ids = list(self.config.sidebar_sections or self.sidebar_sections.keys())
+        visible_ids = set(self.config.sidebar_visible_sections or ordered_ids)
+
+        # Reorder: insertWidget moves an already-present widget to position i
+        for i, sid in enumerate(ordered_ids):
+            section = self.sidebar_sections.get(sid)
+            if section is not None:
+                self.sidebar_splitter.insertWidget(i, section)
+
+        # Apply visibility
+        for sid, section in self.sidebar_sections.items():
+            section.setVisible(sid in visible_ids)
+    
+    # ------------------------------------------------------------------
+    # What's New
+    # ------------------------------------------------------------------
+
+    def _whats_new_unseen(self) -> list:
+        """Return changelog entries newer than the user's last-seen cursor.
+
+        Extracted for testability — callers can assert the decision without
+        constructing or exec-ing the modal dialog.
+        """
+        return _whats_new.entries_since(self.config.last_seen_whats_new_id)
+
+    # ------------------------------------------------------------------
+    # Dev-only QA Testing Checklist (gated by STREAMSELECT_DEV env var)
+    # ------------------------------------------------------------------
+
+    def _schedule_layout_save(self, *args) -> None:
+        """Debounce splitter-drag persistence.
+
+        Connected to every splitter's ``splitterMoved`` (which fires on each
+        pixel of a drag).  Instead of writing the config file per pixel, restart
+        a single-shot timer; :meth:`_persist_layout_now` runs once ~500ms after
+        the drag settles, collapsing the whole burst into ONE config write.
+        Accepts ``*args`` because ``splitterMoved`` delivers ``(pos, index)``.
+        """
+        self._layout_save_debounce.start()
+
+    def _persist_layout_now(self) -> None:
+        """Write all splitter geometry to config in a SINGLE save.
+
+        The debounce-timer target (and the direct path used by ``closeEvent``).
+        Each helper sets its config fields with ``_persist=False`` so only the
+        one ``config.save()`` here runs — one backup + one YAML write per drag,
+        not three (or hundreds).
+        """
+        self.save_splitter_sizes(_persist=False)
+        self.save_sidebar_section_sizes(_persist=False)
+        self._save_filter_panel_width(_persist=False)
+        try:
+            self.config.save()
+        except Exception as e:
+            logger.warning(f"Could not persist layout sizes: {e}")
+
+    def _save_filter_panel_width(self, _persist: bool = True):
+        """Persist filter panel width when inner splitter is moved.
+
+        ``_persist=False`` updates the in-memory config field only (the single
+        write is done by :meth:`_persist_layout_now`).
+        """
+        try:
+            sizes = self._inner_splitter.settled_sizes()
+            if sizes and sizes[0] > 0:
+                self.config.filter_panel_width = sizes[0]
+                if _persist:
+                    self.config.save()
+        except Exception:
+            # A failing config.save() means the layout silently stops persisting.
+            logger.exception("Failed to save the filter-panel width")
+
+    def save_splitter_sizes(self, _persist: bool = True):
+        """Save main splitter (sidebar | content | details) sizes to config.
+
+        ``_persist=False`` updates the in-memory config fields only (the single
+        write is done by :meth:`_persist_layout_now`).
+        """
+        # Clobber guard: while ANY Explore view (History / Favorites / Watch Queue /
+        # Recommended) is active, panels 0 and 2 are auto-collapsed to 0 (so the
+        # trail-map gets the full width).  Persisting then would overwrite the user's
+        # remembered sidebar_width / details_pane_width with 0 (and flip
+        # details_pane_visible off).  A user drag or app-close while in an Explore
+        # view would hit this path, so skip the main-splitter write outright.
+        # (collapse_panel's setSizes() does not emit splitterMoved, so the auto-collapse
+        # itself never triggers a save — this guards the manual-drag / closeEvent cases.)
+        # Plain __dict__ lookup (the codebase's existence-guard convention): `getattr`
+        # on a PyQt object whose C++ __init__ was skipped (the persistence unit-test
+        # shell) raises "super-class __init__() never called" instead of the default.
+        from streamselect.gui.explore_view import EXPLORE_VIEW_MODES
+        if self.__dict__.get("view_mode") in EXPLORE_VIEW_MODES:
+            return
+        try:
+            sizes = self.main_splitter.settled_sizes()
+            if sizes and len(sizes) >= 3:
+                sidebar_width, details_width = sizes[0], sizes[2]
+
+                # A collapsed panel's 0 is its visibility, never its width:
+                # keep the last real width for when it reopens.
+                self.config.sidebar_width = sidebar_width or self.config.sidebar_width
+                self.config.details_pane_width = details_width or self.config.details_pane_width
+                self.config.sidebar_pane_visible = (sidebar_width > 0)
+                self.config.details_pane_visible = (details_width > 0)
+
+                if _persist:
+                    _cfgsave.save_soon(self)
+                logger.debug(f"Saved splitter sizes: sidebar={sidebar_width}px, details={details_width}px")
+        except Exception as e:
+            logger.warning(f"Could not save splitter sizes: {e}")
+
+    def save_sidebar_section_sizes(self, _persist: bool = True):
+        """Save sidebar section sizes to config.
+
+        ``_persist=False`` updates the in-memory config field only (the single
+        write is done by :meth:`_persist_layout_now`).
+        """
+        try:
+            sizes = self.sidebar_splitter.sizes()
+            if sizes:
+                self.config.sidebar_section_sizes = sizes
+                if _persist:
+                    _cfgsave.save_soon(self)
+                logger.debug(f"Saved sidebar section sizes: {sizes}")
+        except Exception as e:
+            logger.warning(f"Could not save sidebar section sizes: {e}")
+    
+    def _deactivate_all_views(self) -> None:
+        """Call ``on_deactivate`` on every content view that has one.
+
+        Derived from this window's own attributes rather than a list of names.
+        Twelve views define ``on_deactivate``; the list it replaced named four,
+        and required the view to be visible — which excludes precisely the case
+        that matters, a hidden view whose loader is still running.
+
+        Each is guarded individually: one view failing to stop must not prevent
+        the next from being asked, or a single bad teardown takes the rest of
+        the shutdown with it.
+        """
+        seen: set[int] = set()
+        for name, value in list(vars(self).items()):
+            if not name.endswith("_view"):
+                continue
+            deactivate = getattr(value, "on_deactivate", None)
+            if not callable(deactivate) or id(value) in seen:
+                continue
+            seen.add(id(value))
+            try:
+                deactivate()
+            except Exception as exc:
+                logger.warning("Deactivating {} failed: {}", name, exc)
+
+        # PreferencesView owns a long-lived executor that on_deactivate does
+        # not stop. Named explicitly because it is an exception to the rule
+        # above, not an instance of it.
+        prefs = vars(self).get("preferences_view")
+        prefs_executor = getattr(prefs, "_executor", None)
+        if prefs_executor is not None:
+            prefs_executor.shutdown(wait=False, cancel_futures=True)
+
+    def _await_background_pools(self) -> None:
+        """Drop queued work and wait, bounded, for what is already running.
+
+        ``shutdown(wait=False)`` returns while its threads are still going, and
+        the next statement in ``closeEvent`` used to be ``db.close()`` — so a
+        worker could still be mid-query when the engine was disposed under it.
+        a user's log shows exactly that: series-monitor output timestamped
+        after "Database connection closed".
+
+        This only JOINS. The pool's ``shutdown(wait=False, cancel_futures=True)``
+        runs earlier, from the cleanup registry where it is owned — dropping
+        queued work there is what makes this join short, because only genuinely
+        in-flight work is left to wait for.
+        """
+        executor = vars(self).get("executor")
+        if executor is None:
+            return
+        deadline = time.monotonic() + _SHUTDOWN_POOL_WAIT_S
+        for thread in list(getattr(executor, "_threads", ()) or ()):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+
+        stragglers = [
+            t.name for t in (getattr(executor, "_threads", ()) or ()) if t.is_alive()
+        ]
+        if stragglers:
+            logger.warning(
+                "Background pool still running at close after {}s: {}",
+                _SHUTDOWN_POOL_WAIT_S, stragglers,
+            )
+
+    def _register_cleanable(self, name: str, fn: callable) -> None:
+        """Register a cleanup callable for closeEvent. Call this after creating each manager."""
+        self._cleanables.append((name, fn))
+
+    def closeEvent(self, event):
+        """Handle window close"""
+        # Ask FIRST, before any state changes — a due recording is the one
+        # thing that makes "just close it" the wrong default (settled Q4).
+        if not self._confirm_quit_with_due_recordings():
+            event.ignore()
+            return
+
+        # FIRST — before any teardown. In-flight background work polls this and
+        # abandons rather than emitting into a dying window or hitting the
+        # database this method is about to close.
+        self._shutting_down = True
+
+        # Save window geometry so it restores on next launch
+        try:
+            self.config.window_geometry = base64.b64encode(
+                bytes(self.saveGeometry())
+            ).decode("ascii")
+        except Exception as e:
+            logger.warning(f"Could not save window geometry: {e}")
+
+        # Persist all splitter geometry one final time in a single write.  Stop
+        # any pending debounce first so it can't fire after teardown.
+        try:
+            self._layout_save_debounce.stop()
+        except RuntimeError:
+            pass  # silent: the timer's C++ object is already gone during teardown
+        self._persist_layout_now()
+
+        # Shut down all registered managers (registered in __init__ / setup_ui via
+        # _register_cleanable — new managers must be registered there, not added here).
+        for _name, _fn in getattr(self, "_cleanables", []):
+            try:
+                _fn()
+            except Exception as e:
+                logger.warning(f"Cleanup of {_name} failed: {e}")
+
+        # Stop background work owned by EVERY content view. on_deactivate quits
+        # loader threads, and _hide_all_content_views only runs on view
+        # switches, not on app close, so it has to happen explicitly here.
+        #
+        # This was a hand-written tuple of four names, and twelve views define
+        # on_deactivate — so eight views' loaders were never stopped at close.
+        # It also required isVisible(), which is backwards: a view that is not
+        # on screen but still has a loader running is exactly the one that
+        # needs stopping. A QObject destroyed while its worker is mid-run is a
+        # RuntimeError at best and a SIGSEGV at worst, and a user hit both:
+        #
+        #   RuntimeError: wrapped C/C++ object of type _LoaderWorker
+        #                 has been deleted
+        #   fish: Job 1, './run.sh' terminated by signal SIGSEGV
+        #
+        # Derived from __dict__ so a thirteenth view is covered on the day it
+        # is written, by someone who never has to learn this list exists.
+        self._deactivate_all_views()
+
+        # Wait for the background pool BEFORE closing the database underneath
+        # it. shutdown(wait=False) returns immediately and leaves its threads
+        # running; a user's log shows worker output arriving after
+        # "Database connection closed". Bounded, because a close must never
+        # hang on a slow query — but bounded ABOVE the slowest thing a worker
+        # does, which a 5 s budget written for millisecond queries no longer is.
+        self._await_background_pools()
+
+        # Close database
+        self.db.close()
+        event.accept()

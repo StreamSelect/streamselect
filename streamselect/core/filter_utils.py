@@ -1,0 +1,1237 @@
+"""Filtering utilities for channel organization"""
+
+import html
+import re
+from typing import Optional, Dict, List
+
+from streamselect.core.region_codes import exclusion_code
+
+
+# Bracket prefix at start of name: [SE], [UK], [4K], etc.
+_BRACKET_RE = re.compile(r'^\[([A-Z0-9]{1,8})\]\s*')
+
+# Valid prefix: starts with uppercase letter or digit, only [A-Z0-9/], max 10 chars.
+# Rejects anything with spaces, lowercase, ★, or other separators embedded in it.
+# + is allowed for streaming brands: D+, DISNEY+, PARAMOUNT+
+_VALID_PREFIX = re.compile(r'^[A-Z0-9][A-Z0-9/+]{0,9}$')
+
+# Fallback: PREFIX-  Title (dash directly after prefix, followed by 1+ spaces).
+# Some providers omit the leading space: "EN-  Walking Dead" instead of "EN - Walking Dead".
+_DASH_NO_SPACE_RE = re.compile(r'^([A-Z][A-Z0-9/+]{0,9})-\s+(.+)$')
+
+# Default separator search order — longer/more-specific patterns first to avoid
+# partial matches (e.g. " ★ " before bare "★").
+DEFAULT_PREFIX_SEPARATORS: list[str] = [" ★ ", "★", " | ", "| ", "|", ": ", ":", " - "]
+
+
+def extract_prefix(channel_name: str, separators: list[str] | None = None) -> Optional[str]:
+    """Extract the prefix code from a channel name.
+
+    Tries, in order:
+    1. Bracket format: ``[XX] Title`` → returns ``XX``
+    2. Each separator in *separators* (default: ★, |, :, then ' - ').
+       The candidate before the separator must match ``[A-Z0-9][A-Z0-9/]{0,9}``
+       (no spaces, no lowercase, ≤ 10 chars) to avoid false positives.
+    3. Dash-no-space fallback: ``PREFIX-  Title`` → returns ``PREFIX``.
+
+    Examples::
+
+        extract_prefix("EN - Breaking Bad")    → 'EN'
+        extract_prefix("EN-  Breaking Bad")    → 'EN'  (dash no-space variant)
+        extract_prefix("AF ★ Wede - Doc")      → 'AF'
+        extract_prefix("AFR| RTN TELE SAHEL")  → 'AFR'
+        extract_prefix("[SE] Star Trek")       → 'SE'
+        extract_prefix("UK: Channel Name")     → 'UK'
+        extract_prefix("Breaking Bad - S01")   → None  (has lowercase)
+        extract_prefix("Just A Title")         → None
+    """
+    if not channel_name:
+        return None
+
+    # [XX] bracket format at start of name
+    m = _BRACKET_RE.match(channel_name)
+    if m:
+        return m.group(1)
+
+    # |XX| leading-pipe format: prefix wrapped in pipes,
+    # e.g. "|WC| BEIN SPORTS 1 HD FR" → "WC", "|EN| Breaking Bad" → "EN".
+    # Splitting on a bare "|" yields an empty candidate, so handle it explicitly:
+    # take the token between the first two pipes and validate it as a prefix.
+    if channel_name.startswith("|"):
+        end = channel_name.find("|", 1)
+        if end > 1:
+            candidate = channel_name[1:end].strip()
+            if _VALID_PREFIX.match(candidate):
+                return candidate
+
+    seps = separators if separators is not None else DEFAULT_PREFIX_SEPARATORS
+    for sep in seps:
+        if sep in channel_name:
+            candidate = channel_name.split(sep, 1)[0].strip()
+            if _VALID_PREFIX.match(candidate):
+                return candidate
+
+    # Fallback: PREFIX-  Title (no space before dash, 1+ spaces after)
+    m2 = _DASH_NO_SPACE_RE.match(channel_name)
+    if m2 and _VALID_PREFIX.match(m2.group(1)):
+        return m2.group(1)
+
+    return None
+
+
+def categorize_prefix(
+    prefix: str,
+    language_groups: Dict[str, List[str]],
+    quality_groups: Dict[str, List[str]],
+    platform_groups: Dict[str, List[str]]
+) -> Dict[str, str]:
+    """Categorize a prefix into language/quality/platform groups.
+    
+    Args:
+        prefix: The detected prefix (e.g., "EN", "4K", "NETFLIX")
+        language_groups: Mapping of group names to prefix lists
+        quality_groups: Mapping of group names to prefix lists
+        platform_groups: Mapping of group names to prefix lists
+        
+    Returns:
+        Dict with keys 'language', 'quality', 'platform' and group names as values
+        Empty string if no match found in that category
+    """
+    result = {
+        'language': '',
+        'quality': '',
+        'platform': ''
+    }
+    
+    prefix_upper = prefix.upper()
+    
+    # Check language groups
+    for group_name, prefixes in language_groups.items():
+        if any(prefix_upper == p.upper() for p in prefixes):
+            result['language'] = group_name
+            break
+    
+    # Check quality groups
+    for group_name, prefixes in quality_groups.items():
+        if any(prefix_upper == p.upper() for p in prefixes):
+            result['quality'] = group_name
+            break
+    
+    # Check platform groups
+    for group_name, prefixes in platform_groups.items():
+        if any(prefix_upper == p.upper() for p in prefixes):
+            result['platform'] = group_name
+            break
+    
+    return result
+
+
+def get_excluded_prefixes(config) -> set[str]:
+    """Return the set of explicitly blocked prefix codes.
+
+    These are always hidden regardless of the allowlist state. Written by the
+    "Block [PREFIX]" quick action in the Other Versions section of the details pane.
+    """
+    from streamselect.core.region_codes import code_family
+    return code_family(getattr(config, "global_filter_excluded_prefixes", []))
+
+
+def get_active_category_filter(config) -> tuple[list[str] | None, bool]:
+    """Return prefix codes to EXCLUDE from the global category blacklist.
+
+    config.global_filter_excluded_categories stores prefix codes to hide
+    (e.g. ["AR", "KU"]). Empty list = hide nothing (show everything).
+
+    Returns:
+        (excluded_prefixes_or_None, include_uncategorized)
+        excluded_prefixes is None when no exclusions are active.
+    """
+    if getattr(config, "global_filter_paused", False):
+        return None, True
+    from streamselect.core.region_codes import code_family
+    # Excluding one code hides the country's other codes too (DK → DNK, DEN).
+    prefixes = sorted(code_family(getattr(config, "global_filter_excluded_categories", [])))
+    include_uncategorized = getattr(config, "global_filter_include_uncategorized", True)
+    return (prefixes if prefixes else None), include_uncategorized
+
+
+# ---------------------------------------------------------------------------
+# Global-Exclusion predicate — the single chokepoint (P1-6)
+# ---------------------------------------------------------------------------
+#
+# THE rule ("language wins over region", shipped an earlier change): a channel is excluded
+# iff its ``detected_prefix`` is in the excluded set; a channel with NO prefix
+# falls back to its ``detected_region``.  ``is_channel_excluded`` (Python),
+# ``channel_exclusion_criterion`` (SQLAlchemy KEEP clause) and
+# ``global_exclusion_set`` (the set builder) below — together with the batch
+# twin ``main_window_channels._apply_python_exclusions`` — are the ONLY
+# implementations of this rule.  Every surface (channel list, details "Other
+# Versions", EPG On-Now, facet/recipe/tag counts) routes through one of them;
+# never fork a parallel prefix/region check (single source of truth, the project rules).
+
+
+def is_channel_excluded(
+    detected_prefix: str | None,
+    detected_region: str | None,
+    excluded: set[str],
+) -> bool:
+    """Return True when a channel is hidden by the Global Exclusions.
+
+    THE canonical Global-Exclusion predicate ("language wins over region",
+    shipped an earlier change).  The channel's ``detected_prefix`` is the primary signal — a
+    channel with an explicit, un-excluded prefix (e.g. ``EN``) is kept even when
+    its region tag is in *excluded* (excluding ``IN``/``DE`` never hides an
+    English movie merely filed under an Indian/German category).  Only when the
+    channel has **no prefix** (``None`` or ``""`` — treated alike, Python
+    truthiness) does the ``detected_region`` decide (the fallback).  An empty
+    *excluded* set never hides anything.
+
+    Args:
+        detected_prefix: The channel's stored ``detected_prefix`` (``None``/``""``
+            when the name carried no prefix).
+        detected_region: The channel's stored ``detected_region`` — the fallback,
+            consulted only when there is no prefix.
+        excluded: The prefix/region codes the user has globally excluded (build
+            it with :func:`global_exclusion_set`).
+
+    Returns:
+        ``True`` when the channel should be hidden, ``False`` otherwise.
+
+    See Also:
+        :func:`global_exclusion_set`: builds *excluded* from ``Config``.
+        :func:`channel_exclusion_criterion`: the SQLAlchemy KEEP twin.
+        ``main_window_channels._apply_python_exclusions``: the batch Python twin.
+    """
+    if not excluded:
+        return False
+    if detected_prefix:
+        return detected_prefix in excluded or exclusion_code(detected_prefix) in excluded
+    return bool(detected_region) and detected_region in excluded
+
+
+def global_exclusion_set(config) -> set[str]:
+    """Return the user's active Global-Exclusion prefix/region codes.
+
+    The single builder of the *excluded* set :func:`is_channel_excluded` (and its
+    SQL twin) consume. Empty when paused (``global_filter_paused``); else the union of
+
+    - the category blacklist expanded to leaf codes via :func:`get_active_category_filter`
+      (**not** ``config.global_filter_excluded_categories`` read raw — that skips the
+      group→leaf expansion, so checked groups would exclude nothing), and
+    - the "Block [PREFIX]" codes (:func:`get_excluded_prefixes`) and finished-event prefixes.
+
+    Args:
+        config: The application ``Config`` (read on the main thread; the engine
+            layers receive the resolved set, never ``Config`` — DR-0007).
+
+    Returns:
+        The prefix/region codes to exclude — empty when paused or nothing set.
+
+    See Also:
+        :func:`is_channel_excluded`: the predicate that consumes this set.
+    """
+    if getattr(config, "global_filter_paused", False):
+        return set()
+    cat_excluded, _ = get_active_category_filter(config)
+    from streamselect.core.content_labels import ENDED_EVENT_PREFIXES
+    ended = set() if getattr(config, "show_ended_events", False) else ENDED_EVENT_PREFIXES
+    return set(cat_excluded or []) | get_excluded_prefixes(config) | ended
+
+
+def channel_exclusion_criterion(excluded: set[str], channel_cls, keep_ids=None):
+    """Return the SQLAlchemy KEEP criterion for the Global-Exclusion rule.
+
+    The SQL twin of :func:`is_channel_excluded`: a boolean clause usable in
+    ``query.filter(...)`` that keeps exactly the rows for which
+    :func:`is_channel_excluded` returns ``False``.  Route every faceted/aggregate
+    query through this instead of hand-rolling a prefix/region ``or_`` (single
+    chokepoint).
+
+    Keep-condition (De Morgan of the predicate, with ``""`` treated like ``NULL``
+    to match Python truthiness):
+
+    - Row HAS a prefix (``detected_prefix`` not NULL/``''``): keep iff neither
+      it nor its stored ``detected_exclusion_code`` is in excluded.
+    - Row has NO prefix: keep iff ``detected_region`` is NULL/``''`` OR
+      ``NOT IN excluded``.
+
+    The ``or_(col IS NULL, col == '', col NOT IN (...))`` shape sidesteps the SQL
+    NULL trap (``NULL NOT IN (...)`` evaluates to NULL, which would drop the row).
+
+    Args:
+        excluded: The prefix/region codes to exclude (see
+            :func:`global_exclusion_set`).  Empty → a tautology (keeps all rows).
+        channel_cls: The ``ChannelDB`` class (or an aliased equivalent) carrying
+            ``detected_prefix`` / ``detected_region`` columns.
+
+    Returns:
+        A SQLAlchemy boolean clause for ``.filter(...)`` — ``true()`` when
+        *excluded* is empty.
+
+    See Also:
+        :func:`is_channel_excluded`: the Python predicate this mirrors.
+    """
+    from sqlalchemy import and_, or_, true
+
+    if not excluded:
+        return true()
+    values = list(excluded)
+    prefix = channel_cls.detected_prefix
+    region = channel_cls.detected_region
+    has_prefix = and_(prefix.isnot(None), prefix != "")
+    no_prefix = or_(prefix.is_(None), prefix == "")
+    # HAS prefix → judged by prefix alone (language wins over region).
+    # NO prefix  → region fallback (NULL/'' region is never a match).
+    code = channel_cls.detected_exclusion_code
+    keep = or_(
+        and_(has_prefix, prefix.notin_(values), or_(code.is_(None), code.notin_(values))),
+        and_(no_prefix, or_(region.is_(None), region == "", region.notin_(values))),
+    )
+    # keep_ids: copies whose measured audio contradicts their excluded prefix
+    # (StreamInfoRepository.prefix_exempt_ids) — a verified fact beats the guess.
+    return or_(keep, channel_cls.id.in_(list(keep_ids))) if keep_ids else keep
+
+
+# Tag-valued exclusions (content type, channel category, genre) live in
+# ``streamselect.core.tag_exclusions`` — one encoded set, one predicate.
+
+
+# ---------------------------------------------------------------------------
+# Keyword exclusion — P1-6 chokepoint family, fourth axis
+# ---------------------------------------------------------------------------
+#
+# A user-defined, free-text axis distinct from prefix/region, user-category, and
+# content_type above: the user may globally hide any channel whose TITLE contains
+# one of their own keywords (e.g. "wrestling", "telenovela") — matched
+# case-insensitively as a substring against ``detected_title`` (falling back to
+# ``name`` for rows with no ingestion-computed title; never re-parses the name).
+#
+# Unlike ``restricted_keywords`` (``channel_name_utils.is_restricted``), which is
+# resolved ONCE at ingestion into the stored ``ChannelDB.detected_restricted`` flag
+# and gates the adult_mode filter, this axis has no ingestion step or stored field —
+# it is read live, at query time, by every consumer below, so editing the keyword
+# list takes effect on the very next load with no re-scan needed.
+#
+# ``keyword_exclusion_criterion`` (SQLAlchemy KEEP clause) is the ONLY
+# implementation of this rule — every surface that filters by keyword (channel
+# list via ``ChannelRepository._apply_channel_filters``, Discover via
+# ``discovery_engine._apply_prefix_filter``, Recommendations via
+# ``preference_engine.score_candidates``) routes through it; never fork a parallel
+# substring check. ``keyword_exclusion_list`` is the single paused-aware builder of
+# the keyword list every one of those callers reads from ``Config``.
+
+
+def global_exclusion_sets(config) -> "tuple[set[str], set[str], set[str], set[str]]":
+    """Resolve the user's Global Exclusions as four plain sets.
+
+    The control layer's answer to "what may a faceted query return" (DR-0007):
+    read ``Config`` here, hand plain sets to the engine, which never touches
+    Config itself. Composes the four single-axis resolvers in this module
+    rather than re-deriving any of them, and is paused-aware — every set is
+    empty while Global Exclusions are paused.
+
+    Lifted out of ``RecipeView._global_exclusion_sets`` when a second caller
+    arrived. A saved recipe rendered as a Discover shelf has to apply exactly
+    the exclusions the recipe view applies, or the same recipe shows different
+    content depending on which screen you look at it from — and until What's
+    New an earlier change the Discover worker's ``fk`` kwargs had no category axis at all
+    (absent from every shelf query but the categories index; an earlier change fixed it).
+
+    Args:
+        config: The application Config.
+
+    Returns:
+        ``(excluded_prefixes, excluded_categories, excluded_content_types,
+        excluded_keywords)``.
+    """
+    if getattr(config, "global_filter_paused", False):
+        return set(), set(), set(), set()
+
+    from streamselect.core.tag_exclusions import excluded_tag_content_types
+
+    excluded_prefixes = global_exclusion_set(config)
+    excluded_categories = set(
+        getattr(config, "global_filter_excluded_user_categories", []) or []
+    )
+    return (
+        excluded_prefixes,
+        excluded_categories,
+        excluded_tag_content_types(config),
+        set(keyword_exclusion_list(config)),
+    )
+
+
+def tag_query_scope(config) -> dict:
+    """Every exclusion a ``TagRepository`` faceted query takes, as its kwargs.
+
+    :func:`global_exclusion_sets` plus the "hide dead streams" floor (ledger
+    D42) — the one scope for tag counts, clouds, YIELDS and recipe samples.
+    Callers add only ``excluded_provider_ids`` (it needs a session). An off
+    axis is ``None``.
+    """
+    from streamselect.core.visibility_resolver import dead_signal_streak_floor
+
+    prefixes, categories, content_types, keywords = global_exclusion_sets(config)
+    return {"excluded_prefixes": prefixes or None, "excluded_categories": categories or None,
+            "excluded_tag_content_types": content_types or None,
+            "excluded_keywords": keywords or None,
+            "dead_signal_streak_floor": dead_signal_streak_floor(config)}
+
+
+def keyword_exclusion_list(config) -> list[str]:
+    """Return the user's active keyword Global Exclusions.
+
+    Paused-aware (mirrors :func:`global_exclusion_set` /
+    :func:`excluded_tag_content_types`): empty when
+    ``config.global_filter_paused`` is set, otherwise the cleaned
+    (stripped, blank-dropped) contents of ``config.global_excluded_keywords``.
+
+    Args:
+        config: The application ``Config`` (read on the main/control thread; the
+            engine layers receive the resolved list, never ``Config`` — DR-0007).
+
+    Returns:
+        The keyword strings to exclude — empty when paused or unset.
+    """
+    if getattr(config, "global_filter_paused", False):
+        return []
+    return [k.strip() for k in (getattr(config, "global_excluded_keywords", None) or []) if k and k.strip()]
+
+
+def keyword_exclusion_criterion(keywords: "list[str] | set[str] | None", channel_cls):
+    """Return the SQLAlchemy KEEP criterion for the keyword Global Exclusion axis.
+
+    A channel is excluded when its title contains ANY of *keywords* (a
+    case-insensitive substring match); the KEEP condition returned here is the
+    conjunction of "does NOT contain keyword i" over every keyword — expressed as
+    an ``ilike`` chain against ``COALESCE(detected_title, name)`` so it runs
+    entirely in SQL (no per-row Python filtering — safe over the 240k+-row
+    ``channels`` table). Route every keyword exclusion on a query/aggregate
+    surface through this helper instead of hand-rolling a parallel ``ilike``
+    chain (single chokepoint, P1-6 family).
+
+    Args:
+        keywords: The user's keyword strings (build with
+            :func:`keyword_exclusion_list`). Blank/whitespace-only entries are
+            ignored. Empty/``None`` → a tautology (keeps all rows) — same
+            "empty exclusion never hides anything" contract as
+            :func:`channel_exclusion_criterion`.
+        channel_cls: The ``ChannelDB`` class (or an aliased equivalent) carrying
+            ``detected_title``/``name`` columns.
+
+    Returns:
+        A SQLAlchemy boolean clause for ``.filter(...)`` — ``true()`` when
+        *keywords* is empty.
+
+    See Also:
+        :func:`keyword_exclusion_list`: builds *keywords* from ``Config``.
+    """
+    from sqlalchemy import and_, func, true
+
+    cleaned = [k.strip() for k in (keywords or []) if k and k.strip()]
+    if not cleaned:
+        return true()
+    title_expr = func.coalesce(channel_cls.detected_title, channel_cls.name)
+    return and_(*[~title_expr.ilike(f"%{kw}%") for kw in cleaned])
+
+
+# Normalises multilingual genre strings from Xtream providers to English canonical names.
+# Providers supply genres in their own language (French, Italian, German, Spanish, Dutch, etc.)
+# which creates duplicate clusters like Drama/Drame/Dramma/Dramat/Dramat.
+# Keys are lowercased for case-insensitive lookup; values are the canonical English label.
+#
+# Canonical home (single source of truth): imported by both
+# ``repositories/channel.py`` (normalize_genre) and ``repositories/channel_stats.py``
+# (filter-stat aggregation). It lives here — a dependency-free leaf — because channel.py
+# imports channel_stats.py, so the table cannot live in either of them without a cycle.
+_GENRE_NORM: dict[str, str] = {
+    # Drama variants (cross-language only — "Drama & History" is its own compound)
+    "drame":                    "Drama",
+    "dramma":                   "Drama",
+    "dramat":                   "Drama",
+    "draама":                   "Drama",
+    # Comedy variants
+    "comédie":                  "Comedy",
+    "comedie":                  "Comedy",
+    "komödie":                  "Comedy",
+    "komedie":                  "Comedy",
+    "commedia":                 "Comedy",
+    "comedia":                  "Comedy",
+    # Crime variants (cross-language only — "Crime & Mystery" is its own compound)
+    "crimen":                   "Crime",
+    "krimi":                    "Crime",
+    "misdaad":                  "Crime",
+    # Documentary variants
+    "documentaire":             "Documentary",
+    "documental":               "Documentary",
+    "dokumentär":               "Documentary",
+    "dokumentar":               "Documentary",
+    "dokumentation":            "Documentary",
+    "doku":                     "Documentary",
+    # Sci-Fi (pure) — abbreviations + cross-language spellings of plain Science
+    # Fiction. Kept DISTINCT from the "Sci-Fi & Fantasy" compound: a pure-SciFi or
+    # pure-Fantasy title must never be mis-tagged into the combined genre — that
+    # would muddy a clean SciFi (or Fantasy) set with the other (user steer
+    #; DR-0005 — compounds and their components are separate categories).
+    "science fiction":          "Science Fiction",
+    "sci-fi":                   "Science Fiction",
+    "sci fi":                   "Science Fiction",
+    "science-fiction":          "Science Fiction",
+    "fantascienza":             "Science Fiction",
+    "ciencia ficción":          "Science Fiction",
+    "fantasy":                  "Fantasy",
+    # "Sci-Fi & Fantasy" is the TMDb combined genre — its own category; only
+    # cross-language aliases of the *compound* normalise to it.
+    "science-fiction & fantastique": "Sci-Fi & Fantasy",
+    # Mystery / Thriller variants
+    "mystère":                  "Mystery",
+    "mystere":                  "Mystery",
+    "misterio":                 "Mystery",
+    "mistero":                  "Mystery",
+    "thriller":                 "Thriller",
+    # Action / Adventure — pure forms stay distinct from the "Action & Adventure"
+    # compound; only cross-language aliases of the *compound* normalise to it.
+    "action & abenteuer":       "Action & Adventure",
+    "action et aventure":       "Action & Adventure",
+    "action":                   "Action",
+    "adventure":                "Adventure",
+    "abenteuer":                "Adventure",
+    "aventure":                 "Adventure",
+    "aventura":                 "Adventure",
+    # Animation variants
+    "animazione":               "Animation",
+    "animación":                "Animation",
+    "dessin animé":             "Animation",
+    # Family / Kids variants
+    "familial":                 "Family",
+    "famille":                  "Family",
+    "famiglia":                 "Family",
+    "familia":                  "Family",
+    "children":                 "Kids",
+    "children & family":        "Family",             # an earlier change: compound → Family ("Family implies children")
+    "kinder":                   "Kids",
+    "jeunesse":                 "Kids",
+    # Reality variants
+    "reality tv":               "Reality",
+    "realité":                  "Reality",
+    "realite":                  "Reality",
+    # War — pure "War" stays distinct from the "War & Politics" compound.
+    "war & politics":           "War & Politics",
+    "guerra":                   "War",
+    "guerre":                   "War",
+    # Western
+    "western":                  "Western",
+    # Horror / Suspense
+    "horror":                   "Horror",
+    "horreur":                  "Horror",
+    "terror":                   "Horror",
+    # Romance
+    "romance":                  "Romance",
+    "romantique":               "Romance",
+    "romantico":                "Romance",
+    # History
+    "history":                  "History",
+    "histoire":                 "History",
+    "historia":                 "History",
+    "historical":               "History",
+    # Music
+    "music":                    "Music",
+    "musique":                  "Music",
+    "música":                   "Music",
+    # Sport — canonical form is plural "Sports" (matches CONTENT_DESCRIPTOR_GROUPS
+    # and BASE_PLATFORM_GROUPS).  Both singular and plural provider strings fold here
+    # so the raw_data genre path and the compound-decomposer/remap path produce the
+    # same facet value ("Sports"), eliminating the split "Sport" / "Sports" facet
+    # that made the singular entry show 450+ count but return nothing on filter.
+    "sport":                    "Sports",
+    "sports":                   "Sports",
+    # News / Current affairs
+    "news":                     "News",
+    "actualité":                "News",
+    # Talk
+    "talk show":                "Talk Show",
+    "talk":                     "Talk Show",
+    # NOTE: "variety" mapping removed — Variety ≠ Talk Show; kept raw.
+    "entertainment":            "Entertainment",  # unscripted light TV (user report)
+    # FORMAT words ("" = no genre): "TV program", "programme", "series" say a
+    # title is a programme, which the media type already says. They were one
+    # canonical "TV Show" that described nothing (user report: "adds ZERO
+    # value"); such titles now land in the filter's Uncategorized row.
+    "tv program":                       "",
+    "tv programme":                     "",
+    "tv proramme":                      "",   # provider typo
+    "tv programe":                      "",   # provider typo
+    "tv show":                          "",
+    "tv series":                        "",
+    "tv series television program":     "",
+    "television series":                "",
+    "program tv":                       "",
+    "program":                          "",
+    "programme":                        "",
+    "programe":                         "",   # provider typo
+    # Arabic script variants (Arabic .lower() is a no-op so keys match directly)
+    "دراما":                    "Drama",
+    "ﺩﺭاﻣﺎ":                    "Drama",    # Arabic presentation-form variant
+    "كوميديا":                  "Comedy",
+    "ﻛﻮﻣﻴﺪﻱ":                  "Comedy",   # Arabic presentation-form variant
+    "وثائقي":                   "Documentary",
+    "جريمة":                    "Crime",
+    "رعب":                      "Horror",
+    "إثارة":                    "Thriller",
+    "رومانسي":                  "Romance",
+    "مغامرة":                   "Adventure",
+    "أكشن":                     "Action",
+    "أطفال":                    "Kids",
+    "تاريخي":                   "History",
+    "رياضة":                    "Sports",
+    # Arabic — additional high-count compound and individual terms
+    "حركة ومغامرة":              "Action & Adventure",   # Action & Adventure
+    "غموض":                     "Mystery",               # Mystery
+    "خيال علمي وفانتازيا":       "Sci-Fi & Fantasy",     # Sci-Fi & Fantasy
+    "رسوم متحركة":               "Animation",             # Animation
+    "عائلي":                    "Family",                # Family
+    "حرب وسياسة":               "War & Politics",        # War & Politics
+    "واقع":                     "Reality",               # Reality
+    "أوبرا صابونية":            "Soap Opera",            # Soap opera (an earlier change: canonical renamed)
+    "غربي":                     "Western",               # Western
+    "كوميدي":                   "Comedy",                # Comedy (masculine form)
+    "ﺗﺸﻮﻳﻖ ﻭﺇﺛﺎﺭﺓ":             "Thriller",              # Suspense & Excitement (presentation forms)
+    "ﻏﻤﻮﺽ":                    "Mystery",               # Mystery (presentation forms)
+    "ﻋﺎﺋﻠﻲ":                    "Family",                # Family (presentation forms)
+    "ﺭﺳﻮﻡ ﻣﺘﺤﺮﻛﺔ":              "Animation",             # Animation (presentation forms)
+    "ﺭﻋﺐ":                     "Horror",                # Horror (presentation forms)
+    # Polish
+    "kryminał":                 "Crime",                 # Crime
+    "komedia":                  "Comedy",                # Comedy
+    "akcja i przygoda":         "Action & Adventure",    # Action & Adventure
+    "animacja":                 "Animation",             # Animation
+    "tajemnica":                "Mystery",               # Mystery / Secret
+    "dokumentalny":             "Documentary",           # Documentary
+    "familijny":                "Family",                # Family
+    "wojenny":                  "War",                   # War
+    "akcja":                    "Action",                # Action
+    "przygoda":                 "Adventure",             # Adventure
+    "przygodowy":               "Adventure",             # Adventure (adjective form)
+    "romans":                   "Romance",               # Romance
+    "sensacyjny":               "Thriller",              # Thriller / Sensational
+    "historyczny":              "History",               # Historical
+    "fantastyczny":             "Fantasy",               # Fantastic/Fantasy
+    # German / Scandinavian shared
+    "kriminal":                 "Crime",                 # Criminal/Crime (German: Kriminal, ~1000 channels)
+    # Swedish
+    "komedi":                   "Comedy",                # Comedy
+    "sci-fi & fantasi":         "Sci-Fi & Fantasy",      # Sci-Fi & Fantasy
+    "mystik":                   "Mystery",               # Mystery
+    "dokumentarfilm":           "Documentary",           # Documentary
+    "äventyr":                  "Adventure",             # Adventure
+    "action & äventyr":         "Action & Adventure",    # Action & Adventure
+    "animerat":                 "Animation",             # Animated
+    "verklighet":               "Reality",               # Reality
+    "brott":                    "Crime",                 # Crime
+    "barn":                     "Kids",                  # Children/Kids
+    "familj":                   "Family",                # Family
+    "mysterium":                "Mystery",               # Mystery
+    "krig & politik":           "War & Politics",        # War & Politics
+    "kriminalitet":             "Crime",                 # Criminality (SV + DA/NO)
+    "västern":                  "Western",               # Western
+    "musik":                    "Music",                 # Music
+    "skräck":                   "Horror",                # Horror/Fright
+    "romantik":                 "Romance",               # Romance
+    # NOTE: "underhållning" (SV entertainment) mapping removed — kept raw.
+    "tävling":                  "Game Show",             # Competition/quiz → Game Show (an earlier change correction)
+    "biografi":                 "Biography",             # Biography (an earlier change: was mis-mapped to History)
+    # Danish / Norwegian
+    "virkelighed":              "Reality",               # Reality (Danish)
+    "børn":                     "Kids",                  # Children (Danish)
+    "sci-fi og fantasy":        "Sci-Fi & Fantasy",      # Sci-Fi & Fantasy (Danish)
+    "dokumentarni":             "Documentary",           # Documentary (Croatian/Bosnian, also Norwegian)
+    # Dutch
+    "mysterie":                 "Mystery",               # Mystery
+    "familie":                  "Family",                # Family
+    "animatie":                 "Animation",             # Animation
+    "misdaad (nordic)":         "Crime",                 # Crime (Nordic label)
+    "romantiek":                "Romance",               # Romance
+    "realiteit":                "Reality",               # Reality
+    "muziek":                   "Music",                 # Music
+    # Slovak
+    "kriminálny":               "Crime",                 # Criminal
+    "mysteriózny":              "Mystery",               # Mysterious
+    "akčný a dobrodružný":      "Action & Adventure",    # Action & Adventure
+    "vojnový a politický":      "War & Politics",        # War & Political
+    "animovaný":                "Animation",             # Animated
+    "rodinný":                  "Family",                # Family
+    "dráma":                    "Drama",                 # Drama (Slovak/Hungarian)
+    "komédia":                  "Comedy",                # Comedy (Slovak)
+    "sf & fantasy":             "Sci-Fi & Fantasy",      # Sci-Fi & Fantasy (Slovak short form)
+    # Croatian / Bosnian / Serbian (Latin)
+    "komedija":                 "Comedy",                # Comedy
+    "akcija i avantura":        "Action & Adventure",    # Action & Adventure
+    "rat i politika":           "War & Politics",        # War & Politics
+    "ratni":                    "War",                   # War (adjective)
+    "misterija":                "Mystery",               # Mystery
+    "horor":                    "Horror",                # Horror
+    "triler":                   "Thriller",              # Thriller
+    "porodica":                 "Family",                # Family
+    "porodični":                "Family",                # Family (adjective)
+    "kriminalistički":          "Crime",                 # Criminal
+    "romansa":                  "Romance",               # Romance
+    # Portuguese
+    "mistério":                 "Mystery",               # Mystery
+    "comédia":                  "Comedy",                # Comedy
+    "animação":                 "Animation",             # Animation
+    "família":                  "Family",                # Family
+    "documentário":             "Documentary",           # Documentary
+    "documentario":             "Documentary",           # Documentary (no accent)
+    "fantasia":                 "Fantasy",               # Fantasy
+    "fantastique":              "Fantasy",               # Fantasy (French)
+    # Greek
+    "δράμα":                    "Drama",                 # Drama
+    "μυστηρίου":                "Mystery",               # Mystery (genitive form)
+    "κωμωδία":                  "Comedy",                # Comedy
+    "κινούμενα σχέδια":         "Animation",             # Animation (lit. "moving designs")
+    "ντοκυμαντέρ":              "Documentary",           # Documentary
+    "οικογενειακή":             "Family",                # Family (feminine)
+    "αστυνομική":               "Crime",                 # Police/Detective
+    # Russian / Cyrillic
+    "драма":                    "Drama",                 # Drama
+    "комедия":                  "Comedy",                # Comedy
+    "детектив":                 "Crime",                 # Detective/Crime
+    "криминал":                 "Crime",                 # Criminal/Crime
+    "боевик и приключения":     "Action & Adventure",    # Action & Adventure
+    "нф и фэнтези":             "Sci-Fi & Fantasy",      # Sci-Fi & Fantasy
+    "семейный":                 "Family",                # Family
+    # Hebrew
+    "דרמה":                     "Drama",                 # Drama
+    "קומדיה":                   "Comedy",                # Comedy
+    "מדע בדיוני ופנטזיה":       "Sci-Fi & Fantasy",      # Sci-Fi & Fantasy
+    "מסתורין":                  "Mystery",               # Mystery
+    "פשע":                      "Crime",                 # Crime
+    "ילדים":                    "Kids",                  # Children/Kids
+    "אקשן והרפתקאות":           "Action & Adventure",    # Action & Adventure
+    "משפחה":                    "Family",                # Family
+    # Turkish
+    "aksiyon & macera":         "Action & Adventure",    # Action & Adventure
+    "bilim kurgu & fantazi":    "Sci-Fi & Fantasy",      # Sci-Fi & Fantasy
+    "suç":                      "Crime",                 # Crime
+    "gizem":                    "Mystery",               # Mystery
+    "aile":                     "Family",                # Family
+    "savaş & politik":          "War & Politics",        # War & Politics
+    "belgesel":                 "Documentary",           # Documentary
+    "animasyon":                "Animation",             # Animation
+    # Romanian
+    "dramă":                    "Drama",                 # Drama
+    "acţiune & aventuri":       "Action & Adventure",    # Action & Adventure
+    "animaţie":                 "Animation",             # Animation
+    "crimă":                    "Crime",                 # Crime
+    # Persian / Farsi (commonly mixed in with English labels by providers)
+    "درام":                     "Drama",                 # Drama (short form)
+    "جنایی":                    "Crime",                 # Criminal/Crime
+    "معمایی":                   "Mystery",               # Mystery
+    "پلیسی":                    "Crime",                 # Police/Detective
+    "خانوادگی":                 "Family",                # Family
+    "تاریخی":                   "History",               # Historical
+    "عاشقانه":                  "Romance",               # Romantic
+    # NOTE: Persian "اجتماعی" (social) mapping removed — concept-guess, kept raw.
+    "انیمیشن":                  "Animation",             # Animation
+    "ماورایی":                  "Fantasy",               # Supernatural/Fantasy
+    # Case-insensitive English variants (ALLCAPS from some providers)
+    "drama":                    "Drama",
+    "comedy":                   "Comedy",
+    "documentary":              "Documentary",
+    "crime":                    "Crime",
+    "animation":                "Animation",
+    "reality":                  "Reality",
+    "kids":                     "Kids",
+
+    # =====================================================================
+    # Genre consolidation an earlier change (confirmed).  129 chart folds
+    # + 6 corrections (above) + 10 new canonicals.  Auditable chart:
+    # the design notes — every fold row there is machine-verified against
+    # this table by tests/test_genre_mapping_parity.py (doc↔code cannot drift).
+    # Keys are lowercased (normalize_genre lowercases before lookup); Arabic
+    # presentation-form / other scripts are a .lower() no-op so their exact
+    # bytes are the key.  Stored tag values are canonical DISPLAY-name strings
+    # (the an earlier change/an earlier change convention); the chart's slugs are documented for future
+    # i18n but intentionally NOT implemented here.
+    # =====================================================================
+    # --- Drama ---
+    'dram':                           'Drama',
+    'deama':                          'Drama',
+    'drma':                           'Drama',
+    'drama series':                   'Drama',
+    'ﺓدراما':                         'Drama',
+    # --- Comedy ---
+    'humor':                          'Comedy',
+    # --- Crime ---
+    'ﺟﺮﻳﻤﺔ':                          'Crime',
+    'brottslighet':                   'Crime',
+    'kriminalistika':                 'Crime',
+    # --- Documentary ---
+    'docu':                           'Documentary',
+    'ducomantary':                    'Documentary',
+    'ducomentaire':                   'Documentary',
+    'documeantary':                   'Documentary',
+    'documemtary':                    'Documentary',
+    'document':                       'Documentary',
+    'documentaryk':                   'Documentary',
+    'ﻭﺛﺎﺋﻘﻲ':                         'Documentary',
+    'dokument':                       'Documentary',
+    'dokumentarno':                   'Documentary',
+    'documentarni':                   'Documentary',
+    'dokumentarna serija':            'Documentary',
+    'dokumentalizowany':              'Documentary',
+    'belgeseli':                      'Documentary',
+    # --- Sci-Fi & Fantasy ---
+    'naučna fantastika i fantazija':  'Sci-Fi & Fantasy',
+    'επ. φαντασία - φαντασίας':       'Sci-Fi & Fantasy',
+    # --- Mystery ---
+    'mystery':                        'Mystery',
+    # --- Thriller ---
+    'thrille':                        'Thriller',
+    'thriler':                        'Thriller',
+    'ﺗﺸﻮﻳﻖ':                          'Thriller',
+    'اثارة':                          'Thriller',
+    # --- Animation ---
+    'كرتون':                          'Animation',
+    'كارتون':                         'Animation',
+    'kreskówka':                      'Animation',
+    'cartone':                        'Animation',
+    # --- Romance ---
+    'rpmance':                        'Romance',
+    'liebesfilm':                     'Romance',
+    'ﺭﻭﻣﺎﻧﺴﻲ':                        'Romance',
+    'رومنسية':                        'Romance',
+    # --- Action ---
+    'actio':                          'Action',
+    'acción':                         'Action',
+    # --- Kids ---
+    'dla dzieci':                     'Kids',
+    # --- Family ---
+    'family':                         'Family',
+    'famely':                         'Family',
+    # --- Reality ---
+    'reality-tv':                     'Reality',
+    'realety':                        'Reality',
+    'reality show':                   'Reality',
+    'reality-show':                   'Reality',
+    'realityseries':                  'Reality',
+    'telereality':                    'Reality',
+    'gerçeklik':                      'Reality',
+    # --- Sports ---
+    'sportowy':                       'Sports',
+    # --- Adventure ---
+    'adventur':                       'Adventure',
+    # --- War & Politics ---
+    'krig och politik':               'War & Politics',
+    # --- Western ---
+    'faroeste':                       'Western',
+    # --- Science Fiction ---
+    'خيال علمي':                      'Science Fiction',
+    # --- Fantasy ---
+    'فانتازيا':                       'Fantasy',
+    'fantasía':                       'Fantasy',
+    'fantasi':                        'Fantasy',
+    # --- History ---
+    'histoey':                        'History',
+    'hostory':                        'History',
+    'تاريخ':                          'History',
+    'historie':                       'History',
+    'istorija':                       'History',
+    # --- Music ---
+    'موسيقي':                         'Music',
+    'piosenki':                       'Music',
+    'موسيقى':                         'Music',
+    # --- Soap Opera ---
+    'såpa':                           'Soap Opera',
+    'telenowela':                     'Soap Opera',
+    'telenovela':                     'Soap Opera',
+    'soap':                           'Soap Opera',
+    # --- format words, no genre (see the "tv program" note above) ---
+    'serial':                         '',
+    'mini serial':                    '',
+    'برنامج':                         '',
+    'برنامج تلفزيوني':                '',
+    'سریال':                          '',
+    'سريال':                          '',
+    'برامج تليفزيوني':                '',
+    'série-tv':                       '',
+    'serie-tv':                       '',
+    'برنامه':                         '',
+    # --- Talk Show ---
+    'talk-show':                      'Talk Show',
+    'tv talk show':                   'Talk Show',
+    'حوار':                           'Talk Show',
+    'تاک شو':                         'Talk Show',
+    # --- War ---
+    'krig':                           'War',
+    'ﺣﺮﺏ':                            'War',
+    # --- News ---
+    'أخبار':                          'News',
+    # --- Drama & Comedy ---
+    'دراما .كوميديا':                 'Drama & Comedy',
+    'دراما كوميديا':                  'Drama & Comedy',
+    'دراما كوميدي':                   'Drama & Comedy',
+    'كوميدي ﺩﺭاﻣﺎ':                   'Drama & Comedy',
+    'ﻛﻮﻣﻴﺪﻱ ﺩﺭاﻣﺎ':                   'Drama & Comedy',
+    # --- Politics ---
+    'politik':                        'Politics',
+    'polityczny':                     'Politics',
+    'politicki':                      'Politics',
+    # --- Biography ---
+    'biography':                      'Biography',
+    'ﺳﻴﺮﺓ ﺫاﺗﻴﺔ':                     'Biography',
+    'biograficzny':                   'Biography',
+    'سيرة ذاتية':                     'Biography',
+    'سيرة':                           'Biography',
+    'biografija':                     'Biography',
+    # --- Game Show ---
+    'game show':                      'Game Show',
+    'gameshow':                       'Game Show',
+    'game-show':                      'Game Show',
+    'teleturniej':                    'Game Show',
+    # --- Drama & Romance ---
+    'drama - romance':                'Drama & Romance',
+    'drama romance':                  'Drama & Romance',
+    'دراما ﺭﻭﻣﺎﻧﺴﻲ':                  'Drama & Romance',
+    'romance drama':                  'Drama & Romance',
+    'ﺭﻭﻣﺎﻧﺴﻲ .دراما':                 'Drama & Romance',
+    # --- Drama & Crime ---
+    'crime. drama':                   'Drama & Crime',
+    'brottsdrama':                    'Drama & Crime',
+    'kriminalistička drama':          'Drama & Crime',
+    # --- Anime ---
+    'amine':                          'Anime',
+    'إنمي':                           'Anime',
+    # --- Adult ---
+    'adult':                          'Adult',
+    # --- Music Show ---
+    'music show':                     'Music Show',
+    # --- TV Movie ---
+    'tv movie':                       'TV Movie',
+    # --- W-1 audit: genuinely missing values found sweeping a user's 672
+    # real movie categories (not case variants — the lookup fix above already
+    # covers those, e.g. bare "anime"/"ANIME" via the existing 'amine' entry) ---
+    'sci-fi & fantasy':               'Sci-Fi & Fantasy',
+    'sci-fi and fantasy':             'Sci-Fi & Fantasy',   # |EN|/|ALB| SCI-FI AND FANTASY
+    'sci-fi und fantasie':            'Sci-Fi & Fantasy',   # |DE| SCI-FI UND FANTASIE
+    'sci-fi e fantasia':              'Sci-Fi & Fantasy',   # |IT| SCI-FI E FANTASIA
+    'documentales':                   'Documentary',        # |ES| DOCUMENTALES (Spanish plural)
+    'documentari':                    'Documentary',        # |IT| Italian plural
+    'drammi':                         'Drama',               # |IT| Italian plural
+    'drammatico':                     'Drama',               # |IT| Italian adjective
+    'romantici':                      'Romance',             # |IT| Italian plural adjective
+    'comedies':                       'Comedy',              # English plural
+    'comedias':                       'Comedy',              # Spanish/Portuguese plural
+    'animes':                         'Anime',               # English/French plural
+    'westerns':                       'Western',             # English plural
+    'aksiyon':                        'Action',              # |TR| Turkish
+    # New canonical (not a fold into an existing genre — same convention as
+    # 'Game Show'/'Talk Show'/'TV Movie', each its own bucket, not folded).
+    'stand-up comedy':                'Stand-Up Comedy',
+    'stand-up':                       'Stand-Up Comedy',     # |AR| STAND-UP / مسرحيات
+}
+
+
+def normalize_genre(genre: str) -> str:
+    """Return the canonical English genre label for a raw genre string.
+
+    Applies the :data:`_GENRE_NORM` lookup a genre clicked in the details
+    pane goes through. HTML entities are unescaped first so provider strings
+    like ``"Action &amp; Adventure"`` and ``"Action & Adventure"`` both
+    resolve to the same canonical label (bug A — duplicate shelves).
+    """
+    unescaped = html.unescape(genre)
+    return _GENRE_NORM.get(unescaped.lower(), unescaped)
+
+
+# Splits comma- or slash-delimited raw provider genre strings into individual
+# segments (e.g. "Action & Adventure / Sci-Fi" → two segments). Read by
+# ``genres_from_raw`` below.
+_GENRE_SEG_SEP_RE = re.compile(r"[/,]")
+
+# Bogus sentinel values some providers store literally in raw_data["genre"]
+# (e.g. a client-side "null"/"undefined" that leaked into the API response).
+# Filtered at ingestion so they never enter detected_genres — get_all_genres
+# used to filter these at query time; moved here per "compute once at
+# ingestion, read everywhere else".
+_BAD_GENRE_TOKENS = frozenset({"null", "undefined", "none"})
+
+
+def genres_from_raw(genre_str: str | None) -> list[str]:
+    """Split a raw provider genre string into ordered, de-duplicated canonical labels.
+
+    Splits on ``/`` and ``,`` (provider compound-genre delimiters), canonicalises
+    each segment via :func:`normalize_genre` (cross-language alias collapse +
+    HTML-entity unescape), drops bogus sentinel tokens (``"null"``,
+    ``"undefined"``, ``"none"``), and de-duplicates while preserving
+    first-seen order.
+
+    This is the **ingestion-time** derivation — the single source of truth
+    ``ChannelDB.detected_genre``/``detected_genres`` are computed from (see
+    ``update_detected_prefixes()`` in ``core/repositories/channel.py``).  Query
+    and render code must read those stored fields, never call this at runtime
+    (the project rules "compute once at ingestion, read everywhere else").
+
+    Args:
+        genre_str: The raw ``raw_data["genre"]`` string, or None/empty.
+
+    Returns:
+        An ordered list of canonical genre labels, e.g.
+        ``genres_from_raw("Action &amp; Adventure / Sci-Fi")`` →
+        ``["Action & Adventure", "Science Fiction"]``. Empty list when *genre_str*
+        carries no usable genre.
+    """
+    if not genre_str or not genre_str.strip():
+        return []
+    from streamselect.core.genre_words import resolve_genres as _resolve_genres
+    seen, out = set(), []
+    for seg in _GENRE_SEG_SEP_RE.split(genre_str):
+        seg = seg.strip()
+        if not seg or seg.lower() in _BAD_GENRE_TOKENS:
+            continue
+        for canon in _resolve_genres(seg):
+            if canon not in seen:
+                seen.add(canon)
+                out.append(canon)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Compound-token splitter (moved here from tag_decomposer.py, GENRE-1) — the
+# ONE tokenizer for a compound provider-category/header string like
+# "USA | NETFLIX | HD", "FR ★ MOVIES", "### WOW SPORT ###", "DE - ENTERTAINMENT".
+# Lives here (not tag_decomposer.py) so genres_from_category() below can reuse
+# it without a reverse import — tag_decomposer already imports
+# DEFAULT_PREFIX_SEPARATORS/categorize_prefix/normalize_genre/recognized_genre
+# from this module, never the other way around. tag_decomposer.py imports
+# _split_compound from here for its own (region/language/platform/quality)
+# compound classification pass.
+# ---------------------------------------------------------------------------
+
+# Splitters beyond DEFAULT_PREFIX_SEPARATORS that appear in provider category/
+# header strings but not in name-prefix strings (bare, no surrounding spaces).
+_EXTRA_SEPS: list[str] = ["|", "★", ":", " - "]
+
+# Ordered split list: longer/more-specific first (same policy as extract_prefix).
+_COMPOUND_SEPS: list[str] = sorted(
+    set(DEFAULT_PREFIX_SEPARATORS) | set(_EXTRA_SEPS),
+    key=len,
+    reverse=True,
+)
+
+
+def _split_compound(text: str) -> list[str]:
+    """Split a compound token string on known separators.
+
+    Uses the same ordered separator list ``extract_prefix`` uses (plus a few
+    header-only extras) so that longer/more-specific patterns win over shorter
+    ones.
+
+    Returns a list of non-empty, stripped tokens.
+    """
+    # Replace each separator with a canonical null byte, then split.
+    result = text
+    for sep in _COMPOUND_SEPS:
+        result = result.replace(sep, "\x00")
+    parts = [p.strip() for p in result.split("\x00")]
+    return [p for p in parts if p]
+
+
+def genres_from_category(category: str) -> list[str]:
+    """Cross-walk a provider CATEGORY string into canonical genre labels.
+
+    The Xtream VOD/movie payload carries no ``raw_data["genre"]`` key at all —
+    only the series payload does (see :func:`genres_from_raw` above) — so a
+    movie's genre lives entirely in its provider category instead, e.g.
+    ``"|EN| HORROR/THRILLER"``, ``"|PL| HORROR/THRILLER"``,
+    ``"|FR| HORREUR/EPOUVANTE"``. This is the ingestion-time fallback for that
+    case (GENRE-1, #genre-perf follow-up): strip ``##…##``/``#`` header
+    decoration, split on the same compound separators
+    ``tag_decomposer._decompose_compound`` uses for provider-category tokens
+    (:func:`_split_compound` above — reused, not re-derived: a naive
+    single-level ``re.split`` under-recovers real categories, e.g. losing
+    "Documentary" out of ``"|EN| 4K DOCUMENTARY/MUSIC/ STAND-UP"`` because the
+    quality/language prefix never gets separated from it first), then applies
+    the same strict :func:`recognized_genre` allowlist to each ``/``/``,``
+    -delimited leaf of every token that :func:`genres_from_raw` applies to a
+    raw genre string's segments.
+
+    Unlike :func:`genres_from_raw` (a source-DENOTED field) and unlike
+    ``tag_decomposer``'s own provider_category cross-walk, this takes no
+    ``Config`` and does not classify out region/language/platform/quality
+    tokens first — it is a coarse, best-effort, ADDITIVE guess (DR-0006
+    "capture generously"), which is why ingestion only calls it as a fallback
+    when ``genres_from_raw`` found nothing. ``tag_decomposer`` calls this same
+    helper per already-classified residual token so its own (narrower) scope
+    is unchanged — one helper, two callers, two different inputs.
+
+    Args:
+        category: The raw ``ChannelDB.category`` string, or None/empty.
+
+    Returns:
+        Ordered, de-duplicated canonical genre labels, e.g.
+        ``genres_from_category("|EN| HORROR/THRILLER")`` →
+        ``["Horror", "Thriller"]``. Empty list when *category* denotes no
+        recognizable genre (e.g. ``"NETFLIX MOVIES"``, ``"4K MOVIES"``).
+    """
+    if not category or not category.strip():
+        return []
+    cleaned = re.sub(r"^#+\s*|\s*#+$", "", category).strip()
+    if not cleaned:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in _split_compound(cleaned):
+        for leaf in _GENRE_SEG_SEP_RE.split(tok):
+            leaf = leaf.strip()
+            if not leaf:
+                continue
+            canon = recognized_genre(leaf)
+            if canon and canon not in seen:
+                seen.add(canon)
+                out.append(canon)
+    return out
+
+
+# The canonical genre vocabulary — the set of all values produced by
+# ``normalize_genre``.  Used as a **strict allowlist** for the category→genre
+# cross-walk: a token is only emitted as a genre tag when it normalizes to one
+# of these known values.  This prevents junk provider labels like
+# "NETFLIX MOVIES" or "TOP IMDB" from leaking into the genre namespace.
+KNOWN_GENRES: frozenset[str] = frozenset(v for v in _GENRE_NORM.values() if v)
+
+# W-1: case-insensitive membership for recognized_genre()'s secondary check —
+# a value that IS canonical but reaches that check in a different casing
+# ("ANIME", canonical "Anime") must still resolve; a case-SENSITIVE
+# `in KNOWN_GENRES` only worked when a value's casing happened to already
+# match its own canonical form (e.g. lowercase "horror", a literal dict key).
+_KNOWN_GENRES_LOWER: dict[str, str] = {g.lower(): g for g in KNOWN_GENRES}
+
+
+def recognized_genre(s: str) -> str | None:
+    """Return the canonical genre if *s* is a recognized genre string, else None.
+
+    Unlike :func:`normalize_genre`, which passes through unknown strings
+    unchanged, this function returns ``None`` for any input that does NOT
+    resolve to a known canonical genre.  Use this as the **strict** predicate
+    for the category→genre cross-walk, where the input is a raw provider
+    category token and many tokens are NOT genres.
+
+    Args:
+        s: A raw string to test (e.g. a provider category segment like
+           ``"ACTION"`` or ``"THRILLER"`` or ``"NETFLIX MOVIES"``).
+
+    Returns:
+        The canonical genre string (e.g. ``"Action"``, ``"Drama"``) if *s* is
+        a recognized genre, or ``None`` if it is not.
+
+    Examples::
+
+        recognized_genre("action")          → "Action"
+        recognized_genre("drame")           → "Drama"
+        recognized_genre("KOMEDIE")         → "Comedy"
+        recognized_genre("DRAMAT")          → "Drama"
+        recognized_genre("NETFLIX MOVIES")  → None
+        recognized_genre("TOP IMDB")        → None
+        recognized_genre("")                → None
+    """
+    if not s or not s.strip():
+        return None
+    # Primary lookup: s.lower() is a key in _GENRE_NORM.
+    lowered = s.strip().lower()
+    canon = _GENRE_NORM.get(lowered)
+    if canon is not None:
+        return canon or None          # "" = a format word, not a genre
+    # Secondary: normalize_genre pass-through — if the result is itself a known
+    # canonical value (e.g. "Action" → "Action"), accept it.
+    unescaped = html.unescape(s.strip())
+    result = _GENRE_NORM.get(unescaped.lower(), unescaped)
+    return _KNOWN_GENRES_LOWER.get(result.lower())
+
+
+# ---------------------------------------------------------------------------
+# Facet INCLUDE criterion — the filter panel's "which values do I want?" axis
+# ---------------------------------------------------------------------------
+
+def facet_include_criterion(facet: str, allowed, channel_key_col=None, *,
+                            allow_untagged: bool = True):
+    """"Show values I ticked, AND anything this facet cannot describe."
+
+    A facet filter answers *which values of this facet do I want to see?* A
+    channel carrying no tag of that type has not made a claim on that facet at
+    all, so excluding it answers a question it never asked. This criterion is
+    therefore::
+
+        (has a tag of this type whose value is allowed)
+        OR
+        (has no tag of this type at all)
+
+    Why this is not merely a preference
+    -----------------------------------
+    It used to be the first half alone — a bare ``EXISTS(matching tag)`` — which
+    made absence indistinguishable from a wrong value. Because the tag corpus is
+    SPARSE by design (the decomposer captures what a feeder actually denotes and
+    guesses nothing), that turned every partially-ticked section into a
+    library-wide cull. Measured against a real many-channel library, switching
+    ONE facet on left:
+
+        dub 12 · subtitle many · format many · category many ·
+        quality many · platform many · genre many
+
+    So unticking a single subtitle language did not remove that language — it
+    removed the 99.6% of the library that was never tagged for subtitles at all.
+    That directly contradicts the tags rule ("confidence is ranking/prune-
+    priority, NEVER a suppression gate") and the mirror-not-cage tenet: a missing
+    guess was acting as a hard exclusion. A user's call, an earlier change: "being more
+    inclusive is the correct behavior — if EVERY filter is selected then
+    EVERYTHING should be included, and having results excluded because the
+    available filters are insufficient to represent them is the issue."
+
+    A ticked-off VALUE is still excluded, and exactly as strictly as before —
+    this only changes what happens to content the vocabulary cannot describe.
+    The details-pane context chip stays strict on purpose (it means "show me
+    only this"), and so does ``tag_excludes``.
+
+    Args:
+        facet: The ``TagDB.type`` to constrain (``"subtitle"``, ``"genre"``, …).
+        allowed: The values the user ticked. Empty/None => no constraint at all.
+        channel_key_col: Column to correlate against; defaults to
+            ``ChannelDB.channel_key`` (DB-9).
+        allow_untagged: The section's "Untagged" footer toggle. ``True``
+            (default, and what the checkbox ships checked as) is the rule
+            described above. ``False`` restores the strict form — the user has
+            explicitly asked to see only titles this facet can describe, which
+            is a deliberate choice rather than a side effect of narrowing.
+
+    Returns:
+        A SQLAlchemy criterion, or ``true()`` when *allowed* is empty.
+    """
+    from sqlalchemy import exists, or_, select, true
+    from sqlalchemy.orm import aliased
+    from streamselect.core.database import ChannelDB, ContentTagDB, TagDB
+
+    if not allowed:
+        return true()
+    if facet == "region":
+        from streamselect.core.region_codes import code_family  # one row per country: IL+ISR
+        allowed = code_family(allowed)
+    if channel_key_col is None:
+        channel_key_col = ChannelDB.channel_key
+
+    def _subq(with_values: bool):
+        ct = aliased(ContentTagDB, flat=True)
+        t = aliased(TagDB, flat=True)
+        where = [ct.channel_key == channel_key_col, t.type == facet]
+        if with_values:
+            where.append(t.value.in_(list(allowed)))
+        return (
+            select(ct.channel_key)
+            .join(t, t.id == ct.tag_id)
+            .where(*where)
+            .correlate_except(ct, t)
+        )
+
+    if not allow_untagged:
+        return exists(_subq(True))
+    # "matches something I ticked" OR "this facet says nothing about it"
+    return or_(exists(_subq(True)), ~exists(_subq(False)))

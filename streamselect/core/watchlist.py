@@ -1,0 +1,621 @@
+"""The one place that answers "what is on the watch list".
+
+Twenty-four sites across nine modules read ``config.epg_watchlist_patterns``
+directly, each re-deciding the same small questions: is ``None`` the same as
+empty (some wrote ``or []``, some did not), does matching lowercase (three did,
+six did not), does adding de-duplicate (four checked, one did not). That is the
+shape a chokepoint exists to end — and it is also what makes the storage
+question tractable, because the *store* is one line behind this seam rather
+than twenty-four call sites.
+
+Module-level functions taking a ``Config`` rather than an injected object:
+every one of those nine modules already holds ``self.config``, so this needs no
+plumbing to adopt. When the backing store moves to the database, only the
+bodies here change.
+
+**A rule is one stored list rendered on two surfaces** — Watch Alerts and the
+EPG watchlist — never two lists (settled design, ROADMAP). This module is that
+list.
+
+Writes never run on the calling thread
+--------------------------------------
+Six click handlers across four modules call :func:`add` and :func:`remove` —
+the EPG watch-list panel, the details pane's watch toggle, the agenda widget
+and the main window. Every one of them ran a DELETE or an INSERT **on the UI
+thread**, and SQLite has one writer with a 30 s ``busy_timeout``: while the
+``sports_reclassify`` migration held the lock, ``_db_remove`` blocked for the
+full timeout and the whole app froze. a user's watchdog logged the stalls at
+29.8 s, 29.9 s and 31.6 s, and then the click did nothing at all, because the
+old ``_db_remove`` logged the failure and returned ``False`` — the user pressed
+Remove and the rule stayed.
+
+So the write is queued to a single-worker pool and the call returns at once.
+The three things that makes work:
+
+* ``max_workers=1`` — watch-list writes serialise against each other, so an add
+  followed by a remove of the same pattern cannot land in the wrong order, and
+  the subsystem never contends with itself (the same rule ``EpgManager`` follows
+  for its fetches).
+* A queued write sits in ``_pending`` until the database confirms it, and every
+  read replays ``_pending`` over the stored rows. The answer :func:`add`,
+  :func:`remove` and :func:`contains` give is therefore the same before and
+  after the write lands — a caller cannot see the gap.
+* When a write FAILS, the entry leaves ``_pending`` (so the next read shows the
+  truth, not the optimistic guess) and the handler installed by
+  :func:`set_write_error_handler` is called with the real cause. The GUI's
+  handler — ``gui/watchlist_write_notifier.py`` — turns that into an error
+  toast. Silence is what this replaces.
+
+``core/`` has no UI dependency, so the handler is a plain callable and it is
+invoked **on the writer thread**: a Qt handler must marshal to the main thread
+itself, which is exactly what the notifier's private signal does.
+"""
+
+from __future__ import annotations
+
+import threading
+from concurrent.futures import Future
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Callable, Optional
+
+from loguru import logger
+
+from streamselect.core.db_lock import retry_on_lock
+from streamselect.core.queued_writer import SingleWriter
+
+if TYPE_CHECKING:                                    # pragma: no cover
+    from streamselect.core.config import Config
+    from streamselect.core.watchlist_matching import WatchRule
+    from streamselect.core.database import Database
+
+
+#: The database the list lives in, bound once at startup by ``bind()``.
+#:
+#: A module-level binding rather than a parameter, because the twenty-four call
+#: sites hold a ``Config`` and not all of them can reach a ``Database`` — adding
+#: one to each is the plumbing this seam exists to avoid. Unbound (tests, any
+#: headless path) the functions fall back to config, so nothing here can make a
+#: caller fail for want of a database.
+_db: "Optional[Database]" = None
+
+#: Gap between retries of a locked watch-list write. Deliberately shorter than
+#: the bulk-writer default: each attempt already spends its own wait inside
+#: ``busy_timeout``, and the person who clicked Remove is watching the row.
+_LOCK_RETRY_DELAY_S = 0.5
+
+_OP_ADD = "add"
+_OP_REMOVE = "remove"
+_OP_UPDATE = "update"
+
+#: How long :func:`flush` waits for queued writes. Generous against the 30 s
+#: ``busy_timeout`` would mean a 30 s app close, and a watch rule is not worth
+#: that; a lost write is logged and surfaced like any other failure.
+_FLUSH_TIMEOUT = 5.0
+
+
+@dataclass(eq=False)
+class _PendingWrite:
+    """One queued mutation. ``eq=False`` so removal from ``_pending`` is by
+    identity — two adds of the same text are two entries, not one."""
+
+    op: str
+    text: str
+    future: "Optional[Future]" = field(default=None)
+    #: For ``_OP_UPDATE`` only: the rule columns to set. Empty for add/remove.
+    fields: dict = field(default_factory=dict)
+
+
+#: This module's own bookkeeping for replay-on-read (:func:`_apply_pending`,
+#: :func:`_pending_rule_fields`) — the reason watchlist cannot just BE a
+#: ``SingleWriter``. The pool/queue/flush/shutdown mechanics underneath are
+#: shared with ``core/profile_store.py`` and live in ``core/queued_writer.py``.
+_pending: list[_PendingWrite] = []
+_lock = threading.Lock()
+_write_error_handler: "Optional[Callable[[str, str, str], None]]" = None
+_writer = SingleWriter(thread_name_prefix="watchlist-write", label="watchlist",
+                        default_timeout=_FLUSH_TIMEOUT)
+
+
+def set_write_error_handler(
+    handler: "Optional[Callable[[str, str, str], None]]",
+) -> None:
+    """Install the callback invoked when a queued write fails.
+
+    Args:
+        handler: Called as ``handler(op, pattern, message)`` where ``op`` is
+            ``"add"`` or ``"remove"``. **Called on the writer thread** — a Qt
+            handler must marshal to the main thread itself. ``None`` clears it.
+    """
+    global _write_error_handler
+    _write_error_handler = handler
+
+
+def flush(timeout: float = _FLUSH_TIMEOUT) -> bool:
+    """Wait for queued writes to reach the database.
+
+    Args:
+        timeout: Seconds to wait.
+
+    Returns:
+        True when the queue drained inside *timeout*.
+    """
+    return _writer.flush(timeout)
+
+
+def shutdown(timeout: float = _FLUSH_TIMEOUT) -> None:
+    """Drain queued writes, bounded, and stop the writer thread.
+
+    Registered on ``MainWindow``'s cleanup registry, so it runs before
+    ``closeEvent`` closes the database underneath a queued write.
+    """
+    _writer.shutdown(timeout)
+
+
+def bind(db: "Optional[Database]") -> None:
+    """Point the watch list at *db*, migrating the config list on first bind.
+
+    Idempotent: binding twice does not duplicate rows, because the migration
+    only writes patterns the table does not already hold. Any write still
+    queued against the PREVIOUS database is drained first — it belongs to that
+    one.
+    """
+    global _db
+    flush()
+    _db = db
+
+
+def unbind() -> None:
+    """Detach from the database — used by tests to force the config path."""
+    global _db
+    shutdown()
+    _db = None
+
+
+def migrate_from_config(config: "Config") -> int:
+    """Copy any config-only patterns into the database. Returns how many moved.
+
+    **The config list is left in place, deliberately.** These are a user's
+    real alerts; a migration that deletes its own source has no way back if the
+    destination turns out wrong, and the YAML doubles as the plain-text export
+    the roadmap wants anyway. Nothing reads it once the database is bound, so
+    it cannot drift into a second source of truth.
+    """
+    if _db is None:
+        return 0
+    stored = _config_patterns(config)
+    if not stored:
+        return 0
+    existing = {p.casefold() for p in _db_patterns()}
+    added = 0
+    for text in stored:
+        if text.casefold() in existing:
+            continue
+        # Synchronous on purpose: this runs once at startup, before any window
+        # is on screen, and the count it returns has to be true. A failure here
+        # must not stop the app launching.
+        try:
+            _db_add(text)
+        except Exception:
+            logger.exception("watchlist: could not migrate {!r} to the database", text)
+            continue
+        added += 1
+    if added:
+        logger.info("watchlist: migrated {} pattern(s) from config to the database", added)
+    return added
+
+
+#: ``AlertPatternDB.pattern_type`` for a watch-list keyword. The table also
+#: serves the Watch Alerts surface, and the settled design is ONE list on two
+#: surfaces — so this discriminates rows by kind, not by which view wrote them.
+PATTERN_TYPE = "keyword"
+
+
+def patterns(config: "Config") -> tuple[str, ...]:
+    """Every watch pattern, in the user's own order.
+
+    Order is the user's, not sorted: they add rules in the order they think of
+    them and the list is short enough to scan.
+
+    Returns:
+        A tuple, so a caller cannot mutate the stored list by accident — which
+        is exactly how ``config.epg_watchlist_patterns.append(...)`` used to
+        write through to config without saving it.
+    """
+    if _db is not None:
+        # Snapshot the queue BEFORE reading the rows. Read after, a write that
+        # commits in between is in neither — the rows predate it and the queue
+        # has dropped it — so a removed rule reappeared for one read (an earlier change's
+        # macOS CI). Replaying a write the rows already hold is a no-op.
+        queued = _pending_snapshot()
+        stored = _apply_pending(_db_patterns(), queued)
+    else:
+        stored = _config_patterns(config)
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in stored:
+        text = (raw or "").strip() if isinstance(raw, str) else ""
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+    return tuple(out)
+
+
+def rules(config: "Config") -> "tuple[WatchRule, ...]":
+    """Every watch pattern as a matchable rule, in the user's own order.
+
+    The rule is what both surfaces are supposed to share (Q4: "one list, two
+    surfaces"), so this — not :func:`patterns` — is what a matching caller
+    wants. :func:`patterns` stays for display and for the write paths.
+
+    Built on top of :func:`patterns` rather than beside it, so ordering,
+    blank-stripping, casefolded de-duplication and the pending-write overlay
+    keep exactly one definition; this only attaches the stored per-rule flags.
+
+    A term with no stored row — one still queued for insert, or a config-only
+    fallback list — gets the settled default: whole-word, no excludes.
+    """
+    from streamselect.core.watchlist_matching import WatchRule
+
+    pending_fields = _pending_rule_fields()   # before the read — see patterns()
+    flags = _db_rule_flags() if _db is not None else {}
+    for key, queued in pending_fields.items():
+        flags.setdefault(key, {}).update(queued)
+    return tuple(WatchRule(term=term, **flags.get(term.casefold(), {}))
+                 for term in patterns(config))
+
+
+def _db_rule_flags() -> "dict[str, dict]":
+    """casefolded term -> the stored rule fields, as WatchRule kwargs.
+
+    Every field reads NULL as the settled default: a row written by an older
+    build has no opinion, and the default is the one to apply. The migration
+    stamps those rows anyway — this is the belt to its braces, and it is what
+    makes the reader safe against a database read mid-upgrade.
+
+    Errors return an EMPTY map rather than raising, matching ``_db_patterns``:
+    a flag read that fails should fall back to default behaviour, not take down
+    the EPG view that asked for it.
+    """
+    from streamselect.core.database import AlertPatternDB
+    from streamselect.core.watchlist_matching import ACTIONS, MATCH_MODES, NOTIFY, PHRASE
+    try:
+        with _db.session_scope(commit=False) as session:
+            rows = (session.query(AlertPatternDB.pattern_value,
+                                  AlertPatternDB.whole_word,
+                                  AlertPatternDB.exclude_terms,
+                                  AlertPatternDB.match_mode,
+                                  AlertPatternDB.search_description,
+                                  AlertPatternDB.live_only,
+                                  AlertPatternDB.action)
+                    .filter(AlertPatternDB.pattern_type == PATTERN_TYPE)
+                    .all())
+        out: dict[str, dict] = {}
+        for value, whole_word, excludes, mode, desc, live, action in rows:
+            if not value:
+                continue
+            out[value.casefold()] = {
+                "whole_word": True if whole_word is None else bool(whole_word),
+                "exclude": tuple(str(x).strip() for x in (excludes or [])
+                                 if str(x).strip()),
+                # An unrecognised stored value falls back to the default rather
+                # than reaching the matcher: a typo in the column should not be
+                # able to change what a rule matches.
+                "match_mode": mode if mode in MATCH_MODES else PHRASE,
+                "search_description": bool(desc),
+                "live_only": bool(live),
+                "action": action if action in ACTIONS else NOTIFY,
+            }
+        return out
+    except Exception:
+        logger.exception("watchlist: could not read rule flags from the database")
+        return {}
+
+
+def lowered(config: "Config") -> tuple[str, ...]:
+    """The patterns, casefolded, for matching.
+
+    ``casefold`` rather than ``lower``: matching is what this is for, and the
+    watch list holds names like "Guten Morgen Österreich".
+    """
+    return tuple(p.casefold() for p in patterns(config))
+
+
+def count(config: "Config") -> int:
+    """How many patterns are watched — for a count badge or an empty state."""
+    return len(patterns(config))
+
+
+def contains(config: "Config", pattern: str) -> bool:
+    """Whether *pattern* is already watched, compared case-insensitively.
+
+    The direct-config sites used ``pattern not in config.epg_watchlist_patterns``,
+    which is case-SENSITIVE — so "NRL" and "nrl" were two rules that matched the
+    same programmes.
+    """
+    return (pattern or "").strip().casefold() in {p.casefold() for p in patterns(config)}
+
+
+def add(config: "Config", pattern: str) -> bool:
+    """Add *pattern*. Returns True when it was accepted.
+
+    On the database store the row is written by the writer thread and this
+    returns as soon as the change is queued — see the module note. Every read
+    replays the queue, so the pattern is on the list the instant this returns.
+
+    Blank and duplicate entries are no-ops rather than errors — the caller is
+    usually a text field with an Add button.
+    """
+    text = (pattern or "").strip()
+    if not text or contains(config, text):
+        return False
+    if _db is not None:
+        return _queue(_OP_ADD, text)
+    config.epg_watchlist_patterns = list(patterns(config)) + [text]
+    config.save()
+    return True
+
+
+#: Rule kwarg -> ``AlertPatternDB`` column. The public API speaks WatchRule's
+#: vocabulary so a caller never has to know the column names; ``exclude`` is
+#: the one that differs, and this table is the only place that knows it.
+_RULE_COLUMNS = {
+    "whole_word": "whole_word",
+    "exclude": "exclude_terms",
+    "match_mode": "match_mode",
+    "search_description": "search_description",
+    "live_only": "live_only",
+    "action": "action",
+}
+
+
+def update(config: "Config", pattern: str, **fields) -> bool:
+    """Change one rule's matching fields. Returns True when it was accepted.
+
+    Queued like :func:`add` and :func:`remove`, and for the same reason — this
+    is called straight from a widget signal. :func:`rules` replays the queue,
+    so a re-read right after this returns already shows the new values.
+
+    Only the DATABASE store carries rule fields. On the config fallback there
+    is nowhere to put them, so this reports False rather than pretending: a
+    caller that silently dropped the edit would be worse than one that can see
+    it did not take.
+    """
+    text = (pattern or "").strip()
+    if not text or not fields:
+        return False
+    unknown = set(fields) - set(_RULE_COLUMNS)
+    if unknown:
+        raise ValueError(f"not watch-rule fields: {sorted(unknown)}")
+    if _db is None:
+        logger.warning(
+            "watchlist: rule fields need the database store; {!r} not updated", text)
+        return False
+    return _queue(_OP_UPDATE, text, fields)
+
+
+def _pending_rule_fields() -> "dict[str, dict]":
+    """casefolded term -> queued field changes, newest last."""
+    with _lock:
+        queued = [w for w in _pending if w.op == _OP_UPDATE]
+    out: dict[str, dict] = {}
+    for write in queued:
+        out.setdefault((write.text or "").casefold(), {}).update(write.fields)
+    return out
+
+
+def _db_update(target_casefold: str, fields: dict) -> None:
+    """Apply field changes to every row matching *target_casefold*. RAISES."""
+    from streamselect.core.database import AlertPatternDB
+    # DB-10: only ever called (via _apply_write) from _run_write, which runs
+    # on the watchlist-write pool thread — never the UI thread (see
+    # _run_write's own docstring).
+    with _db.session_scope(background=True) as session:
+        rows = (session.query(AlertPatternDB)
+                .filter(AlertPatternDB.pattern_type == PATTERN_TYPE).all())
+        for row in rows:
+            if (row.pattern_value or "").casefold() != target_casefold:
+                continue
+            for key, value in fields.items():
+                setattr(row, _RULE_COLUMNS[key],
+                        list(value) if key == "exclude" else value)
+
+
+def remove(config: "Config", pattern: str) -> bool:
+    """Remove *pattern* (case-insensitively). Returns True when it was accepted.
+
+    Queued rather than written inline on the database store, for the reason in
+    the module note: this is called straight from a button handler, and the
+    DELETE it used to run there blocked the UI thread for the full 30 s
+    ``busy_timeout`` whenever a bulk pass held the write lock.
+
+    Returns:
+        True when something was removed. False is not an error: the row may
+        already be gone from another surface showing the same list.
+    """
+    text = (pattern or "").strip()
+    target = text.casefold()
+    if not target:
+        return False
+    if _db is not None:
+        if target not in {p.casefold() for p in patterns(config)}:
+            return False
+        return _queue(_OP_REMOVE, text)
+    kept = [p for p in patterns(config) if p.casefold() != target]
+    if len(kept) == len(patterns(config)):
+        return False
+    config.epg_watchlist_patterns = kept
+    config.save()
+    return True
+
+
+# ── the write queue ──────────────────────────────────────────────────────────
+
+def _pending_snapshot() -> "list[_PendingWrite]":
+    """The queued writes right now — taken before the rows are read."""
+    with _lock:
+        return list(_pending)
+
+
+def _apply_pending(stored: list, queued: "list[_PendingWrite]") -> list:
+    """Replay queued writes over *stored* so a read never shows a stale answer.
+
+    Args:
+        stored: The rows the database held when read.
+        queued: :func:`_pending_snapshot`, taken BEFORE *stored* was read, so
+            every write the rows might be missing is in it. A write the rows
+            already include replays as a no-op (add-if-absent,
+            remove-if-present), which is what makes the early snapshot safe.
+
+    Returns:
+        What the list looks like once every queued write has landed.
+    """
+    if not queued:
+        return stored
+    out = list(stored)
+    for write in queued:
+        if write.op == _OP_UPDATE:
+            continue  # changes a rule's fields, never its membership
+        key = (write.text or "").casefold()
+        matches = [s for s in out if isinstance(s, str) and s.casefold() == key]
+        if write.op == _OP_REMOVE:
+            out = [s for s in out if s not in matches]
+        elif not matches:
+            out.append(write.text)
+    return out
+
+
+def _queue(op: str, text: str, fields: "Optional[dict]" = None) -> bool:
+    """Hand one mutation to the writer thread. Returns True when it was queued."""
+    write = _PendingWrite(op=op, text=text, fields=dict(fields or {}))
+    with _lock:
+        _pending.append(write)
+        try:
+            write.future = _writer.submit(_run_write, write)
+        except Exception:
+            _pending.remove(write)
+            logger.exception("watchlist: could not queue {} of {!r}", op, text)
+            return False
+    return True
+
+
+def _apply_write(write: _PendingWrite) -> None:
+    """The mutation itself — one ``session_scope``, safe to re-run from scratch."""
+    if write.op == _OP_ADD:
+        _db_add(write.text)
+    elif write.op == _OP_UPDATE:
+        _db_update(write.text.casefold(), write.fields)
+    else:
+        _db_remove(write.text.casefold())
+
+
+def _run_write(write: _PendingWrite) -> None:
+    """Writer thread: apply one queued mutation, then report or forget it.
+
+    Retried on a transient SQLite lock through the shared
+    :func:`streamselect.core.db_lock.retry_on_lock` — the same policy the bulk
+    writers use, not a second copy.
+
+    Why it needs one at all, when every connection already carries
+    ``busy_timeout=30000``: this is a READ-then-write transaction (find the
+    row, then delete or update it), and SQLite cannot upgrade a read
+    transaction once another connection has committed underneath it. It
+    returns ``SQLITE_BUSY`` immediately in that case and the busy timeout does
+    not apply. On a user removed two rules while an EPG pass held
+    the writer; both DELETEs raised ``database is locked``, both rules stayed
+    in the list, and each produced a toast saying it could not be removed.
+
+    A shorter gap than the bulk default: the wait is already dominated by
+    whatever each attempt spends inside ``busy_timeout``, and this one has a
+    person watching for a row to disappear. Nothing was committed by a failed
+    attempt, so re-running sees exactly the state the first one saw.
+
+    This runs on the ``watchlist-write`` thread, never the UI thread, which is
+    what makes waiting affordable at all. Quitting is unaffected: :func:`flush`
+    gives up after ``_FLUSH_TIMEOUT``.
+    """
+    message = ""
+    try:
+        retry_on_lock(f"watchlist {write.op}", lambda: _apply_write(write),
+                      delay_s=_LOCK_RETRY_DELAY_S)
+    except Exception as exc:
+        logger.exception("watchlist: could not {} {!r}", write.op, write.text)
+        message = str(exc).split("\n", 1)[0].strip() or exc.__class__.__name__
+    finally:
+        # Dropped whether it succeeded or failed: on failure the next read must
+        # show what the database actually holds, not the optimistic guess.
+        with _lock:
+            if write in _pending:
+                _pending.remove(write)
+    if message and _write_error_handler is not None:
+        try:
+            _write_error_handler(write.op, write.text, message)
+        except Exception:
+            logger.exception("watchlist: the write-error handler raised")
+
+
+# ── the two backing stores ───────────────────────────────────────────────────
+
+def _config_patterns(config: "Config") -> list:
+    """The raw config list — the store before the move, and still the backup."""
+    return list(getattr(config, "epg_watchlist_patterns", None) or [])
+
+
+def _db_patterns() -> list:
+    """Every stored pattern, oldest first, so the user's order survives.
+
+    A database error falls back to an EMPTY list rather than raising: a watch
+    list that fails to load should show as empty and recover on the next read,
+    not take down the EPG view that asked for it.
+    """
+    from streamselect.core.database import AlertPatternDB
+    try:
+        with _db.session_scope(commit=False) as session:
+            rows = (session.query(AlertPatternDB.pattern_value)
+                    .filter(AlertPatternDB.pattern_type == PATTERN_TYPE)
+                    .order_by(AlertPatternDB.created_at, AlertPatternDB.id)
+                    .all())
+        return [r[0] for r in rows if r[0]]
+    except Exception:
+        logger.exception("watchlist: could not read patterns from the database")
+        return []
+
+
+def _db_add(text: str) -> None:
+    """Insert one pattern. RAISES on failure — see the note on ``_db_remove``."""
+    import uuid
+    from streamselect.core.database import AlertPatternDB
+    # DB-10: watchlist-write pool thread only — see _db_update's note above.
+    with _db.session_scope(background=True) as session:
+        session.add(AlertPatternDB(
+            id=str(uuid.uuid4()),
+            name=text,
+            pattern_type=PATTERN_TYPE,
+            pattern_value=text,
+            # Defaults chosen to preserve what the config list MEANT: every
+            # stored string matched anything, anywhere, always on.
+            applies_to="all",
+            is_enabled=True,
+        ))
+
+
+def _db_remove(target_casefold: str) -> None:
+    """Delete every row matching *target_casefold*. RAISES on failure.
+
+    Both writers raise rather than returning a bool, deliberately. They used to
+    log-and-return ``False``, which is how a failed removal became a click that
+    silently did nothing: the caller could not tell "there was nothing to
+    remove" from "the database is locked". Their one caller now is
+    :func:`_run_write`, which turns the exception into the error the user sees.
+    """
+    from streamselect.core.database import AlertPatternDB
+    # DB-10: watchlist-write pool thread only — see _db_update's note above.
+    with _db.session_scope(background=True) as session:
+        rows = (session.query(AlertPatternDB)
+                .filter(AlertPatternDB.pattern_type == PATTERN_TYPE).all())
+        for row in rows:
+            if (row.pattern_value or "").casefold() == target_casefold:
+                session.delete(row)

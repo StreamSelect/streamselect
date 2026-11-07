@@ -1,0 +1,587 @@
+"""Behavioral tests for the Split Streams engine (feat/split-streams-engine).
+
+Tests cover:
+1. ``MPVPlayer._socket_path_for`` — shared key returns exact config path; per-key
+   paths are stable, filesystem-safe, and distinct from the shared path.
+2. ``PlayerManager._resolve_instance_key`` — feature flag controls resolution.
+3. Registry behavior (single-instance mode): two different keys → two Popen calls;
+   same key reused → one Popen, IPC loadfile sent; ``_last_key`` tracks latest.
+4. ``cleanup()`` terminates ALL instances' processes.
+5. Via ``PlayerManager``: split OFF → multiple provider_ids land on one instance;
+   split ON → two providers → two instances; same provider twice → one instance.
+6. ``get_properties(names)`` with key=None targets ``_last_key``'s socket.
+
+No real mpv process or socket is involved.  ``subprocess.Popen`` is replaced with
+a fake whose ``poll()`` returns None (alive).  ``os.path.exists`` is patched to
+report socket readiness.  ``MPVPlayer._send_ipc_command`` is patched to return True
+so IPC succeeds.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from unittest.mock import MagicMock
+
+import pytest
+
+from streamselect.core.players import mpv_ipc
+from streamselect.core.players.mpv import MPVPlayer, _SHARED_KEY
+from streamselect.core.player_manager import PlayerManager
+
+
+# ---------------------------------------------------------------------------
+# Shared fakes
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _FakeConfig:
+    """Minimal stand-in for Config."""
+    player_mode: str = "single-instance"
+    close_player_when_finished: bool = False
+    default_cache_size: str = "auto"
+    mpv_extra_args: list = field(default_factory=list)
+    buffer_profile: str = "modest"
+    prebuffer_before_play: bool = False
+    prebuffer_wait_secs: int = 10
+    mpv_args_override_all: bool = False
+    split_streams_by_source: bool = False
+    max_player_instances: int = 1
+
+
+def _fake_process() -> MagicMock:
+    """Return a mock Popen whose poll() signals the process is alive."""
+    proc = MagicMock()
+    proc.poll.return_value = None   # alive
+    proc.pid = 12345
+    proc.terminate = MagicMock()
+    proc.wait = MagicMock()
+    proc.kill = MagicMock()
+    return proc
+
+
+def _make_player(config: _FakeConfig | None = None) -> MPVPlayer:
+    return MPVPlayer(config or _FakeConfig())
+
+
+def _make_manager(config: _FakeConfig | None = None) -> PlayerManager:
+    from tests.conftest import wire_player_manager_key_maps
+
+    cfg = config or _FakeConfig()
+    mgr = PlayerManager.__new__(PlayerManager)
+    mgr.config = cfg
+    wire_player_manager_key_maps(mgr)
+    mgr._init_connection_accounting()
+    mgr.player = _make_player(cfg)
+    return mgr
+
+
+# ---------------------------------------------------------------------------
+# 1. _socket_path_for
+# ---------------------------------------------------------------------------
+
+def test_socket_path_shared_key_is_the_default_address():
+    """``__shared__`` maps to the one default IPC address."""
+    player = _make_player()
+    assert player._socket_path_for(_SHARED_KEY) == mpv_ipc.address("socket")
+
+
+def test_socket_path_non_shared_differs_from_shared():
+    """A per-key path must be different from the shared path."""
+    player = _make_player()
+    shared = player._socket_path_for(_SHARED_KEY)
+    per_key = player._socket_path_for("provider-xyz")
+    assert per_key != shared
+
+
+def test_socket_path_is_stable_for_same_key():
+    """The same key always produces the same socket path."""
+    player = _make_player()
+    assert player._socket_path_for("p1") == player._socket_path_for("p1")
+
+
+def test_socket_path_suffix_is_filesystem_safe():
+    """Per-key suffix must contain only [A-Za-z0-9_-] characters."""
+    player = _make_player()
+    base = mpv_ipc.address("socket")
+    path = player._socket_path_for("provider/with:special chars!")
+    # Everything after the "-" that follows the shared address is the suffix
+    suffix = path[len(base) + 1:]
+    assert re.fullmatch(r"[A-Za-z0-9_\-]+", suffix), f"Unsafe suffix: {suffix!r}"
+
+
+def test_socket_path_two_different_keys_produce_different_paths():
+    """Two different keys must yield two distinct socket paths."""
+    player = _make_player()
+    assert player._socket_path_for("p1") != player._socket_path_for("p2")
+
+
+def test_socket_path_lives_in_the_per_user_runtime_dir():
+    """Sockets go in the user's runtime dir, never a machine-wide /tmp path."""
+    from streamselect.core import app_paths
+
+    player = _make_player()
+    path = player._socket_path_for("some-provider")
+    assert path.startswith(str(app_paths.runtime_dir()))
+    assert path.startswith(mpv_ipc.address("socket") + "-")
+
+
+# ---------------------------------------------------------------------------
+# 2. PlayerManager._resolve_instance_key
+# ---------------------------------------------------------------------------
+
+def test_resolve_key_split_off_always_shared():
+    """Split OFF → every provider_id maps to ``"__shared__"``."""
+    mgr = _make_manager(_FakeConfig(split_streams_by_source=False))
+    assert mgr._resolve_instance_key("provider-a") == "__shared__"
+    assert mgr._resolve_instance_key(None) == "__shared__"
+    assert mgr._resolve_instance_key("") == "__shared__"
+
+
+def test_resolve_key_split_on_with_provider_id():
+    """Split ON + truthy provider_id → that provider_id is the key."""
+    mgr = _make_manager(_FakeConfig(split_streams_by_source=True))
+    assert mgr._resolve_instance_key("provider-a") == "provider-a"
+    assert mgr._resolve_instance_key("xyz123") == "xyz123"
+
+
+def test_resolve_key_split_on_none_falls_back_to_shared():
+    """Split ON + None provider_id → ``"__shared__"``."""
+    mgr = _make_manager(_FakeConfig(split_streams_by_source=True))
+    assert mgr._resolve_instance_key(None) == "__shared__"
+
+
+def test_resolve_key_split_on_empty_string_falls_back_to_shared():
+    """Split ON + empty string provider_id → ``"__shared__"``."""
+    mgr = _make_manager(_FakeConfig(split_streams_by_source=True))
+    assert mgr._resolve_instance_key("") == "__shared__"
+
+
+# ---------------------------------------------------------------------------
+# 3. Registry behavior (single-instance mode via MPVPlayer directly)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def _patched_player(monkeypatch):
+    """Return an MPVPlayer with Popen, socket existence, and IPC mocked out."""
+    cfg = _FakeConfig()
+    player = _make_player(cfg)
+
+    proc_factory = []
+    def fake_popen(cmd, **kwargs):
+        proc = _fake_process()
+        proc_factory.append(proc)
+        return proc
+
+    monkeypatch.setattr("streamselect.core.players.mpv.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("streamselect.core.players.mpv.os.path.exists", lambda p: True)
+    monkeypatch.setattr(MPVPlayer, "_send_ipc_command", lambda self, cmd, key: True)
+
+    return player, proc_factory
+
+
+def test_two_different_keys_create_two_instances(_patched_player):
+    """Playing on two different keys must start two separate mpv processes."""
+    player, procs = _patched_player
+    player.play("http://a", "A", instance_key="p1")
+    player.play("http://b", "B", instance_key="p2")
+    assert len(procs) == 2
+    assert "p1" in player._instances
+    assert "p2" in player._instances
+
+
+def test_same_key_reused_no_new_popen(_patched_player):
+    """Playing a second URL on the same key must NOT spawn a new process."""
+    player, procs = _patched_player
+    player.play("http://a", "A", instance_key="p1")
+    assert len(procs) == 1
+    player.play("http://b", "B", instance_key="p1")
+    assert len(procs) == 1  # still one process
+
+
+def test_same_key_second_play_sends_loadfile(_patched_player, monkeypatch):
+    """The second play on an existing instance must send a loadfile IPC command."""
+    player, procs = _patched_player
+    sent_commands = []
+
+    def record_ipc(self, cmd, key):
+        sent_commands.append((cmd, key))
+        return True
+
+    monkeypatch.setattr(MPVPlayer, "_send_ipc_command", record_ipc)
+    player.play("http://a", "A", instance_key="p1")
+    sent_commands.clear()  # reset after first launch
+    player.play("http://b", "B", instance_key="p1")
+
+    # The first recorded command for the second play must be a loadfile
+    assert any(
+        cmd.get("command", [])[0] == "loadfile"
+        for cmd, _ in sent_commands
+    )
+
+
+def test_last_key_tracks_most_recent(_patched_player):
+    """``_last_key`` must reflect the most recently played key."""
+    player, _ = _patched_player
+    player.play("http://a", "A", instance_key="p1")
+    assert player._last_key == "p1"
+    player.play("http://b", "B", instance_key="p2")
+    assert player._last_key == "p2"
+    player.play("http://c", "C", instance_key="p1")
+    assert player._last_key == "p1"
+
+
+def test_cleanup_terminates_all_instances(_patched_player):
+    """``cleanup()`` must call terminate() on EVERY running instance."""
+    player, procs = _patched_player
+    player.play("http://a", "A", instance_key="p1")
+    player.play("http://b", "B", instance_key="p2")
+    assert len(procs) == 2
+
+    player.cleanup()
+
+    for proc in procs:
+        proc.terminate.assert_called_once()
+
+
+def test_cleanup_clears_registry(_patched_player):
+    """After cleanup, the instance registry must be empty."""
+    player, _ = _patched_player
+    player.play("http://a", "A", instance_key="p1")
+    player.cleanup()
+    assert player._instances == {}
+
+
+# ---------------------------------------------------------------------------
+# 4. Via PlayerManager — split OFF vs ON
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def _patched_manager(monkeypatch):
+    """Return a PlayerManager with the player's Popen/socket/IPC mocked."""
+    cfg = _FakeConfig(split_streams_by_source=False)
+    mgr = _make_manager(cfg)
+
+    procs = []
+    def fake_popen(cmd, **kwargs):
+        proc = _fake_process()
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr("streamselect.core.players.mpv.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("streamselect.core.players.mpv.os.path.exists", lambda p: True)
+    monkeypatch.setattr(MPVPlayer, "_send_ipc_command", lambda self, cmd, key: True)
+
+    return mgr, procs
+
+
+def test_split_off_two_providers_share_one_instance(_patched_manager):
+    """Split OFF: two different provider_ids land on the single ``__shared__`` window."""
+    mgr, procs = _patched_manager
+    mgr.config.split_streams_by_source = False
+
+    mgr.play("http://a", "A", provider_id="p1")
+    mgr.play("http://b", "B", provider_id="p2")
+
+    # Both calls resolve to __shared__ — the instance is reused (1 Popen)
+    assert len(procs) == 1
+    assert list(mgr.player._instances.keys()) == ["__shared__"]
+
+
+def test_split_on_two_providers_get_two_instances(_patched_manager):
+    """Split ON: two different providers → two distinct mpv windows."""
+    mgr, procs = _patched_manager
+    mgr.config.split_streams_by_source = True
+
+    mgr.play("http://a", "A", provider_id="p1")
+    mgr.play("http://b", "B", provider_id="p2")
+
+    assert len(procs) == 2
+    assert "p1" in mgr.player._instances
+    assert "p2" in mgr.player._instances
+
+
+def test_split_on_same_provider_twice_reuses_instance(_patched_manager):
+    """Split ON: playing twice on the same provider reuses its window (no new Popen)."""
+    mgr, procs = _patched_manager
+    mgr.config.split_streams_by_source = True
+
+    mgr.play("http://a", "A", provider_id="p1")
+    mgr.play("http://b", "B", provider_id="p1")
+
+    assert len(procs) == 1
+
+
+def test_split_on_none_provider_uses_shared(_patched_manager):
+    """Split ON but provider_id=None → falls back to ``__shared__``."""
+    mgr, procs = _patched_manager
+    mgr.config.split_streams_by_source = True
+
+    mgr.play("http://a", "A", provider_id=None)
+    assert list(mgr.player._instances.keys()) == ["__shared__"]
+
+
+def test_provider_for_key_split_on_maps_each_window_to_its_source(_patched_manager):
+    """Split ON: each window key resolves back to the source that played into it."""
+    mgr, procs = _patched_manager
+    mgr.config.split_streams_by_source = True
+
+    mgr.play("http://a", "A", provider_id="p1")
+    mgr.play("http://b", "B", provider_id="p2")
+
+    assert mgr.provider_for_key("p1") == "p1"
+    assert mgr.provider_for_key("p2") == "p2"
+    assert mgr.provider_for_key("unknown") is None
+    assert mgr.provider_for_key(None) is None
+
+
+def test_provider_for_key_shared_tracks_latest_source(_patched_manager):
+    """Split OFF: the shared window resolves to the most-recently-played source."""
+    mgr, procs = _patched_manager
+    mgr.config.split_streams_by_source = False
+
+    mgr.play("http://a", "A", provider_id="p1")
+    assert mgr.provider_for_key("__shared__") == "p1"
+    mgr.play("http://b", "B", provider_id="p2")
+    assert mgr.provider_for_key("__shared__") == "p2"  # follows the latest play
+
+
+# ---------------------------------------------------------------------------
+# 5. get_properties targets _last_key when key=None
+# ---------------------------------------------------------------------------
+
+def test_get_properties_targets_last_key(monkeypatch):
+    """get_properties(names) with key=None must query the ``_last_key`` socket."""
+    cfg = _FakeConfig()
+    player = _make_player(cfg)
+
+    # Inject a fake running instance so the property query path is reachable.
+    proc = _fake_process()
+    from streamselect.core.players.mpv import _Inst
+    inst_p1 = _Inst(process=proc, socket_path=player._socket_path_for("p1"))
+    player._instances["p1"] = inst_p1
+    player._last_key = "p1"
+
+    queried_sockets = []
+
+    def fake_get_property(self, name, key=None):
+        resolved = self._resolve_key(key)
+        if resolved and resolved in self._instances:
+            queried_sockets.append(self._instances[resolved].socket_path)
+        return 42
+
+    monkeypatch.setattr(MPVPlayer, "get_property", fake_get_property)
+
+    result = player.get_properties(["path", "cache-speed"])
+
+    # Both properties should have been queried against the p1 socket.
+    expected_path = player._socket_path_for("p1")
+    assert all(s == expected_path for s in queried_sockets)
+
+
+def test_get_properties_key_none_no_last_key_returns_all_none():
+    """With no ``_last_key`` set, get_properties returns all-None without raising."""
+    player = _make_player()
+    # _last_key starts as None and no instances exist
+    result = player.get_properties(["path", "cache-speed"])
+    assert result == {"path": None, "cache-speed": None}
+
+
+# ---------------------------------------------------------------------------
+# 6. Backward-compat: split OFF is byte-for-byte the same socket path
+# ---------------------------------------------------------------------------
+
+def test_split_off_socket_path_unchanged():
+    """With split_streams_by_source=False, every play uses the default address."""
+    mgr = _make_manager(_FakeConfig())
+    key = mgr._resolve_instance_key("any-provider")
+    assert mgr.player._socket_path_for(key) == mpv_ipc.address("socket")
+
+
+# ---------------------------------------------------------------------------
+# 7. send_command — thin wrapper over MPVPlayer._send_ipc_command
+# ---------------------------------------------------------------------------
+
+def test_mpv_send_command_resolves_last_key_and_delivers(monkeypatch):
+    """MPVPlayer.send_command targets _last_key and delivers via _send_ipc_command."""
+    player = _make_player()
+    delivered = []
+    monkeypatch.setattr(
+        MPVPlayer, "_send_ipc_command",
+        lambda self, cmd, key: delivered.append((cmd, key)) or True,
+    )
+    player._last_key = "p1"
+
+    result = player.send_command(["cycle", "pause"])
+
+    assert result is True
+    assert delivered == [({"command": ["cycle", "pause"], "request_id": 1}, "p1")]
+
+
+def test_mpv_send_command_explicit_key_overrides_last_key(monkeypatch):
+    player = _make_player()
+    delivered = []
+    monkeypatch.setattr(
+        MPVPlayer, "_send_ipc_command",
+        lambda self, cmd, key: delivered.append((cmd, key)) or True,
+    )
+    player._last_key = "p1"
+
+    player.send_command(["cycle", "pause"], key="p2")
+
+    assert delivered[0][1] == "p2"
+
+
+def test_mpv_send_command_no_resolvable_key_returns_false():
+    """Multiple-instances mode with no prior play() has no key to resolve."""
+    player = _make_player(_FakeConfig(player_mode="multiple-instances"))
+    assert player.send_command(["cycle", "pause"]) is False
+
+
+def test_player_manager_send_command_delegates_to_player():
+    """PlayerManager.send_command is a thin wrapper — the sanctioned non-play IPC seam."""
+    mgr = _make_manager()
+    mgr.player = MagicMock()
+    mgr.player.send_command.return_value = True
+
+    result = mgr.send_command(["cycle", "pause"], key="p1")
+
+    assert result is True
+    mgr.player.send_command.assert_called_once_with(["cycle", "pause"], key="p1")
+
+
+def test_player_manager_send_command_no_player_returns_false():
+    mgr = _make_manager()
+    mgr.player = None
+    assert mgr.send_command(["cycle", "pause"]) is False
+
+
+def test_player_plugin_base_default_send_command_returns_false():
+    """Non-abstract base default — a player without a raw-command channel is a safe no-op."""
+    from streamselect.core.players.base import PlayerPlugin
+
+    class _NoOpPlugin(PlayerPlugin):
+        def __init__(self, config):
+            pass
+
+        @property
+        def name(self):
+            return "noop"
+
+        def is_available(self):
+            return True
+
+        def play(self, url, title, instance_key="__shared__"):
+            return True
+
+        def queue(self, url, title, mode=None, instance_key="__shared__"):
+            return True
+
+        def stop(self):
+            return True
+
+        def is_running(self):
+            return False
+
+        def cleanup(self):
+            pass
+
+    plugin = _NoOpPlugin(None)
+    assert plugin.send_command(["cycle", "pause"]) is False
+
+
+# ---------------------------------------------------------------------------
+# 7. play_local_file (DL-4) — a finished download, not a stream
+# ---------------------------------------------------------------------------
+
+
+def test_play_local_file_own_window_uses_the_dedicated_key(_patched_manager):
+    """own_window=True keys to DOWNLOADS_INSTANCE_KEY, never a provider_id —
+    a downloaded file has no source to key by."""
+    from streamselect.core.player_manager import DOWNLOADS_INSTANCE_KEY
+
+    mgr, procs = _patched_manager
+    assert mgr.play_local_file("/lib/gb.mkv", "Ghostbusters", own_window=True)
+    assert list(mgr.player._instances.keys()) == [DOWNLOADS_INSTANCE_KEY]
+    assert len(procs) == 1
+
+
+def test_play_local_file_shared_window_replaces_whatever_is_playing(_patched_manager):
+    """own_window=False lands on the same shared key a non-split play uses."""
+    mgr, procs = _patched_manager
+    mgr.play("http://a", "A", provider_id="p1")   # split OFF in this fixture
+    assert mgr.play_local_file("/lib/gb.mkv", "Ghostbusters", own_window=False)
+    # Still one instance — the shared window was reused, not a second one opened.
+    assert list(mgr.player._instances.keys()) == ["__shared__"]
+    assert len(procs) == 1
+
+
+def test_play_local_file_own_window_does_not_disturb_a_live_shared_stream(_patched_manager):
+    """The whole point of Split Streams for downloads: a live stream elsewhere
+    keeps playing while the download opens its own window."""
+    mgr, procs = _patched_manager
+    mgr.play("http://live", "Live Channel", provider_id="p1")
+    assert mgr.play_local_file("/lib/gb.mkv", "Ghostbusters", own_window=True)
+    assert len(procs) == 2
+    assert "__shared__" in mgr.player._instances
+    from streamselect.core.player_manager import DOWNLOADS_INSTANCE_KEY
+    assert DOWNLOADS_INSTANCE_KEY in mgr.player._instances
+
+
+def test_play_local_file_claims_no_connection_slot(_patched_manager):
+    """A local file has no provider to contend a connection with — never
+    touch the accountant at all."""
+    mgr, _procs = _patched_manager
+    mgr.play_local_file("/lib/gb.mkv", "Ghostbusters", own_window=True)
+    assert mgr.connection_accountant.in_use("p1") == 0
+    assert mgr.provider_for_key("__downloads__") is None, (
+        "play_local_file must never register a provider for its key")
+
+
+def test_play_local_file_over_a_shared_key_releases_the_stale_providers_slot(_patched_manager):
+    """CONN-2: a finished download played into the SAME key a provider stream
+    was using must release that provider's accountant slot.
+
+    Before the fix, ``play_local_file`` never touched ``_key_provider``/
+    ``_key_url`` and never released the old holder — so the provider's one
+    connection stayed charged to a window that had moved on to a local file,
+    and a subsequent download from that same provider was refused even though
+    nothing was actually talking to it.
+    """
+    mgr, _procs = _patched_manager
+    mgr.play("http://a", "A", provider_id="p1", provider_max_connections=1)  # split OFF -> __shared__
+    assert mgr.connection_accountant.in_use("p1") == 1
+
+    assert mgr.play_local_file("/lib/gb.mkv", "Ghostbusters", own_window=False)
+
+    assert mgr.connection_accountant.in_use("p1") == 0
+    # A download (a holder id distinct from the playback key) must be granted
+    # now — before the fix this was refused with holders=("__shared__",), a
+    # slot nothing was actually streaming through any more.
+    mgr.connection_accountant._cooldown_until["p1"] = 0.0  # bypass the unrelated post-playback cooldown
+    grant = mgr.connection_accountant.acquire("p1", "download", "dl-1", preempt_kinds=("monitor",))
+    assert grant.granted is True
+
+
+def test_play_local_file_over_a_shared_key_clears_the_stale_live_base_url(_patched_manager):
+    """CONN-2 second half: ``live_base_url`` must stop naming the old provider
+    host once the window is playing a local file, not that provider's stream.
+
+    Before the fix, ``_key_url[key]`` was never cleared by ``play_local_file``,
+    so ``live_base_url`` kept reporting the old stream's host even though the
+    same (still-running) window was now playing a file with no connection to
+    anyone.
+    """
+    mgr, _procs = _patched_manager
+    mgr.play("http://provider1.example.com/live/a.ts", "A", provider_id="p1")
+    assert mgr.live_base_url("__shared__") == "http://provider1.example.com"
+
+    assert mgr.play_local_file("/lib/gb.mkv", "Ghostbusters", own_window=False)
+
+    assert mgr.is_running(key="__shared__") is True  # same window, still alive
+    assert mgr.live_base_url("__shared__") is None
+
+
+def test_play_local_file_with_no_player_returns_false():
+    mgr = _make_manager()
+    mgr.player = None
+    assert mgr.play_local_file("/lib/gb.mkv", "Ghostbusters", own_window=True) is False

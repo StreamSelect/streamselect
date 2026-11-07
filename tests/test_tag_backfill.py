@@ -1,0 +1,923 @@
+"""Behavioral tests for the tag backfill migration (Tags Slice T3, DR-0005).
+
+Every test exercises the actual code path that could regress — no shape/string
+assertions.  Tests use file-backed SQLite (``tmp_path``) per the the project rules rule
+("not :memory:, whose pooled connections each get an empty DB").
+
+Coverage:
+- Seeds a channel with known category / source_category / detected_* / raw_data
+  fields, runs the full backfill, and asserts the expected ``content_tags`` rows.
+- Verifies that user-tagged channels survive a re-run unharmed.
+- Verifies that a completed run is idempotent (same rows, no duplicates).
+- Verifies that ``source="user"`` tags are never touched by the backfill.
+- Verifies that confidence rises when multiple feeders agree on the same tag.
+- Verifies that ``TagBackfillTask.needs_run`` gates correctly on version.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+import pytest
+
+from streamselect.core.config import Config
+from streamselect.core.database import ChannelDB, ContentTagDB, Database, TagDB
+from streamselect.core.migrations.tag_backfill import (
+    CURRENT_TAG_BACKFILL_VERSION,
+    _TARGETED_REGION_LANGUAGE_FLOOR,
+    TagBackfillTask,
+    _collect_tags,
+)
+from streamselect.core.repositories import RepositoryFactory
+from streamselect.core.repositories.tag_content_tags import _compute_confidence
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def cfg(tmp_path):
+    """Isolated Config instance with default filter groups.
+
+    config_dir is set to tmp_path so no write goes to ~/.config/streamselect.
+    """
+    return Config(config_dir=tmp_path / "cfg")
+
+
+def _add_channel(
+    db: Database,
+    *,
+    name: str = "Test Channel",
+    category: str | None = None,
+    source_category: str | None = None,
+    detected_prefix: str | None = None,
+    detected_quality: str | None = None,
+    detected_region: str | None = None,
+    detected_year: str | None = None,
+    raw_data: dict | None = None,
+) -> str:
+    """Insert a minimal ChannelDB row and return its id."""
+    channel_id = str(uuid.uuid4())
+    with db.session_scope() as session:
+        ch = ChannelDB(
+            id=channel_id,
+            source_id=str(uuid.uuid4()),
+            provider_id="test_provider",
+            name=name,
+            category=category,
+            source_category=source_category,
+            detected_prefix=detected_prefix,
+            detected_quality=detected_quality,
+            detected_region=detected_region,
+            detected_year=detected_year,
+            raw_data=raw_data,
+        )
+        session.add(ch)
+    return channel_id
+
+
+def _run_backfill(db: Database, cfg: Config) -> None:
+    """Run the backfill to completion (no cancellation)."""
+    task = TagBackfillTask(db, config=cfg)
+    _progress_calls: list[tuple[int, int]] = []
+
+    def _progress(done: int, total: int) -> None:
+        _progress_calls.append((done, total))
+
+    task.run(_progress, is_cancelled=lambda: False)
+
+
+def _tags_for(db: Database, channel_id: str) -> list[tuple[str, str, str, list[str]]]:
+    """Return ``(type, value, source, feeders)`` for all content_tags on a channel."""
+    with db.session_scope(commit=False) as session:
+        rows = (
+            session.query(TagDB.type, TagDB.value, ContentTagDB.source, ContentTagDB.feeders)
+            .join(ContentTagDB, ContentTagDB.tag_id == TagDB.id)
+            .join(ChannelDB, ChannelDB.channel_key == ContentTagDB.channel_key)
+            .filter(ChannelDB.id == channel_id)
+            .all()
+        )
+    return [(r.type, r.value, r.source, list(r.feeders or [])) for r in rows]
+
+
+def _content_tag_count(db: Database, channel_id: str, source: str = "generated") -> int:
+    """Count ContentTagDB rows for a channel with the given source."""
+    with db.session_scope(commit=False) as session:
+        return (
+            session.query(ContentTagDB)
+            .join(ChannelDB, ChannelDB.channel_key == ContentTagDB.channel_key)
+            .filter(ChannelDB.id == channel_id, ContentTagDB.source == source)
+            .count()
+        )
+
+
+# ---------------------------------------------------------------------------
+# needs_run
+# ---------------------------------------------------------------------------
+
+class TestNeedsRun:
+    def test_needs_run_when_version_zero(self, cfg):
+        """Task reports needs_run when tag_backfill_version is 0."""
+        task = TagBackfillTask(None, config=cfg)  # type: ignore[arg-type]
+        assert task.needs_run(cfg) is True
+
+    def test_does_not_need_run_when_version_current(self, cfg):
+        """Task reports not-needs_run when version already at current."""
+        cfg.tag_backfill_version = CURRENT_TAG_BACKFILL_VERSION
+        task = TagBackfillTask(None, config=cfg)  # type: ignore[arg-type]
+        assert task.needs_run(cfg) is False
+
+    def test_needs_run_when_version_behind(self, cfg):
+        """Task reports needs_run when stored version is behind current."""
+        cfg.tag_backfill_version = CURRENT_TAG_BACKFILL_VERSION - 1
+        task = TagBackfillTask(None, config=cfg)  # type: ignore[arg-type]
+        assert task.needs_run(cfg) is True
+
+
+# ---------------------------------------------------------------------------
+# on_completed
+# ---------------------------------------------------------------------------
+
+class TestOnCompleted:
+    def test_on_completed_bumps_version(self, tmp_path, cfg):
+        """on_completed sets tag_backfill_version to CURRENT and saves config."""
+        task = TagBackfillTask(None, config=cfg)  # type: ignore[arg-type]
+        task.on_completed(cfg)
+        assert cfg.tag_backfill_version == CURRENT_TAG_BACKFILL_VERSION
+
+
+# ---------------------------------------------------------------------------
+# Feeder wiring (_collect_tags)
+# ---------------------------------------------------------------------------
+
+class TestCollectTags:
+    """Unit tests for _collect_tags — pure function, no DB needed."""
+
+    def test_provider_category_feeder_region(self, cfg):
+        """A recognized region code in category produces a region tag via provider_category."""
+        tags = _collect_tags(
+            config=cfg,
+            category="USA",
+            source_category=None,
+            detected_prefix=None,
+            detected_quality=None,
+            detected_region=None,
+            detected_year=None,
+            raw_data=None,
+        )
+        feeder_map = {(t, v): feeders for t, v, feeders in tags}
+        # "USA" should produce a region:US tag from the compound decomposer
+        assert ("region", "US") in feeder_map
+        assert "provider_category" in feeder_map[("region", "US")]
+
+    def test_provider_category_unrecognized_becomes_collection(self, cfg):
+        """An unrecognized compound category token becomes a collection tag."""
+        tags = _collect_tags(
+            config=cfg,
+            category="Drama",
+            source_category=None,
+            detected_prefix=None,
+            detected_quality=None,
+            detected_region=None,
+            detected_year=None,
+            raw_data=None,
+        )
+        feeder_map = {(t, v): feeders for t, v, feeders in tags}
+        # "Drama" as a raw category string → collection (not genre, since no genre feeder)
+        assert ("collection", "Drama") in feeder_map
+        assert "provider_category" in feeder_map[("collection", "Drama")]
+
+    def test_genre_feeder(self, cfg):
+        """raw_data['genre'] produces a genre tag with feeder='genre'."""
+        tags = _collect_tags(
+            config=cfg,
+            category=None,
+            source_category=None,
+            detected_prefix=None,
+            detected_quality=None,
+            detected_region=None,
+            detected_year=None,
+            raw_data={"genre": "Action"},
+        )
+        feeder_map = {(t, v): feeders for t, v, feeders in tags}
+        assert ("genre", "Action") in feeder_map
+        assert "genre" in feeder_map[("genre", "Action")]
+
+    def test_name_parse_year_produces_decade(self, cfg):
+        """A detected_year field produces a decade tag with feeder='name_parse'."""
+        tags = _collect_tags(
+            config=cfg,
+            category=None,
+            source_category=None,
+            detected_prefix=None,
+            detected_quality=None,
+            detected_region=None,
+            detected_year="1994",
+            raw_data=None,
+        )
+        feeder_map = {(t, v): feeders for t, v, feeders in tags}
+        assert ("decade", "1990s") in feeder_map
+        assert "name_parse" in feeder_map[("decade", "1990s")]
+
+    def test_two_feeders_agreeing_produce_two_entries(self, cfg):
+        """When name_parse and genre both yield a decade tag, two (type, value, feeder)
+        tuples are returned — one per feeder — so set_content_tags can merge them.
+
+        The genre feeder produces genre tags; name_parse produces decade tags from
+        detected_year.  To get two feeders to agree on the same (type, value), we use
+        the header feeder (source_category) and the genre feeder on the same genre string,
+        which both route through _decompose_genre for the genre feeder but NOT for the
+        header feeder.  Instead, we verify that two independent feeders both produce a
+        region tag from the same code — header "USA" → region:US and category "USA" →
+        region:US — giving two entries for (region, US).
+        """
+        tags = _collect_tags(
+            config=cfg,
+            category="USA",          # provider_category → region:US
+            source_category="USA",   # header → region:US
+            detected_prefix=None,
+            detected_quality=None,
+            detected_region=None,
+            detected_year=None,
+            raw_data=None,
+        )
+        us_feeders = [feeder for t, v, feeder in tags if t == "region" and v == "US"]
+        assert len(us_feeders) == 2
+        assert set(us_feeders) == {"provider_category", "header"}
+
+    def test_empty_inputs_return_empty_list(self, cfg):
+        """All-None inputs → empty tag list."""
+        tags = _collect_tags(
+            config=cfg,
+            category=None,
+            source_category=None,
+            detected_prefix=None,
+            detected_quality=None,
+            detected_region=None,
+            detected_year=None,
+            raw_data=None,
+        )
+        assert tags == []
+
+
+# ---------------------------------------------------------------------------
+# Full backfill — seed → run → assert content_tags
+# ---------------------------------------------------------------------------
+
+class TestBackfillPopulatesTags:
+    def test_region_from_category(self, file_db, cfg):
+        """A channel with category='USA' gets a region:US content_tag after backfill."""
+        cid = _add_channel(file_db, category="USA")
+        _run_backfill(file_db, cfg)
+
+        tags = _tags_for(file_db, cid)
+        type_value_pairs = {(t, v) for t, v, _src, _f in tags}
+        assert ("region", "US") in type_value_pairs
+
+    def test_genre_from_raw_data(self, file_db, cfg):
+        """A channel with raw_data genre gets a genre tag after backfill."""
+        cid = _add_channel(file_db, raw_data={"genre": "Thriller"})
+        _run_backfill(file_db, cfg)
+
+        tags = _tags_for(file_db, cid)
+        type_value_pairs = {(t, v) for t, v, _src, _f in tags}
+        assert ("genre", "Thriller") in type_value_pairs
+
+    def test_decade_from_detected_year(self, file_db, cfg):
+        """A channel with detected_year='2003' gets a decade:2000s tag."""
+        cid = _add_channel(file_db, detected_year="2003")
+        _run_backfill(file_db, cfg)
+
+        tags = _tags_for(file_db, cid)
+        type_value_pairs = {(t, v) for t, v, _src, _f in tags}
+        assert ("decade", "2000s") in type_value_pairs
+
+    def test_tags_have_generated_source(self, file_db, cfg):
+        """All backfill-created tags carry source='generated'."""
+        cid = _add_channel(file_db, raw_data={"genre": "Comedy"})
+        _run_backfill(file_db, cfg)
+
+        tags = _tags_for(file_db, cid)
+        assert tags, "Expected at least one tag from the genre feeder"
+        assert all(src == "generated" for _t, _v, src, _f in tags)
+
+    def test_multi_feeder_confidence_higher(self, file_db, cfg):
+        """When category and header both produce region:US, confidence is higher than
+        one feeder alone — because two independent feeders corroborate the same tag."""
+        cid = _add_channel(file_db, category="USA", source_category="USA")
+        _run_backfill(file_db, cfg)
+
+        with file_db.session_scope(commit=False) as session:
+            repos = RepositoryFactory(session)
+            tag = session.query(TagDB).filter_by(type="region", value="US").first()
+            assert tag is not None, "region:US tag should have been created"
+            link = (
+                session.query(ContentTagDB)
+                .join(ChannelDB, ChannelDB.channel_key == ContentTagDB.channel_key)
+                .filter(ChannelDB.id == cid, ContentTagDB.tag_id == tag.id,
+                       ContentTagDB.source == "generated")
+                .one()
+            )
+            assert len(set(link.feeders)) == 2
+            assert _compute_confidence(link.feeders) > _compute_confidence(["single_feeder"])
+
+    def test_no_channel_produces_no_tags(self, file_db, cfg):
+        """A channel with all-None feeder fields gets no content_tags."""
+        cid = _add_channel(file_db, name="Blank Channel")
+        _run_backfill(file_db, cfg)
+
+        count = _content_tag_count(file_db, cid)
+        assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# Non-destructive: user tags survive a backfill run
+# ---------------------------------------------------------------------------
+
+class TestUserTagsSurvive:
+    def test_user_tag_preserved_after_backfill(self, file_db, cfg):
+        """A source='user' content_tag is untouched by the backfill."""
+        cid = _add_channel(file_db, name="No Feeders Channel")
+
+        # Plant a user tag before running the backfill.
+        with file_db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            repos.tags.set_content_tags(
+                cid,
+                [("genre", "Drama", "human_curation")],
+                source="user",
+            )
+
+        _run_backfill(file_db, cfg)
+
+        user_links = _content_tag_count(file_db, cid, source="user")
+        assert user_links == 1, "user tag must survive the backfill"
+
+    def test_user_tag_and_generated_tag_coexist(self, file_db, cfg):
+        """User and generated tags for the same (type, value) coexist independently.
+
+        The channel has raw_data genre='Drama' so the backfill produces a
+        generated genre:Drama tag; a pre-existing user tag on the same (type, value)
+        must survive alongside it.
+        """
+        cid = _add_channel(file_db, raw_data={"genre": "Drama"})
+
+        with file_db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            repos.tags.set_content_tags(
+                cid, [("genre", "Drama", "human")], source="user"
+            )
+
+        _run_backfill(file_db, cfg)
+
+        tags = _tags_for(file_db, cid)
+        sources = {src for _t, _v, src, _f in tags if _t == "genre" and _v == "Drama"}
+        assert "user" in sources
+        assert "generated" in sources
+
+
+# ---------------------------------------------------------------------------
+# Idempotency: running the backfill twice produces the same result
+# ---------------------------------------------------------------------------
+
+class TestIdempotency:
+    def test_second_run_same_tags(self, file_db, cfg):
+        """Running the backfill twice on the same channel produces identical tag sets."""
+        cid = _add_channel(file_db, raw_data={"genre": "Action"})
+
+        _run_backfill(file_db, cfg)
+        tags_first = sorted(_tags_for(file_db, cid))
+
+        _run_backfill(file_db, cfg)
+        tags_second = sorted(_tags_for(file_db, cid))
+
+        assert tags_first == tags_second
+
+    def test_second_run_no_duplicate_links(self, file_db, cfg):
+        """Running the backfill twice does not double the number of ContentTagDB rows."""
+        cid = _add_channel(file_db, raw_data={"genre": "Comedy"})
+
+        _run_backfill(file_db, cfg)
+        count_first = _content_tag_count(file_db, cid)
+        assert count_first > 0, "Expected at least one tag from the genre feeder"
+
+        _run_backfill(file_db, cfg)
+        count_second = _content_tag_count(file_db, cid)
+
+        assert count_first == count_second
+
+
+# ---------------------------------------------------------------------------
+# delete_generated_for_channel (TagRepository helper)
+# ---------------------------------------------------------------------------
+
+class TestDeleteGeneratedForChannel:
+    def test_only_channel_generated_tags_removed(self, file_db, cfg):
+        """delete_generated_for_channel removes only the target channel's generated tags."""
+        cid1 = _add_channel(file_db, category="Drama")
+        cid2 = _add_channel(file_db, category="Action")
+
+        with file_db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            repos.tags.set_content_tags(cid1, [("genre", "Drama", "f")])
+            repos.tags.set_content_tags(cid2, [("genre", "Action", "f")])
+
+        with file_db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            deleted = repos.tags.delete_generated_for_channel(cid1)
+
+        assert deleted == 1
+        assert _content_tag_count(file_db, cid2) == 1, "channel2 tags should be untouched"
+        assert _content_tag_count(file_db, cid1) == 0
+
+    def test_user_tags_on_channel_unaffected(self, file_db):
+        """delete_generated_for_channel leaves user tags on the same channel intact."""
+        cid = _add_channel(file_db)
+
+        with file_db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            repos.tags.set_content_tags(cid, [("genre", "Sci-Fi", "gen")], source="generated")
+            repos.tags.set_content_tags(cid, [("genre", "Sci-Fi", "user")], source="user")
+
+        with file_db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            repos.tags.delete_generated_for_channel(cid)
+
+        assert _content_tag_count(file_db, cid, source="generated") == 0
+        assert _content_tag_count(file_db, cid, source="user") == 1
+
+
+# ---------------------------------------------------------------------------
+# Incremental tagging via tag_fingerprint (provider_loader._update_tags_in_thread)
+# ---------------------------------------------------------------------------
+
+class TestIncrementalTagging:
+    """Behavioral tests for the skip-unchanged fingerprint logic and defer-during-migration."""
+
+    def _run_update_tags(self, db: Database, provider_id: str, provider_name: str, cfg: Config) -> None:
+        """Drive _update_tags_in_thread via the shared ProviderLoadThread skeleton."""
+        from tests.conftest import make_provider_load_thread
+
+        make_provider_load_thread(db, provider_id, provider_name)._update_tags_in_thread()
+
+    def test_unchanged_channel_skipped_on_second_run(self, file_db, cfg, monkeypatch):
+        """A channel whose feeder fields have not changed is NOT re-tagged on second run.
+
+        The tag repository's ``delete_generated_for_channel`` must NOT be called for
+        the unchanged channel after the fingerprint is populated on the first run.
+        """
+        import streamselect.core.repositories.tag as _tag_repo_module
+
+        monkeypatch.setattr(
+            "streamselect.core.config.Config.load",
+            staticmethod(lambda: (cfg, False)),
+        )
+
+        cid = _add_channel(file_db, category="USA", name="Test US Channel")
+
+        # First run — populates fingerprint and tags.
+        self._run_update_tags(file_db, "test_provider", "TestProvider", cfg)
+
+        count_after_first = _content_tag_count(file_db, cid)
+        assert count_after_first > 0, "Expected tags after first run"
+
+        # Check that fingerprint was stored.
+        with file_db.session_scope(commit=False) as session:
+            from streamselect.core.database import ChannelDB as _CDB
+            ch = session.query(_CDB).filter_by(id=cid).one()
+            assert ch.tag_fingerprint is not None, "fingerprint must be set after first run"
+            stored_fp = ch.tag_fingerprint
+
+        # Track delete_generated calls on second run.
+        delete_calls: list[str] = []
+        original_delete = _tag_repo_module.TagRepository.delete_generated_for_channel
+
+        def _tracking_delete(self_repo, channel_id: str) -> int:
+            delete_calls.append(channel_id)
+            return original_delete(self_repo, channel_id)
+
+        monkeypatch.setattr(
+            _tag_repo_module.TagRepository,
+            "delete_generated_for_channel",
+            _tracking_delete,
+        )
+
+        # Second run — feeder fields unchanged, must skip.
+        self._run_update_tags(file_db, "test_provider", "TestProvider", cfg)
+
+        assert cid not in delete_calls, (
+            "delete_generated_for_channel must NOT be called for an unchanged channel"
+        )
+        # Tags must still be there (not deleted).
+        assert _content_tag_count(file_db, cid) == count_after_first
+
+    def test_changed_channel_retagged_and_fingerprint_updated(self, file_db, cfg, monkeypatch):
+        """A channel whose category changes IS re-tagged and its fingerprint updated."""
+        monkeypatch.setattr(
+            "streamselect.core.config.Config.load",
+            staticmethod(lambda: (cfg, False)),
+        )
+
+        cid = _add_channel(file_db, category="USA", name="Changeable Channel")
+
+        # First run — tags and fingerprint set.
+        self._run_update_tags(file_db, "test_provider", "TestProvider", cfg)
+
+        with file_db.session_scope(commit=False) as session:
+            from streamselect.core.database import ChannelDB as _CDB
+            ch = session.query(_CDB).filter_by(id=cid).one()
+            fp_after_first = ch.tag_fingerprint
+        assert fp_after_first is not None
+
+        # Mutate the category field to simulate an ingestion change.
+        with file_db.session_scope() as session:
+            from streamselect.core.database import ChannelDB as _CDB
+            ch = session.query(_CDB).filter_by(id=cid).one()
+            ch.category = "UK"   # different value → different fingerprint
+
+        # Second run — changed feeder field must trigger re-tag.
+        self._run_update_tags(file_db, "test_provider", "TestProvider", cfg)
+
+        with file_db.session_scope(commit=False) as session:
+            from streamselect.core.database import ChannelDB as _CDB
+            ch = session.query(_CDB).filter_by(id=cid).one()
+            fp_after_second = ch.tag_fingerprint
+
+        assert fp_after_second != fp_after_first, "fingerprint must be updated after field change"
+        # The new tags should reflect the changed category.
+        tags = _tags_for(file_db, cid)
+        tag_pairs = {(t, v) for t, v, _src, _f in tags}
+        # "UK" → region:UK
+        assert any(t == "region" for t, v in tag_pairs), "region tag expected from new 'UK' category"
+
+    def test_new_channel_with_null_fingerprint_is_tagged(self, file_db, cfg, monkeypatch):
+        """A brand-new channel (NULL fingerprint) is tagged on first run."""
+        monkeypatch.setattr(
+            "streamselect.core.config.Config.load",
+            staticmethod(lambda: (cfg, False)),
+        )
+
+        cid = _add_channel(file_db, raw_data={"genre": "Drama"})
+
+        # Verify fingerprint starts as NULL.
+        with file_db.session_scope(commit=False) as session:
+            from streamselect.core.database import ChannelDB as _CDB
+            ch = session.query(_CDB).filter_by(id=cid).one()
+            assert ch.tag_fingerprint is None
+
+        self._run_update_tags(file_db, "test_provider", "TestProvider", cfg)
+
+        assert _content_tag_count(file_db, cid) > 0, "NULL-fingerprint channel must be tagged"
+        tags = _tags_for(file_db, cid)
+        assert any(t == "genre" and v == "Drama" for t, v, _src, _f in tags)
+
+    def test_hook_returns_early_when_backfill_active(self, file_db, cfg, monkeypatch):
+        """_update_tags_in_thread returns immediately when TagBackfillTask is running.
+
+        No tags are written and delete_generated_for_channel is never called.
+        """
+        import streamselect.core.migrations.tag_backfill as _tbm
+        import streamselect.core.repositories.tag as _tag_repo_module
+
+        monkeypatch.setattr(
+            "streamselect.core.config.Config.load",
+            staticmethod(lambda: (cfg, False)),
+        )
+
+        # Plant a channel with a tag so we can confirm it is not deleted.
+        cid = _add_channel(file_db, category="USA")
+        with file_db.session_scope() as session:
+            from streamselect.core.repositories import RepositoryFactory
+            repos = RepositoryFactory(session)
+            repos.tags.set_content_tags(cid, [("region", "US", "provider_category")], source="generated")
+
+        count_before = _content_tag_count(file_db, cid)
+        assert count_before > 0
+
+        # Simulate a running backfill by patching is_backfill_active.
+        monkeypatch.setattr(_tbm, "is_backfill_active", lambda: True)
+
+        delete_calls: list[str] = []
+        original_delete = _tag_repo_module.TagRepository.delete_generated_for_channel
+
+        def _tracking_delete(self_repo, channel_id: str) -> int:
+            delete_calls.append(channel_id)
+            return original_delete(self_repo, channel_id)
+
+        monkeypatch.setattr(
+            _tag_repo_module.TagRepository,
+            "delete_generated_for_channel",
+            _tracking_delete,
+        )
+
+        self._run_update_tags(file_db, "test_provider", "TestProvider", cfg)
+
+        assert delete_calls == [], "No tags must be touched when backfill is active"
+        assert _content_tag_count(file_db, cid) == count_before, "Existing tags must survive"
+
+    def test_migration_adds_tag_fingerprint_column(self, tmp_path):
+        """The tag_fingerprint column is present (and readable) after create_tables.
+
+        On an old DB that didn't have the column, the ALTER TABLE migration in
+        _migrate() adds it.  This test verifies the column exists and defaults NULL.
+        """
+        db_file = tmp_path / "mig_test.db"
+        db = Database(f"sqlite:///{db_file}")
+        db.create_tables()
+
+        try:
+            with db.session_scope() as session:
+                import uuid as _uuid
+                from streamselect.core.database import ChannelDB as _CDB
+                ch = _CDB(
+                    id=str(_uuid.uuid4()),
+                    source_id="s1",
+                    provider_id="p1",
+                    name="Migration Test Channel",
+                )
+                session.add(ch)
+
+            with db.session_scope(commit=False) as session:
+                from streamselect.core.database import ChannelDB as _CDB
+                ch = session.query(_CDB).filter_by(name="Migration Test Channel").one()
+                assert ch.tag_fingerprint is None, (
+                    "tag_fingerprint should default NULL on a new row"
+                )
+        finally:
+            db.close()
+
+
+# ---------------------------------------------------------------------------
+# Bulk path behavioral tests (perf/an earlier change — batch delete + batch upsert)
+# ---------------------------------------------------------------------------
+
+class TestBatchPathBehavior:
+    """Prove the new bulk _process_batch path is behaviorally identical to the
+    old per-channel path and that it handles edge cases correctly.
+
+    All tests use file-backed SQLite (not :memory:) per the the project rules rule.
+    """
+
+    def test_bulk_path_produces_same_tags_as_collect_tags(self, file_db, cfg):
+        """Batch backfill produces exactly the tag set predicted by _collect_tags.
+
+        Seeds N channels with varied feeder fields, runs the bulk backfill, then
+        asserts each channel's resulting (type, value) set in the DB matches what
+        _collect_tags returns directly.  This proves the new batch path is
+        semantically identical to the old per-channel path.
+        """
+        # Seed a handful of channels with different feeder combinations so we
+        # exercise multiple code paths through _collect_tags.
+        channels = [
+            {"name": "USA Drama",    "category": "USA",    "raw_data": {"genre": "Drama"}},
+            {"name": "UK Action",    "category": "UK",     "raw_data": {"genre": "Action"}},
+            {"name": "Year 1994",    "detected_year": "1994"},
+            {"name": "Quality HD",   "detected_quality": "HD"},
+            {"name": "Header FR",    "source_category": "FR"},
+        ]
+
+        seeded: list[tuple[str, dict]] = []  # (channel_id, kwargs)
+        for kwargs in channels:
+            cid = _add_channel(file_db, **kwargs)
+            seeded.append((cid, kwargs))
+
+        # Run the full backfill (uses the new bulk path).
+        _run_backfill(file_db, cfg)
+
+        # For each channel, compare the DB tag set to the direct _collect_tags output.
+        for cid, kwargs in seeded:
+            expected_tuples = _collect_tags(
+                config=cfg,
+                category=kwargs.get("category"),
+                source_category=kwargs.get("source_category"),
+                detected_prefix=kwargs.get("detected_prefix"),
+                detected_quality=kwargs.get("detected_quality"),
+                detected_region=kwargs.get("detected_region"),
+                detected_year=kwargs.get("detected_year"),
+                raw_data=kwargs.get("raw_data"),
+            )
+            expected_set = {(t, v) for t, v, _feeder in expected_tuples}
+
+            actual_tags = _tags_for(file_db, cid)
+            actual_set = {(t, v) for t, v, _src, _f in actual_tags}
+
+            assert actual_set == expected_set, (
+                f"Channel '{kwargs['name']}': expected tags {expected_set}, got {actual_set}"
+            )
+
+    def test_user_tag_survives_bulk_batch_retag(self, file_db, cfg):
+        """A source='user' curated tag is preserved after the bulk batch re-tag.
+
+        Seeds a channel with both a user tag AND feeder fields that produce
+        generated tags, runs the bulk backfill, and asserts:
+        - The user tag is still present.
+        - Generated tags were refreshed (still present, not accidentally deleted).
+        """
+        cid = _add_channel(file_db, raw_data={"genre": "Comedy"})
+
+        # Plant a user-curated tag before the backfill.
+        with file_db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            repos.tags.set_content_tags(
+                cid,
+                [("collection", "My Favorites", "human")],
+                source="user",
+            )
+
+        # Confirm user tag is in place.
+        assert _content_tag_count(file_db, cid, source="user") == 1
+
+        # Run the bulk backfill.
+        _run_backfill(file_db, cfg)
+
+        # User tag must survive.
+        assert _content_tag_count(file_db, cid, source="user") == 1, (
+            "source='user' tag must not be deleted by the bulk backfill"
+        )
+
+        # Generated tags from the genre feeder must also be present.
+        tags = _tags_for(file_db, cid)
+        generated = [(t, v) for t, v, src, _f in tags if src == "generated"]
+        assert any(t == "genre" and v == "Comedy" for t, v in generated), (
+            "genre:Comedy generated tag must be present after bulk backfill"
+        )
+
+    def test_channel_with_no_tags_handled_without_crash(self, file_db, cfg):
+        """A channel that yields no tags from any feeder causes no crash and no stray rows.
+
+        This exercises the empty-tag-list path in the bulk delete + bulk upsert,
+        ensuring an empty entry in the tag_map doesn't produce stray rows.
+        """
+        # This channel has all-None feeder fields — _collect_tags returns [].
+        cid = _add_channel(file_db, name="Blank Channel No Tags")
+
+        # Should complete without raising any exception.
+        _run_backfill(file_db, cfg)
+
+        # No generated or user content_tag rows should exist for this channel.
+        assert _content_tag_count(file_db, cid, source="generated") == 0, (
+            "A tag-less channel must produce zero content_tag rows"
+        )
+        assert _content_tag_count(file_db, cid, source="user") == 0
+
+
+# ---------------------------------------------------------------------------
+# TAG-1 (version 11): content_tags catches up with detected_genres
+#
+# W-1 fixed filter_utils.recognized_genre()'s case-sensitivity and
+# added its category->genre cross-walk, then re-derived ChannelDB.
+# detected_genres for the whole library via DetectedGenreBackfillTask v3 --
+# but recognized_genre() is also the provider_category feeder's genre pass
+# here, and content_tags was never re-decomposed. A library already at
+# tag_backfill_version == _TARGETED_GENRE_GAP_FLOOR (10, the version this gap
+# shipped under) only needed THOSE channels re-run.
+#
+# LANG-1 (version 12) superseded this at the run()-dispatch level: run() now
+# gates on _TARGETED_REGION_LANGUAGE_FLOOR (11) instead, so a library sitting
+# at the OLD floor (10) now takes the full-corpus pass, which also closes
+# this gap as a side effect because _collect_tags always runs today's feeder
+# code (see "Targeted vs. full scan" in tag_backfill.py's module docstring).
+# The genre-gap collector itself is unchanged and still correct, so the first
+# test below now calls it directly instead of going through run()'s version
+# dispatch; the dispatch-level tests (targeted vs. full scan) moved to
+# TestRegionLanguageTargetedDispatch below, which exercises the CURRENT
+# (version-12) floor.
+# ---------------------------------------------------------------------------
+
+class TestGenreGapTargetedRerun:
+    def test_channel_missing_genre_tag_gets_one_agreeing_sibling_untouched(
+        self, file_db, cfg
+    ):
+        """_collect_channel_ids_genre_gap + _process_batch -- the same two
+        calls run() used to make when _TARGETED_GENRE_GAP_FLOOR was the
+        current dispatch floor -- still re-decompose exactly the mismatched
+        channel and leave an agreeing sibling alone. Exercised directly
+        (not via run()) because run()'s own floor check has since moved to
+        _TARGETED_REGION_LANGUAGE_FLOOR (LANG-1); the collector itself is
+        unchanged.
+        """
+        # Affected: detected_genres already reflects the post-W-1 recognized_genre()
+        # cross-walk (as if DetectedGenreBackfillTask v3 already ran), but
+        # content_tags predates the fix -- exactly the TAG-1 gap.
+        affected = _add_channel(file_db, name="Affected Movie", category="Documentaire")
+        with file_db.session_scope() as session:
+            ch = session.query(ChannelDB).filter_by(id=affected).one()
+            ch.detected_genres = ["Documentary"]
+            ch.media_type = "movie"
+
+        # Agreeing sibling: same category, but its content_tags already carry
+        # the matching genre tag -- a real post-fix corpus row. Must not be
+        # touched by the targeted pass.
+        agreeing = _add_channel(file_db, name="Agreeing Movie", category="Documentaire")
+        with file_db.session_scope() as session:
+            ch = session.query(ChannelDB).filter_by(id=agreeing).one()
+            ch.detected_genres = ["Documentary"]
+            ch.media_type = "movie"
+        with file_db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            repos.tags.set_content_tags(
+                agreeing, [("genre", "Documentary", "provider_category")], source="generated"
+            )
+
+        # Sanity on the seeded starting state.
+        assert _content_tag_count(file_db, affected, source="generated") == 0
+        assert ("genre", "Documentary") in {
+            (t, v) for t, v, _s, _f in _tags_for(file_db, agreeing)
+        }
+
+        task = TagBackfillTask(file_db, config=cfg)
+        channel_ids = task._collect_channel_ids_genre_gap()
+        assert affected in channel_ids, "the affected channel must be selected"
+        assert agreeing not in channel_ids, "an already-agreeing channel must be left alone"
+
+        task._process_batch(channel_ids, cfg)
+
+        affected_tags = {(t, v) for t, v, _s, _f in _tags_for(file_db, affected)}
+        assert ("genre", "Documentary") in affected_tags, (
+            "the missing genre tag must exist after the targeted pass"
+        )
+
+        agreeing_tags_after = _tags_for(file_db, agreeing)
+        assert len(agreeing_tags_after) == 1, "the agreeing channel's tags must be unchanged"
+
+    def test_collector_finds_only_channels_with_a_genre_mismatch(self, file_db, cfg):
+        """_collect_channel_ids_genre_gap returns exactly the channels whose
+        detected_genres disagrees with their genre content_tags -- not channels
+        with no detected_genres, and not channels that already agree."""
+        no_genre = _add_channel(file_db, name="No Genre Set")
+
+        agreeing = _add_channel(file_db, name="Agreeing")
+        with file_db.session_scope() as session:
+            ch = session.query(ChannelDB).filter_by(id=agreeing).one()
+            ch.detected_genres = ["Comedy"]
+        with file_db.session_scope() as session:
+            repos = RepositoryFactory(session)
+            repos.tags.set_content_tags(
+                agreeing, [("genre", "Comedy", "provider_category")], source="generated"
+            )
+
+        mismatched = _add_channel(file_db, name="Mismatched")
+        with file_db.session_scope() as session:
+            ch = session.query(ChannelDB).filter_by(id=mismatched).one()
+            ch.detected_genres = ["Horror"]
+
+        task = TagBackfillTask(file_db, config=cfg)
+        found = set(task._collect_channel_ids_genre_gap())
+
+        assert found == {mismatched}
+        assert no_genre not in found
+        assert agreeing not in found
+
+
+# ---------------------------------------------------------------------------
+# LANG-1 (version 12): run()'s own targeted-vs-full dispatch, now gated on
+# _TARGETED_REGION_LANGUAGE_FLOOR instead of _TARGETED_GENRE_GAP_FLOOR.
+# ---------------------------------------------------------------------------
+
+class TestRegionLanguageTargetedDispatch:
+    def test_targeted_path_used_when_library_at_floor(self, file_db, cfg, monkeypatch):
+        """A library already at _TARGETED_REGION_LANGUAGE_FLOOR uses the cheap
+        targeted region-language query, never the full-corpus scan."""
+        _add_channel(file_db, category="USA")
+        cfg.tag_backfill_version = _TARGETED_REGION_LANGUAGE_FLOOR
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            TagBackfillTask,
+            "_collect_channel_ids_region_language",
+            lambda self: calls.append("targeted") or [],
+        )
+        monkeypatch.setattr(
+            TagBackfillTask,
+            "_collect_channel_ids",
+            lambda self: calls.append("full") or [],
+        )
+
+        _run_backfill(file_db, cfg)
+
+        assert calls == ["targeted"]
+
+    def test_full_scan_used_when_library_behind_floor(self, file_db, cfg, monkeypatch):
+        """A library behind _TARGETED_REGION_LANGUAGE_FLOOR (catching up across
+        several pending versions at once) still gets the full corpus scan, not
+        the narrow region-language query."""
+        _add_channel(file_db, category="USA")
+        cfg.tag_backfill_version = _TARGETED_REGION_LANGUAGE_FLOOR - 1
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            TagBackfillTask,
+            "_collect_channel_ids_region_language",
+            lambda self: calls.append("targeted") or [],
+        )
+        monkeypatch.setattr(
+            TagBackfillTask,
+            "_collect_channel_ids",
+            lambda self: calls.append("full") or [],
+        )
+
+        _run_backfill(file_db, cfg)
+
+        assert calls == ["full"]

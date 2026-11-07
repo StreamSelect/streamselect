@@ -1,0 +1,92 @@
+"""Migration task: backfill ``detected_genre``/``detected_genres`` for all channel rows.
+
+Discover genre-shelf perf fix (#genre-perf).  ``ChannelDB.detected_genre`` /
+``detected_genres`` were added so ``get_by_genre``/``get_all_genres`` can read a
+small, pre-canonicalised stored field instead of alias-matching against the raw
+``raw_data["genre"]`` JSON blob on every shelf expand (was 15-20s over 240k+
+rows).  New channels get these fields populated automatically at ingestion
+(``ChannelRepository.update_detected_prefixes()``, called after every provider
+refresh); this task performs the one-time backfill for rows that existed
+before the fix shipped.
+
+Idempotency
+-----------
+``needs_run`` returns True when ``config.genre_backfill_version`` is behind
+``CURRENT_VERSION``.  On completion the version is bumped and saved.  An
+interrupted run — including a crash inside ``run()`` — leaves the version
+unbumped (see ``MigrationManager._run_all``, which skips ``on_completed`` for
+any task whose ``run()`` raises) so the task restarts on the next launch from
+scratch; already-committed batches are durable (an earlier change crash-retry semantics).
+
+GENRE-1 (version 2): the Xtream VOD/movie payload carries no
+``raw_data["genre"]`` key at all (only the series payload does), so every
+movie backfilled by version 1 got ``detected_genre(s) = NULL``. Version 2
+re-runs the same full pass; ``update_detected_prefixes()`` now falls back to
+``filter_utils.genres_from_category()`` on the provider ``category`` when
+``genres_from_raw()`` finds nothing, so this backfill populates rows where
+``detected_genres IS NULL AND category IS NOT NULL AND category != ''`` —
+through the identical ingestion codepath a fresh row gets, not a second
+targeted query.
+
+W-1 (version 3): four more ``detected_*``/derived-field bugs fixed at the SAME
+ingestion chokepoint this task already re-runs, so — same as GENRE-1 above —
+they ride this one version bump rather than a fifth registered task. All four
+cost one full ``update_detected_prefixes()`` pass (~3m17s / one heavy launch
+on a user's 2.9 GB library); shipping them as four separate version bumps
+would cost four such launches for the exact same rows:
+
+- ``detected_added`` was NULL for every series (many rows) — the series
+  payload sends ``last_modified``, not ``added``; ``providers/xtream.py``
+  now falls back to it.
+- ``detected_year`` was empty for (a) many series with a year in
+  ``metadata.year`` and none parsed from the name — now filled via
+  ``channel_lens.metadata_years_for_chunk()`` — and (b) any name whose year
+  is followed by an unrecognised trailing parenthetical (e.g.
+  ``"(MULTI FHD HEVC)"``), which the step-1b pre-cut guard in
+  ``channel_name_utils.py`` used to drop entirely; measured many real
+  movie/series names newly keep their year with zero regressions.
+- ``recognized_genre()`` (``filter_utils.py``) was case-sensitive on its
+  fallback path (``recognized_genre("anime")`` returned ``None`` while
+  ``"Anime"`` worked) and missing several real category aliases
+  (``"documentales"``, ``"stand-up comedy"``, localized
+  "sci-fi & fantasy" forms, …); measured ~many movies newly get a genre
+  from their category with the fix.
+"""
+
+from __future__ import annotations
+
+from streamselect.core.migrations.detected_fields_reparse import DetectedFieldsReparseBase
+
+# Bump to re-run the full detected_genre(s) backfill for all users on next launch.
+# History:
+#   1 — initial backfill: populate detected_genre (first-segment canonical label)
+#       and detected_genres (all-segments canonical list) from raw_data["genre"]
+#       for every existing row, via the same update_detected_prefixes() pass that
+#       computes the other detected_* fields.
+#   2 — GENRE-1: movies have no raw_data["genre"] key at all (only series does),
+#       so update_detected_prefixes() now also falls back to
+#       genres_from_category() on the provider category; re-run to backfill the
+#       movie rows version 1 left NULL.
+#   3 — W-1: re-derives detected_added (series "added"→"last_modified" fallback),
+#       detected_year (metadata.year fallback + the unrecognised-trailing-
+#       parenthetical fix) and detected_genre(s) (recognized_genre() case-
+#       insensitivity + new aliases) in the same full pass. See the module
+#       docstring for the measured before/after counts.
+CURRENT_VERSION: int = 3
+
+
+class DetectedGenreBackfillTask(DetectedFieldsReparseBase):
+    """Populate ``detected_genre``/``detected_genres`` for every channel row.
+
+    ``needs_run`` checks ``config.genre_backfill_version`` against
+    ``CURRENT_VERSION``.  On full completion the version is bumped and config
+    is saved; on cancellation (or a crash — see ``MigrationManager._run_all``)
+    the version is left unbumped so the next launch retries from scratch.
+    ``__init__``/``needs_run``/``on_completed``/``run`` all come from
+    ``DetectedFieldsReparseBase``/``VersionGatedTask``.
+    """
+
+    id: str = "detected_genre_backfill"
+    label: str = "Indexing genre shelves"
+    VERSION_FIELD: str = "genre_backfill_version"
+    CURRENT_VERSION: int = CURRENT_VERSION

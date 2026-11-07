@@ -1,0 +1,229 @@
+"""EPG agenda widget — vertical schedule for the details pane (live channels only)."""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
+from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
+from loguru import logger
+
+from streamselect.core import watchlist
+from streamselect.core.database import Database
+from streamselect.core.epg_utils import now_utc as _now_utc, fmt_time as _fmt_time, fmt_duration as _fmt_duration, progress_pct as _progress_pct, remaining_str as _remaining_str
+from streamselect.core.repositories.epg import EpgRepository
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui.progress_paint import ProgressBar
+from streamselect.gui import theme as _theme
+
+
+class EpgAgendaWidget(QWidget):
+    """Vertical schedule agenda for the details pane.
+
+    Shows the current programme (with progress bar) and upcoming programmes
+    for the selected live channel. Hidden automatically when no data is available.
+    """
+
+    now_title_changed = pyqtSignal(str)  # current show title (empty string = no data)
+    #: A title was added to / removed from the watchlist here (D60: Watch Alerts
+    #: in the sidebar must hear about it, as it does from the EPG view).
+    watchlist_changed = pyqtSignal()
+
+    def __init__(self, db: Database, config=None, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._db = db
+        self._config = config
+        self._pending_channel_id: str | None = None
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(False)
+        self._refresh_timer.setInterval(60_000)  # refresh progress bars every minute
+        self._refresh_timer.timeout.connect(self._refresh_if_visible)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 8, 0, 0)
+        layout.setSpacing(0)
+        self._layout = layout
+        self.hide()
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def load_for_channel(self, channel_db_id: str) -> None:
+        """Schedule a DB fetch for the given channel on the next event loop tick."""
+        self._pending_channel_id = channel_db_id
+        QTimer.singleShot(0, self._do_load)
+
+    def clear(self) -> None:
+        """Remove all content and hide."""
+        self._pending_channel_id = None
+        self._refresh_timer.stop()
+        self._clear_layout()
+        self.now_title_changed.emit("")
+        self.hide()
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _refresh_if_visible(self) -> None:
+        if self._pending_channel_id:
+            QTimer.singleShot(0, self._do_load)
+
+    def _do_load(self) -> None:
+        channel_id = self._pending_channel_id
+        if not channel_id:
+            return
+        session = self._db.get_session()
+        try:
+            repo = EpgRepository(session)
+            now_prog = repo.get_now_for_channel(channel_id)
+            upcoming = repo.get_schedule_for_channel(channel_id, hours_ahead=12)
+            # Exclude the current programme from the upcoming list
+            now_id = now_prog.id if now_prog else None
+            upcoming = [p for p in upcoming if p.id != now_id]
+        except Exception:
+            logger.exception("EpgAgendaWidget: DB error")
+            now_prog = None
+            upcoming = []
+        finally:
+            session.close()
+
+        if not now_prog and not upcoming:
+            self.now_title_changed.emit("")
+            self.clear()
+            return
+
+        self._render(now_prog, upcoming)
+
+    def _clear_layout(self) -> None:
+        while self._layout.count():
+            item = self._layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _render(self, now_prog, upcoming: list) -> None:
+        self._clear_layout()
+        now = _now_utc()
+        self.now_title_changed.emit(now_prog.title if now_prog else "")
+
+        # Section divider
+        self._layout.addWidget(_divider())
+
+        if now_prog:
+            self._layout.addWidget(_section_label("NOW PLAYING"))
+            self._layout.addWidget(self._build_now_card(now_prog, now))
+
+        if upcoming:
+            self._layout.addWidget(_section_label("UP NEXT"))
+            for prog in upcoming:
+                self._layout.addWidget(self._build_next_row(prog))
+
+        self._layout.addWidget(_divider())
+        self.show()
+        if not self._refresh_timer.isActive():
+            self._refresh_timer.start()
+
+    def _build_now_card(self, prog, now: datetime) -> QWidget:
+        card = QWidget()
+        card.setObjectName("nowCard")
+        _theme.style_fn(card, lambda: f"""
+            QWidget#nowCard {{
+                background: {_theme.OVERLAY_WARN_06};
+                border-left: 3px solid {_theme.COLOR_WARN};
+                border-radius: 4px;
+            }}
+        """)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(10, 8, 8, 8)
+        layout.setSpacing(4)
+
+        title_lbl = QLabel(prog.title)
+        title_lbl.setWordWrap(True)
+        # Ignored horizontal policy: layout skips minimumSizeHint() for this widget,
+        # preventing a long show title from expanding the scroll area content width.
+        title_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        _theme.style_fn(title_lbl, lambda: f"font-size: {_theme.FONT_XL}; font-weight: bold; color: {_theme.COLOR_TEXT_HI};")
+        layout.addWidget(title_lbl)
+
+        time_str = f"{_fmt_time(prog.start_time)} — {_fmt_time(prog.stop_time)}  ·  {_fmt_duration(prog.start_time, prog.stop_time)}"
+        time_lbl = QLabel(time_str)
+        _theme.style_fn(time_lbl, lambda: f"font-size: {_theme.FONT_MD}; color: {_theme.COLOR_DIM_2};")
+        layout.addWidget(time_lbl)
+
+        pct = _progress_pct(prog.start_time, prog.stop_time, now)
+        bar = ProgressBar(pct, height=4)
+        layout.addWidget(bar)
+
+        remaining_lbl = QLabel(f"{pct}%  ·  {_remaining_str(prog.stop_time, now)}")
+        _theme.style_fn(remaining_lbl, lambda: f"font-size: {_theme.FONT_MD}; color: {_theme.COLOR_TEXT};")
+        layout.addWidget(remaining_lbl)
+
+        return card
+
+    def _build_next_row(self, prog) -> QWidget:
+        row = QWidget()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(10, 3, 8, 3)
+        h.setSpacing(8)
+
+        time_lbl = QLabel(_fmt_time(prog.start_time))
+        time_lbl.setFixedWidth(58)
+        _theme.style_fn(time_lbl, lambda: f"font-size: {_theme.FONT_MD}; color: {_theme.COLOR_DISABLED};")
+        h.addWidget(time_lbl)
+
+        title_lbl = QLabel(prog.title)
+        _theme.style_fn(title_lbl, lambda: f"font-size: {_theme.FONT_MD}; color: {_theme.COLOR_TEXT};")
+        title_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        h.addWidget(title_lbl, 1)
+
+        dur_lbl = QLabel(_fmt_duration(prog.start_time, prog.stop_time))
+        _theme.style_fn(dur_lbl, lambda: f"font-size: {_theme.FONT_MD}; color: {_theme.COLOR_TEXT};")
+        dur_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
+        h.addWidget(dur_lbl)
+
+        if self._config is not None:
+            in_wl = watchlist.contains(self._config, prog.title)
+            bell_btn = QPushButton()
+            bell_btn.setFixedWidth(26)
+            bell_btn.setCheckable(True)
+            bell_btn.setChecked(in_wl)
+            _icon_utils.set_button_icon(bell_btn, "monitor" if in_wl else "monitor_off")
+            bell_btn.setIconSize(QSize(13, 13))
+            _theme.style_fn(bell_btn, lambda: "border: none; padding: 0;")
+            bell_btn.setToolTip("Remove from watchlist" if in_wl else "Add to watchlist")
+            bell_btn.toggled.connect(
+                lambda checked, t=prog.title, b=bell_btn: self._toggle_watchlist(t, checked, b)
+            )
+            h.addWidget(bell_btn)
+
+        return row
+
+    def _toggle_watchlist(self, title: str, add: bool, btn: QPushButton) -> None:
+        if self._config is None:
+            return
+        if add:
+            watchlist.add(self._config, title)
+        else:
+            watchlist.remove(self._config, title)
+        _icon_utils.set_button_icon(btn, "monitor" if add else "monitor_off")
+        btn.setToolTip("Remove from watchlist" if add else "Add to watchlist")
+        self.watchlist_changed.emit()
+
+
+# ------------------------------------------------------------------
+# Helper widgets
+# ------------------------------------------------------------------
+
+def _divider() -> QFrame:
+    line = QFrame()
+    line.setFrameShape(QFrame.Shape.HLine)
+    _theme.style_fn(line, lambda: f"color: {_theme.OVERLAY_08};")
+    return line
+
+
+def _section_label(text: str) -> QLabel:
+    lbl = QLabel(text)
+    _theme.style_fn(lbl, lambda: f"font-size: {_theme.FONT_SM}; font-weight: bold; color: {_theme.COLOR_TEXT}; letter-spacing: 1px;"
+        " padding: 6px 10px 2px 10px;")
+    return lbl

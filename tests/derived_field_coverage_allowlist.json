@@ -1,0 +1,26 @@
+{
+  "_comment": "W-0 seed allowlist (tests/test_derived_field_coverage.py) - every entry is a (field, media_type) combo the real ingestion + metadata-backfill pipeline produces empty for the representative fixture row, seeded. This list IS the audit: each entry's reason names WHY, so W-1/W-2 can fix the real ones and leave the 'not applicable' ones alone. Shrink-only: a combo that starts populating must be REMOVED, never left here (test_the_allowlist_only_shrinks fails the suite if it is). Regenerate with scripts/pytest_verdict.sh tests/test_derived_field_coverage.py and read the failure - never bulk-add without reading each combo.",
+  "combos": {
+    "ChannelDB.detected_tmdb_id|live": "live payload carries no 'tmdb' key (Xtream live streams aren't TMDb titles) - not applicable to this media_type.",
+    "ChannelDB.detected_rating|live": "live payload carries no 'rating' key (Xtream live streams carry no viewer rating) - not applicable to this media_type.",
+    "ChannelDB.detected_year|live": "live channel names carry no release year - not applicable to this media_type (see module docstring: not a payload-key bug).",
+    "ChannelDB.detected_year|series": "worklog W-1 item 2: many series titles omit an embedded year (measured 30.8% populated vs movies' 58.6%). W-1 added the MetadataDB.year fallback (channel_lens.metadata_years_for_chunk), so on a large library this now fills many series - but THIS fixture seeds no metadata row carrying a year, so the fallback has nothing to read here. Listed because the fixture cannot exercise it, not because the gap is unfixed; strengthen the fixture to remove this entry.",
+    "ChannelDB.detected_genre|live": "deliberate: GENRE_MEDIA_TYPES excludes live by design (live channels are grouped by bouquet/category, not genre) - a policy, not a bug.",
+    "ChannelDB.detected_genre|movie": "the movie LIST payload carries no 'genre' key; genres_from_category's strict recognized_genre() allowlist doesn't match a typical non-genre-shaped category name ('US Movies') - matches a large library's majority case (84.6% of movies get no detected_genre this way).",
+    "ChannelDB.detected_genres|live": "same as ChannelDB.detected_genre|live - deliberate, GENRE_MEDIA_TYPES policy.",
+    "ChannelDB.detected_genres|movie": "same as ChannelDB.detected_genre|movie - no genre-shaped category to cross-walk.",
+    "MetadataDB.plot|movie": "the movie LIST payload carries no plot/cast/director/genre/release_date/backdrop key at all (verified 0 of many real movie rows have an 'info' key in raw_data) - only the VOD detail endpoint or network enrichment can supply it.",
+    "MetadataDB.genres|movie": "same cause as MetadataDB.plot|movie - the movie LIST payload has no 'genre' key.",
+    "MetadataDB.cast|movie": "same cause as MetadataDB.plot|movie - the movie LIST payload has no 'cast' key.",
+    "MetadataDB.director|movie": "same cause as MetadataDB.plot|movie - the movie LIST payload has no 'director' key.",
+    "MetadataDB.release_date|movie": "same cause as MetadataDB.plot|movie - the movie LIST payload has no 'releaseDate'/'release_date' key.",
+    "MetadataDB.backdrop_url|movie": "same cause as MetadataDB.plot|movie - the movie LIST payload has no 'backdrop_path' key.",
+    "MetadataDB.runtime|movie": "FLAGSHIP (worklog W-2 item 2): the movie LIST payload carries no 'duration'/'episode_run_time' key at all (verified 0 of many real movie rows); runtime_from_raw has nothing to read at this ingestion stage. Empty for 100% of movies (0 of many measured), populated for series.",
+    "MetadataDB.content_rating|movie": "CORRECTED by W-2a (the original reason here was wrong): metadata_from_raw does NOT actually compute a value for this shape, so a _fill('content_rating', ...) line would be a no-op. 'rating'/'rating_5based' are Xtream stream-API placeholders (a review-style score, e.g. '7.8', never an age rating like 'PG-13') - metadata_from_raw explicitly pops them from the flat info-copy before building the result whenever there's no nested 'info' sub-dict, which is the shape every real payload uses, so info.get('rating') is always None by the time content_rating is computed. No source exists; not filled, per the project rules 'do not invent a source'.",
+    "MetadataDB.content_rating|series": "same as MetadataDB.content_rating|movie - not media_type-specific; the pop happens identically for both shapes.",
+    "MetadataDB.tagline|movie": "no source exists: neither the movie nor the series LIST payload ships a 'tagline' key (verified against a large library), so metadata_from_raw's info.get('tagline') always resolves to None for this shape - only network TMDb/OMDb enrichment can supply it. W-2a confirmed this and deliberately did not add a _fill('tagline', ...) line (the project rules: don't invent a source).",
+    "MetadataDB.tagline|series": "same as MetadataDB.tagline|movie - not media_type-specific.",
+    "MetadataDB.cast|series": "credits live only as cast/director TAGS since an earlier change (core/credits.py); the metadata text column is no longer written.",
+    "MetadataDB.director|series": "credits live only as cast/director TAGS since an earlier change (core/credits.py); the metadata text column is no longer written."
+  }
+}

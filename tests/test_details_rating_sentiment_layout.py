@@ -1,0 +1,556 @@
+"""Behavioral tests for details-pane layout changes.
+
+Change A — Rating on its own row (superseded by DETAILS-3b):
+  * rating_label lives on the title block's ``_rating_row_w`` (the TMDb/IMDb
+    id chips share it); content rating moved into the byline text
+    ("Movie · 2024 · PG-13") and no longer has its own badge.
+  * Shows when raw_data / metadata provide a rating; hidden + no gap when absent.
+
+Change B — actions tiered by frequency (feat/details-action-hierarchy):
+  * Play + Resume graduate to a full-size primary row below the poster; the
+    infrequent set (favorite/queue/sentiment/alert/watchlist/hide) stays in the
+    slim icon rail left of the poster.
+  * Play is full-width when there's no saved position; Play + Resume split 50/50
+    when partially-watched, with Resume the dominant filled-orange button.
+  * The rail is visible for ALL channel types (VOD and live).
+  * like_clicked / dislike_clicked / not_interested_clicked signals still fire.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import pytest
+
+from tests.conftest import wire_details_action_buttons
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    from PyQt6.QtWidgets import QApplication
+    return QApplication.instance() or QApplication([])
+
+
+def _make_config():
+    from streamselect.core.config import Config
+    return Config()
+
+
+def _stub_channel(**kwargs):
+    """Return a minimal MagicMock that passes load_basic() cleanly."""
+    ch = MagicMock()
+    ch.name = kwargs.get("name", "Test Title")
+    ch.media_type = kwargs.get("media_type", "movie")
+    ch.is_favorite = False
+    ch.is_adult = False
+    ch.detected_title = kwargs.get("detected_title", "Test Title")
+    ch.detected_year = kwargs.get("detected_year", None)
+    ch.detected_prefix = kwargs.get("detected_prefix", None)
+    ch.detected_quality = kwargs.get("detected_quality", None)
+    ch.detected_region = kwargs.get("detected_region", None)
+    ch.raw_data = kwargs.get("raw_data", None)
+    ch.provider_id = None
+    ch.watch_completed = False
+    ch.watch_progress = 0
+    return ch
+
+
+# ── Change A: rating on its own row (DETAILS-3b) ─────────────────────────────
+
+def test_rating_label_is_on_the_rating_row(qapp):
+    """rating_label belongs on the title block's rating row, alongside the
+    TMDb/IMDb id chips — not a row of its own and not the media-type row
+    (which is gone; type/year/runtime/content-rating all moved into the
+    byline text)."""
+    from streamselect.gui.details_title import _MetadataSection
+
+    section = _MetadataSection(_make_config())
+    assert section.rating_label.parent() is section._rating_row_w, (
+        "rating_label.parent() must be _rating_row_w"
+    )
+    assert section._tmdb_chip.parent() is section._rating_row_w, (
+        "_tmdb_chip must share the rating row"
+    )
+    assert section._imdb_chip.parent() is section._rating_row_w, (
+        "_imdb_chip must share the rating row"
+    )
+
+
+def test_rating_shown_when_raw_data_has_rating(qapp):
+    """load_basic() with a raw_data rating must show rating_label on the type row."""
+    from streamselect.gui.details_title import _MetadataSection
+
+    section = _MetadataSection(_make_config())
+    ch = _stub_channel(raw_data={"rating": "7.5"})
+    section.load_basic(ch)
+
+    assert not section.rating_label.isHidden(), (
+        "rating_label must be visible after load_basic with a numeric raw_data rating"
+    )
+    assert "7.5" in section.rating_label.toolTip(), (
+        f"the number is on hover; got '{section.rating_label.toolTip()}'"
+    )
+
+
+def test_rating_hidden_when_no_raw_data(qapp):
+    """load_basic() with no raw_data must leave rating_label hidden (no empty gap)."""
+    from streamselect.gui.details_title import _MetadataSection
+
+    section = _MetadataSection(_make_config())
+    ch = _stub_channel(raw_data=None)
+    section.load_basic(ch)
+
+    assert section.rating_label.isHidden(), (
+        "rating_label must be hidden when raw_data is None — no empty gap on the type line"
+    )
+
+
+def test_rating_hidden_when_raw_data_has_no_rating_key(qapp):
+    """load_basic() with raw_data that lacks 'rating' must leave rating_label hidden."""
+    from streamselect.gui.details_title import _MetadataSection
+
+    section = _MetadataSection(_make_config())
+    ch = _stub_channel(raw_data={"stream_type": "movie"})
+    section.load_basic(ch)
+
+    assert section.rating_label.isHidden(), (
+        "rating_label must stay hidden when raw_data exists but has no 'rating' key"
+    )
+
+
+@pytest.mark.parametrize("zero_rating", ["0", "0.0", 0, 0.0])
+def test_rating_hidden_when_raw_rating_is_zero(qapp, zero_rating):
+    """A rating of 0 / '0' / '0.0' means unrated — must hide (not show '0.0 of 10')."""
+    from streamselect.gui.details_title import _MetadataSection
+
+    section = _MetadataSection(_make_config())
+    ch = _stub_channel(raw_data={"rating": zero_rating})
+    section.load_basic(ch)
+
+    assert section.rating_label.isHidden(), (
+        f"rating_label must be hidden for a zero rating ({zero_rating!r}) — "
+        "no '0.0 of 10' on unrated content"
+    )
+
+
+def test_rating_shown_via_load_metadata(qapp):
+    """load_metadata() with a numeric rating must show rating_label."""
+    from streamselect.gui.details_title import _MetadataSection
+    from streamselect.metadata_providers.base import MetadataResult
+
+    section = _MetadataSection(_make_config())
+    section.load_metadata(MetadataResult(rating=8.2, rating_count=5000))
+
+    assert not section.rating_label.isHidden(), (
+        "rating_label must be visible after load_metadata with a rating"
+    )
+    assert "8.2" in section.rating_label.toolTip()
+    assert "5,000 votes" in section.rating_label.toolTip()
+
+
+def test_content_rating_folds_into_the_byline(qapp):
+    """content_rating no longer has its own badge — it is the last segment of
+    the byline text ("Movie · 2024 · PG-13"), DETAILS-3b."""
+    from streamselect.gui.details_title import _MetadataSection
+    from streamselect.metadata_providers.base import MetadataResult
+
+    section = _MetadataSection(_make_config())
+    section.load_basic(_stub_channel(detected_year="2024"))
+    section.load_metadata(MetadataResult(content_rating="PG-13"))
+
+    assert section._byline_lbl.text() == "MOVIE · 2024 · PG-13"
+
+
+def test_rating_cleared_after_clear(qapp):
+    """After clear(), rating_label must be hidden and empty, and the id chips
+    hidden with it."""
+    from streamselect.gui.details_title import _MetadataSection
+    from streamselect.metadata_providers.base import MetadataResult
+
+    section = _MetadataSection(_make_config())
+    section.load_metadata(MetadataResult(rating=7.0, tmdb_id="42"))
+    assert not section.rating_label.isHidden()
+    assert not section._tmdb_chip.isHidden()
+
+    section.clear()
+    assert section.rating_label.isHidden(), "rating_label must be hidden after clear()"
+    assert section.rating_label.text() == "", "rating_label must be empty after clear()"
+    assert section._tmdb_chip.isHidden(), "_tmdb_chip must be hidden after clear()"
+    assert section._rating_row_w.isHidden(), (
+        "_rating_row_w must be hidden after clear() — nothing left to show"
+    )
+
+
+def test_rating_hidden_for_live_via_rating_row(qapp):
+    """For a live channel, set_mode(is_live=True) hides _rating_row_w."""
+    from streamselect.gui.details_title import _MetadataSection
+    from streamselect.metadata_providers.base import MetadataResult
+
+    section = _MetadataSection(_make_config())
+    section.load_metadata(MetadataResult(rating=6.5))
+    assert not section.rating_label.isHidden()
+
+    section.set_mode(is_live=True)
+    assert section._rating_row_w.isHidden(), (
+        "_rating_row_w (which contains rating_label) must be hidden in live mode"
+    )
+
+
+# ── Change B: ALL action buttons in the vertical rail left of the poster ─────
+
+def _wire_rail(poster, action_bar):
+    """Reparent action buttons into their tiered slots (play/resume → primary row)."""
+    wire_details_action_buttons(poster, action_bar)
+
+
+def test_infrequent_buttons_reparented_to_rail(qapp):
+    """After set_action_buttons(), the infrequent action buttons live in _action_rail.
+
+    Play and Resume graduate to the primary row below the poster, Queue ("Watch
+    Later") graduates to the secondary row, and the sentiment trio graduates to the
+    labelled "Rate:" row — none of those are in the rail.
+    """
+    from streamselect.gui.details_sections import _PosterSection
+    from streamselect.gui.details_actions import _ActionBar
+
+    cfg = _make_config()
+    poster = _PosterSection(cfg, MagicMock())
+    action_bar = _ActionBar(cfg)
+
+    _wire_rail(poster, action_bar)
+
+    for btn in (
+        action_bar.favorite_button,
+        action_bar.watchlist_button, action_bar.monitor_button,
+        action_bar.clear_epg_link_button, action_bar.hide_button,
+    ):
+        assert btn.parent() is poster._action_rail, (
+            f"{btn!r} must be reparented to _action_rail after set_action_buttons()"
+        )
+
+    # The rating trio is reparented to the secondary row (right of Watch Later).
+    for btn in (
+        action_bar.like_button, action_bar.not_interested_button, action_bar.dislike_button,
+    ):
+        assert btn.parent() is poster._secondary_action_row, (
+            f"{btn!r} must be reparented to the secondary 'Watch Later' row"
+        )
+
+    # Play/Resume/Queue must NOT be in the rail.
+    rail_widgets = [
+        poster._action_rail_layout.itemAt(i).widget()
+        for i in range(poster._action_rail_layout.count())
+    ]
+    assert action_bar.play_button not in rail_widgets, "Play must NOT be in the rail"
+    assert action_bar.resume_button not in rail_widgets, "Resume must NOT be in the rail"
+    assert action_bar.queue_button not in rail_widgets, "Queue must NOT be in the rail"
+
+
+def test_play_resume_in_primary_row(qapp):
+    """Play and Resume graduate to the full-size primary action row below the poster."""
+    from streamselect.gui.details_sections import _PosterSection
+    from streamselect.gui.details_actions import _ActionBar
+
+    cfg = _make_config()
+    poster = _PosterSection(cfg, MagicMock())
+    action_bar = _ActionBar(cfg)
+
+    _wire_rail(poster, action_bar)
+
+    assert action_bar.play_button.parent() is poster._primary_action_row, (
+        "Play must live in the primary action row below the poster"
+    )
+    assert action_bar.resume_button.parent() is poster._primary_action_row, (
+        "Resume must live in the primary action row below the poster"
+    )
+
+
+def test_queue_in_secondary_zone_full_width_button(qapp):
+    """Queue ("Watch Later") graduates out of the rail to a labeled full-width button
+    in the secondary zone directly under the Play/Resume row."""
+    from streamselect.gui.details_sections import _PosterSection
+    from streamselect.gui.details_actions import _ActionBar
+
+    cfg = _make_config()
+    poster = _PosterSection(cfg, MagicMock())
+    action_bar = _ActionBar(cfg)
+
+    _wire_rail(poster, action_bar)
+
+    assert action_bar.queue_button.parent() is poster._secondary_action_row, (
+        "Queue must live in the secondary action row (under Play/Resume), not the rail"
+    )
+    # It is a labeled, checkable button (not a bare icon) with a tooltip.
+    assert "Watch Later" in action_bar.queue_button.text(), (
+        f"Queue button must be labeled 'Watch Later'; got {action_bar.queue_button.text()!r}"
+    )
+    assert action_bar.queue_button.isCheckable(), "Queue button must stay checkable"
+    assert action_bar.queue_button.toolTip(), "Queue button must keep a tooltip"
+    # Trailer moved to its OWN row (fix/trailer-own-row, user-reported
+    #): the secondary row now starts with Watch Later, the only
+    # widget that stretches (the rating trio shares the line, pinned right).
+    srow = poster._secondary_row_layout
+    assert srow.itemAt(0).widget() is action_bar.queue_button, (
+        "Watch Later must be the leftmost widget on the secondary row"
+    )
+    assert srow.stretch(0) == 1, "Watch Later must absorb the row's spare width"
+
+
+def test_primary_row_play_full_width_when_no_resume(qapp):
+    """VOD with no saved position → only Play is shown in the primary row (full-width)."""
+    from streamselect.gui.details_sections import _PosterSection
+    from streamselect.gui.details_actions import _ActionBar
+
+    cfg = _make_config()
+    poster = _PosterSection(cfg, MagicMock())
+    action_bar = _ActionBar(cfg)
+    _wire_rail(poster, action_bar)
+    poster.set_mode(is_live=False)
+
+    action_bar.set_resume(False)
+    assert not action_bar.play_button.isHidden(), "Play must show"
+    assert action_bar.resume_button.isHidden(), (
+        "Resume must be hidden when there's no saved position → Play fills the row"
+    )
+
+
+def test_primary_row_resume_dominant_when_partially_watched(qapp):
+    """Partially-watched → Play + Resume side-by-side; Resume is the dominant one.
+
+    Both share the primary row (50/50 via equal stretch).  Resume carries the
+    filled-orange dominant style + the M:SS label; Play carries the secondary
+    outline style.
+    """
+    from streamselect.gui.details_sections import _PosterSection
+    from streamselect.gui.details_actions import _ActionBar
+    from streamselect.gui import theme as _theme
+
+    cfg = _make_config()
+    poster = _PosterSection(cfg, MagicMock())
+    action_bar = _ActionBar(cfg)
+    _wire_rail(poster, action_bar)
+    poster.set_mode(is_live=False)
+
+    action_bar.set_resume(True, position_s=125)
+    assert not action_bar.play_button.isHidden(), "Play must show alongside Resume"
+    assert not action_bar.resume_button.isHidden(), "Resume must show when partially watched"
+    # Resume label shows the saved position; it is the dominant filled-orange button.
+    assert "2:05" in action_bar.resume_button.text(), (
+        f"Resume label must show M:SS; got {action_bar.resume_button.text()!r}"
+    )
+    assert action_bar.resume_button.styleSheet() == _theme.DETAIL_RESUME_BTN, (
+        "Resume must use the dominant filled-orange style"
+    )
+    assert action_bar.play_button.styleSheet() == _theme.DETAIL_PLAY_BTN, (
+        "Play must use the secondary outline style"
+    )
+    # Equal stretch → 50/50 split in the primary row.
+    prow = poster._primary_row_layout
+    assert prow.stretch(prow.indexOf(action_bar.play_button)) == 1
+    assert prow.stretch(prow.indexOf(action_bar.resume_button)) == 1
+
+
+def test_action_rail_hidden_until_channel_shown(qapp):
+    """Regression: in the empty/no-selection state the rail must be hidden, so
+    favorite/play/queue/hide icons don't appear with nothing selected.  set_mode()
+    (called only when a channel is shown) reveals it."""
+    from streamselect.gui.details_sections import _PosterSection
+    from streamselect.gui.details_actions import _ActionBar
+
+    cfg = _make_config()
+    poster = _PosterSection(cfg, MagicMock())
+    action_bar = _ActionBar(cfg)
+
+    _wire_rail(poster, action_bar)
+
+    assert poster._action_rail.isHidden(), (
+        "_action_rail must stay hidden after wiring buttons but before a channel is "
+        "shown — no action icons in the empty state"
+    )
+
+    poster.set_mode(is_live=False)
+    assert not poster._action_rail.isHidden(), (
+        "_action_rail must become visible once a channel is shown (set_mode)"
+    )
+
+
+def test_action_rail_visible_for_vod(qapp):
+    """The action rail must be visible for VOD (is_live=False)."""
+    from streamselect.gui.details_sections import _PosterSection
+    from streamselect.gui.details_actions import _ActionBar
+
+    cfg = _make_config()
+    poster = _PosterSection(cfg, MagicMock())
+    action_bar = _ActionBar(cfg)
+
+    _wire_rail(poster, action_bar)
+    poster.set_mode(is_live=False)
+
+    assert not poster._action_rail.isHidden(), (
+        "_action_rail must be visible for VOD (is_live=False)"
+    )
+
+
+def test_action_rail_visible_for_live(qapp):
+    """The action rail stays visible for live channels (regression: 'icons left of
+    poster aren't there').  Only the poster swaps to the live header; the rail stays."""
+    from streamselect.gui.details_sections import _PosterSection
+    from streamselect.gui.details_actions import _ActionBar
+
+    cfg = _make_config()
+    poster = _PosterSection(cfg, MagicMock())
+    action_bar = _ActionBar(cfg)
+
+    _wire_rail(poster, action_bar)
+    poster.set_mode(is_live=False)
+    assert not poster._action_rail.isHidden()
+
+    poster.set_mode(is_live=True)
+    assert not poster._action_rail.isHidden(), (
+        "_action_rail must stay visible for live channels (rail is shown for all types)"
+    )
+    # The poster frame hides for live; the live header takes its place.
+    assert poster._poster_frame.isHidden(), "poster frame must hide in live mode"
+    assert not poster._live_header.isHidden(), "live header must show in live mode"
+
+
+def test_action_bar_set_mode_hides_sentiment_buttons_for_live(qapp):
+    """_ActionBar.set_mode(is_live=True) must set the buttons invisible."""
+    from streamselect.gui.details_actions import _ActionBar
+
+    cfg = _make_config()
+    action_bar = _ActionBar(cfg)
+
+    # Show them first (VOD mode)
+    action_bar.set_mode(is_live=False)
+    assert not action_bar.like_button.isHidden()
+    assert not action_bar.not_interested_button.isHidden()
+    assert not action_bar.dislike_button.isHidden()
+
+    # Switch to live
+    action_bar.set_mode(is_live=True)
+    assert action_bar.like_button.isHidden(), (
+        "like_button must be hidden after set_mode(is_live=True)"
+    )
+    assert action_bar.not_interested_button.isHidden()
+    assert action_bar.dislike_button.isHidden()
+
+
+def test_like_clicked_signal_fires(qapp):
+    """Clicking the like button must emit like_clicked."""
+    from streamselect.gui.details_actions import _ActionBar
+
+    cfg = _make_config()
+    action_bar = _ActionBar(cfg)
+    action_bar.set_mode(is_live=False)  # make buttons visible
+
+    fired: list[bool] = []
+    action_bar.like_clicked.connect(lambda: fired.append(True))
+
+    action_bar.like_button.click()
+
+    assert fired == [True], "like_clicked must emit once on button click"
+
+
+def test_dislike_clicked_signal_fires(qapp):
+    """Clicking the dislike button must emit dislike_clicked."""
+    from streamselect.gui.details_actions import _ActionBar
+
+    cfg = _make_config()
+    action_bar = _ActionBar(cfg)
+    action_bar.set_mode(is_live=False)
+
+    fired: list[bool] = []
+    action_bar.dislike_clicked.connect(lambda: fired.append(True))
+
+    action_bar.dislike_button.click()
+
+    assert fired == [True], "dislike_clicked must emit once on button click"
+
+
+def test_not_interested_clicked_signal_fires(qapp):
+    """Clicking the not_interested button must emit not_interested_clicked."""
+    from streamselect.gui.details_actions import _ActionBar
+
+    cfg = _make_config()
+    action_bar = _ActionBar(cfg)
+    action_bar.set_mode(is_live=False)
+
+    fired: list[bool] = []
+    action_bar.not_interested_clicked.connect(lambda: fired.append(True))
+
+    action_bar.not_interested_button.click()
+
+    assert fired == [True], "not_interested_clicked must emit once on button click"
+
+
+def test_like_dislike_mutually_exclusive_optimistic_state(qapp):
+    """Checking like then dislike must leave only dislike checked (optimistic state)."""
+    from streamselect.gui.details_actions import _ActionBar
+
+    cfg = _make_config()
+    action_bar = _ActionBar(cfg)
+    action_bar.set_mode(is_live=False)
+
+    action_bar.like_button.click()          # rating → +1
+    assert action_bar._rating == 1
+
+    action_bar.dislike_button.click()       # rating → -1, like unchecked
+    assert action_bar._rating == -1
+    assert not action_bar.like_button.isChecked(), (
+        "like_button must not be checked after dislike is clicked"
+    )
+    assert action_bar.dislike_button.isChecked(), (
+        "dislike_button must be checked after clicking dislike"
+    )
+
+
+def test_not_interested_clears_like_and_dislike(qapp):
+    """Activating Not Interested must clear an active like/dislike (exclusive group)."""
+    from streamselect.gui.details_actions import _ActionBar
+
+    action_bar = _ActionBar(_make_config())
+    action_bar.set_mode(is_live=False)
+
+    action_bar.like_button.click()            # rating → +1
+    assert action_bar.like_button.isChecked()
+
+    action_bar.not_interested_button.click()  # suppress ON → must clear rating
+    assert action_bar._suppressed is True
+    assert action_bar._rating == 0, "Not Interested must clear the rating"
+    assert not action_bar.like_button.isChecked(), "like must be unchecked by Not Interested"
+    assert not action_bar.dislike_button.isChecked()
+    assert action_bar.not_interested_button.isChecked()
+
+
+def test_like_clears_not_interested(qapp):
+    """Activating like/dislike must clear an active Not Interested (exclusive group)."""
+    from streamselect.gui.details_actions import _ActionBar
+
+    action_bar = _ActionBar(_make_config())
+    action_bar.set_mode(is_live=False)
+
+    action_bar.not_interested_button.click()  # suppress ON
+    assert action_bar._suppressed is True
+
+    action_bar.like_button.click()            # like ON → must clear suppression
+    assert action_bar._rating == 1
+    assert action_bar._suppressed is False, "like must clear Not Interested"
+    assert not action_bar.not_interested_button.isChecked()
+
+
+def test_resume_button_hidden_until_set(qapp):
+    """The resume button is hidden by default and shown only via set_resume()."""
+    from streamselect.gui.details_actions import _ActionBar
+
+    action_bar = _ActionBar(_make_config())
+    assert action_bar.resume_button.isHidden(), "resume button must start hidden"
+
+    action_bar.set_resume(True, position_s=125)
+    assert not action_bar.resume_button.isHidden(), "set_resume(True) must show it"
+    assert "2:05" in action_bar.resume_button.toolTip(), (
+        f"resume tooltip should show the M:SS position; got {action_bar.resume_button.toolTip()!r}"
+    )
+
+    action_bar.set_resume(False)
+    assert action_bar.resume_button.isHidden(), "set_resume(False) must hide it"

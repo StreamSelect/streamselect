@@ -1,0 +1,519 @@
+"""VOD Watch-Alert dialogs.
+
+``WatchForDialog``  — small "Watch for…" input (text + type selector).
+``ManageVodAlertsDialog`` — see-all + remove active watch-for rules.
+"""
+
+from __future__ import annotations
+
+import html as _html
+
+import html
+from datetime import datetime, timezone
+
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtWidgets import (
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+)
+from loguru import logger
+
+
+from streamselect.gui import cursor_affordance
+from streamselect.gui import series_alert_identity as _series_identity
+from streamselect.gui.dialog_chrome import dialog_buttons
+from streamselect.gui import icon_utils as _icon_utils
+from streamselect.gui import theme as _theme
+
+
+class WatchForDialog(QDialog):
+    """Small dialog to add a new VOD watch-for rule.
+
+    The user enters a keyword / title fragment and selects whether to watch
+    for a Movie, Series, or Any content type.
+    """
+
+    # Emitted when the user clicks "Watch" — carries the new rule dict.
+    rule_added = pyqtSignal(dict)
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Watch for…")
+        self.setMinimumWidth(380)
+        self._setup_ui()
+
+    def _setup_ui(self) -> None:
+        vl = QVBoxLayout(self)
+        vl.setSpacing(10)
+
+        hdr = QLabel(f"{_icon_utils.role_html('alert')}&nbsp;Watch for new content")
+        _theme.style_fn(hdr, lambda: f"font-size: {_theme.FONT_XL}; font-weight: bold;")
+        vl.addWidget(hdr)
+
+        hint = QLabel(
+            "Get an alert when content matching this keyword appears on any of your sources."
+        )
+        hint.setWordWrap(True)
+        _theme.style_fn(hint, lambda: f"color: {_theme.COLOR_TEXT}; font-size: {_theme.FONT_SM};")
+        vl.addWidget(hint)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        _theme.style_fn(sep, lambda: f"color: {_theme.COLOR_LINE};")
+        vl.addWidget(sep)
+
+        # --- Keyword input ---
+        lbl_kw = QLabel("Title / keyword:")
+        _theme.style_fn(lbl_kw, lambda: f"font-size: {_theme.FONT_MD};")
+        vl.addWidget(lbl_kw)
+
+        self._text_edit = QLineEdit()
+        self._text_edit.setClearButtonEnabled(True)
+        self._text_edit.setPlaceholderText("e.g.  Dune,  Breaking Bad,  Severance")
+        _theme.style_fn(self._text_edit, lambda: f"font-size: {_theme.FONT_MD}; padding: 4px 6px;")
+        vl.addWidget(self._text_edit)
+
+        # --- Type selector ---
+        type_row = QHBoxLayout()
+        lbl_type = QLabel("Content type:")
+        _theme.style_fn(lbl_type, lambda: f"font-size: {_theme.FONT_MD};")
+        type_row.addWidget(lbl_type)
+
+        self._type_combo = QComboBox()
+        self._type_combo.addItem("Any", "any")
+        self._type_combo.addItem(_icon_utils.role_icon("movie"), "Movie", "movie")
+        self._type_combo.addItem(_icon_utils.role_icon("series"), "Series", "series")
+        _theme.style_fn(self._type_combo, lambda: f"font-size: {_theme.FONT_MD};")
+        type_row.addWidget(self._type_combo)
+        type_row.addStretch()
+        vl.addLayout(type_row)
+
+        # --- Buttons ---
+        # This one built a QDialogButtonBox, never added it to a layout, and
+        # laid out its own row beside it. The row is the shared one now; the
+        # accent fill stays, applied to the button the box hands back.
+        buttons = dialog_buttons(self, ok="Watch", on_ok=self._on_watch)
+        self._watch_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        _icon_utils.set_button_icon(self._watch_btn, "alert")
+        _theme.style_fn(self._watch_btn, lambda: f"QPushButton {{ background: {_theme.COLOR_ACCENT};"
+            f" color: {_theme.COLOR_ON_ACCENT};"
+            f" border: none; border-radius: 4px; padding: 4px 14px;"
+            f" font-size: {_theme.FONT_MD}; }}"
+            f"QPushButton:hover {{ background: {_theme.COLOR_ACCENT_HOVER}; }}")
+        vl.addWidget(buttons)
+
+        self._text_edit.returnPressed.connect(self._on_watch)
+        self._text_edit.textChanged.connect(self._update_watch_btn)
+        self._update_watch_btn()
+
+    def _update_watch_btn(self) -> None:
+        self._watch_btn.setEnabled(bool(self._text_edit.text().strip()))
+
+    def _on_watch(self) -> None:
+        text = self._text_edit.text().strip()
+        if not text:
+            return
+        match_type = self._type_combo.currentData()
+        rule = {
+            "text": text,
+            "match_type": match_type,
+            "created": datetime.now(timezone.utc).isoformat(),
+            "alerted_ids": [],
+        }
+        self.rule_added.emit(rule)
+        self.accept()
+
+
+class ManageVodAlertsDialog(QDialog):
+    """Manage every VOD watch alert: keyword watch-for rules AND monitored series.
+
+    Opened from the always-visible "Manage" affordance in the Watch Alerts sidebar
+    header.  Two grouped sections:
+
+    - Keyword rules (top): remove a rule, or "View" its matches in the channel list
+      (emits ``view_matches_requested`` and closes so the main window can populate
+      the list).
+    - Series — new-episode alerts (below): each monitored series with a per-series
+      "Stop" button that removes it from ``monitored_series``.
+
+    Absorbs everything the retired ``MonitoredSeriesDialog`` did.
+
+    Remove/Stop are RECOVERABLE (mirror-not-cage), not immediate: clicking either
+    flips the row to strikethrough with the button swapped for "Undo" — the row
+    stays visible, its stored ``alerted_ids``/``viewed_ids`` history untouched.
+    The actual config mutation (``remove_vod_watch_alert`` / ``remove_monitored_series``)
+    only happens for rows STILL pending when the dialog closes (Close button, Esc,
+    or the window's X — all route through ``reject()``); see
+    :meth:`_finalize_pending_removals`.
+    """
+
+    # Emitted when a rule OR series is removed so the host can refresh dependent views.
+    changed = pyqtSignal()
+    # Emitted when the user clicks "View matches" on a rule row (text, match_type).
+    view_matches_requested = pyqtSignal(str, str)
+
+    def __init__(self, config, parent=None) -> None:
+        super().__init__(parent)
+        self._config = config
+        # Recoverable-remove: rows flipped to pending-remove (rule "created" id /
+        # series_channel_id) — nothing is actually deleted from config until the
+        # dialog closes with the row still pending (see _finalize_pending_removals).
+        self._pending_remove_rules: set[str] = set()
+        self._pending_remove_series: set[str] = set()
+        self.setWindowTitle("Manage Watch Alerts")
+        self.setMinimumSize(480, 420)
+        self._setup_ui()
+        self._load()
+
+    # ── UI construction ──────────────────────────────────────────────────────
+
+    def _setup_ui(self) -> None:
+        vl = QVBoxLayout(self)
+        vl.setSpacing(8)
+
+        hdr_row = QHBoxLayout()
+        hdr = QLabel(f"{_icon_utils.role_html('alert')}&nbsp;Manage Watch Alerts")
+        _theme.style_fn(hdr, lambda: f"font-size: {_theme.FONT_XL}; font-weight: bold;")
+        hdr_row.addWidget(hdr)
+        hdr_row.addStretch()
+        self._count_lbl = QLabel("")
+        _theme.style_fn(self._count_lbl, lambda: f"color: {_theme.COLOR_MUTED_2}; font-size: {_theme.FONT_MD};")
+        hdr_row.addWidget(self._count_lbl)
+        vl.addLayout(hdr_row)
+
+        hint = QLabel(
+            "You'll be alerted when matching content — or a new episode of a "
+            "monitored series — appears on any of your sources."
+        )
+        hint.setWordWrap(True)
+        _theme.style_fn(hint, lambda: f"color: {_theme.COLOR_TEXT}; font-size: {_theme.FONT_SM};")
+        vl.addWidget(hint)
+
+        # The SAME setting as Settings → Interface → Watch Alerts, not a second
+        # one: both read and write config.alerts_show_idle_items, so they can
+        # never disagree. It belongs here too because this dialog is where you
+        # see the full list, and "why isn't this in the sidebar?" is asked here.
+        self._show_idle_check = QCheckBox(
+            "Show alerts with nothing new in the sidebar"
+        )
+        self._show_idle_check.setToolTip(
+            "Off (default): the Watch Alerts sidebar section lists only what "
+            "has actually turned up.\n"
+            "On: every rule and monitored series is listed there whether or "
+            "not it is firing.\n\n"
+            "The same switch is in Settings \u2192 Interface \u2192 Watch Alerts."
+        )
+        self._show_idle_check.setChecked(
+            bool(getattr(self._config, "alerts_show_idle_items", False))
+        )
+        self._show_idle_check.toggled.connect(self._on_show_idle_toggled)
+        vl.addWidget(self._show_idle_check)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        _theme.style_fn(sep, lambda: f"color: {_theme.COLOR_LINE};")
+        vl.addWidget(sep)
+
+        self._scroll_area = QScrollArea()
+        self._scroll_area.setWidgetResizable(True)
+        self._scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self._scroll_content = QWidget()
+        self._scroll_vl = QVBoxLayout(self._scroll_content)
+        self._scroll_vl.setSpacing(4)
+        self._scroll_area.setWidget(self._scroll_content)
+        vl.addWidget(self._scroll_area, 1)
+
+        # Close REJECTS, as it always has: edits here save as they are made.
+        vl.addWidget(dialog_buttons(self, ok="Close", cancel=False,
+                                    on_ok=self.reject))
+
+    def _on_show_idle_toggled(self, checked: bool) -> None:
+        """Write the shared setting and tell the host to re-render.
+
+        Saved immediately rather than on Close: this dialog has no OK button,
+        so a deferred write would be lost. ``changed`` is the signal the host
+        already listens to for a rule being removed, so the sidebar refreshes
+        through the path it already had.
+        """
+        self._config.alerts_show_idle_items = bool(checked)
+        save = getattr(self._config, "save", None)
+        if callable(save):
+            save()
+        self.changed.emit()
+
+    # ── Data loading ─────────────────────────────────────────────────────────
+
+    def _sub_header(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        _theme.style(lbl, "DIALOG_SUBHEADER")
+        return lbl
+
+    def _muted_line(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        _theme.style_fn(lbl, lambda: f"color: {_theme.COLOR_TEXT}; font-size: {_theme.FONT_SM}; padding: 2px 4px;")
+        return lbl
+
+    def _load(self) -> None:
+        while self._scroll_vl.count():
+            item = self._scroll_vl.takeAt(0)
+            if w := item.widget():
+                w.deleteLater()
+
+        rules = self._config.get_vod_watch_alerts()
+        series = self._config.get_monitored_series()
+        counts = []
+        if rules:
+            counts.append(f"{len(rules)} rule{'s' if len(rules) != 1 else ''}")
+        if series:
+            counts.append(f"{len(series)} series")
+        self._count_lbl.setText("  ·  ".join(counts))
+
+        # ── Keyword rules ─────────────────────────────────────────────────
+        self._scroll_vl.addWidget(self._sub_header("Movies & Series — keyword rules"))
+        if rules:
+            for rule in rules:
+                self._scroll_vl.addWidget(self._make_row(rule))
+        else:
+            self._scroll_vl.addWidget(self._muted_line(
+                'No keyword rules yet — click the "+" in the Watch Alerts header to add one.'
+            ))
+
+        # ── Monitored series ──────────────────────────────────────────────
+        self._scroll_vl.addWidget(self._sub_header("Series — new-episode alerts"))
+        if series:
+            # New-episode series first, then alphabetical by cleaned title.
+            series_sorted = sorted(
+                series,
+                key=lambda e: (
+                    -(e.get("unseen_new") or 0),
+                    (e.get("display_title") or e.get("title") or "").lower(),
+                ),
+            )
+            # Dim inline disambiguator, non-empty only when two series share a
+            # cleaned title (same helper the sidebar uses — one source of truth).
+            suffixes = _series_identity.disambiguation_suffixes(series_sorted)
+            for entry, suffix in zip(series_sorted, suffixes):
+                self._scroll_vl.addWidget(self._make_series_row(entry, suffix))
+        else:
+            self._scroll_vl.addWidget(self._muted_line(
+                'No monitored series yet — right-click a series → "Alert me to new episodes".'
+            ))
+
+        self._scroll_vl.addStretch()
+
+    def _make_row(self, rule: dict) -> QWidget:
+        rule_created = rule.get("created", "")
+        text = rule.get("text") or "Unknown"
+        match_type = rule.get("match_type", "any")
+        alerted_count = len(rule.get("alerted_ids") or [])
+
+        row = QWidget()
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(4, 2, 4, 2)
+        hl.setSpacing(6)
+
+        # Recoverable remove (mirror-not-cage): a pending row collapses to just its
+        # (strikethrough) name + "Undo" — nothing else is actionable until restored.
+        if rule_created in self._pending_remove_rules:
+            name_lbl = QLabel(f"{_icon_utils.role_html('alert')}&nbsp;{_html.escape(text, quote=False)}")
+            _theme.style(name_lbl, "DIALOG_PENDING_REMOVE_NAME")
+            hl.addWidget(name_lbl, 1)
+
+            undo_btn = QPushButton("Undo")
+            _icon_utils.set_button_icon(undo_btn, "undo")
+            undo_btn.setFlat(True)
+            _theme.style(undo_btn, "LINK_BTN_SM")
+            undo_btn.setToolTip(f"Keep the watch-for rule for '{text}'")
+            undo_btn.clicked.connect(
+                lambda _checked=False, rc=rule_created: self._undo_rule(rc)
+            )
+            hl.addWidget(undo_btn)
+            return row
+
+        cursor_affordance.set_clickable(row)
+
+        name_lbl = QLabel(f"{_icon_utils.role_html('alert')}&nbsp;{_html.escape(text, quote=False)}")
+        _theme.style_fn(name_lbl, lambda: f"font-size: {_theme.FONT_MD}; color: {_theme.COLOR_TEXT};")
+        hl.addWidget(name_lbl, 1)
+
+        type_role = match_type if match_type in ("movie", "series") else ""
+        type_display = (f"{_icon_utils.role_html(type_role)}&nbsp;{match_type.capitalize()}"
+                        if type_role else "Any")
+        type_badge = QLabel(type_display)
+        _theme.style(type_badge, "TEXT_SM_MUTED")
+        hl.addWidget(type_badge)
+
+        if alerted_count > 0:
+            match_badge = QLabel(f"{alerted_count} match{'es' if alerted_count != 1 else ''}")
+            _theme.style_fn(match_badge, lambda: f"color: {_theme.COLOR_ACCENT_GREEN}; font-size: {_theme.FONT_SM};"
+                " font-weight: bold;")
+            match_badge.setToolTip(
+                f"{alerted_count} channel(s) already alerted for this rule"
+            )
+            hl.addWidget(match_badge)
+
+        view_btn = QPushButton("View")
+        _icon_utils.set_button_icon(view_btn, "search")
+        view_btn.setFlat(True)
+        _theme.style_fn(view_btn, lambda: f"QPushButton {{ font-size: {_theme.FONT_SM}; color: {_theme.COLOR_ACCENT_BLUE};"
+            f" border: none; padding: 1px 6px; }}"
+            f"QPushButton:hover {{ color: {_theme.COLOR_ACCENT_BLUE_2}; }}")
+        view_btn.setToolTip(f"Show all content matching '{text}' in the channel list")
+        view_btn.clicked.connect(
+            lambda _checked=False, t=text, mt=match_type: self._view_matches(t, mt)
+        )
+        hl.addWidget(view_btn)
+
+        remove_btn = QPushButton("Remove")
+        _icon_utils.set_button_icon(remove_btn, "close")
+        remove_btn.setFlat(True)
+        _theme.style(remove_btn, "DIALOG_DANGER_LINK")
+        remove_btn.setToolTip(f"Remove the watch-for rule for '{text}'")
+        remove_btn.clicked.connect(
+            lambda _checked=False, rc=rule_created: self._remove(rc)
+        )
+        hl.addWidget(remove_btn)
+
+        return row
+
+    def _make_series_row(self, entry: dict, suffix: str = "") -> QWidget:
+        """One monitored-series row: cleaned title + unseen badge + Stop button.
+
+        Args:
+            entry: The raw monitored-series config entry.
+            suffix: A dim inline disambiguator (non-empty only when this cleaned
+                title collides with another monitored series).
+        """
+        cid = entry.get("series_channel_id", "")
+        title = entry.get("display_title") or entry.get("title") or "Unknown series"
+        unseen = entry.get("unseen_new") or 0
+
+        row = QWidget()
+        hl = QHBoxLayout(row)
+        hl.setContentsMargins(4, 2, 4, 2)
+        hl.setSpacing(6)
+
+        # Recoverable remove (mirror-not-cage): a pending row collapses to just its
+        # (strikethrough) name + "Undo" — nothing else is actionable until restored.
+        if cid in self._pending_remove_series:
+            name_lbl = QLabel(f"{_icon_utils.role_html('series')}&nbsp;{_html.escape(title, quote=False)}")
+            _theme.style(name_lbl, "DIALOG_PENDING_REMOVE_NAME")
+            hl.addWidget(name_lbl, 1)
+
+            undo_btn = QPushButton("Undo")
+            _icon_utils.set_button_icon(undo_btn, "undo")
+            undo_btn.setFlat(True)
+            _theme.style(undo_btn, "LINK_BTN_SM")
+            undo_btn.setToolTip(f"Keep monitoring {title} for new episodes")
+            undo_btn.clicked.connect(
+                lambda _checked=False, c=cid: self._undo_series(c)
+            )
+            hl.addWidget(undo_btn)
+            return row
+
+        # Always-on identity tooltip so any series is fully identifiable on hover,
+        # even when two share a cleaned title.
+        identity_tip = _series_identity.identity_lines(
+            language=entry.get("language", ""),
+            region=entry.get("region", ""),
+            source=entry.get("source", ""),
+        )
+        row.setToolTip(f"{title}\n\n{identity_tip}")
+
+        name_lbl = QLabel()
+        _theme.style_fn(name_lbl, lambda: f"font-size: {_theme.FONT_MD}; color: {_theme.COLOR_TEXT};")
+        if suffix:
+            # Rich text so the dim suffix flows right after the title.
+            name_lbl.setTextFormat(Qt.TextFormat.RichText)
+            name_lbl.setText(
+                f"{_icon_utils.role_html('series')}&nbsp;{html.escape(title)} "
+                f'<span style="color:{_theme.COLOR_TEXT}; font-size:{_theme.FONT_SM}">'
+                f"{html.escape(suffix)}</span>"
+            )
+        else:
+            name_lbl.setText(f"{_icon_utils.role_html('series')}&nbsp;{_html.escape(title, quote=False)}")
+        hl.addWidget(name_lbl, 1)
+
+        if unseen > 0:
+            ep_word = "ep" if unseen == 1 else "eps"
+            badge = QLabel(f"{_icon_utils.role_html('new_episodes')}&nbsp;+{unseen} {ep_word}")
+            _theme.style_fn(badge, lambda: f"color: {_theme.COLOR_ACCENT_GREEN}; font-size: {_theme.FONT_SM};"
+                " font-weight: bold;")
+            badge.setToolTip(f"{unseen} new {ep_word} since you last looked")
+            hl.addWidget(badge)
+
+        stop_btn = QPushButton("Stop")
+        _icon_utils.set_button_icon(stop_btn, "close")
+        stop_btn.setFlat(True)
+        _theme.style(stop_btn, "DIALOG_DANGER_LINK")
+        stop_btn.setToolTip(f"Stop new-episode alerts for {title}")
+        stop_btn.clicked.connect(lambda _checked=False, c=cid: self._stop_series(c))
+        hl.addWidget(stop_btn)
+
+        return row
+
+    # ── Actions ──────────────────────────────────────────────────────────────
+
+    def _view_matches(self, text: str, match_type: str) -> None:
+        """Emit view_matches_requested and close so the main window can show results."""
+        self.view_matches_requested.emit(text, match_type)
+        self.accept()
+
+    def _remove(self, rule_created: str) -> None:
+        """Flip the rule to pending-remove (strikethrough + Undo).
+
+        No config mutation yet — ``alerted_ids``/``viewed_ids`` history stays
+        intact until :meth:`_finalize_pending_removals` runs at dialog close, so
+        an Undo before then restores the rule exactly as it was.
+        """
+        self._pending_remove_rules.add(rule_created)
+        logger.info(f"VOD watch-for rule marked pending-remove: {rule_created}")
+        self._load()
+
+    def _undo_rule(self, rule_created: str) -> None:
+        """Restore a rule flipped to pending-remove."""
+        self._pending_remove_rules.discard(rule_created)
+        self._load()
+
+    def _stop_series(self, series_channel_id: str) -> None:
+        """Flip the series to pending-remove (strikethrough + Undo).
+
+        No config mutation yet — see :meth:`_remove`; the same recoverable-remove
+        standard applies to monitored series.
+        """
+        self._pending_remove_series.add(series_channel_id)
+        logger.info(f"Series marked pending-remove for new-episode alerts: {series_channel_id}")
+        self._load()
+
+    def _undo_series(self, series_channel_id: str) -> None:
+        """Restore a series flipped to pending-remove."""
+        self._pending_remove_series.discard(series_channel_id)
+        self._load()
+
+    def _finalize_pending_removals(self) -> None:
+        """Actually delete anything still flipped to pending-remove.
+
+        Called from :meth:`reject` — the Close button, Esc, and the window's X
+        button all route through ``QDialog.reject()`` (Qt's default ``closeEvent``
+        delegates to it), so this is the single finalize chokepoint regardless of
+        how the dialog closes.  Idempotent: clears both pending sets, so a second
+        call (e.g. reject() invoked more than once) is a no-op.
+        """
+        changed = False
+        for rule_created in self._pending_remove_rules:
+            self._config.remove_vod_watch_alert(rule_created)
+            logger.info(f"Removed VOD watch-for rule: {rule_created}")
+            changed = True
+        for series_channel_id in self._pending_remove_series:
+            self._config.remove_monitored_series(series_channel_id)
+            logger.info(f"Stopped new-episode alerts for series {series_channel_id}")
+            changed = True
+        self._pending_remove_rules.clear()
+        self._pending_remove_series.clear()
+        if changed:
+            self.changed.emit()
+
+    def reject(self) -> None:
+        """Esc / Close button / window X — finalize any still-pending removals first."""
+        self._finalize_pending_removals()
+        super().reject()
