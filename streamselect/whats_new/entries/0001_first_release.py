@@ -2,7 +2,7 @@ from streamselect.whats_new import WhatsNewEntry
 
 ENTRY = WhatsNewEntry(
     id=1,
-    version="0.1.0",
+    version="1.0.0",
     date="2026-11-07",
     title="StreamSelect",
     items=("A lean, native desktop app for organizing and playing your own streams and "

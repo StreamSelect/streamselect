@@ -355,7 +355,10 @@ jobs:
           git tag -f rolling
           git push -f origin rolling
           if gh release view rolling >/dev/null 2>&1; then
+            # Prerelease and never "latest": /releases/latest is what the app's
+            # update checker reads, and `rolling` is not a version it can compare.
             gh release edit rolling \
+              --prerelease --latest=false \
               --title "StreamSelect (rolling) — ${{ steps.meta.outputs.build_id }}" \
               --notes "Latest build of \`main\`.
 
@@ -381,6 +384,7 @@ jobs:
               --target "${{ github.sha }}"
           else
             gh release create rolling \
+              --prerelease --latest=false \
               --title "StreamSelect (rolling) — ${{ steps.meta.outputs.build_id }}" \
               --notes "Latest build of \`main\`." \
               --target "${{ github.sha }}"

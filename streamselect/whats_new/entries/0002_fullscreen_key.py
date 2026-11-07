@@ -2,7 +2,7 @@ from streamselect.whats_new import WhatsNewEntry
 
 ENTRY = WhatsNewEntry(
     id=2,
-    version="0.1.0",
+    version="1.0.0",
     date="2026-11-07",
     title="F11 for full screen",
     items=("Press F11 to make the app full screen, and again to return to the window you had.",),

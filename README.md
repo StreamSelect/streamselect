@@ -1,234 +1,112 @@
-# StreamSelect — a lean, native media manager + companion player
+# StreamSelect
 
-A lean, native cross-platform desktop app for curating and playing your media: a powerful management UI (multi-source, advanced filtering, metadata enrichment, personalized recommendations, discovery) paired with simple, out-of-the-way mpv playback — designed to live as an ambient companion on a working PC.
+A desktop app that turns the huge, messy catalog of an IPTV subscription into a library you can actually browse. Channel and movie names like `EN| 4K - The Matrix (1999) MULTI-SUB` are read once and split into title, year, language, region and quality, copies of the same title are grouped together, and posters, plots and cast are added, so you can search, filter and find what you want instead of scrolling a list of hundreds of thousands of rows.
 
-## Current Features
+Runs on Linux, macOS and Windows. Plays through mpv. Free and open source under GPLv3.
 
-### ✅ Implemented
+**StreamSelect includes no channels, streams or content, and doesn't sell or recommend any. You need your own source.**
 
-**Providers & Streaming**
-- **Multi-Provider Support**: Manage multiple IPTV sources with priority-based URL failover
-- **Xtream API Support**: Full integration with Xtream-based IPTV providers
-- **Stream Validation**: Automatic URL health checks with geo-blocking failover
-- **Single-Instance mpv Player**: Persistent player window with IPC control
-- **External Player Support**: Fallback to VLC, ffplay, or other players
-- **Auto-Reconnect & Buffer Profiles**: mpv auto-reconnects after brief network drops; selectable buffering (reconnect-only / modest / large) plus optional pre-buffer-before-play, all in Settings → Playback
-- **Stream Diagnostics**: one-click Diagnose probes a troubled stream (is it the provider or your connection?) and applies the recommended tuning; consistent HTTP User-Agent across validation, diagnostics, ffprobe, and mpv (fixes UA-gated providers)
-- **Split Streams**: optionally give each source its own player window — watch two sources at once; "Play in New Window" from any channel; click the live playback-health readout (buffer · speed · dropped frames) to cycle open windows
-- **Episode Auto-Queue**: Automatically queue subsequent episodes in a season
+## Who it's for
 
-**Content Organization**
-- **Series Management**: Browse seasons and episodes with hierarchical tree view
-- **Favorites System**: Star your favorite series, movies, and streams (Continue Watching / Never Watched sections)
-- **Watch History**: Tracks recently played content with last episode info
-- **Resume Playback & Watch Progress**: Movies and episodes resume where you left off (configurable default; per-play "Play from Beginning" / "Resume from M:SS" override). Graduated watch-progress glyphs (◔ ◐ ◕ ✓) on list rows, a progress bar on Discover cards, and auto-mark-watched at 90% (with a "Still watching?" check after episode auto-advance)
-- **Watch Queue**: Ordered manual queue with "Continue Watching" / "Up Next" sections, persists across restarts, Clear All / Clear Watched
+People who watch on a computer and want to use what a computer is good at: a big screen, a keyboard and a mouse, and the speed to search and sort a huge catalog. StreamSelect organizes everything your sources carry so the things you care about are easy to find, and gets out of the way once something plays. Videos open in a plain mpv window you can leave in a corner while you work, or make full screen.
 
-**Discovery & Recommendations**
-- **Preference-Based Recommendations**: Attribute-weighted scoring (genres, directors, cast) combined with TF-IDF plot keyword matching; sidebar section + full Preferences dashboard with weight breakdown
-- **Like / Dislike Ratings**: Rate movies and series; signals feed directly into the recommendation engine
-- **Impression Tracking & Decay**: Items shown repeatedly without engagement gradually decay in score (−4% per impression, 40% floor) so the list rotates naturally
-- **Attribute Muting**: Click 🙅 next to any genre, director, or actor to exclude that attribute from scoring; click again to restore
-- **Clickable Keyword Exclusion**: Plot keywords in the Preferences dashboard are clickable links — click to mute/restore individual keywords from the TF-IDF signal
-- **Exclusions Review Panel**: Collapsible panel at the bottom of the Preferences dashboard lists everything excluded (muted attributes and not-interested titles) with "Change your mind?" links to undo each
-- **Not Interested**: Suppress a title from recommendations without hiding it from browsing
-- **Hide Channel**: Remove content from all views permanently
-- **Content Preference Signals**: ▲/▼ indicators on cast and director names in the details pane
-- **Smart Recommendation Exclusions**: Disliked, hidden, watched, favorited, and Watch Queue items are all automatically excluded from recommendations — only unengaged content surfaces
-- **Similar Titles**: Title-linked suggestions in the details pane, plus a full-screen preview lightbox (poster hero, real ratings, cast, "Other Versions") you can browse and dive into without leaving the pane
-- **Cross-Source De-duplication**: The same title across providers, languages, and qualities collapses to a single card in Discover, Recommendations, and Similar — content-identity keyed (TMDb-id-first) — with an "Other Versions" picker in the details pane
+It never hides anything on its own. It suggests and sorts, and you decide what to filter out.
 
-**EPG & Alerts**
-- **EPG System**: XMLTV feed parsing (140 MB+ supported), background fetch, channel matching
-- **EPG Watchlist**: Keyword-based pattern matching; live 🔴 and upcoming ⏰ alerts in sidebar
-- **EPG On Now / Browse**: See what's airing now or browse the full schedule by channel/time
-- **Auto-Relink (no manual Refresh)**: watchlist and Watch Alerts populate automatically — channel↔guide links are rebuilt on launch from existing data, without re-downloading the feed
-- **Active-Source Scoping**: On Now and watchlist surfaces show only your enabled, non-expired sources; categories read from stored fields (no render-time re-parsing)
-- **EPG Events Tab**: platform live-events surfaced in Timeline / By-Network sub-views
-- **EPG Discover**: actionable recommendation rows — add to My Channels, Play, and expand to see upcoming matches
-- **Persistent On Now Columns**: drag to reorder; layout remembered across restarts
+## What it does
 
-**Special Content**
-- **PPV View**: Pay-per-view event detection with countdown timers
-- **Live Events View**: Dedicated view for detected live events
-- **Sports View**: Sports channels with sport/league filtering
+**Compares your sources.** Each source has an Analytics tab that helps you decide whether it's worth keeping:
 
-**Details Pane**
-- **Rich Metadata Display**: Posters, cast, ratings, plot, technical details, and content rating
-- **Metadata Provider System**: Plugin chain for enriching channels with structured data
-- **Image Caching**: Async poster/backdrop loading with LRU cache (500 MB)
+- What only that source carries, and how much of it your other sources also have
+- Movie, series and live counts, guide coverage, titles by region, and days left on the account
+- How often plays start, what time of day they fail, and which server addresses work
+- What you actually watch there, and how much of its connection limit you use
 
-**Filtering & Search**
-- **Real-Time Search**: Filter channels as you type
-- **Advanced Filtering**: Prefix detection for language, quality, and platform grouping
-- **Language / Quality / Platform Filters**: EN, ES, 4K, HD, Netflix, etc.
-- **Collapsible Filter Section**: Expandable filter controls with persistent visibility state
-- **Per-Source Filter Toggle**: click a source in the sidebar to filter the list to it; click it again to clear back to all sources
+**Lets you combine filters and save them.** Pick any mix of genre, region, language, decade, collection, quality, streaming platform and subtitle language, and you see every matching title and how many there are. Save a combination you like and it stays on the Discover page as a row of matching titles, which updates as your sources change.
 
-**UI & Platform**
-- **Smart Notifications**: Auto-dismissing progress notifications for background operations
-- **SQLite Database**: Fast local caching with background loading and WAL mode
-- **Persistent UI State**: All sidebar sizes, section states, and filter selections remembered
-- **Resizable Sections**: Draggable sidebar sections with saved heights
-- **Unified Context-Menu Registry**: one consistent right-click action set (Play, Play in New Window, Favorite, Queue, rate, hide…) across every channel surface — list, history, favorites, sidebar sections, and EPG
-- **What's New**: in-app changelog shown once after each update (and from the Help menu) — a navigable carousel stepping through releases
-- **Async-Read Architecture**: heavy DB reads run off the UI thread via a single `_run_query` seam + frozen DTOs, keeping the window responsive on 240k+ channel libraries
-- **Repository Pattern**: Clean data access layer separating business logic from UI
-- **Player / Provider Abstraction**: Plugin-based systems ready for additional backends
+**Handles several sources and several addresses per source.** Add as many sources as you have and their catalogs are blended into one library. A source can have more than one server address: StreamSelect tries them in order of how reliably and quickly each one has answered, and keeps using the ones that work.
 
-### 🚧 In Progress
-- **TMDb / OMDb Metadata Providers**: Architecture in place, plus a provider-native TMDb-id enrichment path (uses the id your provider returns — no API key). External TMDb/OMDb API lookups (posters/plot beyond your provider) still pending
+**Combines copies of the same title.** The same movie in five languages across three sources shows once in recommendations and suggestions, with the other versions listed under it.
 
-### 📋 Planned
-- **Missing Episode Detection (per-episode)**: Surface gaps *within* a season (missing S01E05); season-number gaps are already flagged inline
-- **Channel-List De-duplication**: Collapse quality/language variants in the main Browse list into one row with a quality selector (cross-source de-dup already ships in Discover, Recommendations, and Similar)
-- **Genre Filters**: Organize by genre from metadata
-- **Custom Collections**: User-created playlists and groups
-- **Export / Import**: Backup and share configuration
+**Tracks what you want to watch:**
 
-## Tech Stack
+- A watch list of shows and keywords, with alerts when something matching is on now or coming up
+- Alerts when a series you follow gets new episodes
+- A list of what you plan to watch next, favorites, history, and resume positions for movies and episodes
 
-- **Language**: Python 3.11+
-- **GUI**: PyQt6 (GPL-compatible)
-- **Database**: SQLite with SQLAlchemy 2.0+ ORM
-- **Logging**: loguru with rotation
-- **Configuration**: YAML with pydantic validation
-- **Player**: mpv with JSON IPC protocol
-- **License**: GPL v3
+**Searches across everything.** One search box covers titles, alternate titles, cast, directors and the languages spoken in a stream. Results are grouped by what matched, and can be shown as posters. Filters cover language, region, quality, streaming platform and category, and you can hide anything you never want to see, everywhere in the app.
 
-## Installation
+**Shows the TV guide.** Reads your provider's program guide, including very large ones: what's on right now, the full schedule with columns you can sort, and upcoming live events.
 
-### Prerequisites
-- Python 3.11 or higher
-- mpv player (recommended) or VLC
+**Recommends.** Likes and dislikes feed a recommendation list based on genres, cast, directors and plot keywords. It shows why something was recommended, and you can mute any genre, person or keyword.
 
-### Setup
+**Lets you adjust a stream while it plays.** Click the buffer and speed figures at the top of the window to change the audio language or subtitles, even out quiet dialogue and loud effects, mix surround sound down to stereo or mono, or skip to another item in what's playing next. If a stream is unreliable, a one-click test in the Tools menu tells you whether the problem is the source or your connection. You can also watch two sources at once in separate windows.
 
-> **Platform:** Linux and macOS are supported today. **Windows is not yet supported** — the single-instance mpv player talks over a Unix domain socket (`AF_UNIX`); a named-pipe port is on the [roadmap](ROADMAP.md) (Platform & Distribution).
+**Pulls in details.** Posters, plots, cast and ratings come from your provider. Add your own free TMDb or OMDb API key in Settings for more.
+
+## Download
+
+Get the latest build from the [releases page](https://github.com/StreamSelect/streamselect/releases/latest). mpv is included in all three.
+
+| Platform | File | Notes |
+|---|---|---|
+| Linux | `StreamSelect.flatpak` | `flatpak install --user StreamSelect.flatpak` |
+| macOS (Apple Silicon) | `.dmg` | Not signed. See below. |
+| Windows | `StreamSelect-windows-x64.zip` | Unzip and run. The least tested of the three. |
+
+**macOS says the app is "damaged":** it isn't. The app isn't signed, so macOS blocks it. Move it to Applications, then run:
+
+```bash
+xattr -cr /Applications/StreamSelect.app
+```
+
+There's no Intel Mac build.
+
+## Getting started
+
+1. Open StreamSelect and add a source.
+2. Enter your server address, username and password, or paste the M3U link your provider sent you. If it's an Xtream link, StreamSelect takes the address and login from it.
+3. Wait for the first refresh to finish. A large catalog can take a few minutes.
+
+Double-click anything to play it. Right-click for everything else. Press `?` for the keyboard shortcuts.
+
+## Current limits
+
+- Xtream accounts only. An Xtream M3U link works, but a plain M3U playlist file or a non-Xtream M3U URL doesn't.
+- Downloads and recordings are still being worked on.
+- The app checks for new versions and takes you to the download, but it doesn't install them itself.
+
+## Run from source
+
+You need Python 3.14 and [mpv](https://mpv.io).
 
 ```bash
 git clone https://github.com/StreamSelect/streamselect.git
 cd streamselect
-
-python -m venv venv
-source venv/bin/activate
-
-pip install -r requirements.txt
-python -m streamselect
+python3.14 -m venv venv
+venv/bin/pip install -r requirements.txt
+./run.sh
 ```
 
-## Usage
+## Where your data lives
 
-### First Run
-1. Launch StreamSelect: `python -m streamselect` or `./run.sh`
-2. Add an IPTV provider via the **+** button in the Sources sidebar section
-3. Enter your Xtream API credentials and click **Refresh** to load channels
+Everything stays on your computer. On Linux:
 
-### Navigating Content
+| What | Where |
+|---|---|
+| Settings | `~/.config/streamselect/` |
+| Library database | `~/.local/share/streamselect/streamselect.db` |
+| Logs | `~/.config/streamselect/logs/` |
+| Image cache | `~/.cache/streamselect/` |
 
-**Double-Click Actions:**
-- **Series** → Load seasons and episodes
-- **Season** → Expand/collapse episode list
-- **Episode / Movie / Stream** → Play immediately
-- **History Item** → Resume from last episode
-
-**Right-Click Menus:**
-- Add/Remove from Favorites or Watch Queue
-- Like / Dislike (drives recommendations)
-- Not Interested / Hide Channel
-- Refresh series data
-
-**Search:**
-- Type in the search box to filter channels in real-time
-- Clear with × or Esc
-
-### Recommendations
-Rate movies and series with 👍/👎 buttons in the details pane. The preference engine learns your taste from genres, directors, and cast, then surfaces personalized recommendations in the sidebar and the **Recommended** dashboard (click the 🎯 chip).
-
-In the Preferences dashboard you can:
-- Click **🙅** next to any genre, director, or actor to mute it from scoring
-- Click any plot keyword to mute/restore it as a recommendation signal
-- See everything you've excluded in the **Exclusions** panel at the bottom, with one-click undo links
-
-The engine automatically excludes content you've disliked, hidden, watched, favorited, or added to the Watch Queue. Items that keep appearing without a reaction are gently deprioritized so new content rotates in.
-
-### Watch Queue
-Right-click any channel → **Add to Queue**. The queue persists across restarts and splits into **Continue Watching** (previously started) and **Never Watched** (never played). Items in the queue are automatically excluded from recommendations — no need to manage both lists.
-
-### EPG / Watch Alerts
-Add show title patterns to the watchlist (+ Watchlist button in the details pane when a live channel is selected). The Watch Alerts sidebar section shows live and upcoming airings matching your patterns.
-
-## Configuration
-
-### File Locations
-- **Config**: `~/.config/streamselect/config.yaml`
-- **Database**: `~/.local/share/streamselect/streamselect.db`
-- **Logs**: `~/.config/streamselect/logs/`
-- **Image cache**: `~/.cache/streamselect/images/`
-
-### Key Settings
-```yaml
-playback:
-  player: mpv
-  use_single_instance: true
-  autoplay_season_episodes: true
-```
-
-## Development
-
-### Project Structure
-```
-streamselect/
-├── streamselect/
-│   ├── core/                    # Business logic (no UI dependencies)
-│   │   ├── config.py            # Pydantic config
-│   │   ├── database.py          # SQLAlchemy models + connection
-│   │   ├── preference_engine.py # Attribute-weight + TF-IDF recommendations
-│   │   ├── epg_manager.py       # EPG fetch/parse/store
-│   │   ├── metadata_manager.py  # Metadata provider chain
-│   │   ├── special_content.py   # PPV/Events/Sports detection
-│   │   └── repositories/        # Data access layer
-│   │       ├── channel.py
-│   │       ├── epg.py
-│   │       ├── queue.py         # Watch queue CRUD
-│   │       └── provider.py
-│   ├── gui/                     # PyQt6 UI components
-│   │   ├── main_window.py       # Three-panel main window
-│   │   ├── sidebar_sections.py  # Collapsible sidebar sections
-│   │   ├── details_pane.py      # Right panel with metadata
-│   │   ├── preferences_view.py  # Preference dashboard + recommendations
-│   │   ├── epg_view.py          # EPG: Watchlist / On Now / Browse
-│   │   ├── events_view.py       # Live events view
-│   │   ├── sports_view.py       # Sports events view
-│   │   └── sports_filter_bar.py # Sport/league filter chips
-│   ├── providers/               # IPTV source plugins
-│   │   └── xtream.py
-│   └── metadata_providers/      # Metadata enrichment plugins
-│       └── provider.py
-```
-
-### Architecture Principles
-- **Clean Separation**: Core logic independent of UI
-- **Async Operations**: Background threads for all blocking I/O
-- **Database First**: Cache everything locally in SQLite
-- **Event-Driven UI**: Qt signals/slots for loose coupling
-- **Plugin-Based**: Providers, players, and metadata sources are swappable
+The app connects to your sources and, if you add keys, to TMDb and OMDb. It contacts GitHub to check for updates, which you can turn off in Settings. Diagnose also downloads a small test file from Cloudflare to compare against your source's speed.
 
 ## Troubleshooting
 
-### Player Not Found
-Install mpv: `sudo apt install mpv` (Ubuntu/Debian) or `brew install mpv` (Mac)
-
-### Connection Failed
-- Verify URL, username, and password
-- Check internet connection
-- Try the provider's web interface first
-
-### No Episodes Showing
-- Right-click the series → **Refresh** to re-fetch from provider
-- Check logs at `~/.config/streamselect/logs/`
+- **A source won't connect:** check the address and login, and try them in your provider's own portal. The Add Source screen says why a connection failed.
+- **A stream won't play or keeps stalling:** select it and choose Stream diagnosis from the Tools menu. It checks whether the problem is the source or your connection.
+- **Quiet voices and loud explosions:** click the buffer and speed figures at the top of the window and turn on Normalize volume.
+- **Anything else:** open an issue and attach the log from the logs folder. Remove your source's address and login from it first.
 
 ## License
 
-GPL v3 — See [LICENSE](LICENSE) file.
-
+[GNU General Public License v3.0](LICENSE)
