@@ -39,7 +39,13 @@ It never hides anything on its own. It suggests and sorts, and you decide what t
 
 **Recommends.** Likes and dislikes feed a recommendation list based on genres, cast, directors and plot keywords. It shows why something was recommended, and you can mute any genre, person or keyword.
 
-**Lets you adjust a stream while it plays.** Click the buffer and speed figures at the top of the window to change the audio language or subtitles, even out quiet dialogue and loud effects, mix surround sound down to stereo or mono, or skip to another item in what's playing next. If a stream is unreliable, a one-click test in the Tools menu tells you whether the problem is the source or your connection. You can also watch two sources at once in separate windows.
+**Lets you adjust a stream while it plays.** Click the buffer and speed figures at the top of the window to change the audio language or subtitles, even out quiet dialogue and loud effects, mix surround sound down to stereo or mono, or skip to another item in what's playing next. You can also watch two sources at once in separate windows.
+
+**Helps you work out why something isn't working.**
+
+- When a stream won't play or keeps stalling, choose Stream diagnosis from the Tools menu. It measures how fast the stream arrives against what the video needs, runs a speed test of your own connection to compare, and tells you in plain words whether the problem is the provider or your internet. It suggests a buffer setting that would help, and can switch to it for you.
+- When a source won't connect, the app says why and what to try: a wrong username or password, an expired subscription, an address that isn't an Xtream server, a provider that's refusing you (often because of a VPN), a temporary lockout after failed logins, or nothing answering at all.
+- Each source's Analytics tab shows how often its streams start and what time of day they tend to fail.
 
 **Pulls in details.** Posters, plots, cast and ratings come from your provider. Add your own free TMDb or OMDb API key in Settings for more.
 
