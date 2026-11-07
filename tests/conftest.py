@@ -29,6 +29,16 @@ from streamselect.core.repositories.tag import _clear_tag_cache
 
 
 @pytest.fixture(autouse=True)
+def _capture_features_on(monkeypatch):
+    """Downloading and recording are hidden from users until finished, but their
+    tests keep running against them. A test that checks they are hidden turns
+    this off itself."""
+    from streamselect.core import feature_gates
+
+    monkeypatch.setattr(feature_gates, "capture_enabled", lambda: True)
+
+
+@pytest.fixture(autouse=True)
 def _clear_tag_id_cache():
     """Clear the process-level tag-id cache around every test.
 

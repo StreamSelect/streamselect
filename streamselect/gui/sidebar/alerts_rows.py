@@ -21,6 +21,7 @@ from datetime import datetime
 from PyQt6.QtCore import QPoint, QRect, QSize, Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QWidget
 
+from streamselect.core import feature_gates as _gates
 from streamselect.core.epg_utils import is_local_today, now_utc, to_local
 from streamselect.gui import cursor_affordance
 from streamselect.gui import icon_utils as _icon_utils
@@ -298,6 +299,7 @@ class _AlertRow(_RowShell):
             lay.addWidget(self._marker)
         lay.addWidget(self._slot)
         lay.addWidget(self._rec_slot)
+        self._rec_slot.setVisible(_gates.capture_enabled())
 
         # A live row with a known duration shows the bar; everything else keeps
         # the words. An upcoming row has no elapsed share, and a live row whose

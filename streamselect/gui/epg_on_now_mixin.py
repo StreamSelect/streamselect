@@ -53,6 +53,7 @@ from PyQt6.QtWidgets import (
 )
 from loguru import logger
 
+from streamselect.core import feature_gates as _gates
 from streamselect.gui.row_activation import connect_row_activation
 
 from streamselect.core import watchlist
@@ -202,6 +203,7 @@ class _EpgOnNowMixin:
         self.on_now_list.setColumnWidth(4, 64)
         self.on_now_list.setColumnWidth(5, 22)
         self.on_now_list.setColumnWidth(6, 22)
+        self.on_now_list.setColumnHidden(6, not _gates.capture_enabled())
         self.on_now_list.headerItem().setToolTip(0, "Category / prefix extracted from channel name")
         self.on_now_list.headerItem().setToolTip(2, "Stream quality (4K / FHD / HD / etc.)")
         self.on_now_list.headerItem().setToolTip(4, "Progress through current show (hover for time remaining)")

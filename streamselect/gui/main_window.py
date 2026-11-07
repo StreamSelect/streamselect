@@ -16,7 +16,7 @@ from streamselect.gui.row_activation import connect_row_activation
 from concurrent.futures import ThreadPoolExecutor
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui import stream_probe_action as _stream_probe_action
-from streamselect.core import watchlist
+from streamselect.core import feature_gates as _gates, watchlist
 from streamselect.core.build_info import window_title
 from streamselect.core.config import Config
 from streamselect.core.update_checker import UpdateChecker
@@ -1046,7 +1046,7 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
             section.channelContextMenuRequested.connect(self._on_rec_channel_context_menu)
             return section
 
-        elif section_id == "downloads":
+        elif section_id == "downloads" and _gates.capture_enabled():
             section = DownloadsSection(self.config, self.db, self)
             section.itemSelected.connect(self.show_channel_details_by_id)
             section.openLibraryFolderClicked.connect(self._open_downloads_folder)
@@ -1057,7 +1057,7 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
                 self.show_downloads_context_menu)
             return section
 
-        elif section_id == "recordings":
+        elif section_id == "recordings" and _gates.capture_enabled():
             section = RecordingsSection(self.config, self.db, self)
             section.itemSelected.connect(self.show_channel_details_by_id)
             section.openLibraryFolderClicked.connect(self._open_recordings_folder)

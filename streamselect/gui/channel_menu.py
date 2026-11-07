@@ -17,7 +17,7 @@ Usage::
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Callable
 
 from PyQt6.QtGui import QAction
@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import QMenu
 if TYPE_CHECKING:                                    # pragma: no cover
     from datetime import datetime
 
+from streamselect.core import feature_gates as _gates
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
 from streamselect.gui.channel_menu_layouts import SURFACE_LAYOUTS
@@ -809,6 +810,16 @@ ACTIONS: dict[str, ChannelAction] = {
         applies=lambda c: c.is_multi,
     ),
 }
+
+
+def _offered_only_when_capture_is_on(action: ChannelAction) -> ChannelAction:
+    """Wrap an entry so it appears only while downloading and recording are offered."""
+    applies = action.applies
+    return replace(action, applies=lambda c: _gates.capture_enabled() and applies(c))
+
+
+for _action_id in _gates.CAPTURE_MENU_ACTIONS:
+    ACTIONS[_action_id] = _offered_only_when_capture_is_on(ACTIONS[_action_id])
 
 
 # ---------------------------------------------------------------------------

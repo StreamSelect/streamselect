@@ -17,6 +17,8 @@ in place and call it.
 
 from __future__ import annotations
 
+from streamselect.core import feature_gates as _gates
+
 
 def scope_from_host(host) -> str:
     """The host's current scope: ``_list_scope`` if set, else derived from ``_hidden_mode``.
@@ -31,6 +33,14 @@ def scope_from_host(host) -> str:
 
 
 def scope_from_state(state: dict) -> tuple[str, bool, bool]:
+    """A saved scope, falling back to All while the Downloaded tab is not offered."""
+    scope, hidden_mode, downloaded_mode = _saved_scope(state)
+    if downloaded_mode and not _gates.capture_enabled():
+        return "all", False, False
+    return scope, hidden_mode, downloaded_mode
+
+
+def _saved_scope(state: dict) -> tuple[str, bool, bool]:
     """``(scope, hidden_mode, downloaded_mode)`` from a saved search-state dict.
 
     ``"list_scope"`` is the source of truth; a pre-DL-5 config only carries
@@ -52,6 +62,8 @@ def sync_scope_buttons(host, scope: str, hidden_mode: bool, downloaded_mode: boo
                           ("_tab_downloaded_btn", downloaded_mode)):
         btn = host.__dict__.get(name)
         if btn is not None:
+            if name == "_tab_downloaded_btn":
+                btn.setVisible(_gates.capture_enabled())
             btn.blockSignals(True)
             btn.setChecked(checked)
             btn.blockSignals(False)

@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
 from loguru import logger
 
 from streamselect.core import app_paths
+from streamselect.core import feature_gates as _gates
 from streamselect.core.config import Config
 from streamselect.core.http_headers import stream_user_agent
 from streamselect.core.preference_engine import RecScoringSettings
@@ -307,9 +308,15 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
         layout.setSpacing(12)
 
         self._nav = ThreePanelSectionNav(_SECTION_HELP)
+        # A page that is not offered is still built: its controls are loaded and
+        # saved like every other, so its settings survive untouched.
+        self._unlisted_pages = []
         for section_id, label, builder_name, _help in SECTIONS:
             page = getattr(self, builder_name)()
             _align_label_columns(page)
+            if section_id in _gates.CAPTURE_SETTINGS_PAGES and not _gates.capture_enabled():
+                self._unlisted_pages.append(page)
+                continue
             self._nav.add_section(section_id, label, page)
         layout.addWidget(self._nav, 1)
 
@@ -581,6 +588,8 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
                 ordered.append(sid)
         self._sidebar_list.clear()
         for sid in ordered:
+            if sid in _gates.CAPTURE_SIDEBAR_SECTIONS and not _gates.capture_enabled():
+                continue
             label = _SIDEBAR_SECTION_LABELS.get(sid, sid)
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, sid)
@@ -757,6 +766,14 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
             new_order.append(sid)
             if item.checkState() == Qt.CheckState.Checked:
                 new_visible.append(sid)
+        # Sections not offered right now keep the place and visibility they had.
+        old_order = list(c.sidebar_sections or [])
+        old_visible = set(c.sidebar_visible_sections or old_order)
+        for sid in old_order:
+            if sid in _gates.CAPTURE_SIDEBAR_SECTIONS and sid not in new_order:
+                new_order.insert(min(old_order.index(sid), len(new_order)), sid)
+                if sid in old_visible:
+                    new_visible.append(sid)
         # Appearance
         _save_theme_combo(self._theme_combo, c)
         save_text_size(self._text_size_combo, c)

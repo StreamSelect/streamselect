@@ -72,7 +72,6 @@ Double-click anything to play it. Right-click for everything else. Press `?` for
 ## Current limits
 
 - Xtream accounts only. An Xtream M3U link works, but a plain M3U playlist file or a non-Xtream M3U URL doesn't.
-- Downloads and recordings are still being worked on.
 - The app checks for new versions and takes you to the download, but it doesn't install them itself.
 
 ## Run from source

@@ -55,6 +55,7 @@ from PyQt6.QtWidgets import (
 )
 from loguru import logger
 
+from streamselect.core import feature_gates as _gates
 from streamselect.gui.row_activation import connect_row_activation
 
 from streamselect.core import watchlist
@@ -247,6 +248,7 @@ class _EpgBrowseMixin(_EpgBrowseScrubberMixin):
         hdr.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
         self.browse_list.setColumnWidth(3, 44)
         self.browse_list.setColumnWidth(6, 22)
+        self.browse_list.setColumnHidden(6, not _gates.capture_enabled())
         # Q6: header tooltips (verbatim from On Now) + movable sections.
         self.browse_list.headerItem().setToolTip(
             1, "Category / prefix extracted from channel name"
