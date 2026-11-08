@@ -23,12 +23,13 @@ from sqlalchemy.dialects.sqlite import insert as _sqlite_insert
 
 from streamselect.core.database import ChannelDB
 from streamselect.core.migrations.sports_reclassify import DERIVED_FIELDS
-from streamselect.core.repositories.channel_change_detection import touch_last_seen_at
+from streamselect.core.repositories.channel_change_detection import renumber_rows, touch_last_seen_at
 
 
 def flush_channel_batch(
     session, batch: list[dict], catalog_update_cols: tuple[str, ...], *,
     seen_at=None, unchanged_ids: frozenset[str] | set[str] = frozenset(),
+    renumbered_ids: frozenset[str] | set[str] = frozenset(),
 ) -> None:
     """Execute one bulk upsert for *batch* and commit the transaction.
 
@@ -63,12 +64,17 @@ def flush_channel_batch(
         seen_at: Presence-stamp instant for this refresh pass, or ``None`` to
             skip presence stamping entirely (direct-call tests only).
         unchanged_ids: Ids within *batch* to gate — see above.
+        renumbered_ids: Ids whose only change is the source's list position;
+            they get ``renumber_rows`` (position + presence), not the upsert.
     """
     to_touch = [row["id"] for row in batch if row["id"] in unchanged_ids]
-    to_upsert = [row for row in batch if row["id"] not in unchanged_ids]
+    to_renumber = [row for row in batch if row["id"] in renumbered_ids]
+    to_upsert = [row for row in batch
+                 if row["id"] not in unchanged_ids and row["id"] not in renumbered_ids]
 
     if seen_at is not None:
         touch_last_seen_at(session, to_touch, seen_at)
+    renumber_rows(session, to_renumber, seen_at)
 
     if to_upsert:
         # Stamp presence on every row in this batch, inserted or updated.

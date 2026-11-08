@@ -352,9 +352,9 @@ class ProviderLoadThread(QThread):
         # DB-7: diff each batch against its stored rows before flushing it (gated).
         def _diff_and_flush(b: list[dict]) -> None:
             nonlocal changed_ids
-            b_changed, b_unchanged = diff_batch_for_upsert(session, b, _CATALOG_UPDATE_COLS)
-            changed_ids |= b_changed
-            self._flush_batch(session, b, seen_at=self._seen_at, unchanged_ids=b_unchanged)
+            ch, un, rn = diff_batch_for_upsert(session, b, _CATALOG_UPDATE_COLS)
+            changed_ids |= ch
+            self._flush_batch(session, b, seen_at=self._seen_at, unchanged_ids=un, renumbered_ids=rn)
 
         # Disable autoflush so writes only happen at each explicit commit().
         # Without this, ORM operations would trigger an autoflush before internal
@@ -540,14 +540,14 @@ class ProviderLoadThread(QThread):
 
     @staticmethod
     def _flush_batch(
-        session, batch: list[dict], *, seen_at=None,
-        unchanged_ids: frozenset[str] | set[str] = frozenset(),
+        session, batch: list[dict], *, seen_at=None, **gates: frozenset[str] | set[str],
     ) -> None:
         """See ``channel_upsert.flush_channel_batch``. One batch is one upsert plus
-        its commit, so after a rollback it re-runs cleanly on a lock (D17)."""
+        its commit, so after a rollback it re-runs cleanly on a lock (D17). *gates*
+        are ``flush_channel_batch``'s ``unchanged_ids``/``renumbered_ids``."""
         retry_on_lock("catalogue batch", lambda: flush_channel_batch(
-            session, batch, _CATALOG_UPDATE_COLS, seen_at=seen_at,
-            unchanged_ids=unchanged_ids), before_retry=session.rollback)
+            session, batch, _CATALOG_UPDATE_COLS, seen_at=seen_at, **gates),
+            before_retry=session.rollback)
 
     def _categorize_special_content(self) -> None:
         """Categorize PPV / Events / Sports for uncategorized channels from this provider.

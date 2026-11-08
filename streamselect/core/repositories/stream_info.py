@@ -7,6 +7,7 @@ from loguru import logger
 from sqlalchemy import func, or_
 
 from streamselect.core.database import ChannelDB, StreamInfoDB
+from streamselect.core.sql_batching import fetch_in_chunks
 from streamselect.core.stream_info import audio_contradicts_prefix, summarize
 
 
@@ -27,7 +28,10 @@ class StreamInfoRepository:
         """``{channel_id: record}`` for every channel that has one, in one query."""
         if not channel_ids:
             return {}
-        rows = self.session.query(StreamInfoDB).filter(StreamInfoDB.channel_id.in_(channel_ids)).all()
+        rows = fetch_in_chunks(
+            lambda ids: self.session.query(StreamInfoDB)
+                                    .filter(StreamInfoDB.channel_id.in_(ids)).all(),
+            list(channel_ids))
         return {r.channel_id: {"info": r.info, "source": r.source, "measured_at": r.measured_at}
                 for r in rows}
 
@@ -117,9 +121,13 @@ class StreamInfoRepository:
         ids = list(channel_ids or [])
         if not ids:
             return 0
-        rows = (self.session.query(StreamInfoDB, ChannelDB.name)
-                .join(ChannelDB, ChannelDB.id == StreamInfoDB.channel_id)
-                .filter(StreamInfoDB.channel_id.in_(ids)).all())
+        # Chunked: a source that renames a whole list hands this every id, and
+        # one IN list that long raised "too many SQL variables" mid-refresh.
+        rows = fetch_in_chunks(
+            lambda chunk: (self.session.query(StreamInfoDB, ChannelDB.name)
+                           .join(ChannelDB, ChannelDB.id == StreamInfoDB.channel_id)
+                           .filter(StreamInfoDB.channel_id.in_(chunk)).all()),
+            ids)
         stale = []
         for record, name in rows:
             if record.fingerprint is None:

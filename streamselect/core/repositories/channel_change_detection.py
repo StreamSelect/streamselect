@@ -41,9 +41,11 @@ covers their ``detected_*`` derivation.
 
 from __future__ import annotations
 
+import json as _json
 from typing import Any, Collection
 
 from loguru import logger
+from sqlalchemy import bindparam, func, update
 
 from streamselect.core.database import ChannelDB
 
@@ -53,11 +55,26 @@ from streamselect.core.database import ChannelDB
 #: either way.
 _COALESCED_COL = "detected_tmdb_id"
 
+#: The source's list position. Xtream ``num`` is where a channel sits in the
+#: provider's list, not anything about the channel: one insertion near the top
+#: renumbers every row after it (measured: 379 of 399 sampled rows in one
+#: refresh, against 4 real renames). It must not make a row "changed".
+_POSITION_KEY = "num"
+#: The catalog columns that carry only that position.
+_POSITION_COLS = frozenset({"raw_data", "source_num"})
+
+
+def _without_position(raw: Any) -> Any:
+    """*raw* minus its list-position key, for content comparison."""
+    if isinstance(raw, dict) and _POSITION_KEY in raw:
+        return {k: v for k, v in raw.items() if k != _POSITION_KEY}
+    return raw
+
 
 def diff_batch_for_upsert(
     session, batch: list[dict], catalog_cols: Collection[str],
-) -> tuple[set[str], set[str]]:
-    """Return ``(changed_ids, unchanged_ids)`` for one ``_store_channels`` batch.
+) -> tuple[set[str], set[str], set[str]]:
+    """Return ``(changed_ids, unchanged_ids, renumbered_ids)`` for one batch.
 
     Args:
         session: An active database session (queried before the batch's
@@ -73,8 +90,11 @@ def diff_batch_for_upsert(
         ``changed_ids`` — ids whose stored ``name``/``category``/``raw_data``
         differ from the incoming row. ``unchanged_ids`` — ids whose stored
         row already matches the incoming row across every column in
-        *catalog_cols*. The two sets are disjoint; a brand-new id (no stored
-        row) is in neither.
+        *catalog_cols*. ``renumbered_ids`` — ids whose ONLY difference is the
+        source's list position (``source_num`` and ``raw_data["num"]``): they
+        take :func:`renumber_rows`, never the full upsert, and are not in
+        ``changed_ids`` because a position feeds no ``detected_*`` field. The
+        three sets are disjoint; a brand-new id (no stored row) is in none.
     """
     catalog_cols = tuple(catalog_cols)
     ids = [row["id"] for row in batch]
@@ -86,28 +106,66 @@ def diff_batch_for_upsert(
 
     changed: set[str] = set()
     unchanged: set[str] = set()
+    renumbered: set[str] = set()
     for row in batch:
         prior = existing.get(row["id"])
         if prior is None:
             continue  # brand-new row — always a full insert, never "changed" or "unchanged"
 
-        if (prior["name"], prior["category"], prior["raw_data"]) != (
-            row["name"], row["category"], row["raw_data"]
+        if (prior["name"], prior["category"], _without_position(prior["raw_data"])) != (
+            row["name"], row["category"], _without_position(row["raw_data"])
         ):
             changed.add(row["id"])
 
-        identical = True
+        differing = set()
         for col in catalog_cols:
             incoming = row.get(col)
             if col == _COALESCED_COL and incoming is None:
                 continue  # COALESCE keeps the stored value; never a difference
             if incoming != prior[col]:
-                identical = False
-                break
-        if identical:
+                differing.add(col)
+        if not differing:
             unchanged.add(row["id"])
+        elif (differing <= _POSITION_COLS
+              and isinstance(prior["raw_data"], dict) and isinstance(row["raw_data"], dict)
+              and _without_position(prior["raw_data"]) == _without_position(row["raw_data"])):
+            renumbered.add(row["id"])
 
-    return changed, unchanged
+    return changed, unchanged, renumbered
+
+
+def renumber_rows(session, rows: list[dict], seen_at) -> None:
+    """Write only the new list position (and presence stamp) for *rows*.
+
+    The cheap path for :func:`diff_batch_for_upsert`'s ``renumbered_ids``. A
+    source that inserts one channel near the top shifts ``num`` on nearly
+    every row after it, and the full upsert would re-serialize ~300k
+    ``raw_data`` blobs for that. Here ``raw_data``'s ``num`` is patched in
+    place by SQLite's ``json_set`` (the incoming value's JSON type preserved,
+    so a string stays a string) and ``source_num`` is set: one executemany,
+    no Python-side JSON encoding of the blob.
+
+    Args:
+        session: An active database session.
+        rows: Incoming row dicts (``id``, ``source_num``, ``raw_data``).
+        seen_at: Presence-stamp instant, or ``None`` to leave it alone.
+    """
+    if not rows:
+        return
+    table = ChannelDB.__table__
+    values = {
+        "source_num": bindparam("b_source_num"),
+        "raw_data": func.json_set(table.c.raw_data, "$." + _POSITION_KEY,
+                                  func.json(bindparam("b_num_json"))),
+    }
+    if seen_at is not None:
+        values["last_seen_at"] = seen_at
+    stmt = update(table).where(table.c.id == bindparam("b_id")).values(**values)
+    session.execute(stmt, [
+        {"b_id": r["id"], "b_source_num": r.get("source_num"),
+         "b_num_json": _json.dumps(r["raw_data"].get(_POSITION_KEY))}
+        for r in rows
+    ])
 
 
 def touch_last_seen_at(session, ids: Collection[str], seen_at) -> None:
