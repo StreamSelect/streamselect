@@ -71,3 +71,32 @@ def test_all_button_clears_a_value_stuck_off_while_absent(qapp, qtbot):
     relaunched = _panel(qapp, qtbot, cfg)
     _show(relaunched, {"EN": 100, "FR": 50, "DE": 30})
     assert set(relaunched._lang_sec.get_selected_keys()) == {"EN", "FR", "DE"}
+
+
+def test_a_value_returning_on_a_refresh_in_the_same_session_stays_included(qapp, qtbot):
+    """A refresh rebuilds the panel in place: the live selection only knows the
+    values the last build showed, so one coming back read as unticked and was
+    saved that way — the Language/Region chips that appeared after a refresh."""
+    cfg = _make_config()  # All: nothing configured
+    cfg.filter_known_languages = ["EN", "FR", "DE"]
+
+    panel = _panel(qapp, qtbot, cfg)
+    _show(panel, {"EN": 100, "FR": 50})            # launch: DE absent
+    _show(panel, {"EN": 100, "FR": 50, "DE": 30})  # refresh: DE back
+
+    assert set(panel._lang_sec.get_selected_keys()) == {"EN", "FR", "DE"}
+    assert "language" not in (panel.get_filter_state()["tag_includes"] or {})
+
+
+def test_a_value_unticked_before_a_refresh_stays_unticked_after_it(qapp, qtbot):
+    cfg = _make_config()
+    cfg.filter_known_languages = ["EN", "FR", "DE"]
+
+    panel = _panel(qapp, qtbot, cfg)
+    _show(panel, {"EN": 100, "FR": 50, "DE": 30})
+    panel._lang_sec.restore_selection({"EN", "FR"})  # the user unticks DE
+    panel.save_state()
+    _show(panel, {"EN": 100, "FR": 50})            # DE absent for a while
+    _show(panel, {"EN": 100, "FR": 50, "DE": 30})  # and back
+
+    assert "DE" not in panel._lang_sec.get_selected_keys()

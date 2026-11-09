@@ -72,6 +72,7 @@ class FilterPanel(_ChipSeamMixin, QWidget):
         # list.  Static sections (Media, Untagged) are populated in __init__ and are
         # always safe to save.
         self._stats_loaded = False
+        self._built_keys: dict = {}  # section → values its last build showed
         # Live handle on the in-flight chunked update_data() build, if any
         # (PERF-17) — a superseding call cancels this before starting its own.
         self._update_handle = None
@@ -825,13 +826,11 @@ class FilterPanel(_ChipSeamMixin, QWidget):
           INCLUDE every present value (un-hide the user's currently-hidden content,
           overriding any prior Tier-1 deselection) and record the baseline.  No
           popup — the un-hide is silent.
-        * otherwise → ``new = current − known``.  The effective selection is
-          ``base ∪ new`` where ``base`` is the live in-memory selection (``prev``)
-          or, when empty, the persisted ``included_attr`` (None persisted → all
-          present).  New values stay CHECKED (opt-out); a value in ``known`` but not
-          in ``base`` was genuinely deselected and stays unchecked.  ``known`` grows
-          to ``known ∪ current`` and never shrinks, so a value that disappears and
-          later reappears is not re-flagged as new.
+        * otherwise → ``new = current − known``; selection = ``base ∪ new``. ``base``
+          is the live selection (``prev``) for values the last build showed, and the
+          persisted ``included_attr`` (None → all) for the rest — or a value back
+          after a refresh reads as unticked (owner, 2026-11-09). New values stay
+          CHECKED; ``known`` grows to ``known ∪ current`` and never shrinks.
 
         Newly-seen values are recorded in ``new_out[section_key]`` for the popup,
         but only on non-first calls (``was_first`` False — i.e. a source refresh).
@@ -843,15 +842,16 @@ class FilterPanel(_ChipSeamMixin, QWidget):
             # Feature's first run for this facet → establish the opt-out baseline.
             sec.restore_selection(current)
             setattr(self.config, known_attr, sorted(current))
+            self._built_keys[sec] = current
             return
 
         known = set(known_raw)
         new = current - known
-        if prev:
-            base = set(prev)
-        else:
-            saved = getattr(self.config, included_attr, None)
-            base = set(saved) if saved is not None else set(current)
+        saved = getattr(self.config, included_attr, None)
+        persisted = set(saved) if saved is not None else set(current)
+        unshown = current - self._built_keys.get(sec, set())
+        base = set(prev) | (persisted & unshown) if prev else persisted
+        self._built_keys[sec] = current
         sec.restore_selection(base | new)
         setattr(self.config, known_attr, sorted(known | current))
         if new and not was_first:
