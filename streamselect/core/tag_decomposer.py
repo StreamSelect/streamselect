@@ -89,6 +89,7 @@ from streamselect.core.content_labels import (
 )
 from streamselect.core.quality_vocab import QUALITY_TOKENS
 from streamselect.core.prefix_vocabulary import prefix_genres, prefix_quality_tokens
+from streamselect.core.category_headings import masks_country
 from streamselect.core.region_codes import (
     CODE_FACETS,
     LANGUAGE_ONLY_CODES,
@@ -96,6 +97,7 @@ from streamselect.core.region_codes import (
     PLATFORM_CODES,
     REGION_FULL_NAMES,
     normalize_region_code,
+    split_category_prefix,
 )
 from streamselect.core.tag_confidence import CONF_DENOTED, CONF_STRONG_PRIOR, CONF_WEAK_PRIOR
 from streamselect.core.genre_words import platform_named_as_genre, resolve_genres
@@ -129,6 +131,7 @@ def decompose(
     raw: str,
     *,
     config,
+    headings: frozenset[str] = frozenset(),
 ) -> list[tuple[str, str, float]]:
     """Return canonical ``(type, value, confidence)`` tags extracted from *raw*.
 
@@ -142,6 +145,9 @@ def decompose(
                  Use :func:`decompose_name_parse` for pre-typed ``name_parse`` data.
         raw:     The raw string to classify.
         config:  Live ``Config`` instance (provides ``filter_*_groups``).
+        headings: The source's category headings
+                 (:func:`~streamselect.core.category_headings.detect_headings`);
+                 a country-coded head used as one carries no country.
 
     Returns:
         Deduplicated list of ``(type, value, confidence)`` triples.  Unrecognised
@@ -154,7 +160,7 @@ def decompose(
 
     try:
         if feeder in ("provider_category", "header"):
-            tags = _decompose_compound(raw, config)
+            tags = _decompose_compound(raw, config, headings)
         elif feeder == "genre":
             tags = _decompose_genre(raw)
         elif feeder == "epg":
@@ -174,7 +180,9 @@ def decompose(
     return _dedup(tags)
 
 
-def region_code_from_category(category: str | None, *, config) -> str | None:
+def region_code_from_category(
+    category: str | None, *, config, headings: frozenset[str] = frozenset(),
+) -> str | None:
     """Return the explicit region code carried by a provider-category string.
 
     This is the single source of truth for "what region does ``|FR|`` denote",
@@ -191,6 +199,8 @@ def region_code_from_category(category: str | None, *, config) -> str | None:
     Args:
         category: A provider category label, e.g. ``"|FR|"``, ``"USA | HD"``.
         config:   Live ``Config`` instance (provides ``filter_*_groups``).
+        headings: The source's category headings — ``"AM| CANADA HD"`` is
+                  Canada, never Armenia (see ``category_headings``).
 
     Returns:
         A normalized region code (``"FR"``) or ``None`` when the category
@@ -199,11 +209,51 @@ def region_code_from_category(category: str | None, *, config) -> str | None:
     if not category or not category.strip():
         return None
     for tag_type, tag_value, _conf in decompose(
-        "provider_category", category, config=config
+        "provider_category", category, config=config, headings=headings
     ):
         if tag_type == "region":
             return normalize_region_code(tag_value)
     return None
+
+
+def category_region_fallback(
+    prefix: str | None,
+    region: str | None,
+    category: str | None,
+    *,
+    config,
+    headings: frozenset[str] = frozenset(),
+) -> tuple[str | None, str | None]:
+    """Fill an empty prefix/region from the provider category (fill-empty-only).
+
+    Steps 2 and 2b of ``update_detected_prefixes``: the category's region via
+    :func:`region_code_from_category`, then a bare ``"XX| REST"`` head via
+    :func:`~streamselect.core.region_codes.split_category_prefix`, which also
+    covers codes ``CODE_FACETS`` treats as language-only (``AR`` = Arabic) and
+    fills ``detected_prefix`` — the field Exclusions check first. A head used
+    as a continent heading (``"AM| CARIBBEAN"``) fills neither: it names no
+    country.
+
+    Args:
+        prefix: The name-derived prefix, or None.
+        region: The name-derived region, or None.
+        category: ``ChannelDB.category``.
+        config: Live ``Config``.
+        headings: The source's category headings.
+
+    Returns:
+        ``(prefix, region)`` — a value already set is never overwritten.
+    """
+    if not category:
+        return prefix, region
+    if not region:
+        region = region_code_from_category(category, config=config, headings=headings)
+    if prefix is None or not region:
+        code, _ = split_category_prefix(category)
+        if code and not masks_country(category, headings):
+            prefix = code if prefix is None else prefix
+            region = region or code
+    return prefix, region
 
 
 def decompose_name_parse(
@@ -566,7 +616,9 @@ def reattribute_region_languages(
 # --------------------------------------------------------------------------- #
 
 
-def _decompose_compound(raw: str, config) -> list[tuple[str, str, float]]:
+def _decompose_compound(
+    raw: str, config, headings: frozenset[str] = frozenset(),
+) -> list[tuple[str, str, float]]:
     """Decompose a compound provider-category or header string.
 
     Splits on separators and classifies each token.  Any token that is not
@@ -584,6 +636,10 @@ def _decompose_compound(raw: str, config) -> list[tuple[str, str, float]]:
     cleaned = re.sub(r"^#+\s*|\s*#+$", "", raw).strip()
 
     tokens = _split_compound(cleaned)
+    # "AM| CANADA HD": AM is the Americas folder, not Armenia — its country
+    # reading is dropped and the country under it decides (category_headings).
+    if tokens and masks_country(raw, headings):
+        tokens = tokens[1:]
 
     tags: list[tuple[str, str, float]] = []
     residual_parts: list[str] = []

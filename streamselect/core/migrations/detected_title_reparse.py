@@ -165,7 +165,12 @@ from streamselect.core.migrations.detected_fields_reparse import DetectedFieldsR
 #       cards the way SxxExx ones do (ledger F32).
 #   18  "SxxExx N. Bölüm" names also drop the absolute "N. Bölüm" (14 Konusanlar
 #       rows kept "76 Bolum" in the title after v17).
-CURRENT_VERSION: int = 18
+#   19  A category head used as a continent heading is not a country:
+#       "AM| CANADA HD" (one source's Americas folder) stored region AM —
+#       Armenia — on 1,125 rows; the country under it now decides
+#       (category_headings, found by counting). "NA" is North America, not
+#       Namibia (262 rows, one actually Namibian).
+CURRENT_VERSION: int = 19
 
 
 class DetectedTitleReparseTask(DetectedFieldsReparseBase):

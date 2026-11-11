@@ -52,12 +52,12 @@ from streamselect.core.content_labels import (
     AI_VOICEOVER_VALUE, AGE_RATING_PREFIXES, detect_ai_provenance, is_restricted,
 )
 from streamselect.core.quality_vocab import QUALITY_TOKENS
+from streamselect.core.category_headings import headings_by_provider
 from streamselect.core.region_codes import (
     AUDIO_LANG_WORD_MAP,
     CODE_FACETS,
     exclusion_code,
     normalize_region_code,
-    split_category_prefix,
 )
 from streamselect.core.content_identity import added_from_raw, content_key_for, valid_tmdb_id
 from streamselect.core.fixture_titles import fixture_ingest_title
@@ -65,7 +65,7 @@ from streamselect.core.repositories.channel_lens import GENRE_MEDIA_TYPES, metad
 from streamselect.core.repositories.sweep_guard import single_flight
 from streamselect.core.database import ChannelDB, MetadataDB
 from streamselect.core.filter_utils import extract_prefix, genres_from_category, genres_from_raw
-from streamselect.core.tag_decomposer import region_code_from_category
+from streamselect.core.tag_decomposer import category_region_fallback
 
 # Moved here WITH _start_year_int, its only user (the project rules: take the private
 # helpers with the concern — a move that leaves them behind grows the total).
@@ -230,6 +230,7 @@ class ChannelIngestionMixin:
             id_query = id_query.filter(ChannelDB.provider_id == provider_id)
         all_ids = list(channel_ids) if channel_ids is not None else [row[0] for row in id_query.all()]
         total = len(all_ids)
+        headings = headings_by_provider(self.session, provider_id)  # "AM| …" = Americas
 
         updated = 0
         processed = 0
@@ -246,7 +247,7 @@ class ChannelIngestionMixin:
 
             chunk_ids = all_ids[batch_start : batch_start + _BATCH]
             batch_updated, batch_processed = self._commit_prefix_batch_with_retry(
-                chunk_ids, separators, config,
+                chunk_ids, separators, config, headings,
             )
             updated += batch_updated
             processed += batch_processed
@@ -294,6 +295,7 @@ class ChannelIngestionMixin:
         chunk_ids: list[str],
         separators: list[str] | None,
         config,
+        headings: dict[str, frozenset[str]],
     ) -> tuple[int, int]:
         """Run one ``update_detected_prefixes`` batch, retrying on a transient lock.
 
@@ -307,6 +309,7 @@ class ChannelIngestionMixin:
             chunk_ids: Channel ids in this batch.
             separators: Prefix separators passed through to per-channel parsing.
             config: Live ``Config`` instance for the category→region fallback.
+            headings: ``{provider_id: category headings}`` for that fallback.
 
         Returns:
             ``(batch_updated, batch_processed)`` from the successful attempt.
@@ -317,6 +320,7 @@ class ChannelIngestionMixin:
             chunk_ids,
             separators,
             config,
+            headings,
         )
 
     def _process_prefix_batch(
@@ -324,6 +328,7 @@ class ChannelIngestionMixin:
         chunk_ids: list[str],
         separators: list[str] | None,
         config,
+        headings: dict[str, frozenset[str]],
     ) -> tuple[int, int]:
         """Query, parse, and commit one ``update_detected_prefixes`` batch.
 
@@ -337,6 +342,7 @@ class ChannelIngestionMixin:
             chunk_ids: Channel ids in this batch.
             separators: Prefix separators passed through to per-channel parsing.
             config: Live ``Config`` instance for the category→region fallback.
+            headings: ``{provider_id: category headings}`` for that fallback.
 
         Returns:
             ``(batch_updated, batch_processed)`` — channels actually changed vs.
@@ -437,25 +443,11 @@ class ChannelIngestionMixin:
                     and region and region.upper() == "AI"):
                 region = None
 
-            # Fill-empty fallback (step 2): when the NAME carries no region, derive
-            # it from the provider category via the shared tag_decomposer
-            # extraction (never overwrites a name-derived region).
-            if not region and channel.category:
-                region = region_code_from_category(channel.category, config=config)
-
-            # Fill-empty fallback (step 2b, an earlier change): a bare "XX| REST" category with
-            # NO leading pipe — a different convention from the marker below and
-            # from region_code_from_category's split, which misses codes
-            # CODE_FACETS treats as language-only (AR = Arabic, never a region —
-            # an earlier change). Also fills detected_prefix — the field Exclusions checks
-            # first. Fill-empty-only: the name-derived value always wins.
-            if (prefix is None or not region) and channel.category:
-                _cat_code, _ = split_category_prefix(channel.category)
-                if _cat_code:
-                    if prefix is None:
-                        prefix = _cat_code
-                    if not region:
-                        region = _cat_code
+            # Fill-empty fallbacks (steps 2/2b): a NAME with no prefix/region takes
+            # the category's — never a continent heading's ("AM| CANADA HD").
+            prefix, region = category_region_fallback(
+                prefix, region, channel.category, config=config,
+                headings=headings.get(channel.provider_id, frozenset()))
 
             # ── Category marker (user report: "|EN| ANIME" style leading marker
             # duplicates channel-name language/subtitle info and crowds the

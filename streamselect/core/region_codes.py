@@ -601,7 +601,11 @@ REGION_FULL_NAMES: dict[str, str] = {
     "ARM": "Armenia",
     "TWN": "Taiwan",
     "HKG": "Hong Kong",
-    "NA": "Namibia",
+    # "NA" is North America in IPTV labels, not Namibia's ISO code: measured on a
+    # large library, 262 rows carried it ("NA| HOCKEY LEAGUE", "ERT WORLD (NA)",
+    # "ARIRANG (NA)" feeds) and one was Namibian. Namibia is "NAM".
+    "NA": "North America",
+    "NAM": "Namibia",
     "NAMIBIA": "Namibia",
     "MC": "Monaco",
     "MQ": "Martinique",
@@ -856,6 +860,17 @@ def leading_country(label: str) -> tuple[str, str] | None:
     country word inside a title is never read as a region."""
     m = _LEADING_COUNTRY_RE.match((label or "").strip())
     return (_FULL_NAME_TO_CODE[m.group(1).upper()], m.group(2).strip()) if m else None
+
+
+def is_country_code(code: str) -> bool:
+    """True when *code* names a single country ("AM" Armenia, "SK" Slovakia).
+
+    False for continent and language codes ("AF" Africa, "LAT" Latin America,
+    "AR" Arabic, "NA" North America) — they denote no one country, so reading
+    them as a provider's folder heading loses nothing.
+    """
+    name = REGION_FULL_NAMES.get(normalize_region_code(code or ""), "")
+    return name.upper() in _FULL_NAME_TO_CODE
 
 
 def split_category_prefix(category: str) -> tuple[Optional[str], Optional[str]]:

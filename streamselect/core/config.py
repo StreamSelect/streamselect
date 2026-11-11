@@ -56,11 +56,11 @@ BASE_PREFIX_GROUPS: dict[str, list[str]] = {
     # "English" = all English content (backward-compatible aggregate).
     # Sub-groups allow narrowing to a specific English-speaking region.
     "English":            ["EN", "UK", "US", "AU", "CA", "NZ", "IE", "GB", "ENG", "ENGLISH",
-                           "ZA", "ZM", "ZW", "NG", "AUS", "NA"],  # BS = Serbian/Croatian (Bosnia), not English — moved out
+                           "ZA", "ZM", "ZW", "NG", "AUS", "NAM"],  # BS = Serbian/Croatian (Bosnia), not English — moved out
     "English (North America)":  ["US", "CA"],           # US + Canada only
     "English (UK / Ireland)":   ["UK", "IE", "GB"],     # British & Irish
     "English (Oceania)":        ["AU", "AUS", "NZ"],    # Australian / NZ
-    "English (Africa)":         ["ZA", "ZW", "ZM", "NG", "NA"],  # South/East African English
+    "English (Africa)":         ["ZA", "ZW", "ZM", "NG", "NAM"],  # South/East African English
     # ── end English ───────────────────────────────────────────────────────────
     "Filipino":         ["PH"],
     "Finnish":          ["FI", "FIN"],
@@ -236,6 +236,7 @@ BASE_REGIONAL_GROUPS: dict[str, list[str]] = {
     # ── Americas ──────────────────────────────────────────────────────────────
     "North America": [
         "US", "CA",
+        "NA",           # North America itself: "NA| HOCKEY LEAGUE", "GEO NEWS (NA)" feeds
         "MX", "MEX",    # Mexico: geographically North America, culturally LatAm
     ],
     "Caribbean": [
@@ -374,7 +375,7 @@ BASE_REGIONAL_GROUPS: dict[str, list[str]] = {
         "ZM",           # Zambia
         "AO",           # Angola
         "CI",           # Ivory Coast
-        "NA",           # Namibia
+        "NAM",          # Namibia ("NA" is North America — see region_codes)
         "BW",           # Botswana
         "RW", "RWA",    # Rwanda
         "BJ",           # Benin
@@ -390,7 +391,7 @@ BASE_REGIONAL_GROUPS: dict[str, list[str]] = {
         "CM", "CMR", "KE", "KEN", "ET", "ETH", "SO", "SOM",
         "TGO", "GA", "GAB", "GM", "GMB", "TZ", "TZA", "MLI",
         "GN", "GIN", "MZ", "MOZ", "ZA", "ZAF", "ZW", "ZM",
-        "AO", "CI", "NA", "BW", "RW", "RWA", "BJ",
+        "AO", "CI", "NAM", "BW", "RW", "RWA", "BJ",
         "AF", "AFR", "DSTV", "GENERAL",
         "TD", "TCD",    # Chad
     ],

@@ -2,20 +2,21 @@
   "_comment": "Debt ratchet baseline \u2014 see docs/AUDIT_2026-08-16.md. Regenerate with scripts/rebaseline_code_health.py ONLY for a deliberate, reviewed increase.",
   "file_lines": {
     "streamselect/core/channel_name_utils.py": 1799,
-    "streamselect/core/config.py": 2595,
+    "streamselect/core/config.py": 2591,
     "streamselect/core/database.py": 1346,
-    "streamselect/core/filter_utils.py": 1238,
+    "streamselect/core/filter_utils.py": 1237,
     "streamselect/core/players/mpv.py": 1275,
-    "streamselect/core/preference_engine.py": 957,
-    "streamselect/core/provider_loader.py": 1322,
-    "streamselect/core/repositories/channel.py": 1739,
-    "streamselect/core/repositories/channel_ingestion.py": 1327,
+    "streamselect/core/provider_loader.py": 1321,
+    "streamselect/core/repositories/channel.py": 1711,
+    "streamselect/core/repositories/channel_ingestion.py": 1318,
     "streamselect/core/series_monitor.py": 1035,
+    "streamselect/gui/details_pane.py": 1000,
     "streamselect/gui/details_sections.py": 1012,
-    "streamselect/gui/discover_view.py": 1016,
-    "streamselect/gui/epg_watchlist_mixin.py": 1135,
+    "streamselect/gui/discover_view.py": 1014,
+    "streamselect/gui/epg_watchlist_mixin.py": 1134,
+    "streamselect/gui/filter_panel.py": 1000,
     "streamselect/gui/global_filter_dialog.py": 1394,
-    "streamselect/gui/main_window.py": 2388,
+    "streamselect/gui/main_window.py": 2387,
     "streamselect/gui/main_window_channels.py": 2184,
     "streamselect/gui/main_window_favorites.py": 1093,
     "streamselect/gui/main_window_streaming.py": 1314,
@@ -24,5 +25,5 @@
     "streamselect/gui/sidebar/base.py": 1420,
     "streamselect/gui/theme.py": 2415
   },
-  "get_session_calls": 72
+  "get_session_calls": 68
 }

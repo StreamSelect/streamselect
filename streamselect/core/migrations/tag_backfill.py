@@ -238,7 +238,16 @@ def _set_backfill_active(active: bool) -> None:
 #       (ppv), and no longer part of a collection name ("Soccer Ppv").
 #       Targeted: channels whose category/header mentions it
 #       (``_collect_channel_ids_ppv_label``).
-CURRENT_TAG_BACKFILL_VERSION = 15
+#   16 — a category head used as a continent heading is no longer a country:
+#       "AM| CANADA HD" (one source's Americas folder, 1,125 rows) carried
+#       language:Armenian + region:AM. Headings are found by counting the
+#       countries filed under a head (category_headings). And "NA" is North
+#       America, not Namibia, so it no longer implies English. Targeted: rows
+#       under a masked head or carrying NA (``_collect_channel_ids_heading``).
+CURRENT_TAG_BACKFILL_VERSION = 16
+
+#: A library already at version 15 only needs its heading/NA rows re-run.
+_TARGETED_HEADING_FLOOR: int = 15
 
 #: A library already at version 14 only needs its PPV-labelled rows re-run.
 _TARGETED_PPV_LABEL_FLOOR: int = 14
@@ -350,20 +359,28 @@ class TagBackfillTask:
                            if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_PPV_LABEL_FLOOR
                            else [])
             ppv_ids = (self._collect_channel_ids_ppv_label()
-                       if stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR else [])
-            if stored_version >= _TARGETED_PPV_LABEL_FLOOR:
+                       if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_HEADING_FLOOR
+                       else [])
+            headings = self._headings()
+            heading_ids = (self._collect_channel_ids_heading(headings)
+                           if stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR else [])
+            if stored_version >= _TARGETED_HEADING_FLOOR:
+                logger.info("TagBackfillTask: library at version {} — targeted "
+                            "heading/NA re-tag only", stored_version)
+                channel_ids = heading_ids
+            elif stored_version >= _TARGETED_PPV_LABEL_FLOOR:
                 logger.info("TagBackfillTask: library at version {} — targeted "
                             "PPV-label re-tag only", stored_version)
-                channel_ids = ppv_ids
+                channel_ids = sorted(set(ppv_ids) | set(heading_ids))
             elif stored_version >= _TARGETED_COUNTRY_LABEL_FLOOR:
                 logger.info("TagBackfillTask: library at version {} — targeted "
                             "country-label re-tag only", stored_version)
-                channel_ids = sorted(set(country_ids) | set(ppv_ids))
+                channel_ids = sorted(set(country_ids) | set(ppv_ids) | set(heading_ids))
             elif stored_version >= _TARGETED_PLATFORM_SC_FLOOR:
                 logger.info("TagBackfillTask: library at version {} — targeted "
                             "platform:SC re-tag only", stored_version)
                 channel_ids = sorted(set(self._collect_channel_ids_platform_sc())
-                                     | set(country_ids) | set(ppv_ids))
+                                     | set(country_ids) | set(ppv_ids) | set(heading_ids))
             elif stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR:
                 logger.info(
                     "TagBackfillTask: library already at version {} — targeted "
@@ -372,7 +389,7 @@ class TagBackfillTask:
                 )
                 channel_ids = sorted(set(self._collect_channel_ids_region_language())
                                      | set(self._collect_channel_ids_platform_sc())
-                                     | set(country_ids) | set(ppv_ids))
+                                     | set(country_ids) | set(ppv_ids) | set(heading_ids))
             else:
                 logger.info(
                     "TagBackfillTask: library at version {} — full corpus pass",
@@ -397,7 +414,7 @@ class TagBackfillTask:
                     return
 
                 chunk = channel_ids[batch_start : batch_start + _BATCH_SIZE]
-                self._process_batch(chunk, config)
+                self._process_batch(chunk, config, headings)
                 done = batch_start + len(chunk)
                 logger.debug(
                     "TagBackfillTask: committed batch {}–{}", batch_start, done
@@ -515,6 +532,24 @@ class TagBackfillTask:
                     "country-named label", len(found))
         return sorted(found)
 
+    def _headings(self) -> dict[str, frozenset[str]]:
+        """``{provider_id: category headings}`` — one query, read once per run."""
+        from streamselect.core.category_headings import headings_by_provider
+        with self._db.session_scope(commit=False) as session:
+            return headings_by_provider(session)
+
+    def _collect_channel_ids_heading(self, headings: dict[str, frozenset[str]]) -> list[str]:
+        """Rows under a masked category head, or carrying "NA" (version 16)."""
+        from streamselect.core.category_headings import masks_country
+        with self._db.session_scope(commit=False) as session:
+            rows = session.execute(text(
+                "SELECT id, provider_id, category, detected_prefix, detected_region"
+                " FROM channels WHERE COALESCE(category, '') LIKE '%|%'"
+                " OR detected_prefix = 'NA' OR detected_region = 'NA'")).all()
+        return [cid for cid, pid, cat, prefix, region in rows
+                if "NA" in (prefix, region) or (cat or "").strip().lstrip("|").upper().startswith("NA|")
+                or masks_country(cat, headings.get(pid, frozenset()))]
+
     def _collect_channel_ids_ppv_label(self) -> list[str]:
         """Channels whose provider category or header says PPV (version 15)."""
         with self._db.session_scope(commit=False) as session:
@@ -555,7 +590,10 @@ class TagBackfillTask:
             )).all()
         return [r[0] for r in rows]
 
-    def _process_batch(self, channel_ids: list[str], config: "Config") -> None:
+    def _process_batch(
+        self, channel_ids: list[str], config: "Config",
+        headings: dict[str, frozenset[str]] | None = None,
+    ) -> None:
         """Scrub-and-re-tag one batch of channels inside a single session_scope.
 
         The session is committed at the end of the scope; cancellation between
@@ -576,6 +614,7 @@ class TagBackfillTask:
         Args:
             channel_ids: Slice of channel IDs to process.
             config: Live Config instance.
+            headings: ``{provider_id: category headings}`` (see ``category_headings``).
         """
         from streamselect.core.database import ChannelDB
         from streamselect.core.repositories import RepositoryFactory
@@ -603,6 +642,7 @@ class TagBackfillTask:
                     ChannelDB.media_type,
                     ChannelDB.detected_audio,
                     ChannelDB.detected_name_cast,
+                    ChannelDB.provider_id,
                 )
                 .filter(ChannelDB.id.in_(channel_ids))
                 .yield_per(_YIELD_SIZE)
@@ -626,6 +666,7 @@ class TagBackfillTask:
                     media_type,
                     detected_audio,
                     detected_name_cast,
+                    provider_id,
                 ) = row
 
                 all_tags = _collect_tags(
@@ -641,6 +682,7 @@ class TagBackfillTask:
                     media_type=media_type,
                     detected_audio=detected_audio,
                     detected_name_cast=detected_name_cast,
+                    category_headings=(headings or {}).get(provider_id, frozenset()),
                 )
                 # Include every channel (even empty) so channels with no tags
                 # still get their generated rows cleared.
@@ -706,6 +748,7 @@ def _collect_tags(
     detected_audio: dict | None = None,
     name: str | None = None,
     detected_name_cast: str | None = None,
+    category_headings: frozenset[str] = frozenset(),
 ) -> list[tuple[str, str, str]]:
     """Run all feeders and return a merged ``(type, value, feeder)`` list.
 
@@ -741,6 +784,9 @@ def _collect_tags(
         name:             ``ChannelDB.name`` (ai_provenance feeder).  When a trailing
                           ``(AI Generated)`` / ``(AI)`` marker is present, adds a
                           ``content_type:`` tag (``ai_generated`` / ``ai_voiceover``).
+        category_headings: The row's source's category headings, so a
+                          continent folder ("AM| CANADA HD") is not read as a
+                          country (``category_headings``).
 
     Returns:
         List of ``(type, value, feeder)`` tuples ready for
@@ -762,7 +808,7 @@ def _collect_tags(
     # Feeder 1: provider_category
     if category:
         for tag_type, tag_value, _conf in decompose(
-            "provider_category", category, config=config
+            "provider_category", category, config=config, headings=category_headings
         ):
             feeder_map[(tag_type, tag_value)].add("provider_category")
 

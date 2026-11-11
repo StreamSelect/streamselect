@@ -711,6 +711,7 @@ class ProviderLoadThread(QThread):
 
         from streamselect.core.config import Config as _Config
         from streamselect.core.database import ChannelDB
+        from streamselect.core.category_headings import headings_by_provider
         from streamselect.core.migrations.tag_backfill import _collect_tags, is_backfill_active
         from streamselect.core.repositories import RepositoryFactory
         from sqlalchemy import text as _text
@@ -739,12 +740,9 @@ class ProviderLoadThread(QThread):
         # Step 1: collect IDs for just-loaded provider (column-only, no ORM objects).
         try:
             with self.db.session_scope(commit=False) as session:
-                id_rows = (
-                    session.query(ChannelDB.id)
-                    .filter(ChannelDB.provider_id == self.provider.id)
-                    .yield_per(_YIELD_SIZE)
-                    .all()
-                )
+                id_rows = session.query(ChannelDB.id).filter(
+                    ChannelDB.provider_id == self.provider.id).yield_per(_YIELD_SIZE).all()
+                headings = headings_by_provider(session, self.provider.id).get(self.provider.id, frozenset())
             channel_ids: list[str] = [r[0] for r in id_rows]
         except Exception as e:
             logger.error("_update_tags_in_thread: ID fetch failed: {}", e)
@@ -873,6 +871,7 @@ class ProviderLoadThread(QThread):
                             media_type=media_type,
                             detected_audio=detected_audio,
                             detected_name_cast=detected_name_cast,
+                            category_headings=headings,
                         )
 
                         if all_tags:
