@@ -274,7 +274,9 @@ def _set_backfill_active(active: bool) -> None:
 #       ``tag_backfill_targets.quality_led_prefix_ids``.
 #   22 — "|4K| BORA BORA" / "|8ᴋ| SKY SPORTS 2": a bare quality in pipes is the
 #       quality (the same collector, widened).
-CURRENT_TAG_BACKFILL_VERSION = 22
+#   23 — a trailing "|PT|" / "|ARABIC|" is read as the "(PT)" it stands for
+#       (204 rows; the same collector, widened again).
+CURRENT_TAG_BACKFILL_VERSION = 23
 
 #: A library already at version 20 only needs its quality-led prefixes re-run.
 _TARGETED_QUALITY_PREFIX_FLOOR: int = 20

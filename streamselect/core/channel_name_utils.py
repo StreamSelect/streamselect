@@ -112,6 +112,8 @@ _POST_PREFIX_RESIDUE_RE = re.compile(r'^[.\-:|,;]+\s+')
 # Leading CATEGORY marker: "|EN| ANIME", "|AR-SUB| AMAZON PRIME",
 # "|DE| FILME 1990-2023" — a provider ``category`` string (not the channel
 # name) that duplicates language/subtitle info already carried elsewhere.
+_TRAILING_PIPE_MARKER_RE = re.compile(r'\s+\|([^|]+?)\s*\|\s*$')
+
 # Mirrors _LEADING_PIPE_PREFIX_RE's shape but separately captures an optional
 # "-SUB"/"-DUB" compound suffix so parse_category_marker can route it
 # distinctly from a plain language code. See parse_category_marker.
@@ -1408,13 +1410,9 @@ def parse_channel_name(name: str) -> ParsedChannel:
     # every derived detected_* field — and the content_key built from detected_title —
     # is computed from clean text and never carries the non-printing artifact.
     bare = clean_control_chars(name)
-    # Decoration first, and as its OWN class rather than folded into the plain
-    # vocabulary. Folding was the first attempt and it regressed a decision this
-    # codebase had already made correctly: 'EN - WWE Raw (2023)' is a title, and
-    # bare RAW must not be stripped (test_raw_live_cam_fix.py, regression B0).
-    # Folding 'ᴿᴬᵂ' to 'RAW' made the two indistinguishable, so the fix for one
-    # broke the other. A SUPERSCRIPT token cannot be part of a title, which is
-    # what makes it safe to read here and unsafe to read after folding.
+    # Decoration first, as its OWN class: folded to 'RAW' it is indistinguishable
+    # from the title word in 'EN - WWE Raw (2023)' (test_raw_live_cam_fix.py, B0).
+    # A SUPERSCRIPT token cannot be part of a title, so it is safe to read here.
     bare, _sup_attrs = _extract_superscript_attributes(bare)
     # Same argument for a slash-joined pair: "HD/RAW" is unambiguously two
     # attributes, so RAW is readable there even though a bare trailing RAW is not.
@@ -1440,6 +1438,8 @@ def parse_channel_name(name: str) -> ParsedChannel:
         # ". "; only punctuation FOLLOWED BY whitespace is residue (".hack//Sign").
         bare = _POST_PREFIX_RESIDUE_RE.sub("", bare)
         _prefix_consumed = True
+        # This grammar's trailing marker ("BENFICA TV |PT|") is its parenthetical.
+        bare = _TRAILING_PIPE_MARKER_RE.sub(r" (\1)", bare)
 
     # 0b. EPG-embedded event feed: "US (Peacock 01) | Title (timestamp)" — set the
     # region and strip the network/pipe/timestamp to a clean title. The event fields

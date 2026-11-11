@@ -132,3 +132,31 @@ def test_a_bare_quality_in_pipes_is_the_quality(tmp_path, name, quality, title):
         c = s.get(ChannelDB, "q")
         assert (c.detected_prefix, c.detected_quality, c.detected_title) == (None, quality, title)
     assert quality_led_prefix_ids(db) == ["q"]
+
+
+@pytest.mark.parametrize("name, region, title", [
+    ("|8ᴋ| BENFICA TV |PT|", "PT", "BENFICA TV"),       # the marker gives the country
+    ("|EXYU| ARENA SPORT 4 HD |HR|", "HR", "ARENA SPORT 4"),  # Croatia, within ex-Yu
+    ("|US| NBC SPORTS HD |BOSTON|", None, "NBC SPORTS HD (BOSTON)"),  # a feed, as "(BOSTON)"
+])
+def test_a_trailing_pipe_marker_reads_as_its_parenthetical(tmp_path, name, region, title):
+    """204 names end in a marker — "|PT|", "|PERSIAN|", "|BOSTON|" — that stayed
+    in the title verbatim; written "(PT)" the parser already read it."""
+    from streamselect.core.channel_name_utils import parse_channel_name
+    from streamselect.core.database import ChannelDB, Database
+    from streamselect.core.migrations.tag_backfill_targets import quality_led_prefix_ids
+    from streamselect.core.repositories import RepositoryFactory
+
+    db = Database(f"sqlite:///{tmp_path}/t.db")
+    db.create_tables()
+    with db.session_scope() as s:
+        s.add(ChannelDB(id="t", source_id="t", provider_id="p", name=name,
+                        media_type="live", category="X"))
+    with db.session_scope() as s:
+        RepositoryFactory(s).channels.update_detected_prefixes()
+    with db.session_scope() as s:
+        c = s.get(ChannelDB, "t")
+        assert (c.detected_region, c.detected_title) == (region, title)
+    assert quality_led_prefix_ids(db) == ["t"]
+    assert parse_channel_name("|IQ| IMAM HUSSEIN 1 TV |PERSIAN|").audio_langs == ["Persian"]
+    assert parse_channel_name("|ES| A | B").bare_name == "A | B"  # no closing marker

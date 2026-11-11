@@ -177,7 +177,9 @@ from streamselect.core.migrations.detected_fields_reparse import DetectedFieldsR
 #       marker in its title (91 rows) and lost DS (Disney+) / AP (Amazon Prime).
 #   23  A bare quality in pipes is the quality: "|4K| BORA BORA" kept "|4K|" in
 #       its title and "|8ᴋ| SKY SPORTS 2" (small-capital K) lost its 8K (85 rows).
-CURRENT_VERSION: int = 23
+#   24  A trailing pipe marker is the parenthetical it stands for: "BENFICA TV |PT|"
+#       → "BENFICA TV" + PT, "… |PERSIAN|" → Persian audio (204 rows).
+CURRENT_VERSION: int = 24
 
 
 class DetectedTitleReparseTask(DetectedFieldsReparseBase):
