@@ -23,12 +23,6 @@ from streamselect.core.quality_vocab import TIER_TOKENS
 #: Groups whose aliases never lead a label.
 _NOT_BRANDS: frozenset[str] = CONTENT_DESCRIPTOR_GROUPS | {"Pay TV"}
 
-#: Aliases too broad to lead: "DISNEY 4K" mixes Fox catalogue with other
-#: studios' titles, so it is not Disney+ until someone verifies what it holds.
-#: A bare "DISNEY" piece keeps its whole-token meaning unchanged.
-_NOT_LEADING: frozenset[str] = frozenset({"DISNEY"})
-
-
 def split_leading_brand(
     piece: str, platform_groups: dict[str, list[str]],
 ) -> tuple[str, str] | None:
@@ -46,7 +40,7 @@ def split_leading_brand(
     up = " ".join(piece.upper().split())
     aliases = sorted(
         (a.upper() for group, codes in platform_groups.items()
-         if group not in _NOT_BRANDS for a in codes if a.upper() not in _NOT_LEADING),
+         if group not in _NOT_BRANDS for a in codes),
         key=len, reverse=True,
     )
     if up in aliases:

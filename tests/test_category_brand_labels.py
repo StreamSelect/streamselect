@@ -64,9 +64,25 @@ def test_multi_is_the_audio_form_not_collection_text():
     assert "Multi" not in _collections("|MULTI| NETFLIX")
 
 
-def test_disney_4k_stays_unassigned_until_verified():
-    assert not {v for t, v in _tags("|MULTI| DISNEY 4K") if t == "platform"}
+def test_disney_4k_is_disney_plus_in_4k():
+    # Owner-verified: the folder holds Pixar, Fox and Hulu titles.
+    tags = _tags("|MULTI| DISNEY 4K")
+    assert ("platform", "Disney+") in tags and ("quality", "4K / UHD") in tags
+    assert _collections("|MULTI| DISNEY 4K") == set()
     assert ("platform", "Disney+") in _tags("|FR| DISNEY")  # bare piece: unchanged
+
+
+def test_v20_collector_selects_disney_labels(tmp_path):
+    from streamselect.core.database import ChannelDB, Database
+    from streamselect.core.migrations.tag_backfill_targets import disney_label_ids
+
+    db = Database(f"sqlite:///{tmp_path}/disney.db")
+    db.create_tables()
+    with db.session_scope() as s:
+        for cid, cat in [("d4", "|MULTI| DISNEY 4K"), ("dp", "|EN| DISNEY+"), ("nf", "|EN| NETFLIX")]:
+            s.add(ChannelDB(id=cid, source_id=cid, provider_id="p", name=cid,
+                            media_type="movie", category=cat))
+    assert disney_label_ids(db) == ["d4"]
 
 
 @pytest.mark.parametrize("piece", ["SPORT RAW", "SKY NEWS", "KIDS MOVIES", "NETFLIX"])

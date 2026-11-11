@@ -82,6 +82,14 @@ def decorated_label_ids(db) -> list[str]:
         return _ids_with_labels(session, hit)
 
 
+def disney_label_ids(db) -> list[str]:
+    """Rows filed under a "DISNEY …" label: Disney+ from version 20 ("DISNEY 4K"
+    holds Pixar, Fox and Hulu titles — Disney+ catalogue, verified by the owner)."""
+    with db.session_scope(commit=False) as session:
+        return [r[0] for r in session.execute(text(
+            "SELECT id FROM channels WHERE upper(COALESCE(category, '')) LIKE '%DISNEY %'"))]
+
+
 def prefix_review_ids(db) -> list[str]:
     """Rows with a compound prefix or a code whose meaning changed (version 19)."""
     from streamselect.core.database import ChannelDB

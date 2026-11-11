@@ -266,7 +266,13 @@ def _set_backfill_active(active: bool) -> None:
 #       lineups (T2, ES-C, PT-NOS…) are platforms; FRQ/CA-FR are Quebec French;
 #       KURD/SRB/SKR/MH/BANGLA/ZIMBABWE/SU are aliases. Targeted:
 #       ``_collect_channel_ids_prefix_review``.
-CURRENT_TAG_BACKFILL_VERSION = 19
+#   20 — "DISNEY 4K" is Disney+ in 4K (the owner checked: Pixar, Fox, Hulu
+#       titles); it had been held back from the brand rule. Targeted:
+#       ``tag_backfill_targets.disney_label_ids``.
+CURRENT_TAG_BACKFILL_VERSION = 20
+
+#: A library already at version 19 only needs its DISNEY-labelled rows re-run.
+_TARGETED_DISNEY_LABEL_FLOOR: int = 19
 
 #: A library already at version 18 only needs its reviewed-prefix rows re-run.
 _TARGETED_PREFIX_REVIEW_FLOOR: int = 18
@@ -403,11 +409,19 @@ class TagBackfillTask:
                              if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_PREFIX_REVIEW_FLOOR
                              else [])
             review_ids = (targets.prefix_review_ids(self._db)
+                          if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_DISNEY_LABEL_FLOOR
+                          else [])
+            disney_ids = (targets.disney_label_ids(self._db)
                           if stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR else [])
+            review_ids = sorted(set(review_ids) | set(disney_ids))
             decorated_ids = sorted(set(decorated_ids) | set(review_ids))
             brand_ids = sorted(set(brand_ids) | set(decorated_ids))
             heading_ids = sorted(set(heading_ids) | set(brand_ids))
-            if stored_version >= _TARGETED_PREFIX_REVIEW_FLOOR:
+            if stored_version >= _TARGETED_DISNEY_LABEL_FLOOR:
+                logger.info("TagBackfillTask: library at version {} — targeted "
+                            "DISNEY-label re-tag only", stored_version)
+                channel_ids = disney_ids
+            elif stored_version >= _TARGETED_PREFIX_REVIEW_FLOOR:
                 logger.info("TagBackfillTask: library at version {} — targeted "
                             "prefix-review re-tag only", stored_version)
                 channel_ids = review_ids
