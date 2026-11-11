@@ -110,3 +110,25 @@ def test_a_quality_led_pipe_prefix_is_parsed_and_its_service_tagged(tmp_path):
     assert ("platform", "Disney+") in _tags("4K-DS")
     assert ("platform", "Amazon Prime") in _tags("4K-AP")
     assert sorted(quality_led_prefix_ids(db)) == ["ap", "ds"]
+
+
+@pytest.mark.parametrize("name, quality, title", [
+    ("|4K| BORA BORA", "4K", "BORA BORA"),
+    ("|8ᴋ| SKY SPORTS 2", "8K", "SKY SPORTS 2"),  # a small-capital K
+])
+def test_a_bare_quality_in_pipes_is_the_quality(tmp_path, name, quality, title):
+    from streamselect.core.database import ChannelDB, Database
+    from streamselect.core.migrations.tag_backfill_targets import quality_led_prefix_ids
+    from streamselect.core.repositories import RepositoryFactory
+
+    db = Database(f"sqlite:///{tmp_path}/q.db")
+    db.create_tables()
+    with db.session_scope() as s:
+        s.add(ChannelDB(id="q", source_id="q", provider_id="p", name=name,
+                        media_type="live", category="X"))
+    with db.session_scope() as s:
+        RepositoryFactory(s).channels.update_detected_prefixes()
+    with db.session_scope() as s:
+        c = s.get(ChannelDB, "q")
+        assert (c.detected_prefix, c.detected_quality, c.detected_title) == (None, quality, title)
+    assert quality_led_prefix_ids(db) == ["q"]

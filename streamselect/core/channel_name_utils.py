@@ -95,11 +95,11 @@ _BRACKET_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Leading-pipe prefix: |WC| Title, |EN| Title, |4K-DS| Title (a quality may lead:
-# without it the marker stayed in 91 titles). The standard separator patterns
+# Leading-pipe prefix: |WC| Title, |4K-DS| Title, |8ᴋ| Title (a quality may lead or
+# stand alone: without it the marker stayed in 176 titles). The standard separator patterns
 # require the prefix *before* the separator, so they miss this format entirely.
 _LEADING_PIPE_PREFIX_RE = re.compile(
-    r'^\|\s*((?:\dK-)?[A-Z][A-Z0-9\-+]{0,11})\s*\|\s*(.+)$',
+    r'^\|\s*(\d[Kᴋ](?:-[A-Z][A-Z0-9\-+]{0,11})?|[A-Z][A-Z0-9\-+]{0,11})\s*\|\s*(.+)$',
     re.IGNORECASE,
 )
 
@@ -1433,12 +1433,11 @@ def parse_channel_name(name: str) -> ParsedChannel:
     # 0a. Leading-pipe prefix: |WC| Title — strip the pipe-wrapped token to region.
     lpm = _LEADING_PIPE_PREFIX_RE.match(bare)
     if lpm:
-        region = normalize_region_code(lpm.group(1).upper())
+        tok = lpm.group(1).upper().replace("ᴋ", "K")  # "|8ᴋ|": a small-capital K
+        region, _prefix_quality = ("", tok) if tok in QUALITY_TOKENS else (normalize_region_code(tok), "")
         bare = lpm.group(2).strip()
-        # Some feeds put a separator AFTER the closing pipe ("|MULTI|. Title"),
-        # which survives the prefix strip as a leading ". " on the title.  Only a
-        # punctuation run FOLLOWED BY whitespace is residue — a bare leading dot
-        # can be a real title (".hack//Sign").
+        # A separator AFTER the closing pipe ("|MULTI|. Title") survives as a leading
+        # ". "; only punctuation FOLLOWED BY whitespace is residue (".hack//Sign").
         bare = _POST_PREFIX_RESIDUE_RE.sub("", bare)
         _prefix_consumed = True
 

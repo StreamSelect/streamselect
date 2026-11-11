@@ -272,7 +272,9 @@ def _set_backfill_active(active: bool) -> None:
 #   21 — "4K-DS"/"4K-AP" prefixes (one source's 4K-<service> code) are parsed
 #       and their platform part tagged: Disney+ / Amazon Prime. Targeted:
 #       ``tag_backfill_targets.quality_led_prefix_ids``.
-CURRENT_TAG_BACKFILL_VERSION = 21
+#   22 — "|4K| BORA BORA" / "|8ᴋ| SKY SPORTS 2": a bare quality in pipes is the
+#       quality (the same collector, widened).
+CURRENT_TAG_BACKFILL_VERSION = 22
 
 #: A library already at version 20 only needs its quality-led prefixes re-run.
 _TARGETED_QUALITY_PREFIX_FLOOR: int = 20

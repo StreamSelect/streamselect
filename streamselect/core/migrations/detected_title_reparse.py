@@ -175,7 +175,9 @@ from streamselect.core.migrations.detected_fields_reparse import DetectedFieldsR
 #       French), KURD → KU, SRB → RS, SKR → KR, MH → MR, BANGLA → BN.
 #   22  A quality may lead a pipe-wrapped prefix: "|4K-DS| Deadpool 4K" kept the
 #       marker in its title (91 rows) and lost DS (Disney+) / AP (Amazon Prime).
-CURRENT_VERSION: int = 22
+#   23  A bare quality in pipes is the quality: "|4K| BORA BORA" kept "|4K|" in
+#       its title and "|8ᴋ| SKY SPORTS 2" (small-capital K) lost its 8K (85 rows).
+CURRENT_VERSION: int = 23
 
 
 class DetectedTitleReparseTask(DetectedFieldsReparseBase):

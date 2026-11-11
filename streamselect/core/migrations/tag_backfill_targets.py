@@ -91,10 +91,12 @@ def disney_label_ids(db) -> list[str]:
 
 
 def quality_led_prefix_ids(db) -> list[str]:
-    """Rows whose prefix leads with a quality — "4K-DS", "4K-AP" (version 21)."""
+    """Rows whose name leads with a quality in pipes — "|4K-DS|" (version 21),
+    "|4K|", "|8ᴋ|" (version 22)."""
     with db.session_scope(commit=False) as session:
         return [r[0] for r in session.execute(text(
-            "SELECT id FROM channels WHERE detected_prefix GLOB '[0-9]K-*'"))]
+            "SELECT id FROM channels WHERE detected_prefix GLOB '[0-9]K-*'"
+            " OR name GLOB '|[0-9][Kᴋ]|*'"))]
 
 
 def prefix_review_ids(db) -> list[str]:
