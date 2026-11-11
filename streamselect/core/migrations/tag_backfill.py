@@ -244,7 +244,17 @@ def _set_backfill_active(active: bool) -> None:
 #       countries filed under a head (category_headings). And "NA" is North
 #       America, not Namibia, so it no longer implies English. Targeted: rows
 #       under a masked head or carrying NA (``_collect_channel_ids_heading``).
-CURRENT_TAG_BACKFILL_VERSION = 16
+#   17 — a streaming brand leading a label is the platform, and what follows
+#       is read on its own: "NETFLIX KIDS" → platform:Netflix + Kids, where it
+#       used to be collection "Multi Netflix Kids" with no platform. "MULTI" in
+#       a label is the audio format (format:/subtitle: Multi), not collection
+#       text. New aliases: "AMAZON PRIME" (29k rows had no platform), "APPLE TV+",
+#       "PRIME VIDEO", "HBO MAX". Targeted: rows whose label has a brand-led or
+#       MULTI piece (``_collect_channel_ids_brand_label``).
+CURRENT_TAG_BACKFILL_VERSION = 17
+
+#: A library already at version 16 only needs its brand/MULTI-labelled rows re-run.
+_TARGETED_BRAND_LABEL_FLOOR: int = 16
 
 #: A library already at version 15 only needs its heading/NA rows re-run.
 _TARGETED_HEADING_FLOOR: int = 15
@@ -363,8 +373,16 @@ class TagBackfillTask:
                        else [])
             headings = self._headings()
             heading_ids = (self._collect_channel_ids_heading(headings)
-                           if stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR else [])
-            if stored_version >= _TARGETED_HEADING_FLOOR:
+                           if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_BRAND_LABEL_FLOOR
+                           else [])
+            brand_ids = (self._collect_channel_ids_brand_label(config)
+                         if stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR else [])
+            heading_ids = sorted(set(heading_ids) | set(brand_ids))
+            if stored_version >= _TARGETED_BRAND_LABEL_FLOOR:
+                logger.info("TagBackfillTask: library at version {} — targeted "
+                            "brand/MULTI-label re-tag only", stored_version)
+                channel_ids = brand_ids
+            elif stored_version >= _TARGETED_HEADING_FLOOR:
                 logger.info("TagBackfillTask: library at version {} — targeted "
                             "heading/NA re-tag only", stored_version)
                 channel_ids = heading_ids
@@ -549,6 +567,27 @@ class TagBackfillTask:
         return [cid for cid, pid, cat, prefix, region in rows
                 if "NA" in (prefix, region) or (cat or "").strip().lstrip("|").upper().startswith("NA|")
                 or masks_country(cat, headings.get(pid, frozenset()))]
+
+    def _collect_channel_ids_brand_label(self, config) -> list[str]:
+        """Rows whose label has a brand-led, MULTI or new-alias piece (version 17)."""
+        from streamselect.core.category_platforms import split_leading_brand
+        from streamselect.core.channel_name_utils import extract_audio_annotation
+        from streamselect.core.database import ChannelDB
+        from streamselect.core.filter_utils import _split_compound
+        groups = config.filter_platform_groups
+        new_aliases = {"AMAZON PRIME", "AMAZONE PRIME", "PRIME VIDEO", "APPLE+",
+                       "APPLE TV", "APPLE TV+", "HBO MAX"}
+        with self._db.session_scope(commit=False) as session:
+            labels = [r[0] for r in session.execute(text(
+                "SELECT DISTINCT category FROM channels WHERE COALESCE(category, '') != ''"))]
+            hit = [lab for lab in labels if any(
+                split_leading_brand(p, groups) or p.upper() in new_aliases
+                or extract_audio_annotation(p)[0] == "Multi" for p in _split_compound(lab))]
+            ids: list[str] = []
+            for i in range(0, len(hit), 500):  # bounded IN lists
+                ids += [r[0] for r in session.query(ChannelDB.id)
+                        .filter(ChannelDB.category.in_(hit[i:i + 500]))]
+            return ids
 
     def _collect_channel_ids_ppv_label(self) -> list[str]:
         """Channels whose provider category or header says PPV (version 15)."""

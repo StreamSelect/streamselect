@@ -90,6 +90,8 @@ from streamselect.core.content_labels import (
 from streamselect.core.quality_vocab import QUALITY_TOKENS
 from streamselect.core.prefix_vocabulary import prefix_genres, prefix_quality_tokens
 from streamselect.core.category_headings import masks_country
+from streamselect.core.category_platforms import split_leading_brand
+from streamselect.core.channel_name_utils import extract_audio_annotation
 from streamselect.core.region_codes import (
     CODE_FACETS,
     LANGUAGE_ONLY_CODES,
@@ -228,15 +230,12 @@ def category_region_fallback(
 
     Steps 2 and 2b of ``update_detected_prefixes``: the category's region via
     :func:`region_code_from_category`, then a bare ``"XX| REST"`` head via
-    :func:`~streamselect.core.region_codes.split_category_prefix`, which also
-    covers codes ``CODE_FACETS`` treats as language-only (``AR`` = Arabic) and
-    fills ``detected_prefix`` — the field Exclusions check first. A head used
-    as a continent heading (``"AM| CARIBBEAN"``) fills neither: it names no
-    country.
+    ``split_category_prefix`` — which also covers language-only codes (``AR``)
+    and fills ``detected_prefix``, the field Exclusions check first. A
+    continent heading (``"AM| CARIBBEAN"``) fills neither: it names no country.
 
     Args:
-        prefix: The name-derived prefix, or None.
-        region: The name-derived region, or None.
+        prefix, region: The name-derived values, or None.
         category: ``ChannelDB.category``.
         config: Live ``Config``.
         headings: The source's category headings.
@@ -644,7 +643,21 @@ def _decompose_compound(
     tags: list[tuple[str, str, float]] = []
     residual_parts: list[str] = []
 
-    for tok in tokens:
+    pending = list(tokens)
+    while pending:
+        tok = pending.pop(0)
+        # "|MULTI| NETFLIX": MULTI is the audio form, crossing platforms — the
+        # same format:/subtitle: tags a "(MULTI SUB)" name carries.
+        form, audio, dub, sub = extract_audio_annotation(tok)
+        if form == "Multi":
+            tags.extend(decompose_audio({"form": form, "audio": audio, "dub": dub, "sub": sub}))
+            continue
+        # "NETFLIX KIDS": the brand is the platform; the rest is read on its own.
+        brand = split_leading_brand(tok, config.filter_platform_groups)
+        if brand:
+            tags.extend(_classify_prefix_token(brand[0], config))
+            pending[:0] = [brand[1]] if brand[1] else []
+            continue
         # A country NAME leading the label ("SWEDEN SOCCER PPV") is a region,
         # classified exactly like its code; the rest of the token carries on.
         country = leading_country(tok)

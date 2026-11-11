@@ -433,6 +433,7 @@ _ALIAS_MAP: dict[str, str] = {
     "USA": "US",
     "BRASIL": "BRA",
     "ESPANA": "ESP",
+    "MULT": "MULTI",  # provider typo: "|MULT| Prometheus" under "|MULTI| DISNEY 4K"
     # Streaming platforms
     "NETFLIX": "NF",
     "DISNEY+": "D+", "DISNEY": "D+", "DPLUS": "D+", "DISNEYPLUS": "D+",

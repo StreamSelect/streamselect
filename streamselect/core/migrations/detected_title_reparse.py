@@ -170,7 +170,8 @@ from streamselect.core.migrations.detected_fields_reparse import DetectedFieldsR
 #       Armenia — on 1,125 rows; the country under it now decides
 #       (category_headings, found by counting). "NA" is North America, not
 #       Namibia (262 rows, one actually Namibian).
-CURRENT_VERSION: int = 19
+#   20  The "MULT" prefix typo normalizes to MULTI (5 rows under "|MULTI| DISNEY 4K").
+CURRENT_VERSION: int = 20
 
 
 class DetectedTitleReparseTask(DetectedFieldsReparseBase):

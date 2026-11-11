@@ -191,7 +191,8 @@ BASE_PLATFORM_GROUPS: dict[str, list[str]] = {
     # Value target: Arabic-speaking audience. Also appears in Multi/Subtitle group.
     "EAR":           ["EAR"],
     "Netflix":       ["NF", "NETFLIX"],
-    "Amazon Prime":  ["PRIME", "AMAZON"],
+    "Amazon Prime":  ["PRIME", "AMAZON", "AMAZON PRIME", "AMAZONE PRIME",
+                     "PRIME VIDEO"],  # AMAZONE: provider typo
     "Disney+":       ["D+", "DISNEY+", "DISNEY"],
     "VIX":           ["VIX"],           # TelevisaUnivision streaming — predominantly Mexican/Latin content
     "Joyn":          ["JOYN"],          # German streaming (ARD/3sat confirmed)
@@ -201,10 +202,10 @@ BASE_PLATFORM_GROUPS: dict[str, list[str]] = {
     "VIP":           ["VIP"],           # French 4K tier (TF1 4K, M6 4K, France 2 4K confirmed)
     "Shahid":        ["SHAHID"],        # Arabic/Middle East streaming confirmed
     # Less common full-name variants (low channel counts, catch-all):
-    "Apple TV+":     ["A+", "APPLE", "APPLETV"],  # A+ confirmed Apple TV+ content
+    "Apple TV+":     ["A+", "APPLE", "APPLETV", "APPLE+", "APPLE TV", "APPLE TV+"],  # A+ confirmed Apple TV+ content
     # "SC" is NOT a platform: it is the Scandinavian-subtitled library ("4K-SC",
     # "|SCA| NORDIC FILMS 4K") — a region code, already REGION_FULL_NAMES["SC"].
-    "Other Streaming": ["HBO", "HULU", "PEACOCK", "PARAMOUNT", "PARAMOUNT+",
+    "Other Streaming": ["HBO", "HBO MAX", "HULU", "PEACOCK", "PARAMOUNT", "PARAMOUNT+",
                         "PLAY", "PLAY+"],  # PLAY/PLAY+ = Belgian streaming (PLAY ACTIE, PLAY CRIME etc.)
     # ── Broadcast / Pay TV ────────────────────────────────────────────────────
     "Sports":     ["ESPN", "DAZN", "PPV", "NBA", "NFL", "MLB", "NHL", "AHL", "UFC", "WWE", "BEIN", "SKY SPORTS",
