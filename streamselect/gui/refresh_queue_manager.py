@@ -48,6 +48,11 @@ if TYPE_CHECKING:
     from streamselect.core.notifications import NotificationManager
 
 
+#: What each refresh kind covers, named in the toast title so a live-only
+#: refresh is never mistaken for a full one.
+_KIND_LABELS = {"live_only": "live channels only", "full": "live, movies and series"}
+
+
 class ProviderRefreshStatus(Enum):
     """Per-source status in the overview notification."""
     QUEUED  = "queued"
@@ -250,12 +255,12 @@ class RefreshQueueManager(QObject):
             session.close()
 
         # Decide whether to show EPG steps
-        epg_enabled = self._provider_has_epg(entry.provider_id)
+        epg_enabled = self._provider_has_epg(entry.provider_id, entry.kind)
         initial_steps = _make_steps(epg=epg_enabled)
 
         # Show the active (step-checklist) notification for this source
         active_notif_id = self._nm.show_progress(
-            title=f"Refreshing {entry.provider_name}",
+            title=f"Refreshing {entry.provider_name} ({_KIND_LABELS.get(entry.kind, 'all content')})",
             total=100,
             steps=initial_steps,
         )
@@ -291,6 +296,7 @@ class RefreshQueueManager(QObject):
             kind=entry.kind,
         )
         thread.provider_id = entry.provider_id  # Store for the finished handler
+        thread.fetch_epg = epg_enabled  # the one decision the post-refresh EPG step reads
         thread.progress.connect(_on_progress)
         thread.finished.connect(_on_finished)
 
@@ -458,6 +464,8 @@ class RefreshQueueManager(QObject):
                 label = f"{entry.provider_name}  failed"
             else:
                 label = entry.provider_name
+            if entry.kind == "live_only":
+                label += "  (live only)"
             steps.append((label, step_status))
         return steps
 
@@ -493,8 +501,11 @@ class RefreshQueueManager(QObject):
     # Helpers that probe the DB / config
     # ------------------------------------------------------------------
 
-    def _provider_has_epg(self, provider_id: str) -> bool:
+    def _provider_has_epg(self, provider_id: str, kind: str = "full") -> bool:
         """Return True if the provider has EPG enabled and a usable URL.
+
+        A ``live_only`` refresh also requires the guide to be due by its own
+        interval (``EpgManager.needs_refresh``).
 
         Mirrors the same logic as ``_ProviderMixin._provider_has_epg`` but
         uses the manager's own references to ``_db`` and ``_epg_manager``.
@@ -510,6 +521,8 @@ class RefreshQueueManager(QObject):
                 return False
             if not getattr(provider, "epg_enabled", True):
                 return False
-            return bool(epg_manager.effective_epg_url(provider))
+            if not epg_manager.effective_epg_url(provider):
+                return False
+            return kind != "live_only" or epg_manager.needs_refresh(provider)
         finally:
             session.close()

@@ -1,12 +1,12 @@
 {
   "_comment": "Debt ratchet baseline \u2014 see docs/AUDIT_2026-08-16.md. Regenerate with scripts/rebaseline_code_health.py ONLY for a deliberate, reviewed increase.",
   "file_lines": {
-    "streamselect/core/channel_name_utils.py": 1799,
+    "streamselect/core/channel_name_utils.py": 1798,
     "streamselect/core/config.py": 2591,
     "streamselect/core/database.py": 1346,
     "streamselect/core/filter_utils.py": 1237,
     "streamselect/core/players/mpv.py": 1275,
-    "streamselect/core/provider_loader.py": 1321,
+    "streamselect/core/provider_loader.py": 1307,
     "streamselect/core/repositories/channel.py": 1711,
     "streamselect/core/repositories/channel_ingestion.py": 1318,
     "streamselect/core/series_monitor.py": 1035,

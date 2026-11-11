@@ -9,7 +9,7 @@ in test_add_source_in_editor, where sources are added now):
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import pytest
 
@@ -65,7 +65,7 @@ def test_successful_refresh_triggers_epg_and_clears_add_flag(qapp):
 
     mw.on_provider_refresh_finished("notif", True, "done", _thread("p1"))
 
-    mw._maybe_refresh_provider_epg.assert_called_once_with("p1")
+    mw._maybe_refresh_provider_epg.assert_called_once_with("p1", ANY)
     assert "p1" not in mw._epg_fetch_after_add  # add flag cleared (now just bookkeeping)
 
 
@@ -81,7 +81,7 @@ def test_ordinary_refresh_also_triggers_epg(qapp):
 
     mw.on_provider_refresh_finished("notif", True, "done", _thread("p2"))
 
-    mw._maybe_refresh_provider_epg.assert_called_once_with("p2")
+    mw._maybe_refresh_provider_epg.assert_called_once_with("p2", ANY)
 
 
 def test_failed_load_does_not_fetch_epg(qapp):

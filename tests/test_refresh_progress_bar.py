@@ -394,6 +394,7 @@ class TestTaggingThreadEmitsProgress:
         thread = ProviderLoadThread.__new__(ProviderLoadThread)
         thread.db = db
         thread.provider = provider
+        thread._media_scope = None  # a full refresh
 
         # Capture emissions via _try_emit_progress override
         def _capture(cur: int, tot: int, msg: str) -> None:

@@ -11,15 +11,15 @@ empty ``channel_name`` that no re-fetch can fill, e.g. Delta) keeps
 re-fetch on EVERY launch, ignoring ``epg_refresh_interval``.
 
 Fix: a persistent ``ProviderDB.epg_unnamed_refetch_attempted`` marker (set + committed
-when the branch fires) stops the cross-launch loop.  The marker is cleared when the source
-is content-refreshed so a genuinely-improved feed re-attempts exactly once.  The normal
+when the branch fires) stops the cross-launch loop.  A content refresh no longer
+clears it (it re-armed the re-fetch every launch); the refresh's own EPG fetch is the
+retry.  The normal
 ``needs_refresh`` interval still governs periodic refreshes.
 """
 
 from __future__ import annotations
 
 from datetime import timedelta
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
@@ -140,41 +140,21 @@ def test_marker_persists_stops_next_launch_end_to_end(db):
 
 
 # ---------------------------------------------------------------------------
-# Content refresh resets the marker → one re-attempt.
+# A content refresh no longer re-arms the marker: it re-armed it on every
+# scheduled 3-hourly live refresh, so a feed serving nameless rows got its
+# "one-time" re-fetch at every launch. The refresh's own EPG fetch is the retry.
 # ---------------------------------------------------------------------------
 
-def test_content_refresh_resets_marker(db):
-    """The provider-load reset path clears the persistent marker."""
+def test_content_refresh_does_not_rearm_the_refetch(db):
     with db.session_scope() as s:
         _add_provider(s, "delta", marker=True)
-
-    loader = ProviderLoadThread.__new__(ProviderLoadThread)  # skip QThread init
-    loader.provider = SimpleNamespace(id="delta")
-    with db.session_scope() as s:
-        loader._reset_epg_unnamed_refetch_marker(s)
-
-    assert _read_marker(db, "delta") is False, "content refresh must clear the marker"
-
-
-def test_content_refresh_reenables_exactly_one_reattempt(db):
-    """After a content refresh clears the marker, a fresh launch re-attempts the names
-    re-fetch exactly once (then re-sets the marker)."""
-    with db.session_scope() as s:
-        _add_provider(s, "delta", marker=True)          # already attempted before
-        _add_epg_row(s, "delta", channel_name="")       # still nameless
-
-    # Content refresh clears the marker.
-    loader = ProviderLoadThread.__new__(ProviderLoadThread)
-    loader.provider = SimpleNamespace(id="delta")
-    with db.session_scope() as s:
-        loader._reset_epg_unnamed_refetch_marker(s)
-
+        _add_epg_row(s, "delta", channel_name="")
+    assert not hasattr(ProviderLoadThread, "_reset_epg_unnamed_refetch_marker")
     manager = _make_manager(db)
     with patch.object(manager, "_start_refresh") as mock_refresh:
         manager.refresh_all_if_needed()
-        assert mock_refresh.call_count == 1, "reset marker → one re-attempt"
+        mock_refresh.assert_not_called()
     manager._executor.shutdown(wait=False)
-    assert _read_marker(db, "delta") is True, "re-attempt re-sets the persistent marker"
 
 
 # ---------------------------------------------------------------------------
@@ -184,17 +164,11 @@ def test_content_refresh_reenables_exactly_one_reattempt(db):
 
 def test_populated_names_converge_and_stop(db):
     """A converging feed whose re-fetch DID populate names stops even after the marker
-    is reset: ``has_unmatched_unnamed_epg`` is False, so the branch never fires."""
+    is cleared: ``has_unmatched_unnamed_epg`` is False, so the branch never fires."""
     with db.session_scope() as s:
         _add_provider(s, "good", marker=True)
         # Re-fetch populated the name (and matched it) — the converging case.
         _add_epg_row(s, "good", channel_name="Good Channel 1", channel_db_id=None)
-
-    # Even a content refresh (marker reset) must NOT re-fetch, because the rows are named.
-    loader = ProviderLoadThread.__new__(ProviderLoadThread)
-    loader.provider = SimpleNamespace(id="good")
-    with db.session_scope() as s:
-        loader._reset_epg_unnamed_refetch_marker(s)
 
     manager = _make_manager(db)
     with patch.object(manager, "_start_refresh") as mock_refresh:

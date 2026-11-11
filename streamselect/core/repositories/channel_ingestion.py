@@ -177,6 +177,7 @@ class ChannelIngestionMixin:
         is_cancelled=None,
         config=None,
         channel_ids: Optional[Collection[str]] = None,
+        media_types: Optional[Collection[str]] = None,
     ):
         """Update detected_prefix, detected_quality, and detected_region for all channels.
 
@@ -216,6 +217,7 @@ class ChannelIngestionMixin:
             channel_ids: DERIVE-1 — when given, forces recompute for exactly
                 these ids (skips provider_id gathering and the library-wide
                 sibling-propagation phase — out of scope for a targeted call).
+            media_types: Only these media types (a live-only refresh: ``("live",)``).
         """
         _BATCH = 2000
 
@@ -228,6 +230,8 @@ class ChannelIngestionMixin:
         id_query = self.session.query(ChannelDB.id)
         if provider_id:
             id_query = id_query.filter(ChannelDB.provider_id == provider_id)
+        if media_types:
+            id_query = id_query.filter(ChannelDB.media_type.in_(tuple(media_types)))
         all_ids = list(channel_ids) if channel_ids is not None else [row[0] for row in id_query.all()]
         total = len(all_ids)
         headings = headings_by_provider(self.session, provider_id)  # "AM| …" = Americas
@@ -269,13 +273,9 @@ class ChannelIngestionMixin:
         sib_filled = 0
         tmdb_adopted = 0
         if channel_ids is None and not (is_cancelled is not None and is_cancelled()):
-            # Both propagation phases below are bulk writers like the batch loop
-            # above and hit the identical lock-contention hazard (a user's log
-            #: propagate_tmdb_from_title_siblings crashed on
-            # `database is locked`, uncovered by an earlier change's batch-only retry). Both
-            # retry internally via the shared `_retry_on_lock` helper, covering
-            # their OTHER caller too — the standalone tmdb_sibling_propagation
-            # migration task.
+            # Both phases are bulk writers with the batch loop's lock hazard, so
+            # both retry via the shared `_retry_on_lock` (covering their other
+            # caller, the tmdb_sibling_propagation migration, too).
             sib_filled = self._propagate_region_from_siblings(provider_id)
             # Free (no-network) tmdb propagation: an idless row self-heals by adopting
             # a confident same-title sibling's detected_tmdb_id so new content collapses

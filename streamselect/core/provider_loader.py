@@ -10,7 +10,7 @@ from sqlalchemy import or_
 
 from streamselect.core.models import Provider
 from streamselect.core.database import (
-    Database, ChannelDB, SeasonDB, EpisodeDB, ProviderDB, UserRatingDB, WatchQueueDB,
+    Database, ChannelDB, SeasonDB, EpisodeDB, UserRatingDB, WatchQueueDB,
 )
 from streamselect.core.episode_metadata_extract import extract_episode_metadata_fields
 from streamselect.core.repositories.stream_info import StreamInfoRepository
@@ -140,11 +140,9 @@ class ProviderLoadThread(QThread):
         Args:
             kind: "full" (default) fetches live+VOD+series, the historical
                 behaviour. "live_only" (LIVE-1) fetches ONLY
-                ``get_live_streams`` — the same chunked upsert and ingestion
-                hooks (categorize/prefix/tag) run over just those rows, and
-                the vanished-channel prune is skipped so VOD/series rows this
-                pass never touched are not mistaken for gone (see
-                :meth:`load_provider`).
+                ``get_live_streams``; categorize/prefix/tag run over the live
+                rows only (``_media_scope``) and the vanished-channel prune is
+                skipped, so untouched VOD/series rows are not taken for gone.
         """
         super().__init__()
         self.provider = provider
@@ -155,6 +153,7 @@ class ProviderLoadThread(QThread):
         self._platform_groups = platform_groups or {}
         self._regional_groups = regional_groups or {}
         self.kind = kind
+        self._media_scope = ("live",) if kind == "live_only" else None
         self.prefix_stats: dict | None = None  # populated after run; read by main thread
         self._changed_detected_ids: set[str] = set()  # DERIVE-1: set by _store_channels
     
@@ -185,9 +184,9 @@ class ProviderLoadThread(QThread):
         # measured on a user's two sources, that single call returns the
         # COMPLETE live catalog (many/5.0MB/1.6s; many/18.7MB/3.9s),
         # byte-identical to the live half of a full refresh.
-        media_types = {"live"} if self.kind == "live_only" else None
         channels = await provider_plugin.fetch_channels(
-            self.provider, progress_callback=on_progress, media_types=media_types
+            self.provider, progress_callback=on_progress,
+            media_types=set(self._media_scope) if self._media_scope else None,
         )
         _t_fetched = time.monotonic()
 
@@ -221,7 +220,6 @@ class ProviderLoadThread(QThread):
 
         try:
             self._changed_detected_ids = self._store_channels(session, channels, total)
-            self._reset_epg_unnamed_refetch_marker(session)
             self.progress.emit(_BAND_STORE[1], 100, f"Stored {total:,} channels")
 
             # Only now that the whole catalog stored cleanly: drop the rows this
@@ -525,19 +523,6 @@ class ProviderLoadThread(QThread):
                 len(changed), self.provider.name,
             )
 
-    def _reset_epg_unnamed_refetch_marker(self, session) -> None:
-        """Clear this provider's persistent EPG "unnamed re-fetch attempted" marker.
-
-        Content was just (re)ingested, so a feed that improved gets one more chance
-        at the one-time re-fetch driven by ``EpgManager.refresh_all_if_needed`` (which
-        re-sets the marker if still nameless, capping it to one attempt per refresh).
-        Generated/system state only; a bulk UPDATE (no ORM load) keeps it cheap.
-        """
-        session.query(ProviderDB).filter_by(id=self.provider.id).update(
-            {"epg_unnamed_refetch_attempted": False}
-        )
-        session.commit()
-
     @staticmethod
     def _flush_batch(
         session, batch: list[dict], *, seen_at=None, **gates: frozenset[str] | set[str],
@@ -567,13 +552,11 @@ class ProviderLoadThread(QThread):
         session = self.db.get_session()
         try:
             # Fetch only IDs first — avoids loading raw_data for all channels upfront.
-            ids = [
-                row[0]
-                for row in session.query(ChannelDB.id).filter(
-                    ChannelDB.provider_id == self.provider.id,
-                    ChannelDB.special_view.is_(None),
-                ).all()
-            ]
+            query = session.query(ChannelDB.id).filter(
+                ChannelDB.provider_id == self.provider.id, ChannelDB.special_view.is_(None))
+            if self._media_scope:
+                query = query.filter(ChannelDB.media_type.in_(self._media_scope))
+            ids = [row[0] for row in query.all()]
 
             if not ids:
                 return
@@ -656,6 +639,7 @@ class ProviderLoadThread(QThread):
                 provider_id=self.provider.id,
                 separators=self._separators,
                 progress_cb=_progress_cb,
+                media_types=self._media_scope,
             )
             logger.info(f"Prefix detection: updated {updated:,} channels")
 
@@ -740,8 +724,10 @@ class ProviderLoadThread(QThread):
         # Step 1: collect IDs for just-loaded provider (column-only, no ORM objects).
         try:
             with self.db.session_scope(commit=False) as session:
-                id_rows = session.query(ChannelDB.id).filter(
-                    ChannelDB.provider_id == self.provider.id).yield_per(_YIELD_SIZE).all()
+                id_query = session.query(ChannelDB.id).filter(ChannelDB.provider_id == self.provider.id)
+                if self._media_scope:
+                    id_query = id_query.filter(ChannelDB.media_type.in_(self._media_scope))
+                id_rows = id_query.yield_per(_YIELD_SIZE).all()
                 headings = headings_by_provider(session, self.provider.id).get(self.provider.id, frozenset())
             channel_ids: list[str] = [r[0] for r in id_rows]
         except Exception as e:

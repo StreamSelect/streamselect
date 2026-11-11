@@ -312,13 +312,16 @@ class _ProviderMixin:
         if sources is not None:
             sources.set_provider_epg_refreshing(provider_id, False)
 
-    def _maybe_refresh_provider_epg(self, provider_id: str) -> None:
+    def _maybe_refresh_provider_epg(self, provider_id: str, due: bool = True) -> None:
         """Step 2 of a source refresh: pull current EPG — unless EPG is off.
 
         Gated on the per-provider ``epg_enabled`` flag and a usable EPG URL, so a
         source whose EPG the user turned off is skipped entirely. Reuses the
         canonical EPG-refresh path (sidebar spinner + status + force_refresh), so a
         refreshed source's guide is fresh without a separate manual EPG refresh.
+        *due* is the queue's start-time decision (``thread.fetch_epg``): a live-only
+        refresh fetches the guide only when its interval says so — forcing it
+        fetched the guide every 3 hours, and minutes after the launch fetch.
         """
         if getattr(self, "epg_manager", None) is None:
             return
@@ -333,6 +336,9 @@ class _ProviderMixin:
                 return
             if not self.epg_manager.effective_epg_url(provider):
                 logger.info(f"No EPG URL for {provider_id} — skipping post-refresh EPG fetch")
+                return
+            if not due:
+                logger.info(f"EPG for {provider_id} is current — skipping post-refresh EPG fetch")
                 return
         finally:
             session.close()
@@ -663,7 +669,8 @@ class _ProviderMixin:
         self._sync_empty_state()
 
         if success:
-            self._mark_catalog_refreshed(provider_id)  # SPORT-7 stamp; catalog_refresh_tick.py
+            kind = getattr(thread, "kind", "full")
+            self._mark_catalog_refreshed(provider_id, kind)  # live-only: not a full refresh
             # Prefix stats were computed in the worker thread — keep the unmapped
             # list for the "Uncategorized" workflow.  NOTE: we no longer feed these
             # prefix stats to FilterPanel.update_data() — that expected the legacy
@@ -716,7 +723,7 @@ class _ProviderMixin:
             # Post-refresh EPG pull: step 2 of a source refresh.
             if provider_id:
                 self._epg_fetch_after_add.discard(provider_id)
-                self._maybe_refresh_provider_epg(provider_id)
+                self._maybe_refresh_provider_epg(provider_id, getattr(thread, "fetch_epg", True))
         else:
             # Channel load failed — drop any pending add-time EPG flag.
             if provider_id:
