@@ -173,7 +173,9 @@ from streamselect.core.migrations.detected_fields_reparse import DetectedFieldsR
 #   20  The "MULT" prefix typo normalizes to MULTI (5 rows under "|MULTI| DISNEY 4K").
 #   21  Owner-confirmed prefix spellings normalize: FRQ/CA-FR → QFR (Quebec
 #       French), KURD → KU, SRB → RS, SKR → KR, MH → MR, BANGLA → BN.
-CURRENT_VERSION: int = 21
+#   22  A quality may lead a pipe-wrapped prefix: "|4K-DS| Deadpool 4K" kept the
+#       marker in its title (91 rows) and lost DS (Disney+) / AP (Amazon Prime).
+CURRENT_VERSION: int = 22
 
 
 class DetectedTitleReparseTask(DetectedFieldsReparseBase):

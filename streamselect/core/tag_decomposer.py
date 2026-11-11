@@ -88,7 +88,7 @@ from streamselect.core.content_labels import (
     detect_ai_provenance,
 )
 from streamselect.core.quality_vocab import QUALITY_TOKENS, TIER_TOKENS
-from streamselect.core.prefix_vocabulary import prefix_genres, prefix_quality_tokens
+from streamselect.core.prefix_vocabulary import prefix_genres, prefix_platforms, prefix_quality_tokens
 from streamselect.core.category_headings import masks_country
 from streamselect.core.category_platforms import split_leading_brand
 from streamselect.core.channel_name_utils import _extract_superscript_attributes, extract_audio_annotation
@@ -260,6 +260,8 @@ def decompose_name_parse(
         # Global Exclusions judges it by — or a PREM-tier lineup has no locale.
         if code := exclusion_code(detected_prefix):
             tags.extend(_classify_prefix_token(code, config))
+        for part in prefix_platforms(detected_prefix):  # "4K-DS" → Disney+
+            tags.extend(_classify_prefix_token(part, config))
         # A genre the provider filed the title under ("WESTERN-DE - …").
         tags.extend(("genre", g, CONF_DENOTED) for g in prefix_genres(detected_prefix))
         # Every quality a compound prefix names ("SD/CAM": a camcorder copy).

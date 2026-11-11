@@ -90,6 +90,13 @@ def disney_label_ids(db) -> list[str]:
             "SELECT id FROM channels WHERE upper(COALESCE(category, '')) LIKE '%DISNEY %'"))]
 
 
+def quality_led_prefix_ids(db) -> list[str]:
+    """Rows whose prefix leads with a quality — "4K-DS", "4K-AP" (version 21)."""
+    with db.session_scope(commit=False) as session:
+        return [r[0] for r in session.execute(text(
+            "SELECT id FROM channels WHERE detected_prefix GLOB '[0-9]K-*'"))]
+
+
 def prefix_review_ids(db) -> list[str]:
     """Rows with a compound prefix or a code whose meaning changed (version 19)."""
     from streamselect.core.database import ChannelDB

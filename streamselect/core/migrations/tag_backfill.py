@@ -269,7 +269,13 @@ def _set_backfill_active(active: bool) -> None:
 #   20 — "DISNEY 4K" is Disney+ in 4K (the owner checked: Pixar, Fox, Hulu
 #       titles); it had been held back from the brand rule. Targeted:
 #       ``tag_backfill_targets.disney_label_ids``.
-CURRENT_TAG_BACKFILL_VERSION = 20
+#   21 — "4K-DS"/"4K-AP" prefixes (one source's 4K-<service> code) are parsed
+#       and their platform part tagged: Disney+ / Amazon Prime. Targeted:
+#       ``tag_backfill_targets.quality_led_prefix_ids``.
+CURRENT_TAG_BACKFILL_VERSION = 21
+
+#: A library already at version 20 only needs its quality-led prefixes re-run.
+_TARGETED_QUALITY_PREFIX_FLOOR: int = 20
 
 #: A library already at version 19 only needs its DISNEY-labelled rows re-run.
 _TARGETED_DISNEY_LABEL_FLOOR: int = 19
@@ -412,12 +418,20 @@ class TagBackfillTask:
                           if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_DISNEY_LABEL_FLOOR
                           else [])
             disney_ids = (targets.disney_label_ids(self._db)
-                          if stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR else [])
+                          if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_QUALITY_PREFIX_FLOOR
+                          else [])
+            qprefix_ids = (targets.quality_led_prefix_ids(self._db)
+                           if stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR else [])
+            disney_ids = sorted(set(disney_ids) | set(qprefix_ids))
             review_ids = sorted(set(review_ids) | set(disney_ids))
             decorated_ids = sorted(set(decorated_ids) | set(review_ids))
             brand_ids = sorted(set(brand_ids) | set(decorated_ids))
             heading_ids = sorted(set(heading_ids) | set(brand_ids))
-            if stored_version >= _TARGETED_DISNEY_LABEL_FLOOR:
+            if stored_version >= _TARGETED_QUALITY_PREFIX_FLOOR:
+                logger.info("TagBackfillTask: library at version {} — targeted "
+                            "quality-led prefix re-tag only", stored_version)
+                channel_ids = qprefix_ids
+            elif stored_version >= _TARGETED_DISNEY_LABEL_FLOOR:
                 logger.info("TagBackfillTask: library at version {} — targeted "
                             "DISNEY-label re-tag only", stored_version)
                 channel_ids = disney_ids

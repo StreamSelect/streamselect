@@ -192,8 +192,10 @@ BASE_PLATFORM_GROUPS: dict[str, list[str]] = {
     "EAR":           ["EAR"],
     "Netflix":       ["NF", "NETFLIX"],
     "Amazon Prime":  ["PRIME", "AMAZON", "AMAZON PRIME", "AMAZONE PRIME",
-                     "PRIME VIDEO"],  # AMAZONE: provider typo
-    "Disney+":       ["D+", "DISNEY+", "DISNEY", "DISNEY +", "DISNEYTV+"],
+                     "PRIME VIDEO",   # AMAZONE: provider typo
+                     "AP"],           # "|4K-AP| Reacher 4K" (one source's 4K-<service> code)
+    "Disney+":       ["D+", "DISNEY+", "DISNEY", "DISNEY +", "DISNEYTV+",
+                      "DS"],          # "|4K-DS| Deadpool 4K"
     "VIX":           ["VIX"],           # TelevisaUnivision streaming — predominantly Mexican/Latin content
     "Joyn":          ["JOYN"],          # German streaming (ARD/3sat confirmed)
     "Tubi":          ["TUBI"],

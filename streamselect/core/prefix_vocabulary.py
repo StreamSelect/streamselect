@@ -105,3 +105,10 @@ def prefix_quality_tokens(prefix: str) -> list[str]:
 def prefix_genres(prefix: str) -> list[str]:
     """Canonical genres a prefix names ("WESTERN-DE" → ["Western"])."""
     return [g for p in _parts(prefix) if prefix_part_kind(p) == "genre" and (g := _genre(p))]
+
+
+def prefix_platforms(prefix: str) -> list[str]:
+    """Platform parts of a compound prefix ("4K-DS" → ["DS"], Disney+): the tagger
+    files each, as it does a compound's genre and quality parts."""
+    parts = _parts(prefix)
+    return [p for p in parts if len(parts) > 1 and prefix_part_kind(p) == "platform"]

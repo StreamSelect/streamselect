@@ -95,11 +95,11 @@ _BRACKET_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Leading-pipe prefix: |WC| Title, |EN| Title. The prefix is
-# wrapped in pipes at the very start; the standard separator patterns require the
-# prefix *before* the separator, so they miss this format entirely.
+# Leading-pipe prefix: |WC| Title, |EN| Title, |4K-DS| Title (a quality may lead:
+# without it the marker stayed in 91 titles). The standard separator patterns
+# require the prefix *before* the separator, so they miss this format entirely.
 _LEADING_PIPE_PREFIX_RE = re.compile(
-    r'^\|\s*([A-Z][A-Z0-9\-+]{0,11})\s*\|\s*(.+)$',
+    r'^\|\s*((?:\dK-)?[A-Z][A-Z0-9\-+]{0,11})\s*\|\s*(.+)$',
     re.IGNORECASE,
 )
 

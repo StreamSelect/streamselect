@@ -83,3 +83,30 @@ def test_v19_collector_selects_compound_and_changed_codes(tmp_path):
             s.add(ChannelDB(id=cid, source_id=cid, provider_id="p", name=cid,
                             media_type="live", detected_prefix=prefix, detected_region=region))
     assert sorted(prefix_review_ids(db)) == ["pb", "t2", "tm"]
+
+
+def test_a_quality_led_pipe_prefix_is_parsed_and_its_service_tagged(tmp_path):
+    """"|4K-DS| Deadpool 4K": DS is Disney+, AP Amazon Prime (one source's
+    4K-<service> code). The pipe pattern required a letter first, so the marker
+    stayed in 91 titles and the service was lost."""
+    from streamselect.core.database import ChannelDB, Database
+    from streamselect.core.migrations.tag_backfill_targets import quality_led_prefix_ids
+    from streamselect.core.repositories import RepositoryFactory
+
+    db = Database(f"sqlite:///{tmp_path}/ds.db")
+    db.create_tables()
+    with db.session_scope() as s:
+        for cid, name in [("ds", "|4K-DS| Deadpool 4K"), ("ap", "|4K-AP| Reacher 4K"),
+                          ("ar", "|AR-4K| Test")]:
+            s.add(ChannelDB(id=cid, source_id=cid, provider_id="p", name=name,
+                            media_type="movie", category="|MULTI| X"))
+    with db.session_scope() as s:
+        RepositoryFactory(s).channels.update_detected_prefixes()
+    with db.session_scope() as s:
+        got = {c.id: (c.detected_prefix, c.detected_title) for c in s.query(ChannelDB)}
+    assert got["ds"] == ("4K-DS", "Deadpool")
+    assert got["ap"] == ("4K-AP", "Reacher")
+    assert got["ar"] == ("AR-4K", "Test")
+    assert ("platform", "Disney+") in _tags("4K-DS")
+    assert ("platform", "Amazon Prime") in _tags("4K-AP")
+    assert sorted(quality_led_prefix_ids(db)) == ["ap", "ds"]
