@@ -193,13 +193,13 @@ BASE_PLATFORM_GROUPS: dict[str, list[str]] = {
     "Netflix":       ["NF", "NETFLIX"],
     "Amazon Prime":  ["PRIME", "AMAZON", "AMAZON PRIME", "AMAZONE PRIME",
                      "PRIME VIDEO"],  # AMAZONE: provider typo
-    "Disney+":       ["D+", "DISNEY+", "DISNEY"],
+    "Disney+":       ["D+", "DISNEY+", "DISNEY", "DISNEY +", "DISNEYTV+"],
     "VIX":           ["VIX"],           # TelevisaUnivision streaming — predominantly Mexican/Latin content
     "Joyn":          ["JOYN"],          # German streaming (ARD/3sat confirmed)
     "Tubi":          ["TUBI"],
     "WOW":           ["WOW"],           # German Sky streaming (Sky Cinema confirmed)
-    "GOLD":          ["GOLD"],          # BBC Nordic DK etc. confirmed
-    "VIP":           ["VIP"],           # French 4K tier (TF1 4K, M6 4K, France 2 4K confirmed)
+    # No "VIP"/"GOLD": they are package tiers (quality_vocab.TIER_TOKENS) on
+    # ordinary channels — "LAT| MEXICO VIP", "NORWAY ᴳᴼᴸᴰ ᴿᴬᵂ" — not platforms.
     "Shahid":        ["SHAHID"],        # Arabic/Middle East streaming confirmed
     # Less common full-name variants (low channel counts, catch-all):
     "Apple TV+":     ["A+", "APPLE", "APPLETV", "APPLE+", "APPLE TV", "APPLE TV+"],  # A+ confirmed Apple TV+ content

@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import re
 
-from streamselect.core.channel_name_utils import _is_superscript_char
-from streamselect.core.content_labels import CONTENT_DESCRIPTOR_GROUPS
+from streamselect.core.content_labels import CONTENT_DESCRIPTOR_GROUPS, CONTENT_TYPE_WORDS
+from streamselect.core.quality_vocab import TIER_TOKENS
 
 #: Groups whose aliases never lead a label.
 _NOT_BRANDS: frozenset[str] = CONTENT_DESCRIPTOR_GROUPS | {"Pay TV"}
@@ -54,9 +54,9 @@ def split_leading_brand(
     for alias in aliases:
         m = re.match(rf"{re.escape(alias)}(?=\s)\s+(.+)$", up)
         if m:
-            # "/ NATGEO" → "NATGEO"; "ᴿᴬᵂ ⁶⁰ᶠᵖˢ" is decoration (the channel NAME
-            # carries it to detected_quality), never a category of its own.
+            # "/ NATGEO" → "NATGEO"; a tier ("SHAHID VIP 4K") is package
+            # decoration, never a category — PPV stays, it is a content type.
             words = [w for w in m.group(1).split()
-                     if not all(_is_superscript_char(c) for c in w)]
+                     if w not in TIER_TOKENS or w in CONTENT_TYPE_WORDS]
             return alias, " ".join(words).lstrip("/&+- ")
     return None

@@ -36,6 +36,8 @@ def _collections(category):
     ("|MULTI| APPLE+", "Apple TV+", None),
     ("|EN| APPLE TV+", "Apple TV+", None),
     ("|NL| DISNEY+ / NATGEO", "Disney+", ("collection", "Natgeo")),
+    ("|NL| DISNEY +", "Disney+", None),
+    ("|NL| DISNEYTV+", "Disney+", None),
 ])
 def test_brand_is_the_platform_and_the_rest_is_its_own(category, platform, rest):
     tags = _tags(category)

@@ -87,11 +87,11 @@ from streamselect.core.content_labels import (
     CONTENT_DESCRIPTOR_GROUPS,
     detect_ai_provenance,
 )
-from streamselect.core.quality_vocab import QUALITY_TOKENS
+from streamselect.core.quality_vocab import QUALITY_TOKENS, TIER_TOKENS
 from streamselect.core.prefix_vocabulary import prefix_genres, prefix_quality_tokens
 from streamselect.core.category_headings import masks_country
 from streamselect.core.category_platforms import split_leading_brand
-from streamselect.core.channel_name_utils import extract_audio_annotation
+from streamselect.core.channel_name_utils import _extract_superscript_attributes, extract_audio_annotation
 from streamselect.core.region_codes import (
     CODE_FACETS,
     LANGUAGE_ONLY_CODES,
@@ -620,9 +620,8 @@ def _decompose_compound(
 ) -> list[tuple[str, str, float]]:
     """Decompose a compound provider-category or header string.
 
-    Splits on separators and classifies each token.  Any token that is not
-    recognized as region / language / platform / quality becomes a candidate
-    for ``collection``.
+    Splits on separators and classifies each token; an unrecognised token
+    becomes a candidate for ``collection``.
 
     Examples::
 
@@ -633,14 +632,16 @@ def _decompose_compound(
     """
     # Strip leading/trailing hash blocks (header format: "## LABEL ##", "###")
     cleaned = re.sub(r"^#+\s*|\s*#+$", "", raw).strip()
-
+    # Superscript decoration, read as names read it: "ᴿᴬᵂ" is quality RAW, "ᴳᴼᴸᴰ" a tier.
+    cleaned, deco = _extract_superscript_attributes(cleaned)
     tokens = _split_compound(cleaned)
     # "AM| CANADA HD": AM is the Americas folder, not Armenia — its country
     # reading is dropped and the country under it decides (category_headings).
     if tokens and masks_country(raw, headings):
         tokens = tokens[1:]
 
-    tags: list[tuple[str, str, float]] = []
+    tags: list[tuple[str, str, float]] = [
+        t for q in deco.quality for t in _classify_quality_token(q, config)]
     residual_parts: list[str] = []
 
     pending = list(tokens)
@@ -676,8 +677,8 @@ def _decompose_compound(
             continue
         tok_upper = tok.upper()
 
-        # Try as quality first (quality tokens are a closed set).
-        if tok_upper in QUALITY_TOKENS:
+        # Quality first (a closed set); a tier ("VIP", "GOLD") is package decoration.
+        if tok_upper in QUALITY_TOKENS or tok_upper in TIER_TOKENS:
             qtags = _classify_quality_token(tok_upper, config)
             if qtags:
                 tags.extend(qtags)

@@ -62,6 +62,7 @@ tag raises confidence; a feeder in ``_FEEDER_WEIGHTS`` raises it less.
 
 from __future__ import annotations
 
+import re
 import threading
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable
@@ -251,7 +252,16 @@ def _set_backfill_active(active: bool) -> None:
 #       text. New aliases: "AMAZON PRIME" (29k rows had no platform), "APPLE TV+",
 #       "PRIME VIDEO", "HBO MAX". Targeted: rows whose label has a brand-led or
 #       MULTI piece (``_collect_channel_ids_brand_label``).
-CURRENT_TAG_BACKFILL_VERSION = 17
+#   18 — superscript decoration in a label is read the way names read it:
+#       "TELE2 VERMAAK ᴿᴬᵂ ᴳᴼᴸᴰ" is quality:RAW + collection "Tele2 Vermaak"
+#       (126 labels, 12.5k rows on a large library). VIP and GOLD are package
+#       tiers (quality_vocab.TIER_TOKENS), no longer platforms: 1,724 rows
+#       carried platform:VIP from "LAT| MEXICO VIP"-style labels. Targeted:
+#       ``_collect_channel_ids_decorated_label``.
+CURRENT_TAG_BACKFILL_VERSION = 18
+
+#: A library already at version 17 only needs its decorated/tier labels re-run.
+_TARGETED_DECORATED_LABEL_FLOOR: int = 17
 
 #: A library already at version 16 only needs its brand/MULTI-labelled rows re-run.
 _TARGETED_BRAND_LABEL_FLOOR: int = 16
@@ -376,9 +386,17 @@ class TagBackfillTask:
                            if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_BRAND_LABEL_FLOOR
                            else [])
             brand_ids = (self._collect_channel_ids_brand_label(config)
-                         if stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR else [])
+                         if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_DECORATED_LABEL_FLOOR
+                         else [])
+            decorated_ids = (self._collect_channel_ids_decorated_label()
+                             if stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR else [])
+            brand_ids = sorted(set(brand_ids) | set(decorated_ids))
             heading_ids = sorted(set(heading_ids) | set(brand_ids))
-            if stored_version >= _TARGETED_BRAND_LABEL_FLOOR:
+            if stored_version >= _TARGETED_DECORATED_LABEL_FLOOR:
+                logger.info("TagBackfillTask: library at version {} — targeted "
+                            "decorated/tier-label re-tag only", stored_version)
+                channel_ids = decorated_ids
+            elif stored_version >= _TARGETED_BRAND_LABEL_FLOOR:
                 logger.info("TagBackfillTask: library at version {} — targeted "
                             "brand/MULTI-label re-tag only", stored_version)
                 channel_ids = brand_ids
@@ -576,13 +594,30 @@ class TagBackfillTask:
         from streamselect.core.filter_utils import _split_compound
         groups = config.filter_platform_groups
         new_aliases = {"AMAZON PRIME", "AMAZONE PRIME", "PRIME VIDEO", "APPLE+",
-                       "APPLE TV", "APPLE TV+", "HBO MAX"}
+                       "APPLE TV", "APPLE TV+", "HBO MAX", "DISNEY +", "DISNEYTV+"}
         with self._db.session_scope(commit=False) as session:
             labels = [r[0] for r in session.execute(text(
                 "SELECT DISTINCT category FROM channels WHERE COALESCE(category, '') != ''"))]
             hit = [lab for lab in labels if any(
                 split_leading_brand(p, groups) or p.upper() in new_aliases
                 or extract_audio_annotation(p)[0] == "Multi" for p in _split_compound(lab))]
+            ids: list[str] = []
+            for i in range(0, len(hit), 500):  # bounded IN lists
+                ids += [r[0] for r in session.query(ChannelDB.id)
+                        .filter(ChannelDB.category.in_(hit[i:i + 500]))]
+            return ids
+
+    def _collect_channel_ids_decorated_label(self) -> list[str]:
+        """Rows whose label carries superscript decoration or a tier word (version 18)."""
+        from streamselect.core.channel_name_utils import _extract_superscript_attributes
+        from streamselect.core.database import ChannelDB
+        from streamselect.core.quality_vocab import TIER_TOKENS
+        tier_re = re.compile(rf"\b({'|'.join(sorted(TIER_TOKENS))})\b", re.IGNORECASE)
+        with self._db.session_scope(commit=False) as session:
+            labels = [r[0] for r in session.execute(text(
+                "SELECT DISTINCT category FROM channels WHERE COALESCE(category, '') != ''"))]
+            hit = [lab for lab in labels if tier_re.search(lab)
+                   or _extract_superscript_attributes(lab)[0] != lab]
             ids: list[str] = []
             for i in range(0, len(hit), 500):  # bounded IN lists
                 ids += [r[0] for r in session.query(ChannelDB.id)
