@@ -98,8 +98,8 @@ from streamselect.core.region_codes import (
     leading_country,
     PLATFORM_CODES,
     REGION_FULL_NAMES,
+    exclusion_code,
     normalize_region_code,
-    split_category_prefix,
 )
 from streamselect.core.tag_confidence import CONF_DENOTED, CONF_STRONG_PRIOR, CONF_WEAK_PRIOR
 from streamselect.core.genre_words import platform_named_as_genre, resolve_genres
@@ -218,43 +218,6 @@ def region_code_from_category(
     return None
 
 
-def category_region_fallback(
-    prefix: str | None,
-    region: str | None,
-    category: str | None,
-    *,
-    config,
-    headings: frozenset[str] = frozenset(),
-) -> tuple[str | None, str | None]:
-    """Fill an empty prefix/region from the provider category (fill-empty-only).
-
-    Steps 2 and 2b of ``update_detected_prefixes``: the category's region via
-    :func:`region_code_from_category`, then a bare ``"XX| REST"`` head via
-    ``split_category_prefix`` — which also covers language-only codes (``AR``)
-    and fills ``detected_prefix``, the field Exclusions check first. A
-    continent heading (``"AM| CARIBBEAN"``) fills neither: it names no country.
-
-    Args:
-        prefix, region: The name-derived values, or None.
-        category: ``ChannelDB.category``.
-        config: Live ``Config``.
-        headings: The source's category headings.
-
-    Returns:
-        ``(prefix, region)`` — a value already set is never overwritten.
-    """
-    if not category:
-        return prefix, region
-    if not region:
-        region = region_code_from_category(category, config=config, headings=headings)
-    if prefix is None or not region:
-        code, _ = split_category_prefix(category)
-        if code and not masks_country(category, headings):
-            prefix = code if prefix is None else prefix
-            region = region or code
-    return prefix, region
-
-
 def decompose_name_parse(
     *,
     detected_prefix: str | None,
@@ -293,6 +256,10 @@ def decompose_name_parse(
 
     if detected_prefix:
         tags.extend(_classify_prefix_token(detected_prefix, config))
+        # "PB-PREM", "IN-TE": a compound's locale part (language wins) — the code
+        # Global Exclusions judges it by — or a PREM-tier lineup has no locale.
+        if code := exclusion_code(detected_prefix):
+            tags.extend(_classify_prefix_token(code, config))
         # A genre the provider filed the title under ("WESTERN-DE - …").
         tags.extend(("genre", g, CONF_DENOTED) for g in prefix_genres(detected_prefix))
         # Every quality a compound prefix names ("SD/CAM": a camcorder copy).

@@ -84,7 +84,7 @@ BASE_PREFIX_GROUPS: dict[str, list[str]] = {
                          # Full language names & alternate abbreviations confirmed from channel data:
                          "HINDI", "IND",
                          "TEL", "TELUGU", "TELEGU",         # Telugu (TELEGU = common typo)
-                         "TAM", "TAMIL",                     # Tamil
+                         "TAM", "TAMIL", "TM",               # Tamil ("TM" in IPTV labels, not Turkmenistan)
                          "KAN", "KANNADA",                   # Kannada
                          "MAL", "MALAYALAM",                 # Malayalam
                          "MARATHI",                          # Marathi
@@ -119,7 +119,7 @@ BASE_PREFIX_GROUPS: dict[str, list[str]] = {
     "Portuguese (Africa)":   ["MZ", "MOZ", "AO", "CV", "ANGOLA", "MOZAMBIQUE", "CABO", "CAPEVERDE"],
     # ── end Portuguese ────────────────────────────────────────────────────────
     "Romanian":         ["RO"],
-    "Russian":          ["RU", "BY", "KZ", "KG", "TJ", "TM", "UZ", "RUS"],
+    "Russian":          ["RU", "BY", "KZ", "KG", "TJ", "TKM", "UZ", "RUS"],  # TM is Tamil — see region_codes
     "Serbian/Croatian": ["RS", "HR", "BA", "ME", "SI", "MK", "SR",
                          "EXYU", "EX",   # EX confirmed Ex-Yugoslav content (Croatian sinhronizirano dubs + EXYU productions)
                          "BIH", "BS", "SLO", "SLN", "MNG"],  # MNG=Montenegro (RTCG SAT confirmed)
@@ -206,7 +206,12 @@ BASE_PLATFORM_GROUPS: dict[str, list[str]] = {
     # "SC" is NOT a platform: it is the Scandinavian-subtitled library ("4K-SC",
     # "|SCA| NORDIC FILMS 4K") — a region code, already REGION_FULL_NAMES["SC"].
     "Other Streaming": ["HBO", "HBO MAX", "HULU", "PEACOCK", "PARAMOUNT", "PARAMOUNT+",
-                        "PLAY", "PLAY+"],  # PLAY/PLAY+ = Belgian streaming (PLAY ACTIE, PLAY CRIME etc.)
+                        "PLAY", "PLAY+",  # PLAY/PLAY+ = Belgian streaming (PLAY ACTIE, PLAY CRIME etc.)
+                        "VIA",            # Viaplay ("NL| VIAPLAY")
+                        "VD",             # Vidio (Indonesia)
+                        "TY",             # Tivify (Spain)
+                        "PLAYER",         # Atresplayer (Spain)
+                        "UK-BBCI", "UK-NOWTV"],  # BBC iPlayer, Now TV
     # ── Broadcast / Pay TV ────────────────────────────────────────────────────
     "Sports":     ["ESPN", "DAZN", "PPV", "NBA", "NFL", "MLB", "NHL", "AHL", "UFC", "WWE", "BEIN", "SKY SPORTS",
                    "SPT", "SPORT", "SPORTS",         # generic sports prefixes
@@ -224,7 +229,16 @@ BASE_PLATFORM_GROUPS: dict[str, list[str]] = {
                    "STC",     # Saudi Telecom Company TV (confirmed: STC TV Sports)
                    "MYHD",    # MyHD pay TV
                    "GOBX",    # GOtv Box
-                   "DIGI"],   # Digi (Romanian/Hungarian telecom TV)
+                   "DIGI",    # Digi (Romanian/Hungarian telecom TV)
+                   # Operator lineups — a cable/satellite/telco package, region from the label:
+                   "T2",      # Tele2 NL ("NL| TELE2 VERMAAK")
+                   "ES-C", "ES-AV", "TF",  # Cabel TV, Avatel, Telefónica (Spain)
+                   "PT-NOS",  # NOS (Portugal)
+                   "NL-CW",   # Caiway (NL)
+                   "ONE",     # Direct One (HU)
+                   "SAT",     # Albanian satellite lineup ("AL| ALBANIA PREMIUM")
+                   "AZAM",    # Azam TV (East Africa)
+                   "V+"],     # Vision+ (Indonesia)
     "News":       ["CNN", "BBC", "FOX", "NBC", "CBS", "ABC", "MSNBC", "SKY NEWS", "AL JAZEERA", "FRANCE24"],
     "Kids":       ["KIDS", "CARTOON", "DISNEY JUNIOR", "NICK", "NICKELODEON", "PBS KIDS",
                    "ENF"],  # ENF confirmed kids/children (Baby TV, Disney Channel, Disney Junior — French "enfants")
@@ -452,7 +466,7 @@ BASE_REGIONAL_GROUPS: dict[str, list[str]] = {
         "MV",           # Maldives
         "AF", "AFG",    # Afghanistan
         # Indian language codes (South Asia lingua franca group):
-        "HI", "TA", "TE", "ML", "KN", "BN", "MR", "GU", "PB",   # PB = Punjabi (PA = Panama, not South Asia)
+        "HI", "TA", "TM", "TE", "ML", "KN", "BN", "MR", "GU", "PB",   # PB = Punjabi (PA = Panama, not South Asia)
         "OR", "BHO", "IND",
         # Abbreviated forms:
         "TEL", "TAM", "KAN", "MAL", "GUJ", "PUN",
@@ -462,7 +476,7 @@ BASE_REGIONAL_GROUPS: dict[str, list[str]] = {
         "KG",           # Kyrgyzstan
         "UZ",           # Uzbekistan
         "TJ",           # Tajikistan
-        "TM",           # Turkmenistan
+        "TKM",          # Turkmenistan ("TM" is Tamil in IPTV labels)
         "MN",           # Mongolia
     ],
     "Asia": [
@@ -471,8 +485,8 @@ BASE_REGIONAL_GROUPS: dict[str, list[str]] = {
         "JP", "JPN", "KR", "KO", "CN", "CHN", "TW", "TWN", "HK", "HKG", "MO",
         "TH", "VN", "ID", "PH", "MY", "SG", "MM", "KH", "LA",
         "IN", "IND", "PK", "PAK", "BD", "LK", "SRI", "NP", "BT", "AF", "AFG",
-        "KZ", "KG", "UZ", "TJ", "TM", "MN",
-        "HI", "TA", "TE", "ML", "KN", "MR", "GU",
+        "KZ", "KG", "UZ", "TJ", "TKM", "MN",
+        "HI", "TA", "TM", "TE", "ML", "KN", "MR", "GU",
     ],
 
     # ── Oceania ───────────────────────────────────────────────────────────────

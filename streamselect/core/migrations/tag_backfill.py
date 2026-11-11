@@ -62,13 +62,14 @@ tag raises confidence; a feeder in ``_FEEDER_WEIGHTS`` raises it less.
 
 from __future__ import annotations
 
-import re
 import threading
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable
 
 from loguru import logger
 from sqlalchemy import text
+
+from streamselect.core.migrations import tag_backfill_targets as targets
 
 if TYPE_CHECKING:
     from streamselect.core.config import Config
@@ -258,7 +259,17 @@ def _set_backfill_active(active: bool) -> None:
 #       tiers (quality_vocab.TIER_TOKENS), no longer platforms: 1,724 rows
 #       carried platform:VIP from "LAT| MEXICO VIP"-style labels. Targeted:
 #       ``_collect_channel_ids_decorated_label``.
-CURRENT_TAG_BACKFILL_VERSION = 18
+#   19 — a compound prefix's locale part is tagged ("PB-PREM" → Indian,
+#       "AR-4K" → Arabic; 728 of 733 PREM-tier rows had no locale), through
+#       the same exclusion_code Global Exclusions judges it by. "TM" is Tamil,
+#       not Turkmenistan (~3,500 Tamil rows were tagged Russian). Operator
+#       lineups (T2, ES-C, PT-NOS…) are platforms; FRQ/CA-FR are Quebec French;
+#       KURD/SRB/SKR/MH/BANGLA/ZIMBABWE/SU are aliases. Targeted:
+#       ``_collect_channel_ids_prefix_review``.
+CURRENT_TAG_BACKFILL_VERSION = 19
+
+#: A library already at version 18 only needs its reviewed-prefix rows re-run.
+_TARGETED_PREFIX_REVIEW_FLOOR: int = 18
 
 #: A library already at version 17 only needs its decorated/tier labels re-run.
 _TARGETED_DECORATED_LABEL_FLOOR: int = 17
@@ -381,18 +392,26 @@ class TagBackfillTask:
             ppv_ids = (self._collect_channel_ids_ppv_label()
                        if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_HEADING_FLOOR
                        else [])
-            headings = self._headings()
-            heading_ids = (self._collect_channel_ids_heading(headings)
+            headings = targets.headings(self._db)
+            heading_ids = (targets.heading_ids(self._db, headings)
                            if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_BRAND_LABEL_FLOOR
                            else [])
-            brand_ids = (self._collect_channel_ids_brand_label(config)
+            brand_ids = (targets.brand_label_ids(self._db, config)
                          if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_DECORATED_LABEL_FLOOR
                          else [])
-            decorated_ids = (self._collect_channel_ids_decorated_label()
-                             if stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR else [])
+            decorated_ids = (targets.decorated_label_ids(self._db)
+                             if _TARGETED_REGION_LANGUAGE_FLOOR <= stored_version < _TARGETED_PREFIX_REVIEW_FLOOR
+                             else [])
+            review_ids = (targets.prefix_review_ids(self._db)
+                          if stored_version >= _TARGETED_REGION_LANGUAGE_FLOOR else [])
+            decorated_ids = sorted(set(decorated_ids) | set(review_ids))
             brand_ids = sorted(set(brand_ids) | set(decorated_ids))
             heading_ids = sorted(set(heading_ids) | set(brand_ids))
-            if stored_version >= _TARGETED_DECORATED_LABEL_FLOOR:
+            if stored_version >= _TARGETED_PREFIX_REVIEW_FLOOR:
+                logger.info("TagBackfillTask: library at version {} — targeted "
+                            "prefix-review re-tag only", stored_version)
+                channel_ids = review_ids
+            elif stored_version >= _TARGETED_DECORATED_LABEL_FLOOR:
                 logger.info("TagBackfillTask: library at version {} — targeted "
                             "decorated/tier-label re-tag only", stored_version)
                 channel_ids = decorated_ids
@@ -567,62 +586,6 @@ class TagBackfillTask:
         logger.info("TagBackfillTask: {:,} channel(s) take their region from a "
                     "country-named label", len(found))
         return sorted(found)
-
-    def _headings(self) -> dict[str, frozenset[str]]:
-        """``{provider_id: category headings}`` — one query, read once per run."""
-        from streamselect.core.category_headings import headings_by_provider
-        with self._db.session_scope(commit=False) as session:
-            return headings_by_provider(session)
-
-    def _collect_channel_ids_heading(self, headings: dict[str, frozenset[str]]) -> list[str]:
-        """Rows under a masked category head, or carrying "NA" (version 16)."""
-        from streamselect.core.category_headings import masks_country
-        with self._db.session_scope(commit=False) as session:
-            rows = session.execute(text(
-                "SELECT id, provider_id, category, detected_prefix, detected_region"
-                " FROM channels WHERE COALESCE(category, '') LIKE '%|%'"
-                " OR detected_prefix = 'NA' OR detected_region = 'NA'")).all()
-        return [cid for cid, pid, cat, prefix, region in rows
-                if "NA" in (prefix, region) or (cat or "").strip().lstrip("|").upper().startswith("NA|")
-                or masks_country(cat, headings.get(pid, frozenset()))]
-
-    def _collect_channel_ids_brand_label(self, config) -> list[str]:
-        """Rows whose label has a brand-led, MULTI or new-alias piece (version 17)."""
-        from streamselect.core.category_platforms import split_leading_brand
-        from streamselect.core.channel_name_utils import extract_audio_annotation
-        from streamselect.core.database import ChannelDB
-        from streamselect.core.filter_utils import _split_compound
-        groups = config.filter_platform_groups
-        new_aliases = {"AMAZON PRIME", "AMAZONE PRIME", "PRIME VIDEO", "APPLE+",
-                       "APPLE TV", "APPLE TV+", "HBO MAX", "DISNEY +", "DISNEYTV+"}
-        with self._db.session_scope(commit=False) as session:
-            labels = [r[0] for r in session.execute(text(
-                "SELECT DISTINCT category FROM channels WHERE COALESCE(category, '') != ''"))]
-            hit = [lab for lab in labels if any(
-                split_leading_brand(p, groups) or p.upper() in new_aliases
-                or extract_audio_annotation(p)[0] == "Multi" for p in _split_compound(lab))]
-            ids: list[str] = []
-            for i in range(0, len(hit), 500):  # bounded IN lists
-                ids += [r[0] for r in session.query(ChannelDB.id)
-                        .filter(ChannelDB.category.in_(hit[i:i + 500]))]
-            return ids
-
-    def _collect_channel_ids_decorated_label(self) -> list[str]:
-        """Rows whose label carries superscript decoration or a tier word (version 18)."""
-        from streamselect.core.channel_name_utils import _extract_superscript_attributes
-        from streamselect.core.database import ChannelDB
-        from streamselect.core.quality_vocab import TIER_TOKENS
-        tier_re = re.compile(rf"\b({'|'.join(sorted(TIER_TOKENS))})\b", re.IGNORECASE)
-        with self._db.session_scope(commit=False) as session:
-            labels = [r[0] for r in session.execute(text(
-                "SELECT DISTINCT category FROM channels WHERE COALESCE(category, '') != ''"))]
-            hit = [lab for lab in labels if tier_re.search(lab)
-                   or _extract_superscript_attributes(lab)[0] != lab]
-            ids: list[str] = []
-            for i in range(0, len(hit), 500):  # bounded IN lists
-                ids += [r[0] for r in session.query(ChannelDB.id)
-                        .filter(ChannelDB.category.in_(hit[i:i + 500]))]
-            return ids
 
     def _collect_channel_ids_ppv_label(self) -> list[str]:
         """Channels whose provider category or header says PPV (version 15)."""

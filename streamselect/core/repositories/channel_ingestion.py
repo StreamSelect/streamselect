@@ -65,7 +65,7 @@ from streamselect.core.repositories.channel_lens import GENRE_MEDIA_TYPES, metad
 from streamselect.core.repositories.sweep_guard import single_flight
 from streamselect.core.database import ChannelDB, MetadataDB
 from streamselect.core.filter_utils import extract_prefix, genres_from_category, genres_from_raw
-from streamselect.core.tag_decomposer import category_region_fallback
+from streamselect.core.category_region import category_region_fallback
 
 # Moved here WITH _start_year_int, its only user (the project rules: take the private
 # helpers with the concern — a move that leaves them behind grows the total).

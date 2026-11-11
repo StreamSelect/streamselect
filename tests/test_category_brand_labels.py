@@ -93,7 +93,7 @@ def test_kids_after_a_brand_is_refaceted_like_any_kids_label(tmp_path):
 
 def test_v17_collector_selects_brand_and_multi_labels(tmp_path):
     from streamselect.core.database import ChannelDB, Database
-    from streamselect.core.migrations.tag_backfill import TagBackfillTask
+    from streamselect.core.migrations.tag_backfill_targets import brand_label_ids
 
     db = Database(f"sqlite:///{tmp_path}/brand.db")
     db.create_tables()
@@ -102,5 +102,5 @@ def test_v17_collector_selects_brand_and_multi_labels(tmp_path):
                          ("mu", "|MULTI| SOMETHING"), ("de", "|DE| FILME")]:
             s.add(ChannelDB(id=cid, source_id=cid, provider_id="p", name=cid,
                             media_type="movie", category=cat))
-    ids = TagBackfillTask(db, Config())._collect_channel_ids_brand_label(Config())
+    ids = brand_label_ids(db, Config())
     assert sorted(ids) == ["ap", "mu", "nk"]

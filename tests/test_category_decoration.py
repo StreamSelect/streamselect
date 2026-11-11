@@ -47,7 +47,7 @@ def test_shahid_vip_4k_is_shahid_in_4k():
 
 def test_v18_collector_selects_decorated_and_tier_labels(tmp_path):
     from streamselect.core.database import ChannelDB, Database
-    from streamselect.core.migrations.tag_backfill import TagBackfillTask
+    from streamselect.core.migrations.tag_backfill_targets import decorated_label_ids
 
     db = Database(f"sqlite:///{tmp_path}/deco.db")
     db.create_tables()
@@ -56,4 +56,4 @@ def test_v18_collector_selects_decorated_and_tier_labels(tmp_path):
                          ("de", "|DE| FILME"), ("ac", "|ES| ACCIÓN")]:
             s.add(ChannelDB(id=cid, source_id=cid, provider_id="p", name=cid,
                             media_type="live", category=cat))
-    assert sorted(TagBackfillTask(db, Config())._collect_channel_ids_decorated_label()) == ["mx", "t2"]
+    assert sorted(decorated_label_ids(db)) == ["mx", "t2"]

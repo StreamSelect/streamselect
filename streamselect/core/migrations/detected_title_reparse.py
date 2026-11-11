@@ -171,7 +171,9 @@ from streamselect.core.migrations.detected_fields_reparse import DetectedFieldsR
 #       (category_headings, found by counting). "NA" is North America, not
 #       Namibia (262 rows, one actually Namibian).
 #   20  The "MULT" prefix typo normalizes to MULTI (5 rows under "|MULTI| DISNEY 4K").
-CURRENT_VERSION: int = 20
+#   21  Owner-confirmed prefix spellings normalize: FRQ/CA-FR → QFR (Quebec
+#       French), KURD → KU, SRB → RS, SKR → KR, MH → MR, BANGLA → BN.
+CURRENT_VERSION: int = 21
 
 
 class DetectedTitleReparseTask(DetectedFieldsReparseBase):

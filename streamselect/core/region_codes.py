@@ -384,6 +384,7 @@ _FULL_NAME_TO_CODE: dict[str, str] = {
     "ARGENTINA": "ARG", "AUSTRALIA": "AUS", "AUSTRIA": "AUT",
     "BELGIUM": "BEL", "BOLIVIA": "BOL", "BRAZIL": "BRA",
     "CANADA": "CAN", "CHILE": "CHL", "COLOMBIA": "COL",
+    "ZIMBABWE": "ZW", "SURINAME": "SU",
     "CROATIA": "HRV", "DENMARK": "DEN", "ECUADOR": "ECU",
     "FINLAND": "FIN", "FRANCE": "FRA", "GERMANY": "GER",
     "GREECE": "GRE", "HUNGARY": "HUN", "IRELAND": "IRL",
@@ -434,6 +435,10 @@ _ALIAS_MAP: dict[str, str] = {
     "BRASIL": "BRA",
     "ESPANA": "ESP",
     "MULT": "MULTI",  # provider typo: "|MULT| Prometheus" under "|MULTI| DISNEY 4K"
+    # Owner-confirmed spellings (unrecognized-prefix review, 2026-11-11):
+    "FRQ": "QFR", "CA-FR": "QFR",  # Quebec / Canadian French ("|FR| QUEBEC FILMS")
+    "KURD": "KU", "SRB": "RS", "SKR": "KR", "MH": "MR",  # MH = Maharashtra → Marathi
+    "BANGLA": "BN",
     # Streaming platforms
     "NETFLIX": "NF",
     "DISNEY+": "D+", "DISNEY": "D+", "DPLUS": "D+", "DISNEYPLUS": "D+",
@@ -483,7 +488,10 @@ REGION_FULL_NAMES: dict[str, str] = {
     # (Israel). DELIBERATELY NOT ADDED (evidence genuinely split): SO many
     # ("South Hindi Dubbed" many vs a Somali brand 158) and MULTI many
     # (a multi-audio marker, not a country — needs its own concept).
-    "AR": "Arabic", "EX": "Ex-Yugoslavia", "TM": "Tamil", "TG": "Telugu",
+    "AR": "Arabic", "EX": "Ex-Yugoslavia",
+    # "TM" is Tamil, not Turkmenistan: ~3,500 rows under "IN| TAMIL MOVIES"-style
+    # labels carry it and none is Turkmen; it was tagged Russian. Turkmenistan is "TKM".
+    "TM": "Tamil", "TKM": "Turkmenistan", "TG": "Telugu",
     "TL": "Telugu", "AF": "Africa", "SW": "Sweden", "UR": "Urdu",
     "SCAN": "Scandinavia", "KD": "Kannada", "IS": "Israel",
     # Streaming platforms
@@ -607,6 +615,7 @@ REGION_FULL_NAMES: dict[str, str] = {
     # "ARIRANG (NA)" feeds) and one was Namibian. Namibia is "NAM".
     "NA": "North America",
     "NAM": "Namibia",
+    "SU": "Suriname",  # "SU| SURINAME"
     "NAMIBIA": "Namibia",
     "MC": "Monaco",
     "MQ": "Martinique",
@@ -786,7 +795,7 @@ CODE_FACETS: dict[str, list[tuple[str, str, float]]] = {
 #: groups (config.BASE_PREFIX_GROUPS: HI -> "Indian", UR -> "Urdu/Pakistani");
 #: this list only stops the decomposer ALSO tagging the code as a region.
 LANGUAGE_ONLY_CODES: frozenset[str] = frozenset({
-    "HI", "TA", "TE", "TG", "TL", "ML", "KN", "KD", "MR", "PB", "GU", "BHO", "OR",
+    "HI", "TA", "TM", "TE", "TG", "TL", "ML", "KN", "KD", "MR", "PB", "GU", "BHO", "OR",
     "BN", "UR", "KU",
     "TEL", "TAM", "KAN", "MAL", "PUN", "GUJ", "BAN", "BENGLAI", "ASSAM", "ARA", "KO",
 })

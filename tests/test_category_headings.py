@@ -110,6 +110,7 @@ def test_ingestion_and_retag_end_to_end(db):
     carried language:Armenian; the hockey row was Namibian and English.
     """
     from streamselect.core.database import ChannelDB, ContentTagDB, TagDB
+    from streamselect.core.migrations import tag_backfill_targets as targets
     from streamselect.core.migrations.tag_backfill import TagBackfillTask
     from streamselect.core.repositories import RepositoryFactory
 
@@ -130,9 +131,9 @@ def test_ingestion_and_retag_end_to_end(db):
     assert stored["am"][1] == "AM"
 
     task = TagBackfillTask(db, Config())
-    ids = task._collect_channel_ids_heading(task._headings())
+    ids = targets.heading_ids(db, targets.headings(db))
     assert {"ca", "cb", "hy"} <= set(ids) and "am" not in ids
-    task._process_batch(sorted(ids) + ["am"], Config(), task._headings())
+    task._process_batch(sorted(ids) + ["am"], Config(), targets.headings(db))
 
     def tags(cid):
         with db.session_scope() as s:
