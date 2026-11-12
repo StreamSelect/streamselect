@@ -182,3 +182,27 @@ class TestItDoesNotBreakTheSweep:
         w.setStyleSheet("color: #abcdef;")
         assert _theme._rewrite_stale_palette_values({}) == frozenset()
         assert w.styleSheet() == "color: #abcdef;"
+
+
+class TestGruvboxToGruvboxLight:
+    """User report: switching Gruvbox -> Gruvbox Light turned every sidebar
+    card #3c3836. Gruvbox's COLOR_TEXT_HI and Gruvbox Light's COLOR_BG_CARD
+    are both #ebdbb2, so the value fallback re-read an already-correct sheet
+    as "old text colour" and swapped in the new one."""
+
+    def test_a_registered_sheet_is_not_rewritten_after_it_is_re_rendered(self, qapp):
+        from PyQt6.QtWidgets import QFrame
+
+        from tests.conftest import destroy_widget
+
+        _theme.apply_theme("Gruvbox")
+        card = QFrame()
+        card.setObjectName("sidebarSection")
+        _theme.style(card, "SIDEBAR_SECTION_CARD")
+
+        _theme.apply_theme("Gruvbox Light")
+
+        sheet = card.styleSheet()
+        destroy_widget(card)
+        assert sheet == _theme.SIDEBAR_SECTION_CARD, sheet
+        assert f"background: {_theme.COLOR_BG_CARD}" in sheet

@@ -2195,14 +2195,15 @@ _CONSTANT_REWRITE: dict[str, str] = {}
 _SEMANTIC_CONSTANT_NAMES: tuple[str, ...] = tuple(_build_semantic_constants())
 
 
-def _rewrite_stale_palette_values(mapping: dict[str, str]) -> frozenset[int]:
+def _rewrite_stale_palette_values(mapping: dict[str, str], skip=frozenset()) -> frozenset[int]:
     """Swap old palette colours for new ones in every live widget's stylesheet.
 
-    Registered widgets have already been re-rendered exactly by
-    :func:`_reapply_registered_styles`; this is the fallback for everything else.
+    The fallback for widgets :func:`_reapply_registered_styles` did not re-render.
 
     Args:
         mapping: ``{old_value: new_value}`` from :func:`_build_palette_rewrite_map`.
+        skip: ``id()`` of widgets already re-rendered: a NEW value can equal another
+            token's OLD one (Gruvbox's text is Gruvbox Light's card), so never swap twice.
 
     Returns:
         ``id()`` of every widget actually changed — already polished, so
@@ -2216,23 +2217,22 @@ def _rewrite_stale_palette_values(mapping: dict[str, str]) -> frozenset[int]:
     ordered = sorted(mapping.items(), key=lambda kv: len(kv[0]), reverse=True)
     changed: set[int] = set()
     for widget in app.allWidgets():
+        if id(widget) in skip:
+            continue
         try:
             sheet = widget.styleSheet()
         except RuntimeError:
             continue                      # C++ object already deleted
         if not sheet:
             continue
-        # Exact case first: the whole sheet IS a semantic role constant, so it
-        # can be replaced wholesale with that role's new rendering.
+        # Exact case first: the whole sheet IS a role constant; swap it wholesale.
         exact = _CONSTANT_REWRITE.get(sheet)
         if exact is not None:
             widget.setStyleSheet(exact)
             changed.add(id(widget))
             continue
-        # Token-aware when we know what this widget's sheet was composed from:
-        # build the substitution from ONLY those tokens. A colour shared by two
-        # tokens is then ambiguous only if this widget used both AND they
-        # diverge in the new palette — checkable, rather than guessed globally.
+        # Token-aware when we know which tokens composed this sheet: a colour shared
+        # by two is then ambiguous only if this widget used both and they diverge.
         per_widget = _widget_rewrite_map(widget)
         ordered_here = (
             sorted(per_widget.items(), key=lambda kv: len(kv[0]), reverse=True)
@@ -2367,7 +2367,7 @@ def _apply_theme_locked(name: str, force: bool = False) -> bool:
         t1 = time.perf_counter()
         registered_ids = _reapply_registered_styles()  # style()/style_fn() widgets
         t2 = time.perf_counter()
-        rewritten_ids = _rewrite_stale_palette_values(rewrite_map)  # hand-composed
+        rewritten_ids = _rewrite_stale_palette_values(rewrite_map, registered_ids)
         t3 = time.perf_counter()
         repolished = _repolish_all_widgets(registered_ids | rewritten_ids)  # the rest
         t4 = time.perf_counter()
