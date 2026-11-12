@@ -1,7 +1,7 @@
 """The guided tour: spotlight the real controls, one at a time, with a sentence each.
 
-A user (Q10/R8; revised): a short tour of search, the
-top bar, Exclusions, the sidebar's lists and Sources, re-runnable, and the user
+A user (Q10/R8; revised): a short tour of search, what each kind of row
+plays, the top bar, Exclusions, the sidebar's lists and Sources, re-runnable, and the user
 is told where it lives when it ends. It is offered once, when a new source
 finishes its first load — before that every view is empty and the tour would
 point at controls with nothing in them — and always from Tools ▸ Take the tour.
@@ -43,6 +43,9 @@ class TourStop:
     #: stretches far past its content (the Sources line fills the sidebar's
     #: spare height, so its box is ~440 px of empty space).
     tight: bool = False
+    #: Icon rows shown under the body: (icon role, what it means). Each is the
+    #: same mark the control draws, so the card can be read against the screen.
+    legend: tuple[tuple[str, str], ...] = ()
 
 
 def _attr(name: str) -> Callable[[object], QWidget | None]:
@@ -57,6 +60,14 @@ TOUR_STOPS: tuple[TourStop, ...] = (
              "Search every source at once: titles, channels and categories. "
              "Type, then press Enter.",
              _attr("search_input")),
+    TourStop("What each row is",
+             "The mark at the start of a row says what playing it does.",
+             _attr("channels_list"),
+             legend=(("live", "Live channel: joins the broadcast already in "
+                              "progress, like turning on a TV."),
+                     ("movie", "Movie: on demand, starts from the beginning."),
+                     ("series", "Series: on demand; pick an episode and it "
+                                "starts from the beginning."))),
     TourStop("The top bar",
              "Switch views here: Search, EPG (the TV guide), Recommended, "
              "Discover and Recipe. The lit one is where you are.",
@@ -130,7 +141,9 @@ class TourOverlay(QWidget):
         self._body = QLabel()
         self._body.setWordWrap(True)
         _theme.style(self._body, "PANEL_BODY")
-        for w in (self._step, self._title, self._body):
+        self._legend = QWidget()
+        QVBoxLayout(self._legend).setContentsMargins(0, 4, 0, 0)
+        for w in (self._step, self._title, self._body, self._legend):
             card.addWidget(w)
         row = QHBoxLayout()
         row.setContentsMargins(0, 6, 0, 0)
@@ -195,11 +208,38 @@ class TourOverlay(QWidget):
         self._step.setText(f"{index + 1} of {len(self._stops)}")
         self._title.setText(stop.title)
         self._body.setText(stop.body)
+        self._fill_legend(stop.legend)
         self._back_btn.setEnabled(index > 0)
         self._next_btn.setText("Got it" if self._tip else ("Done" if last else "Next"))
         self._hole = self._target_rect(stop)
         self._place_card()
         self.update()
+
+    def _fill_legend(self, legend: tuple[tuple[str, str], ...]) -> None:
+        from streamselect.gui import icon_utils as _icon_utils
+
+        box = self._legend.layout()
+        while box.count():
+            box.takeAt(0).widget().deleteLater()
+        for role, text in legend:
+            row = QWidget()
+            line = QHBoxLayout(row)
+            line.setContentsMargins(0, 0, 0, 0)
+            line.setSpacing(8)
+            mark = QLabel()
+            mark.setObjectName(f"tourLegend_{role}")
+            # The row's own colours: live is the accent, the rest neutral
+            # (channel_list_delegate._paint_kind_icon).
+            color = _theme.COLOR_ACCENT if role == "live" else _theme.COLOR_TEXT
+            mark.setPixmap(_icon_utils.role_pixmap(role, color, 18))
+            mark.setAlignment(Qt.AlignmentFlag.AlignTop)
+            label = QLabel(text)
+            label.setWordWrap(True)
+            _theme.style(label, "PANEL_BODY")
+            line.addWidget(mark)
+            line.addWidget(label, 1)
+            box.addWidget(row)
+        self._legend.setVisible(bool(legend))
 
     def _target_rect(self, stop: TourStop) -> QRect | None:
         widget = stop.target(self._host)
