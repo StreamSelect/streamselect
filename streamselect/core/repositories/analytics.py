@@ -171,12 +171,12 @@ class AnalyticsRepository:
 
         seconds, since = self.session.query(
             func.sum(PlaybackEventDB.seconds_watched), func.min(PlaybackEventDB.started_at),
-        ).filter(PlaybackEventDB.provider_id == provider_id).one()
+        ).filter(PlaybackEventDB.provider_id == provider_id, PlaybackEventDB.channel_id != "").one()
         events = self.session.query(
             PlaybackEventDB.channel_id, PlaybackEventDB.title, PlaybackEventDB.started_at,
             PlaybackEventDB.seconds_watched,
-        ).filter(PlaybackEventDB.provider_id == provider_id,
-                 PlaybackEventDB.outcome == "started").all()
+        ).filter(PlaybackEventDB.provider_id == provider_id, PlaybackEventDB.channel_id != "",
+                 PlaybackEventDB.outcome == "started").all()     # "": forgotten with History
         ids = {cid for cid, *_ in events}
         series = dict(self.session.query(EpisodeDB.id, ChannelDB.id).join(
             ChannelDB, (ChannelDB.provider_id == EpisodeDB.provider_id)

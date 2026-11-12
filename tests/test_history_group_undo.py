@@ -205,6 +205,7 @@ class TestClearHistoryGroupInstantWithUndo:
             )
 
         monkeypatch.setattr(QMessageBox, "question", _boom)
+        monkeypatch.setattr(QMessageBox, "exec", _boom)
 
         with db.session_scope() as s:
             _seed_channel(s, "recent", datetime.now() - timedelta(minutes=5))

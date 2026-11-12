@@ -67,6 +67,21 @@ class PlaybackEventRepository:
                 raise ValueError(f"unknown play outcome {outcome!r}")
             row.outcome = outcome
 
+    def forget_what_was_played(self) -> int:
+        """Erase which title each recorded play was and how long it ran, on every source.
+
+        Clear History's "also clear the play record" box. A play's outcome,
+        HTTP code and time to picture are kept — they describe the SOURCE, not
+        the viewer, and are what Playback's reliability figures read. The
+        Analytics viewing card skips a row with no channel. Returns rows changed.
+        """
+        count = self.session.query(PlaybackEventDB).filter(
+            (PlaybackEventDB.channel_id != "") | (PlaybackEventDB.title != "")
+            | PlaybackEventDB.seconds_watched.isnot(None),
+        ).update({PlaybackEventDB.channel_id: "", PlaybackEventDB.title: "",
+                  PlaybackEventDB.seconds_watched: None}, synchronize_session=False)
+        return count
+
     def summary(self, provider_id: str) -> PlaybackSummaryDTO:
         """Counts per outcome over the kept rows, the median time to picture, and
         attempts/failures per local hour of day (Q11)."""

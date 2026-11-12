@@ -42,7 +42,7 @@ class _HistoryMixin:
         self._show_context_menu_for(channel_id, gp.x(), gp.y(), "history")
 
     def _confirm_and_clear_history(self, *, title: str, question: str,
-                                   purge, describe) -> None:
+                                   purge, describe, also: tuple[str, object] | None = None) -> None:
         """Ask, purge, report, reload — the shape all three clears share.
 
         Refreshing Favorites too is not incidental: a cleared row can be a
@@ -53,19 +53,25 @@ class _HistoryMixin:
             question: Body text; says what SURVIVES as well as what goes.
             purge: ``channels_repo -> int | None``.
             describe: ``count -> str`` for the status bar.
+            also: ``(label, repos -> None)`` — an extra purge behind an
+                unticked checkbox in the same dialog, run in the same session.
         """
-        from PyQt6.QtWidgets import QMessageBox
+        from PyQt6.QtWidgets import QCheckBox, QMessageBox
 
-        reply = QMessageBox.question(
-            self, title, question,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        box = QMessageBox(QMessageBox.Icon.Question, title, question,
+                          QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, self)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        if also is not None:
+            box.setCheckBox(QCheckBox(also[0], box))   # parented: an unowned box is freed under the dialog
+        if box.exec() != QMessageBox.StandardButton.Yes:
             return
+        extra = also is not None and box.checkBox().isChecked()
         try:
             with self.db.session_scope() as session:
-                count = purge(RepositoryFactory(session).channels)
+                repos = RepositoryFactory(session)
+                count = purge(repos.channels)
+                if extra:
+                    also[1](repos)
             self.status(describe(count), ms=0)
             self.load_history()
             self.load_favorites()
@@ -171,5 +177,7 @@ class _HistoryMixin:
             ),
             purge=lambda channels: channels.clear_history(),
             describe=lambda _count: "History cleared",
+            also=("Also forget which titles source analytics recorded you playing",
+                  lambda repos: repos.playback_events.forget_what_was_played()),
         )
 
