@@ -259,3 +259,29 @@ def test_the_theme_card_rings_style_in_the_menu_bar(qapp, owned_widgets, tmp_pat
     assert tour.hole().width() < entry.width() * 3, "the ring circles the whole menu bar"
     assert not tour._card.geometry().intersects(tour.hole())
     tour.end()
+
+
+def _squeezed(tour):
+    """Widgets on the card drawn shorter than they need (or not at all)."""
+    from PyQt6.QtWidgets import QAbstractButton, QLabel
+
+    bad = []
+    for w in tour._card.findChildren(QWidget):
+        if not w.isVisibleTo(tour._card) or not isinstance(w, (QLabel, QAbstractButton)):
+            continue
+        need = w.heightForWidth(w.width()) if w.hasHeightForWidth() else w.sizeHint().height()
+        if not w.isVisible() or w.height() < need:
+            bad.append(f"{w.objectName() or w.text()[:20]!r}: {w.height()} < {need}")
+    return bad
+
+
+def test_no_stop_squeezes_its_card(host, qapp):
+    """The theme list was added after the card measured itself, so it showed
+    later and crushed the text and buttons (user screenshot)."""
+    from streamselect.gui.guided_tour import TOUR_STOPS
+
+    tour = _start(host)
+    for i in range(len(TOUR_STOPS)):
+        qapp.processEvents()
+        assert not _squeezed(tour), f"stop {i}: {_squeezed(tour)}"
+        tour.next()

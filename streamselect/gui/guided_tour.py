@@ -130,6 +130,15 @@ def _drawn_rect(widget: QWidget) -> QRect:
     return area if not area.isEmpty() else widget.rect()
 
 
+def _clear(box) -> None:
+    """Empty *box*. Hidden at once: a widget only taken out of the layout keeps
+    painting where it was until deleteLater runs."""
+    while box.count():
+        widget = box.takeAt(0).widget()
+        widget.hide()
+        widget.deleteLater()
+
+
 _RING_PAD = 6
 _CARD_WIDTH = 340
 _MARGIN = 16
@@ -245,13 +254,13 @@ class TourOverlay(QWidget):
         from streamselect.gui.tour_theme_picker import ThemeList
 
         box = self._themes.layout()
-        while box.count():
-            box.takeAt(0).widget().deleteLater()
+        _clear(box)
         if show:
             current = getattr(self._host.config, "theme_name", _theme.current_theme())
             picker = ThemeList(current)
             picker.picked.connect(self._pick_theme)
             box.addWidget(picker)
+            picker.show()       # now, not queued: the card measures itself next
         self._themes.setVisible(show)
 
     def _pick_theme(self, name: str) -> None:
@@ -263,8 +272,7 @@ class TourOverlay(QWidget):
         from streamselect.gui import icon_utils as _icon_utils
 
         box = self._legend.layout()
-        while box.count():
-            box.takeAt(0).widget().deleteLater()
+        _clear(box)
         for role, text in legend:
             row = QWidget()
             line = QHBoxLayout(row)
@@ -283,6 +291,7 @@ class TourOverlay(QWidget):
             line.addWidget(mark)
             line.addWidget(label, 1)
             box.addWidget(row)
+            row.show()          # now, not queued: the card measures itself next
         self._legend.setVisible(bool(legend))
 
     def _target_rect(self, stop: TourStop) -> QRect | None:
