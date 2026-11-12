@@ -36,6 +36,8 @@ class _Host(QWidget):
         self.config = Config(config_dir=str(config_dir))
         self.notification_manager = NotificationManager()
         self.section = _Section(self)
+        self._playback_health_label = QPushButton("18s buffer · 6.2 Mbps · 0 drops", self)
+        self._playback_health_label.setGeometry(600, 10, 220, 24)
 
 
 @pytest.fixture
@@ -128,3 +130,44 @@ def test_the_ready_notice_offers_the_tour_until_it_is_taken(qapp, tmp_path, take
     labels = [a[0] for a in note.actions]
     assert ("Take the tour" in labels) is offered
     assert "Open Exclusions" in labels
+
+
+def test_the_first_play_explains_the_playback_line(host, qapp):
+    """Tester report: the playback line's menu (audio, Normalize volume,
+    Downmix) went unnoticed; the first play rings that line once."""
+    from streamselect.gui.just_in_time_tips import offer_playback_tip
+
+    offer_playback_tip(host)
+    assert _wait(qapp, lambda: host.__dict__.get("_tour") is not None)
+    tip = host._tour
+    assert "Normalize volume" in tip._body.text() and "mono" in tip._body.text()
+    line = host._playback_health_label
+    assert tip.hole().contains(QRect(line.mapTo(host, QPoint(0, 0)), line.size()))
+    tip._next_btn.click()
+    offer_playback_tip(host)
+    assert not _wait(qapp, lambda: host.__dict__.get("_tour") is not None, 1.0)
+
+
+def test_a_hidden_playback_line_waits_for_a_later_play(host, qapp):
+    from streamselect.gui.just_in_time_tips import offer_playback_tip
+
+    host._playback_health_label.hide()
+    offer_playback_tip(host)
+    assert not _wait(qapp, lambda: host.__dict__.get("_tour") is not None, 1.0)
+    assert "playback" not in (host.config.tips_seen or [])
+
+
+def test_a_play_that_advances_offers_the_playback_tip(qapp):
+    """The seam: playback_start_watch's first-progress branch calls it."""
+    from unittest.mock import patch
+
+    import streamselect.gui.playback_start_watch as watch
+    from tests.test_play_count_needs_progress import _host
+
+    host = _host()
+    watch.arm(host, watch.PlayAttempt("ch-1", "T1", "http://x"))
+    with patch("streamselect.gui.just_in_time_tips.offer_playback_tip") as offer:
+        watch.on_loaded_tick(host, 0.0, False, cache_duration=3.0)
+        offer.assert_not_called()
+        watch.on_loaded_tick(host, 1.0, False, cache_duration=3.0)
+    offer.assert_called_once_with(host)

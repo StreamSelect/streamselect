@@ -44,6 +44,14 @@ TIPS: dict[str, Tip] = {
         "larger view with posters, where you can follow what's similar from "
         "one title to the next. Every list's count does the same.",
     ),
+    "playback": Tip(
+        "While something plays",
+        "This line shows how the stream is doing: how much is buffered, the "
+        "download speed and any dropped frames. Click it for the audio track, "
+        "subtitles and sound. Normalize volume keeps quiet dialogue and loud "
+        "action at a similar level. Downmix audio: choose mono for a single "
+        "speaker, stereo for headphones or a pair of speakers.",
+    ),
 }
 
 
@@ -106,3 +114,15 @@ def offer_explore_tip(host, section) -> None:
     target = section.__dict__.get("_status_label")
     if count and target is not None:
         show_tip_once(host, "explore", target)
+
+
+def offer_playback_tip(host) -> None:
+    """A play has started advancing: the first time, explain the playback line.
+
+    Called on every play's first progress; until the tip has actually been
+    shown (the line visible, nothing else on screen) it is not marked seen, so
+    a later play tries again.
+    """
+    target = host.__dict__.get("_playback_health_label")
+    if target is not None and not seen(host, "playback"):
+        show_tip_once(host, "playback", target)

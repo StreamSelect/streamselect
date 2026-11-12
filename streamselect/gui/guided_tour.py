@@ -81,7 +81,8 @@ TOUR_STOPS: tuple[TourStop, ...] = (
              _menu_bar, area=_style_entry, centred=True, themes=True),
     TourStop("Search",
              "Search every source at once: titles, channels and categories. "
-             "Type, then press Enter.",
+             "Type, then press Enter. To narrow down what's listed, type in "
+             "\"Filter these results\" above the list.",
              _attr("search_input")),
     TourStop("What each row is",
              "The mark at the start of a row says what playing it does.",
@@ -92,8 +93,10 @@ TOUR_STOPS: tuple[TourStop, ...] = (
                      ("series", "Series: on demand; pick an episode and it "
                                 "starts from the beginning."))),
     TourStop("The top bar",
-             "Switch views here: Search, EPG (the TV guide), Recommended, "
-             "Discover and Recipe. The lit one is where you are.",
+             "Switch views here. Know what you want? Use Search. Want to "
+             "browse? Use Discover. Want to narrow everything down by what "
+             "you choose? Use Recipe. EPG is the TV guide, and Recommended "
+             "learns from what you like. The lit one is where you are.",
              _attr("_nav_track")),
     TourStop("Exclusions",
              "Hide what you never want to see — regions, languages, "
@@ -387,5 +390,6 @@ def _on_tour_finished(host, tour: TourOverlay) -> None:
         host.__dict__.pop("_tour", None)
     host.notification_manager.show(
         title="Tour finished",
-        message=f"Take it again any time from {TOUR_MENU_PATH}.",
+        message=("Hover over any button to see what it does. "
+                 f"Take the tour again any time from {TOUR_MENU_PATH}."),
         type="info", auto_dismiss_seconds=12)

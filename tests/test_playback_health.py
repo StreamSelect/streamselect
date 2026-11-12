@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import socket
+from types import SimpleNamespace
 
 
 from streamselect.gui.main_window import MainWindow
@@ -526,6 +527,8 @@ def _gone_host(reason, *, progressed=False):
     wire_status_method(host)
     host.notification_manager = MagicMock()
     host.stream_retry_manager = MagicMock()
+    # The first advance offers the playback tip; this host has already seen it.
+    host.config = SimpleNamespace(tips_seen=["playback"])
     watch.arm(host, watch.PlayAttempt("ch-1", "Title", "http://x/1.mkv"))
     watch.on_playing(host)
     if progressed:

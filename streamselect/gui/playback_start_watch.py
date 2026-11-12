@@ -339,6 +339,8 @@ def on_loaded_tick(host: Any, time_pos: Any, paused: bool, cache_duration: Any =
                 host.status_bar.clearMessage()   # progress seen — the wait is over
             except Exception:                                    # pragma: no cover
                 logger.exception("could not clear the status bar")
+            from streamselect.gui.just_in_time_tips import offer_playback_tip
+            offer_playback_tip(host)
             # PLAY-15: only now — playback actually advanced — does the play
             # get recorded. host.__dict__ (this module's idiom) so a double
             # that never set the attribute is treated as "nothing pending".
