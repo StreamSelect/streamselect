@@ -455,3 +455,34 @@ def test_enter_on_an_empty_box_does_nothing(window):
         window.switch_to_list_view = real_switch
         window.load_channels = real_load
         window.channels_list.setVisible(True)
+
+
+@pytest.mark.parametrize("view", [
+    "switch_to_list_view", "switch_to_epg_view", "switch_to_preferences_view",
+    "switch_to_discover_view", "switch_to_recipe_view", "switch_to_sources_manager",
+])
+def test_every_visible_button_explains_itself(window, view, qapp):
+    """The tour ends on "Hover over any button to see what it does": every
+    button showing in each view must have a tooltip. Qt's own internal buttons
+    (a field's clear ×, tab-bar scroll arrows) and checkboxes, whose text is
+    their explanation, are exempt."""
+    from PyQt6.QtWidgets import QAbstractButton, QCheckBox, QMenuBar, QRadioButton, QTabBar
+
+    window.__dict__["_offer_view_tip"] = lambda _view: None   # no one-time tip mid-test
+    try:
+        getattr(window, view)()
+        qapp.processEvents()
+        bare = []
+        for btn in window.findChildren(QAbstractButton):
+            parent = btn.parentWidget()
+            if (isinstance(btn, (QCheckBox, QRadioButton)) or not btn.isVisibleTo(window)
+                    or isinstance(parent, (QLineEdit, QTabBar, QMenuBar))
+                    or btn.objectName().startswith("qt_")):
+                continue
+            if not btn.toolTip().strip():
+                bare.append(f"{type(btn).__name__} {btn.text()!r} in {type(parent).__name__}")
+        assert not bare, f"{view}: buttons with no tooltip: {bare}"
+    finally:
+        window.__dict__.pop("_offer_view_tip", None)
+        window.switch_to_list_view()
+        qapp.processEvents()

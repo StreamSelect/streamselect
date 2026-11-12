@@ -206,7 +206,7 @@ class _EpgWatchlistMixin:
         _theme.style(self._rec_title_lbl, "CHANNEL_NAME_DIM")
         rec_header.addWidget(self._rec_title_lbl)
         rec_header.addStretch()
-        self.manage_dismissed_btn = QPushButton("Manage dismissed")
+        self.manage_dismissed_btn = QPushButton("Manage dismissed", toolTip="Bring back dismissed ones")
         _theme.style_fn(self.manage_dismissed_btn, lambda: f"color: {_theme.COLOR_TEXT}; font-size: {_theme.FONT_MD}; border: none; background: transparent;")
         self.manage_dismissed_btn.clicked.connect(self._manage_dismissed)
         rec_header.addWidget(self.manage_dismissed_btn)

@@ -171,3 +171,102 @@ def test_a_play_that_advances_offers_the_playback_tip(qapp):
         offer.assert_not_called()
         watch.on_loaded_tick(host, 1.0, False, cache_duration=3.0)
     offer.assert_called_once_with(host)
+
+
+class _ActionBar:
+    def __init__(self, row):
+        self.like_button = QPushButton("+", row)
+        self.not_interested_button = QPushButton("o", row)
+        self.dislike_button = QPushButton("-", row)
+        for i, b in enumerate((self.like_button, self.not_interested_button, self.dislike_button)):
+            b.setGeometry(10 + 40 * i, 4, 36, 24)
+
+
+class _Cast:
+    def __init__(self, parent):
+        self.chip = QPushButton("Nathan Fielder", parent)
+        self.chip.setGeometry(10, 120, 120, 24)
+
+    def person_chips(self, role):
+        return [self.chip] if role == "cast" else []
+
+
+class _Pane(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setGeometry(650, 100, 300, 400)
+        row = QWidget(self)
+        row.setGeometry(0, 40, 300, 32)
+        self._action_bar = _ActionBar(row)
+        self._cast = _Cast(self)
+
+
+def test_the_first_title_explains_like_not_interested_and_dislike_then_cast(host, qapp):
+    """Owner's guide: rating teaches Recommended; a cast name lists their work.
+    The rating tip rings all three buttons; the cast tip waits for the next title."""
+    from streamselect.gui.just_in_time_tips import offer_details_tips
+
+    host.details_pane = _Pane(host)
+    host.details_pane.show()
+    qapp.processEvents()
+    offer_details_tips(host)
+    assert _wait(qapp, lambda: host.__dict__.get("_tour") is not None)
+    tip = host._tour
+    assert tip._title.text() == "Teach it your taste"
+    bar = host.details_pane._action_bar
+    for b in (bar.like_button, bar.not_interested_button, bar.dislike_button):
+        assert tip.hole().contains(QRect(b.mapTo(host, QPoint(0, 0)), b.size())), b.text()
+    tip._next_btn.click()
+    offer_details_tips(host)
+    assert _wait(qapp, lambda: host.__dict__.get("_tour") is not None)
+    chip = host.details_pane._cast.chip
+    assert host._tour._title.text() == "Cast and crew"
+    assert host._tour.hole().contains(QRect(chip.mapTo(host, QPoint(0, 0)), chip.size()))
+
+
+@pytest.mark.parametrize("view, chip, title", [
+    ("discover", "discover_chip", "Discover"), ("recipe", "recipe_chip", "Recipe"),
+    ("epg", "epg_chip", "EPG"), ("preferences", "prefs_chip", "Recommended"),
+])
+def test_each_view_explains_itself_once_on_its_chip(host, qapp, view, chip, title):
+    from streamselect.gui.just_in_time_tips import offer_view_tip
+
+    button = QPushButton(title, host)
+    button.setGeometry(300, 10, 90, 26)
+    button.show()
+    setattr(host, chip, button)
+    offer_view_tip(host, view)
+    assert _wait(qapp, lambda: host.__dict__.get("_tour") is not None)
+    assert host._tour._title.text() == title
+    assert host._tour.hole().contains(QRect(button.mapTo(host, QPoint(0, 0)), button.size()))
+    host._tour._next_btn.click()
+    offer_view_tip(host, view)
+    assert not _wait(qapp, lambda: host.__dict__.get("_tour") is not None, 1.0)
+
+
+@pytest.mark.parametrize("view", ["epg", "preferences", "discover", "recipe"])
+def test_switching_to_a_view_offers_its_tip(view):
+    """The seam: each switch_to_*_view calls offer_view_tip with its view."""
+    from unittest.mock import MagicMock, patch
+
+    from streamselect.gui.main_window_menu_actions import _MenuActionsMixin
+    from streamselect.gui.main_window_nav import _NavMixin
+
+    host = MagicMock()
+    host.__dict__.update(epg_status_label=MagicMock(), epg_refresh_btn=MagicMock())
+    host.epg_view._provider_ids = []
+    name = {"preferences": "switch_to_preferences_view", "epg": "switch_to_epg_view"}.get(
+        view, f"switch_to_{view}_view")
+    getattr(_NavMixin, name)(host)
+    host._offer_view_tip.assert_called_once_with(view)
+    with patch("streamselect.gui.just_in_time_tips.offer_view_tip") as offer:
+        _MenuActionsMixin._offer_view_tip(host, view)
+    offer.assert_called_once_with(host, view)
+
+
+def test_show_tips_again_forgets_every_tip_but_the_tour(host):
+    from streamselect.gui.just_in_time_tips import TOUR_KEY, reset_tips
+
+    host.config.tips_seen = [TOUR_KEY, "explore", "playback", "view_epg"]
+    assert reset_tips(host) == 3
+    assert host.config.tips_seen == [TOUR_KEY]

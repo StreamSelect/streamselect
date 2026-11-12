@@ -317,6 +317,7 @@ class SourceAnalyticsTab(QWidget):
         self._tiles = {k: _Tile() for k in ("only", "movie", "series", "live", "guide", "days", "started", "limit")}
         self._place_tiles(TILES_ACROSS_NARROW)
         self._browse = QPushButton("Browse them")
+        self._browse.setToolTip("List the titles only this source carries")
         _theme.style(self._browse, "LINK_BTN_SM")
         cursor_affordance.set_clickable(self._browse)
         self._browse.clicked.connect(self._emit_browse)

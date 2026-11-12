@@ -736,6 +736,7 @@ VECTOR_KEYS: dict[str, str] = {
     "new_match": "mdi6.bell-plus-outline",
     "provider": "mdi6.server-network",
     "info": "mdi6.information-outline",
+    "tips": "mdi6.lightbulb-on-outline",
     "missing_data": "mdi6.database-off-outline",
     "reconnect": "mdi6.power-plug-outline",
     "log_viewer": "mdi6.text-box-outline",

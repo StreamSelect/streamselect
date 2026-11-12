@@ -135,8 +135,11 @@ class EmptyStatePanel(QFrame):
         self.hide()
 
     def show_state(self, headline: str, hint: str,
-                   actions: Sequence[tuple[str, Callable[[], object]]] = ()) -> None:
-        """Say why the view is empty and offer what fixes it."""
+                   actions: Sequence[tuple[str, Callable[[], object], str]] = ()) -> None:
+        """Say why the view is empty and offer what fixes it.
+
+        Each action is ``(label, callback, tooltip)``.
+        """
         self.headline.setText(headline)
         self.hint.setText(hint)
         self.hint.setVisible(bool(hint))
@@ -146,8 +149,9 @@ class EmptyStatePanel(QFrame):
             old.hide()
             old.deleteLater()
         self._buttons = []
-        for label, callback in actions:
+        for label, callback, tip in actions:
             btn = QPushButton(label)
+            btn.setToolTip(tip)
             _theme.style(btn, "EMPTY_STATE_BTN")
             btn.clicked.connect(lambda _=False, cb=callback: cb())
             self._actions_layout.addWidget(btn)

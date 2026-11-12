@@ -303,6 +303,7 @@ class PreferencesView(QWidget):
         self._excl_toggle_btn.setFlat(True)
         _theme.style_fn(self._excl_toggle_btn, lambda: f"QPushButton {{ text-align: left; color: {_theme.COLOR_TEXT}; font-size: {_theme.FONT_MD}; border: none; padding: 2px 0; }}"
             f"QPushButton:hover {{ color: {_theme.COLOR_TEXT}; }}")
+        self._excl_toggle_btn.setToolTip("Expand Excluded")
         self._excl_toggle_btn.clicked.connect(self._toggle_exclusions)
         excl_header.addWidget(self._excl_toggle_btn)
         excl_header.addStretch()
@@ -461,6 +462,7 @@ class PreferencesView(QWidget):
         prefix_btn_row.addWidget(self._ver_prefix_input)
 
         add_prefix_btn = QPushButton("Add")
+        add_prefix_btn.setToolTip("Add this prefix to the list")
         add_prefix_btn.setFixedWidth(48)
         add_prefix_btn.clicked.connect(self._add_version_prefix)
         prefix_btn_row.addWidget(add_prefix_btn)

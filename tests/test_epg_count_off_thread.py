@@ -57,6 +57,8 @@ def _make_host(view_mode: str = "list") -> _NavMixin:
 
     host._run_query = _fake_run_query
     host._hide_all_content_views = lambda: None
+    from tests.conftest import wire_nav_host
+    wire_nav_host(host)   # the cross-cutting bits every view switch touches
     return host
 
 

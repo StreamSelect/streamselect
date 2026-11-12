@@ -15,8 +15,9 @@ ringed. What has been shown — tips and the tour alike — is ``Config.tips_see
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Callable
 
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QRect, QTimer
 from PyQt6.QtWidgets import QWidget
 
 from streamselect.gui import deferred_config_save as _cfgsave
@@ -52,6 +53,49 @@ TIPS: dict[str, Tip] = {
         "action at a similar level. Downmix audio: choose mono for a single "
         "speaker, stereo for headphones or a pair of speakers.",
     ),
+    "rating": Tip(
+        "Teach it your taste",
+        "Like, not interested and dislike. Search for a few things you already "
+        "enjoy and like them: Recommended starts finding more like them. Not "
+        "interested keeps a title out of your recommendations.",
+    ),
+    "people": Tip(
+        "Cast and crew",
+        "Click a name to list everything they're in, across all your sources. "
+        "Typing a name in Search finds them too.",
+    ),
+    "view_epg": Tip(
+        "EPG",
+        "The TV guide for live channels: what's on now and what's coming up. "
+        "Watchlist keeps the shows you follow, On Now shows what's airing, and "
+        "Browse lists the schedule.",
+    ),
+    "view_recommended": Tip(
+        "Recommended",
+        "Picks based on what you like, watch and favourite. The more you rate, "
+        "the better it gets: like or dislike titles from their details.",
+    ),
+    "view_discover": Tip(
+        "Discover",
+        "For browsing when you don't have a title in mind: rows of films and "
+        "series by genre, decade, actor, collection and more. Click a poster "
+        "for its details.",
+    ),
+    "view_recipe": Tip(
+        "Recipe",
+        "Narrow everything down by what you pick. Click tags, such as a genre, "
+        "a language and a decade, and the matching titles appear below. Save "
+        "a recipe to come back to it.",
+    ),
+}
+
+#: Which tip each content view gets the first time it opens, and the nav
+#: chip it rings (the chip the user just clicked).
+VIEW_TIPS: dict[str, tuple[str, str]] = {
+    "epg": ("view_epg", "epg_chip"),
+    "preferences": ("view_recommended", "prefs_chip"),
+    "discover": ("view_discover", "discover_chip"),
+    "recipe": ("view_recipe", "recipe_chip"),
 }
 
 
@@ -67,7 +111,24 @@ def mark_seen(host, key: str) -> None:
     _cfgsave.save_soon(host)
 
 
-def show_tip_once(host, key: str, target: QWidget) -> bool:
+def reset_tips(host) -> int:
+    """Forget which tips were shown, so each shows again at its moment.
+
+    Tools ▸ Show tips again. The tour's own key is kept: the tour is offered
+    from its menu entry, not by a moment.
+
+    Returns:
+        How many tips were reset.
+    """
+    kept = [k for k in (host.config.tips_seen or []) if k == TOUR_KEY]
+    count = len(host.config.tips_seen or []) - len(kept)
+    host.config.tips_seen = kept
+    _cfgsave.save_soon(host)
+    return count
+
+
+def show_tip_once(host, key: str, target: QWidget,
+                  area: Callable[[QWidget], QRect] | None = None) -> bool:
     """Show tip *key* ringing *target*, unless it was shown before.
 
     Waits ``SETTLE_MS`` and then re-checks everything — the window is up,
@@ -79,11 +140,11 @@ def show_tip_once(host, key: str, target: QWidget) -> bool:
     """
     if seen(host, key) or key not in TIPS:
         return False
-    QTimer.singleShot(SETTLE_MS, lambda: _show_now(host, key, target))
+    QTimer.singleShot(SETTLE_MS, lambda: _show_now(host, key, target, area))
     return True
 
 
-def _show_now(host, key: str, target: QWidget) -> None:
+def _show_now(host, key: str, target: QWidget, area=None) -> None:
     from streamselect.gui.guided_tour import TourOverlay, TourStop
 
     if seen(host, key) or host.__dict__.get("_tour") is not None:
@@ -96,7 +157,8 @@ def _show_now(host, key: str, target: QWidget) -> None:
         return
     tip = TIPS[key]
     mark_seen(host, key)
-    overlay = TourOverlay(host, [TourStop(tip.title, tip.body, lambda _h: target)], tip=True)
+    overlay = TourOverlay(host, [TourStop(tip.title, tip.body, lambda _h: target, area=area)],
+                          tip=True)
     host._tour = overlay
     overlay.finished.connect(lambda: host.__dict__.pop("_tour", None))
     overlay.start()
@@ -126,3 +188,45 @@ def offer_playback_tip(host) -> None:
     target = host.__dict__.get("_playback_health_label")
     if target is not None and not seen(host, "playback"):
         show_tip_once(host, "playback", target)
+
+
+def offer_view_tip(host, view: str) -> None:
+    """A content view was switched to: the first time, explain it, ringing its chip."""
+    key, chip = VIEW_TIPS.get(view, (None, None))
+    target = host.__dict__.get(chip) if chip else None
+    if target is not None and not seen(host, key):
+        show_tip_once(host, key, target)
+
+
+def _span(buttons: list[QWidget]) -> Callable[[QWidget], QRect]:
+    """The rect covering *buttons*, in their shared parent's coordinates."""
+    def area(_parent: QWidget) -> QRect:
+        rect = QRect()
+        for b in buttons:
+            rect = rect.united(b.geometry())
+        return rect
+    return area
+
+
+def offer_details_tips(host) -> None:
+    """The details pane has filled with a title: explain rating, then cast.
+
+    One tip at a time — ``_show_now`` skips while another is on screen, and
+    an unshown tip is not marked seen — so the cast tip waits for a later
+    title once the rating tip has shown.
+    """
+    pane = host.__dict__.get("details_pane")
+    if pane is None:
+        return
+    bar = pane.__dict__.get("_action_bar")
+    if bar is not None and not seen(host, "rating"):
+        buttons = [bar.like_button, bar.not_interested_button, bar.dislike_button]
+        parent = bar.like_button.parentWidget()
+        if all(b.isVisibleTo(host) and b.parentWidget() is parent for b in buttons):
+            show_tip_once(host, "rating", parent, area=_span(buttons))
+            return
+    cast = pane.__dict__.get("_cast")
+    if cast is not None and not seen(host, "people"):
+        chips = cast.person_chips("director") + cast.person_chips("cast")
+        if chips and chips[0].isVisibleTo(host):
+            show_tip_once(host, "people", chips[0])

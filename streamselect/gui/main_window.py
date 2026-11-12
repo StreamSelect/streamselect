@@ -1299,7 +1299,7 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
         nav_layout = QHBoxLayout(self._series_nav_bar)
         nav_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.back_button = QPushButton("← Back")
+        self.back_button = QPushButton("← Back", toolTip="Back to the previous list")
         self.back_button.clicked.connect(self.navigate_back)
         nav_layout.addWidget(self.back_button)
 

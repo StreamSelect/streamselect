@@ -54,6 +54,7 @@ class ProviderIconPicker(QWidget):
         for icon in _icons.provider_icon_palette:
             b = QPushButton(icon)
             b.setFixedSize(30, 30)
+            b.setToolTip(f"Use {icon} as this source's mark")
             _theme.style(b, "ICON_PICK_BTN")
             b.clicked.connect(lambda checked, i=icon: self._pick(i))
             btn_row.addWidget(b)
@@ -74,6 +75,7 @@ class ProviderIconPicker(QWidget):
         custom_row.addWidget(self._custom_input)
         apply_btn = QPushButton("Apply")
         apply_btn.setFixedWidth(54)
+        apply_btn.setToolTip("Use the emoji typed here as this source's mark")
         apply_btn.clicked.connect(self._apply_custom)
         custom_row.addWidget(apply_btn)
         custom_row.addStretch()

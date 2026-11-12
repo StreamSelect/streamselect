@@ -310,6 +310,7 @@ class EpgView(_EpgWatchlistMixin, _EpgOnNowMixin, _EpgBrowseMixin, _EpgEventsMix
         add_input.setClearButtonEnabled(True)
         add_input.setPlaceholderText("Add filler pattern…")
         add_btn = QPushButton("Add")
+        add_btn.setToolTip("Hide programmes whose title matches this")
         add_btn.setFixedWidth(50)
         add_btn.clicked.connect(lambda: self._add_filler_pattern(add_input.text().strip()))
         add_input.returnPressed.connect(lambda: self._add_filler_pattern(add_input.text().strip()))
@@ -726,6 +727,7 @@ class EpgView(_EpgWatchlistMixin, _EpgOnNowMixin, _EpgBrowseMixin, _EpgEventsMix
             btn_cat.clicked.connect(lambda: (self._hide_category(category), dlg.accept()))
             lay.addWidget(btn_cat)
         cancel = QPushButton("Cancel")
+        cancel.setToolTip("Close without hiding anything")
         _theme.style_fn(cancel, lambda: f"color: {_theme.COLOR_TEXT};")
         cancel.clicked.connect(dlg.reject)
         lay.addWidget(cancel)
@@ -793,9 +795,13 @@ class EpgView(_EpgWatchlistMixin, _EpgOnNowMixin, _EpgBrowseMixin, _EpgEventsMix
         if self.filler_check_btn.isChecked():
             # Hiding is active — clicking will show everything
             self.filler_check_btn.setText("Show All")
+            self.filler_check_btn.setToolTip(
+                f"Show the {n} hidden channels and filler programmes too")
         else:
             # Hiding is off — clicking will re-enable hiding
             self.filler_check_btn.setText(f"Hide ({n})")
+            self.filler_check_btn.setToolTip(
+                f"Hide the {n} channels and filler programmes you chose to hide")
 
     def _on_search_changed(self, _: str) -> None:
         self._reload_browse()

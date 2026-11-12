@@ -317,6 +317,7 @@ class FilterDropdown(QPushButton):
         self.selected_groups: set = set(groups.keys()) if all_selected else set()
 
         self.setText(label)
+        self.setToolTip(f"{label}: tick the ones to show")
         _theme.style(self, "FILTER_CONTROL_BTN")
         _icon_utils.set_button_icon(self, "dropdown_caret", trailing=True)
 
@@ -353,9 +354,11 @@ class FilterDropdown(QPushButton):
 
         button_layout = QHBoxLayout()
         select_all_btn = QPushButton(DROPDOWN_SELECT_ALL_LABEL)
+        select_all_btn.setToolTip("Tick every one")
         select_all_btn.clicked.connect(self.select_all)
         button_layout.addWidget(select_all_btn)
         clear_btn = QPushButton(DROPDOWN_CLEAR_LABEL)
+        clear_btn.setToolTip("Untick every one")
         clear_btn.clicked.connect(self.clear_all)
         button_layout.addWidget(clear_btn)
         layout.addLayout(button_layout)

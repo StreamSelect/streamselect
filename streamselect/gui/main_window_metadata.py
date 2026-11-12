@@ -948,6 +948,8 @@ class _MetadataMixin:
             # in update_details_pane_for_channel — a repeat request for this
             # id now short-circuits instead of re-rendering + re-fetching.
             self._details_shown = (channel.id, True)
+            from streamselect.gui.just_in_time_tips import offer_details_tips
+            offer_details_tips(self)
             logger.debug(f"Details pane updated with metadata for {channel.name}")
         except Exception as e:
             logger.error(f"Error updating details pane: {e}", exc_info=True)

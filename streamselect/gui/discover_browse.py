@@ -92,6 +92,7 @@ class _BrowseView(QWidget):
         top = QHBoxLayout()
         self._back_btn = QPushButton("Back")
         self._back_btn.setFlat(True)
+        self._back_btn.setToolTip("Back to the shelves")
         _theme.style_fn(self._back_btn, lambda: f"QPushButton {{ color: {_theme.COLOR_ACCENT_BLUE}; border: none; font-size: {_theme.FONT_LG}; }}"
             f"QPushButton:hover {{ color: {_theme.COLOR_ACCENT_HOVER}; }}")
         self._back_btn.clicked.connect(self.backRequested)

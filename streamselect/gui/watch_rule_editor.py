@@ -195,6 +195,7 @@ class WatchRuleEditor(QWidget):
             footer.addStretch()
             self.cancel_btn = QPushButton("Cancel")
             self.cancel_btn.setFlat(True)
+            self.cancel_btn.setToolTip("Close without tracking anything")
             self.cancel_btn.clicked.connect(self.cancelled.emit)
             footer.addWidget(self.cancel_btn)
             self.add_btn = QPushButton("Track it")

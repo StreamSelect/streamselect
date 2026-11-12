@@ -165,6 +165,7 @@ class _EpgOnNowMixin:
         filter_row.addStretch()
 
         self.filler_check_btn = QPushButton("Show All")
+        self.filler_check_btn.setToolTip("Show the hidden channels and filler programmes too")
         self.filler_check_btn.setCheckable(True)
         self.filler_check_btn.setChecked(True)
         self.filler_check_btn.setFixedWidth(110)

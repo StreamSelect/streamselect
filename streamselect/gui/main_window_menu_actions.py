@@ -177,6 +177,13 @@ class _MenuActionsMixin:
         )
         tour_action.triggered.connect(self.start_tour)
         tools_menu.addAction(tour_action)
+        tips_action = QAction(_icon_utils.role_icon("tips"), "Show tips again", self)
+        tips_action.setToolTip(
+            "Show each one-time tip again the next time its moment comes, such "
+            "as opening a view for the first time."
+        )
+        tips_action.triggered.connect(self.reset_tips)
+        tools_menu.addAction(tips_action)
         tools_menu.addSeparator()
         for keep, text, tip in (
             (False, "Fresh start…",
@@ -409,6 +416,17 @@ class _MenuActionsMixin:
             # open). Withdraw the request, or the NEXT ordinary launch would
             # wipe everything without being asked again.
             fresh_start.cancel()
+
+    def _offer_view_tip(self, view: str) -> None:
+        """The first switch to *view* explains it once (just_in_time_tips.VIEW_TIPS)."""
+        from streamselect.gui.just_in_time_tips import offer_view_tip
+        offer_view_tip(self, view)
+
+    def reset_tips(self) -> None:
+        """Tools ▸ Show tips again — each tip shows at its next moment."""
+        from streamselect.gui.just_in_time_tips import reset_tips
+        reset_tips(self)
+        self.status("Tips will show again as you use the app")
 
     def start_tour(self) -> None:
         """Tools ▸ Take the tour — the guided tour over this window."""

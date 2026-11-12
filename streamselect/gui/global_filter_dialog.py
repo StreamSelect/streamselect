@@ -1050,7 +1050,7 @@ class GlobalFilterDialog(QDialog):
         self._keyword_input.setPlaceholderText("Add a keyword (e.g. wrestling)…")
         self._keyword_input.returnPressed.connect(self._add_keyword)
         add_hl.addWidget(self._keyword_input, 1)
-        add_btn = QPushButton("Add")
+        add_btn = QPushButton("Add", toolTip="Hide everything whose name contains this keyword")
         add_btn.clicked.connect(self._add_keyword)
         add_hl.addWidget(add_btn)
         self._inner_vl.addWidget(add_row)

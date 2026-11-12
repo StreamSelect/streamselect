@@ -95,11 +95,14 @@ class _EmptyStateMixin:
         headline, hint, action = text
         panel.show_state(headline, hint, self._empty_state_actions(action))
 
-    def _empty_state_actions(self, action: str | None) -> list[tuple[str, Callable]]:
+    def _empty_state_actions(self, action: str | None) -> list[tuple[str, Callable, str]]:
         if action == "add":
-            return [("Add Source", self.add_provider)]
+            return [("Add Source", self.add_provider,
+                     "Add a source: its server address, username and password")]
         if action == "open":
-            return [("Open Sources", self.switch_to_sources_manager)]
+            return [("Open Sources", self.switch_to_sources_manager,
+                     "Open Sources to turn a source on, renew it or add another")]
         if action == "clear_search":
-            return [("Clear search", self.search_input.clear)]
+            return [("Clear search", self.search_input.clear,
+                     "Clear the search box and list everything again")]
         return []

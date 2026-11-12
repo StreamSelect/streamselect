@@ -347,6 +347,7 @@ class ProviderEditorView(_NewSourceMixin, _ConnectionTestMixin, _AccountInfoMixi
         actions_flow.addWidget(self._test_btn)
 
         self._discard_btn = QPushButton("Discard")
+        self._discard_btn.setToolTip("Close without saving your changes")
         self._discard_btn.clicked.connect(self._discard)
         actions_flow.addWidget(self._discard_btn)
 

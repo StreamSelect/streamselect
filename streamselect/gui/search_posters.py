@@ -200,6 +200,7 @@ class _SearchPostersMixin:
 
         self._shelf_btn = QPushButton("Save as shelf")
         self._shelf_btn.setFlat(True)
+        self._shelf_btn.setToolTip("Search or filter first: everything at once is not a shelf")
         self._shelf_btn.clicked.connect(self._on_shelf_btn_clicked)
         layout.addWidget(self._shelf_btn)
 

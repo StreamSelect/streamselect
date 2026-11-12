@@ -203,6 +203,7 @@ class WatchQueueSection(BackgroundRefreshMixin, CollapsibleSection):
         # clicking opens the matched content (where it is flagged 🚨/green).
         self._new_matches_btn = QPushButton()
         _theme.style(self._new_matches_btn, "QUEUE_NEW_MATCHES_LINE")
+        self._new_matches_btn.setToolTip("Open the new matches for your watch alerts")
         self._new_matches_btn.clicked.connect(self.newMatchesClicked.emit)
         self._new_matches_btn.hide()
         self.content_layout.addWidget(self._new_matches_btn)

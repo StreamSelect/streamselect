@@ -2824,6 +2824,10 @@ def wire_nav_host(host) -> None:
         host.breadcrumb_label = MagicMock()
     if "series_icon" not in host.__dict__:
         host.series_icon = "S"
+    # A view switch offers that view's one-time tip, which waits and then
+    # measures a real window; a double has none to show it in.
+    if "_offer_view_tip" not in host.__dict__:
+        host._offer_view_tip = MagicMock()
 
 #: Holds the QApplication for the whole process. See _bundled_ui_font.
 _SESSION_QAPP = None

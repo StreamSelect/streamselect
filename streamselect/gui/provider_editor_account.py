@@ -85,6 +85,7 @@ class _AccountInfoMixin:
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         self._refresh_acct_btn = QPushButton("↻  Refresh Account Info")
+        self._refresh_acct_btn.setToolTip("Ask the source again for its expiry date and connection limit")
         self._refresh_acct_btn.clicked.connect(self._fetch_account_info)
         btn_row.addWidget(self._refresh_acct_btn)
         group_layout.addLayout(btn_row)
