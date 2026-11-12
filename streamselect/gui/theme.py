@@ -64,7 +64,7 @@ from streamselect.gui.tokens.scales import (  # noqa: F401
     SPACE_LG, SPACE_MD, SPACE_NONE, SPACE_SM, SPACE_XS,
     radius_px, space_px, zoomed_font,
 )
-# Role groups that compose themselves from the tokens and merge in below.
+from streamselect.gui.tokens import analytics_roles as _analytics_roles  # role groups: merged below
 from streamselect.gui.tokens import chip_roles as _chip_roles
 from streamselect.gui.tokens import detail_roles as _detail_roles
 from streamselect.gui.tokens import progress_roles as _progress_roles
@@ -1791,9 +1791,9 @@ globals().update(_build_semantic_constants())
 # ratchet, and a semantic constant is a pure function of the tokens — so a new
 # family composes itself from the token globals and merges in here, the same
 # way tokens/scales.py keeps the radius and spacing scales out of this file.
-# Both this call and apply_theme's rebuild must run, or a theme switch would
-# leave these roles on the old palette — so both read this ONE tuple.
-_ROLE_GROUPS = (_chip_roles, _detail_roles, _progress_roles, _state_roles, _tour_roles)
+# This call and apply_theme's rebuild both read this ONE tuple, or a switch strands them.
+_ROLE_GROUPS = (_analytics_roles, _chip_roles, _detail_roles, _progress_roles, _state_roles,
+                _tour_roles)
 for _group in _ROLE_GROUPS:
     globals().update(_group.build(globals()))
 

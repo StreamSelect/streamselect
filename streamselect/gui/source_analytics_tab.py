@@ -50,7 +50,6 @@ from streamselect.gui.attempt_ticks import AttemptTicks
 from streamselect.gui import theme as _theme
 from streamselect.gui.connection_wait import minutes_text
 from streamselect.gui.chip_row import MiddleElideLabel
-from streamselect.gui.flow_layout import FlowLayout
 from streamselect.gui.hour_strip import HourStrip, struggle_span
 from streamselect.gui.progress_paint import ProgressBar
 from streamselect.gui.tool_view import clear_layout, show_loading, show_panel_error
@@ -93,6 +92,7 @@ REGIONS_TWO_FROM = 560
 
 #: Media type → the singular noun a Most played row shows.
 MEDIA_SINGULAR = {"movie": "film", "series": "series", "live": "live"}
+_ONE = {"movie": "film", "live": "live channel"}       # MEDIA's nouns for a count of one
 
 #: A short bar: long enough to compare, too short to be a page-wide empty track.
 BAR_PX = 56
@@ -222,21 +222,30 @@ class _Tile(QFrame):
         self.show()
 
 
-def _facts(section: _Section, facts) -> None:
-    """Caption · figure pairs that wrap as a flow — Playback and What you watch."""
-    holder = QWidget()
-    flow = FlowLayout(holder, h_spacing=24, v_spacing=6)
-    flow.setContentsMargins(0, 0, 0, 0)
-    for caption, value in facts:
-        pair = QWidget()
-        row = QHBoxLayout(pair)
-        row.setContentsMargins(0, 0, 0, 0)
-        row.addWidget(_label(caption, "META_HINT"))
-        figure = _label(value, "FIELD_LABEL")
-        figure.setWordWrap(True)                 # a long value wraps rather than widen the card
-        row.addWidget(figure)
-        flow.addWidget(pair)
-    section.body.addWidget(holder)
+#: Stat blocks per row on a card. Three keep each block wide enough for a
+#: one-line caption at the editor's narrowest two-column width.
+STATS_ACROSS = 3
+
+
+def _stats(section: _Section, stats) -> None:
+    """(figure, caption, detail) blocks in an even grid: the number first, what it
+    counts under it, and any breakdown below that — Playback and What you watch."""
+    grid = QGridLayout()
+    grid.setHorizontalSpacing(18)
+    grid.setVerticalSpacing(12)
+    for col in range(STATS_ACROSS):
+        grid.setColumnStretch(col, 1)
+    for i, (figure, caption, *detail) in enumerate(stats):
+        block = QVBoxLayout()
+        block.setSpacing(0)
+        block.addWidget(_label(figure, "STAT_FIGURE_MD"))
+        for text in (caption, *(d for d in detail if d)):
+            line = _label(text, "META_HINT")
+            line.setWordWrap(True)               # a long caption wraps rather than widen the card
+            block.addWidget(line)
+        block.addStretch(1)
+        grid.addLayout(block, *divmod(i, STATS_ACROSS))
+    section.body.addLayout(grid)
 
 
 class _LinkLabel(MiddleElideLabel):
@@ -573,28 +582,32 @@ class SourceAnalyticsTab(QWidget):
         if not viewing.plays:
             self._viewing.text("Nothing played from this source yet.")
             return
-        kinds = " · ".join(f"{viewing.by_media[m]:,} {noun}" for m, noun in MEDIA
-                           if viewing.by_media.get(m))
+        kinds = " · ".join(f"{n:,} {noun if n != 1 else _ONE.get(m, noun)}" for m, noun in MEDIA
+                           if (n := viewing.by_media.get(m)))
         if viewing.seconds_watched:
-            watched = f"{viewing.seconds_watched / 3600:.1f} h"
-            if viewing.watched_since:
-                watched += f" since {short_date_text(viewing.watched_since)}"
+            since = viewing.watched_since
+            watched = (f"{viewing.seconds_watched / 3600:.1f} h", "watching time",
+                       f"since {short_date_text(since)}" if since else "")
         else:
-            watched = "counted from now on"
-        facts = [
-            ("Titles played", f"{viewing.titles:,} ({kinds})" if kinds else f"{viewing.titles:,}"),
-            ("Plays", f"{viewing.plays:,}"),
-            ("Time watched", watched),
-            ("Played in the last 30 days", f"{viewing.recent:,} titles"),
+            watched = ("—", "watching time", "counted from now on")
+        stats = [
+            (f"{viewing.titles:,}", "titles watched", kinds),
+            (f"{viewing.plays:,}", "plays" if viewing.plays != 1 else "play"),
+            watched,
+            (f"{viewing.recent:,}", "in the last 30 days"),
         ]
         if viewing.episodes:
-            facts.append(("Episodes", f"{viewing.episodes:,} across {viewing.episode_series:,} series"))
+            stats.append((f"{viewing.episodes:,}", "episodes",
+                          f"across {viewing.episode_series:,} series"))
         if viewing.favourites:
-            facts.append(("Favourites here", f"{viewing.favourites:,}"))
-        _facts(self._viewing, facts)
+            stats.append((f"{viewing.favourites:,}", "favourites"))
+        _stats(self._viewing, stats)
         if viewing.only_here:
-            self._viewing.text(f"<b>{viewing.only_here:,}</b> of the {viewing.titles:,} titles you've "
-                               "played are on no other source — you'd lose them without it.")
+            only = self._viewing.text(
+                f"<b>{viewing.only_here:,}</b> of the {viewing.titles:,} titles you've watched "
+                f"{'is' if viewing.only_here == 1 else 'are'} only available from this source.",
+                "ANALYTICS_VERDICT")
+            only.setObjectName("onlyHereVerdict")
         if viewing.top:
             self._viewing.body.addWidget(_label("Most played", "LABEL_MUTED"))
             grid = self._viewing.grid()
@@ -624,11 +637,12 @@ class SourceAnalyticsTab(QWidget):
                                    warn=summary.started / summary.attempts < 0.8)
         self._playback.subtitle.setText(f"since {short_date_text(summary.since)}" if summary.since else "")
         ttp = summary.median_time_to_picture_ms
-        _facts(self._playback, (
-            ("Never loaded", f"{summary.never_started:,}"),
-            ("Refused — connections in use", f"{summary.refused:,}"),
-            ("Dropped while playing", f"{summary.dropped:,}"),
-            ("Time to picture", f"{ttp / 1000:.1f} s typical" if ttp else "not recorded yet"),
+        _stats(self._playback, (
+            (f"{summary.never_started:,}", "never loaded"),
+            (f"{summary.refused:,}", "refused", "all connections in use"),
+            (f"{summary.dropped:,}", "dropped while playing"),
+            (f"{ttp / 1000:.1f} s", "typical time to picture") if ttp
+            else ("—", "time to picture", "not recorded yet"),
         ))
         self._render_time_of_day(summary)
 
@@ -657,10 +671,10 @@ class SourceAnalyticsTab(QWidget):
                                    "connections are in use, StreamSelect waits for one, starts the "
                                    "title, and records how long it took.", "META_HINT")
             return
-        _facts(self._connections, (
-            ("Usually frees up within", minutes_text(conns.median_seconds)),
-            ("Longest wait", minutes_text(conns.longest_seconds)),
-            ("Waits recorded", f"{conns.waits:,}"),
+        _stats(self._connections, (
+            (minutes_text(conns.median_seconds), "typical wait for a connection"),
+            (minutes_text(conns.longest_seconds), "longest wait"),
+            (f"{conns.waits:,}", "waits recorded"),
         ))
 
     def _on_addresses(self, addresses: list[ServerAddressDTO]) -> None:

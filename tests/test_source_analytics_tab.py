@@ -183,7 +183,7 @@ def test_playback_section_reports_recorded_outcomes(qapp, file_db):
         texts = _texts(ed._analytics_tab._playback)
         started = ed._analytics_tab._tiles["started"]        # dropped counts as started
         assert (started.figure.text(), started.caption.text()) == ("75%", "of plays started (3 of 4)")
-        assert "1.8 s typical" in texts
+        assert "1.8 s" in texts and "typical time to picture" in texts
         assert ed._analytics_tab._playback.subtitle.text().startswith("since ")
     finally:
         destroy_widget(ed)
@@ -269,10 +269,12 @@ def test_what_you_watch_names_titles_plays_and_the_most_played(qapp, file_db):
     try:
         viewing = ed._analytics_tab._viewing
         texts = _texts(viewing)
-        assert "4 (2 films · 2 series)" in texts                 # titles, not rows
+        assert "4" in texts and "2 films · 2 series" in texts    # titles, not rows
         assert "27" in texts                                     # plays, Birch's excluded
-        assert any(t.startswith("1.5 h since") for t in texts)
-        assert any("<b>4</b> of the 4 titles you've played are on no other source" in t for t in texts)
+        assert "1.5 h" in texts and any(t.startswith("since ") for t in texts)
+        assert ("<b>4</b> of the 4 titles you've watched are only available from this source."
+                in texts)
+        _assert_stat_blocks_read_figure_over_caption(viewing)
         # Most played: one row per title, most first, each with its plays.
         rows = {lbl.text(): _top_left(viewing, lbl)[1] for lbl in viewing.findChildren(QLabel)
                 if lbl.isVisible() and lbl.text() in ("Futurama", "Altered Carbon & Co", "Innocent Blood",
@@ -282,6 +284,27 @@ def test_what_you_watch_names_titles_plays_and_the_most_played(qapp, file_db):
         assert viewing.subtitle.text().startswith("last played ")
     finally:
         destroy_widget(ed)
+
+
+def _assert_stat_blocks_read_figure_over_caption(card):
+    """Each number sits directly above what it counts, left-aligned with it,
+    and a row of blocks shares one baseline (the user's screenshot: captions
+    and values ran together as a wrapped line of pairs)."""
+    from streamselect.gui import theme
+    labels = [lbl for lbl in card.findChildren(QLabel) if lbl.isVisible()]
+    figures = [lbl for lbl in labels if lbl.styleSheet() == theme.STAT_FIGURE_MD]
+    assert len(figures) >= 4
+    for fig in figures:
+        x, y = _top_left(card, fig)
+        under = [lbl for lbl in labels if lbl is not fig and _top_left(card, lbl)[0] == x
+                 and 0 < _top_left(card, lbl)[1] - y <= fig.height() + 4]
+        assert under, f"nothing directly under {fig.text()!r}"
+    tops = sorted({_top_left(card, f)[1] for f in figures})
+    xs_per_row = [sorted(_top_left(card, f)[0] for f in figures if _top_left(card, f)[1] == t)
+                  for t in tops]
+    assert all(len(r) <= 3 for r in xs_per_row) and len(xs_per_row[0]) == 3
+    verdict = card.findChild(QLabel, "onlyHereVerdict")
+    assert verdict is not None and verdict.styleSheet() == theme.ANALYTICS_VERDICT
 
 
 def test_what_you_watch_with_nothing_played(qapp, file_db):
@@ -376,9 +399,9 @@ def test_what_you_watch_counts_recent_episodes_and_favourites(qapp, file_db):
     ed = _analytics(qapp, file_db)
     try:
         texts = _texts(ed._analytics_tab._viewing)
-        assert "1 titles" in texts                      # played in the last 30 days
-        assert "4 across 2 series" in texts
-        assert "Favourites here" in texts
+        assert "in the last 30 days" in texts
+        assert "across 2 series" in texts and "episodes" in texts
+        assert "favourites" in texts
     finally:
         destroy_widget(ed)
 
@@ -419,5 +442,16 @@ def test_a_loaded_analytics_tab_still_lets_the_editor_fit_400px(qapp, file_db):
         assert ed.width() == 400, f"the editor refused 400px (min {ed.minimumSizeHint().width()})"
         assert tab.minimumSizeHint().width() <= ed._analytics_scroll.viewport().width()
         assert _top_left(tab, tab._viewing)[0] == _top_left(tab, tab._playback)[0]   # stacked
+    finally:
+        destroy_widget(ed)
+
+
+def test_a_count_of_one_takes_the_singular(qapp, file_db):
+    _seed(file_db)
+    _play(file_db, "delta", "ib", 2, title="Innocent Blood")
+    _play(file_db, "delta", "news", 1, title="News", media="live")
+    ed = _analytics(qapp, file_db)
+    try:
+        assert "1 film · 1 live channel" in _texts(ed._analytics_tab._viewing)
     finally:
         destroy_widget(ed)
