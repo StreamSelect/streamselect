@@ -1,6 +1,7 @@
 """The guided tour: spotlight the real controls, one at a time, with a sentence each.
 
-A user (Q10/R8; revised): a short tour of search, what each kind of row
+A user (Q10/R8; revised): a short tour that opens on a theme picker
+(tour_theme_picker), then search, what each kind of row
 plays, the top bar, Exclusions, the sidebar's lists and Sources, re-runnable, and the user
 is told where it lives when it ends. It is offered once, when a new source
 finishes its first load — before that every view is empty and the tour would
@@ -25,7 +26,7 @@ from dataclasses import dataclass
 from PyQt6.QtCore import QEvent, QRect, QRectF, QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QVBoxLayout, QWidget,
 )
 
 from streamselect.gui import theme as _theme
@@ -46,6 +47,12 @@ class TourStop:
     #: Icon rows shown under the body: (icon role, what it means). Each is the
     #: same mark the control draws, so the card can be read against the screen.
     legend: tuple[tuple[str, str], ...] = ()
+    #: Ring only this part of the target (the Style entry of the menu bar).
+    area: Callable[[QWidget], QRect] | None = None
+    #: Keep the card in the middle of the window even when something is ringed.
+    centred: bool = False
+    #: Show the theme list (tour_theme_picker) on this card.
+    themes: bool = False
 
 
 def _attr(name: str) -> Callable[[object], QWidget | None]:
@@ -54,8 +61,24 @@ def _attr(name: str) -> Callable[[object], QWidget | None]:
     return lambda host: host.__dict__.get(name)
 
 
+def _menu_bar(host: object) -> QWidget | None:
+    return host.menuBar() if isinstance(host, QMainWindow) else None
+
+
+def _style_entry(menu_bar: QWidget) -> QRect:
+    """Where the menu bar draws its Style entry (empty: not found)."""
+    for action in menu_bar.actions():
+        if action.text().replace("&", "") == "Style":
+            return menu_bar.actionGeometry(action)
+    return QRect()
+
+
 #: The stops, in order.
 TOUR_STOPS: tuple[TourStop, ...] = (
+    TourStop("Pick a look",
+             "Click a theme to switch to it now. You can change it any time "
+             "from Style ▸ Theme in the menu bar.",
+             _menu_bar, area=_style_entry, centred=True, themes=True),
     TourStop("Search",
              "Search every source at once: titles, channels and categories. "
              "Type, then press Enter.",
@@ -143,7 +166,9 @@ class TourOverlay(QWidget):
         _theme.style(self._body, "PANEL_BODY")
         self._legend = QWidget()
         QVBoxLayout(self._legend).setContentsMargins(0, 4, 0, 0)
-        for w in (self._step, self._title, self._body, self._legend):
+        self._themes = QWidget()
+        QVBoxLayout(self._themes).setContentsMargins(0, 0, 0, 0)
+        for w in (self._step, self._title, self._body, self._legend, self._themes):
             card.addWidget(w)
         row = QHBoxLayout()
         row.setContentsMargins(0, 6, 0, 0)
@@ -209,10 +234,29 @@ class TourOverlay(QWidget):
         self._title.setText(stop.title)
         self._body.setText(stop.body)
         self._fill_legend(stop.legend)
+        self._fill_themes(stop.themes)
         self._back_btn.setEnabled(index > 0)
         self._next_btn.setText("Got it" if self._tip else ("Done" if last else "Next"))
         self._hole = self._target_rect(stop)
         self._place_card()
+        self.update()
+
+    def _fill_themes(self, show: bool) -> None:
+        from streamselect.gui.tour_theme_picker import ThemeList
+
+        box = self._themes.layout()
+        while box.count():
+            box.takeAt(0).widget().deleteLater()
+        if show:
+            current = getattr(self._host.config, "theme_name", _theme.current_theme())
+            picker = ThemeList(current)
+            picker.picked.connect(self._pick_theme)
+            box.addWidget(picker)
+        self._themes.setVisible(show)
+
+    def _pick_theme(self, name: str) -> None:
+        # The Style menu's own handler: applies live and saves (no Apply step).
+        self._host._set_theme_from_menu(name)
         self.update()
 
     def _fill_legend(self, legend: tuple[tuple[str, str], ...]) -> None:
@@ -245,7 +289,12 @@ class TourOverlay(QWidget):
         widget = stop.target(self._host)
         if widget is None or not widget.isVisible():
             return None
-        area = _drawn_rect(widget) if stop.tight else widget.rect()
+        if stop.area is not None:
+            area = stop.area(widget)
+            if area.isEmpty():
+                return None
+        else:
+            area = _drawn_rect(widget) if stop.tight else widget.rect()
         top_left = widget.mapTo(self._host, area.topLeft())
         rect = QRect(top_left, area.size()).adjusted(-_RING_PAD, -_RING_PAD, _RING_PAD, _RING_PAD)
         return rect.intersected(self.rect())
@@ -256,7 +305,7 @@ class TourOverlay(QWidget):
         size = QSize(_CARD_WIDTH, self._card.layout().totalHeightForWidth(_CARD_WIDTH))
         area = self.rect().adjusted(_MARGIN, _MARGIN, -_MARGIN, -_MARGIN)
         hole = self._hole
-        if hole is None:
+        if hole is None or self._stops[self._index].centred:
             x = area.center().x() - size.width() // 2
             y = area.center().y() - size.height() // 2
         elif hole.bottom() + 12 + size.height() <= area.bottom():     # below

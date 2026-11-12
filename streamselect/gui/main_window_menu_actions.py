@@ -623,6 +623,8 @@ class _MenuActionsMixin:
         self.config.theme_name = name
         _cfgsave.save_soon(self)
         self.apply_configured_theme()
+        # A caller other than the menu (the tour's theme list) must move its tick.
+        self._sync_style_menu_state()
 
     def _build_buffer_menu(self, menubar) -> None:
         """Build the Buffer menu — how much mpv reads ahead while playing.

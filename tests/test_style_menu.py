@@ -33,6 +33,7 @@ class _Host:
         self.config.channel_list_density = density
         self.apply_configured_theme = MagicMock()
         self._apply_channel_list_density = MagicMock()
+        self._sync_style_menu_state = MagicMock()
         self._set_theme_from_menu = MainWindow._set_theme_from_menu.__get__(self)
         self._set_density_from_menu = MainWindow._set_density_from_menu.__get__(self)
 

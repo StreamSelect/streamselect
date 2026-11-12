@@ -36,6 +36,11 @@ class _Host(QWidget):
         self._sources_lbl = QLineEdit("Sources", self.sources_strip)
         self._sources_lbl.setGeometry(10, 185, 120, 30)
         self.sidebar_sections = {}
+        self.picked_themes = []
+
+    def _set_theme_from_menu(self, name):
+        self.picked_themes.append(name)
+        self.config.theme_name = name
 
 
 @pytest.fixture
@@ -52,7 +57,7 @@ def _start(host):
     return tour
 
 
-@pytest.mark.parametrize("stop", [0, 1, 2, 3, 4])  # 5 (Sources) rings tight: below
+@pytest.mark.parametrize("stop", [1, 2, 3, 4, 5])  # 0 is centred, 6 (Sources) tight: below
 def test_each_stop_rings_its_real_control(host, stop):
     from streamselect.gui.guided_tour import TOUR_STOPS
 
@@ -71,7 +76,7 @@ def test_each_stop_rings_its_real_control(host, stop):
 
 def test_sources_is_ringed_around_what_it_draws_not_its_stretched_box(host):
     tour = _start(host)
-    for _ in range(5):
+    for _ in range(6):
         tour.next()
     assert tour._title.text() == "Sources"
     label = host._sources_lbl
@@ -86,7 +91,7 @@ def test_sources_is_ringed_around_what_it_draws_not_its_stretched_box(host):
 def test_a_missing_control_centres_the_card_tall_enough_for_its_text(host, qapp):
     host.sources_strip.hide()
     tour = _start(host)
-    for _ in range(5):
+    for _ in range(6):
         tour.next()
     qapp.processEvents()
     assert tour.hole() is None
@@ -122,7 +127,7 @@ def test_keys_step_and_escape_ends_with_where_to_find_it(host, qapp):
 
 def test_the_last_stop_finishes_on_done(host):
     tour = _start(host)
-    for _ in range(5):
+    for _ in range(6):
         tour.next()
     assert tour._next_btn.text() == "Done"
     tour._next_btn.click()
@@ -186,4 +191,71 @@ def test_the_row_kinds_stop_shows_each_mark_as_the_list_paints_it(host, qapp):
     assert tour.hole() is not None and not tour._card.geometry().intersects(tour.hole())
     tour.next()
     assert not tour._legend.isVisible(), "the legend stays on the stop it belongs to"
+    tour.end()
+
+
+def test_the_tour_opens_on_every_theme_and_a_click_switches_to_it(host, qapp):
+    """A new user is shown the themes first; a click applies and saves through
+    the Style menu's handler, with no Apply step."""
+    from PyQt6.QtWidgets import QPushButton
+
+    from streamselect.gui import theme
+
+    host.config.theme_name = "Midnight"
+    tour = _start(host)
+    qapp.processEvents()
+    rows = {n: tour._card.findChild(QPushButton, f"tourTheme_{n}")
+            for n in theme.available_themes()}
+    assert all(r is not None and r.isVisible() for r in rows.values())
+    assert [n for n, r in rows.items() if r.isChecked()] == ["Midnight"]
+    rows["Daylight"].click()
+    assert host.picked_themes == ["Daylight"]
+    assert [n for n, r in rows.items() if r.isChecked()] == ["Daylight"]
+    card, inner = tour._card.geometry(), tour.rect()
+    assert abs(card.center().x() - inner.center().x()) <= 2, "the theme card is not centred"
+    last = rows[theme.available_themes()[-1]]
+    assert last.mapTo(tour._card, last.rect().bottomLeft()).y() <= tour._card.rect().bottom(), (
+        "the theme list runs off the card")
+    tour.next()
+    assert not tour._themes.isVisible(), "the theme list stays on its own card"
+    tour.end()
+
+
+def test_each_swatch_is_painted_in_its_own_theme(qapp):
+    from PyQt6.QtGui import QColor
+
+    from streamselect.gui import theme_palettes
+    from streamselect.gui.tour_theme_picker import swatch
+
+    def corner(name):     # inside the border, on the theme's background
+        return QColor(swatch(name).toImage().pixel(2, 13)).lightness()
+
+    assert corner("Daylight") > 200 and corner("Midnight") < 60
+    accent = QColor(swatch("Gruvbox").toImage().pixel(35, 12)).name()
+    assert accent == QColor(theme_palettes.PALETTES["Gruvbox"]["COLOR_ACCENT"]).name()
+
+
+def test_the_theme_card_rings_style_in_the_menu_bar(qapp, owned_widgets, tmp_path):
+    from PyQt6.QtWidgets import QMainWindow
+
+    from streamselect.core.config import Config
+    from streamselect.core.notifications import NotificationManager
+    from streamselect.gui.guided_tour import start_tour
+
+    win = owned_widgets.own(QMainWindow())
+    win.resize(1200, 800)
+    win.config = Config(config_dir=str(tmp_path))
+    win.notification_manager = NotificationManager()
+    for title in ("&File", "&View", "&Style", "&Layout"):
+        win.menuBar().addMenu(title)
+    win.show()
+    qapp.processEvents()
+    tour = start_tour(win)
+    bar = win.menuBar()
+    style = next(a for a in bar.actions() if a.text() == "&Style")
+    entry = bar.actionGeometry(style)
+    entry = QRect(bar.mapTo(win, entry.topLeft()), entry.size())
+    assert tour.hole() is not None and tour.hole().contains(entry)
+    assert tour.hole().width() < entry.width() * 3, "the ring circles the whole menu bar"
+    assert not tour._card.geometry().intersects(tour.hole())
     tour.end()

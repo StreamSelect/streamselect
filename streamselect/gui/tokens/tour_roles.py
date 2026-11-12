@@ -29,4 +29,14 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
             f" font-size: {_('FONT_MD')}; }}"
             f"QPushButton:hover {{ color: {_('COLOR_TEXT_HI')}; border-color: {_('COLOR_ACCENT')}; }}"
         ),
+        # A theme in the tour's picker. The chosen one is filled with the accent
+        # tint AND drawn with a heavier border, so it is not told by colour alone.
+        "TOUR_THEME_ROW": (
+            f"QPushButton {{ text-align: left; border: 1px solid {_('COLOR_BORDER')};"
+            f" background: transparent; color: {_('COLOR_TEXT')};"
+            f" border-radius: {_('RADIUS_SM')}; padding: 6px 10px; font-size: {_('FONT_MD')}; }}"
+            f"QPushButton:hover {{ color: {_('COLOR_TEXT_HI')}; border-color: {_('COLOR_ACCENT')}; }}"
+            f"QPushButton:checked {{ background: {_('OVERLAY_ACCENT_35')};"
+            f" color: {_('COLOR_TEXT_HI')}; border: 2px solid {_('COLOR_ACCENT')}; }}"
+        ),
     }
