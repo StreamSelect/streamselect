@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
     QBoxLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 
+from streamselect.core.epg_utils import to_local_naive
 from streamselect.core.region_codes import REGION_FULL_NAMES
 from streamselect.core.repositories.dtos import (
     CatalogueMixDTO, ConnectionsDTO, GuideCoverageDTO, PlaybackSummaryDTO, PrefixStatDTO, ServerAddressDTO,
@@ -578,7 +579,7 @@ class SourceAnalyticsTab(QWidget):
     def _on_viewing(self, viewing: ViewingDTO) -> None:
         clear_layout(self._viewing.body)
         self._viewing.subtitle.setText(
-            f"last played {short_date_text(viewing.last_played)}" if viewing.last_played else "")
+            f"last played {short_date_text(to_local_naive(viewing.last_played))}" if viewing.last_played else "")
         if not viewing.plays:
             self._viewing.text("Nothing played from this source yet.")
             return
@@ -587,7 +588,7 @@ class SourceAnalyticsTab(QWidget):
         if viewing.seconds_watched:
             since = viewing.watched_since
             watched = (f"{viewing.seconds_watched / 3600:.1f} h", "watching time",
-                       f"since {short_date_text(since)}" if since else "")
+                       f"since {short_date_text(to_local_naive(since))}" if since else "")
         else:
             watched = ("—", "watching time", "counted from now on")
         stats = [
@@ -609,16 +610,21 @@ class SourceAnalyticsTab(QWidget):
                 "ANALYTICS_VERDICT")
             only.setObjectName("onlyHereVerdict")
         if viewing.top:
-            self._viewing.body.addWidget(_label("Most played", "LABEL_MUTED"))
+            since = viewing.watched_since
+            self._viewing.body.addWidget(_label(
+                f"Most played since {short_date_text(to_local_naive(since))}" if since
+                else "Most played", "LABEL_MUTED"))
             grid = self._viewing.grid()
-            grid.setColumnStretch(4, 1)       # the row hugs its title; slack goes last
+            grid.setColumnStretch(5, 1)       # the row hugs its title; slack goes last
             hidden: list[QWidget] = []
-            for row, (title, media, plays, when, key) in enumerate(viewing.top):
+            for row, (title, media, plays, when, key, seconds) in enumerate(viewing.top):
                 link = _LinkLabel(title, f"Show {title} in Search")
                 link.clicked.connect(lambda k=key, t=title: self._browse_title(k, t))
                 cells = (link, _label(MEDIA_SINGULAR.get(media, media), "META_HINT"),
                          _label(f"{plays:,} plays" if plays != 1 else "1 play", "FIELD_LABEL"),
-                         _label(short_date_text(when) if when else "", "META_HINT"))
+                         _label(f"{seconds / 3600:.1f} h" if seconds >= 360 else
+                                f"{max(1, round(seconds / 60))} min" if seconds else "", "META_HINT"),
+                         _label(short_date_text(to_local_naive(when)), "META_HINT"))
                 for col, widget in enumerate(cells):
                     grid.addWidget(widget, row, col)
                 if row >= TOP_ROWS:

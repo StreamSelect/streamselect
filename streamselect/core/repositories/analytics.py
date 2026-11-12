@@ -157,50 +157,65 @@ class AnalyticsRepository:
         return out
 
     def viewing(self, provider_id: str) -> ViewingDTO:
-        """What has been watched from *provider_id*: titles, plays, most played, time.
+        """What has been watched from *provider_id*, read from the play log.
 
-        Titles and plays read the per-channel history, so they reach back
-        before play recording began; time watched is only what
-        ``playback_events`` has recorded since.
+        Everything but favourites comes from ``playback_events``, never from
+        the History columns (``ChannelDB.play_count``/``last_played``):
+        clearing History zeroed those and took the analytics with it, an
+        episode's plays never reached them, and a live event channel is renamed
+        for each new game, so its count named something never watched. A film
+        or series is one title by its title key, an episode counts for its
+        series, and a live channel keeps the name it had when it was played.
         """
-        played = [ChannelDB.provider_id == provider_id, ChannelDB.play_count > 0]
-        titles, plays, last = self.session.query(
-            func.count(func.distinct(_TITLE_KEY)), func.sum(ChannelDB.play_count),
-            func.max(ChannelDB.last_played),
-        ).filter(*played).one()
-        by_media = dict(
-            self.session.query(ChannelDB.media_type, func.count(func.distinct(_TITLE_KEY)))
-            .filter(*played).group_by(ChannelDB.media_type)
-        )
-        title = func.coalesce(ChannelDB.detected_title, ChannelDB.name)
-        top = tuple(
-            (name, media or "", int(n), when, key) for name, media, n, when, key in self.session.query(
-                title, ChannelDB.media_type, func.sum(ChannelDB.play_count), func.max(ChannelDB.last_played),
-                _TITLE_KEY)
-            .filter(*played).group_by(_TITLE_KEY)
-            .order_by(func.sum(ChannelDB.play_count).desc(), title).limit(TOP_TITLES)
-        )
+        from streamselect.core.epg_utils import now_utc
+
         seconds, since = self.session.query(
             func.sum(PlaybackEventDB.seconds_watched), func.min(PlaybackEventDB.started_at),
         ).filter(PlaybackEventDB.provider_id == provider_id).one()
-        # Titles played here that no other source carries — what you'd lose.
-        elsewhere = select(ChannelDB.content_key).where(
-            ChannelDB.provider_id != provider_id, ChannelDB.content_key.isnot(None))
-        only_here = self.session.query(func.count(func.distinct(_TITLE_KEY))).filter(
-            *played, ChannelDB.content_key.is_(None) | ChannelDB.content_key.not_in(elsewhere)).scalar()
-        from streamselect.core.epg_utils import now_utc
-        recent = self.session.query(func.count(func.distinct(_TITLE_KEY))).filter(
-            *played, ChannelDB.last_played >= now_utc() - timedelta(days=RECENT_DAYS)).scalar()
+        events = self.session.query(
+            PlaybackEventDB.channel_id, PlaybackEventDB.title, PlaybackEventDB.started_at,
+            PlaybackEventDB.seconds_watched,
+        ).filter(PlaybackEventDB.provider_id == provider_id,
+                 PlaybackEventDB.outcome == "started").all()
+        ids = {cid for cid, *_ in events}
+        series = dict(self.session.query(EpisodeDB.id, ChannelDB.id).join(
+            ChannelDB, (ChannelDB.provider_id == EpisodeDB.provider_id)
+            & (ChannelDB.source_id == EpisodeDB.series_id) & (ChannelDB.media_type == "series"),
+        ).filter(EpisodeDB.id.in_(ids))) if ids else {}
+        title = func.coalesce(ChannelDB.detected_title, ChannelDB.name)
+        rows = {cid: (name, media or "", key, ck) for cid, name, media, key, ck in self.session.query(
+            ChannelDB.id, title, ChannelDB.media_type, _TITLE_KEY, ChannelDB.content_key,
+        ).filter(ChannelDB.id.in_(ids | set(series.values())))} if ids else {}
+        groups: dict[tuple, list] = {}     # [name, media, plays, last, title key, seconds, content key]
+        for cid, raw, when, secs in events:
+            owner = series.get(cid, cid)
+            name, media, key, ck = rows.get(owner, (raw, "", f"id:{owner}", None))
+            by_name = media in ("live", "")
+            group = groups.setdefault((key, raw) if by_name else (key,),
+                                      [raw if by_name else name, media, 0, when, key, 0, ck])
+            group[2] += 1
+            group[3] = max(group[3], when)
+            group[5] += secs or 0
+        keys = {g[6] for g in groups.values() if g[6]}
+        elsewhere = {k for (k,) in self.session.query(ChannelDB.content_key).filter(
+            ChannelDB.provider_id != provider_id, ChannelDB.content_key.in_(keys)).distinct()} if keys else set()
+        by_media: dict[str, int] = defaultdict(int)
+        for g in groups.values():
+            if g[1]:
+                by_media[g[1]] += 1
+        cutoff = now_utc() - timedelta(days=RECENT_DAYS)
+        ranked = sorted(groups.values(), key=lambda g: (-g[2], -g[3].timestamp()))
         favourites = self.session.query(func.count(func.distinct(_TITLE_KEY))).filter(
             ChannelDB.provider_id == provider_id, ChannelDB.is_favorite.is_(True)).scalar()
-        episodes, episode_series = self.session.query(
-            func.count(EpisodeDB.id), func.count(func.distinct(EpisodeDB.series_id)),
-        ).filter(EpisodeDB.provider_id == provider_id, EpisodeDB.play_count > 0).one()
+        played_episodes = ids & set(series)
         return ViewingDTO(
-            titles=titles or 0, plays=int(plays or 0), last_played=last, by_media=by_media,
-            top=top, seconds_watched=int(seconds or 0), watched_since=since,
-            only_here=only_here or 0, recent=recent or 0, favourites=favourites or 0,
-            episodes=episodes or 0, episode_series=episode_series or 0,
+            titles=len(groups), plays=len(events),
+            last_played=max((g[3] for g in groups.values()), default=None), by_media=dict(by_media),
+            top=tuple(tuple(g[:6]) for g in ranked[:TOP_TITLES]),
+            seconds_watched=int(seconds or 0), watched_since=since,
+            only_here=sum(1 for g in groups.values() if g[6] is None or g[6] not in elsewhere),
+            recent=sum(1 for g in groups.values() if g[3] >= cutoff), favourites=favourites or 0,
+            episodes=len(played_episodes), episode_series=len({series[e] for e in played_episodes}),
         )
 
     def title_channel_ids(self, provider_id: str, title_key: str) -> frozenset[str]:

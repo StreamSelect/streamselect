@@ -483,15 +483,16 @@ class PlaybackSummaryDTO:
 class ViewingDTO:
     """What you have actually watched from one source (Source Analytics).
 
-    Titles and plays come from the per-channel history (``play_count`` /
-    ``last_played``), which predates play recording; ``seconds_watched`` comes
-    from ``playback_events`` and only covers plays since that started.
+    Everything but ``favourites`` comes from ``playback_events`` — never the
+    History columns, which clearing History resets — so it covers plays since
+    that recording started (``watched_since``).
     """
     titles: int                                   # distinct titles played (content_key)
     plays: int
     last_played: datetime | None                  # UTC-naive
     by_media: dict[str, int]                      # media_type -> titles played
-    top: tuple[tuple[str, str, int, datetime | None, str], ...]  # (title, media, plays, last played, title key)
+    # (title, media, plays, last played UTC-naive, title key, seconds watched), from the play log
+    top: tuple[tuple[str, str, int, datetime, str, int], ...]
     seconds_watched: int
     watched_since: datetime | None                # first recorded play, None when none
     only_here: int = 0                            # played titles no other source carries

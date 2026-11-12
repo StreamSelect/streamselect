@@ -242,12 +242,35 @@ def test_narrow_cards_stack_and_regions_go_two_across(qapp, file_db):
 
 
 def _play(db, provider_id, key, plays, *, title=None, media="movie", region=None, last=None):
-    """One channel on *provider_id* with a play history."""
+    """One channel on *provider_id*, played *plays* times: one play-log event each,
+    the latest at *last* (UTC). The History columns get the same count, which the
+    card must not read."""
     from streamselect.core.database import ChannelDB
+    cid = str(uuid.uuid4())
     with db.session_scope() as s:
-        s.add(ChannelDB(id=str(uuid.uuid4()), source_id=str(uuid.uuid4()), provider_id=provider_id,
+        s.add(ChannelDB(id=cid, source_id=str(uuid.uuid4()), provider_id=provider_id,
                         name=title or key, detected_title=title, media_type=media, content_key=key,
                         detected_region=region, play_count=plays, last_played=last))
+    latest = last or datetime.utcnow() - timedelta(hours=1)
+    for n in range(plays):
+        _event(db, provider_id, cid, title or key, latest - timedelta(hours=n))
+
+
+def _event(db, provider_id, channel_id, title, started_at, seconds=None):
+    """One recorded play in the play log."""
+    from streamselect.core.repositories import RepositoryFactory
+    with db.session_scope() as s:
+        repo = RepositoryFactory(s).playback_events
+        event = repo.record(provider_id=provider_id, channel_id=channel_id, title=title,
+                            outcome="started", started_at=started_at)
+        if seconds is not None:
+            repo.update(event, seconds_watched=seconds)
+
+
+def _channel_id(db, key):
+    from streamselect.core.database import ChannelDB
+    with db.session_scope(commit=False) as s:
+        return s.query(ChannelDB.id).filter_by(content_key=key).first()[0]
 
 
 def test_what_you_watch_names_titles_plays_and_the_most_played(qapp, file_db):
@@ -259,29 +282,58 @@ def test_what_you_watch_names_titles_plays_and_the_most_played(qapp, file_db):
     _play(file_db, "delta", "ib", 2, title="Innocent Blood")
     _play(file_db, "delta", "low", 1, title="Least")
     _play(file_db, "birch", "other", 50, title="Not Delta")
-    from streamselect.core.repositories import RepositoryFactory
-    with file_db.session_scope() as s:
-        repo = RepositoryFactory(s).playback_events
-        event = repo.record(provider_id="delta", channel_id="c", title="t", outcome="started",
-                            started_at=datetime(2026, 10, 31, 9, 0))
-        repo.update(event, seconds_watched=5400)
+    _event(file_db, "delta", _channel_id(file_db, "ib"), "Innocent Blood",
+           datetime(2026, 10, 31, 9, 0), seconds=5400)
     ed = _analytics(qapp, file_db)
     try:
         viewing = ed._analytics_tab._viewing
         texts = _texts(viewing)
         assert "4" in texts and "2 films · 2 series" in texts    # titles, not rows
-        assert "27" in texts                                     # plays, Birch's excluded
+        assert "28" in texts                                     # plays, Birch's excluded
         assert "1.5 h" in texts and any(t.startswith("since ") for t in texts)
         assert ("<b>4</b> of the 4 titles you've watched are only available from this source."
                 in texts)
         _assert_stat_blocks_read_figure_over_caption(viewing)
-        # Most played: one row per title, most first, each with its plays.
+        # Most played: one row per title, most first, each with its plays and time.
+        assert any(t.startswith("Most played since ") for t in texts)
         rows = {lbl.text(): _top_left(viewing, lbl)[1] for lbl in viewing.findChildren(QLabel)
                 if lbl.isVisible() and lbl.text() in ("Futurama", "Altered Carbon & Co", "Innocent Blood",
                                                       "Least")}
         assert rows["Futurama"] < rows["Altered Carbon & Co"] < rows["Innocent Blood"] < rows["Least"]
-        assert "19 plays" in texts and "1 play" in texts
+        assert "19 plays" in texts and "1 play" in texts and "3 plays" in texts
         assert viewing.subtitle.text().startswith("last played ")
+    finally:
+        destroy_widget(ed)
+
+
+def test_most_played_counts_what_was_played_not_the_history(qapp, file_db):
+    """The owner's screenshot: after History was cleared, Innocent Blood, Futurama
+    and Doctor Who were gone; episodes never counted; and a live event channel
+    showed tonight's name for a game watched days earlier."""
+    from streamselect.core.database import ChannelDB, EpisodeDB
+    _seed(file_db)
+    with file_db.session_scope() as s:
+        s.add(ChannelDB(id="delta_44", source_id="44", provider_id="delta", name="Doctor Who",
+                        detected_title="Doctor Who", media_type="series", content_key="dw"))
+        for n in range(3):
+            s.add(EpisodeDB(id=f"delta_e{n}", season_id="x", series_id="44", provider_id="delta",
+                            episode_id=f"e{n}", episode_num=n, season_num=1, title=f"Ep {n}"))
+        s.add(ChannelDB(id="delta_slot", source_id="slot", provider_id="delta",
+                        name="(SLOT 6) | wrestling tonight", media_type="live"))
+    day = datetime(2026, 11, 1, 9, 0)
+    for n in range(3):
+        _event(file_db, "delta", f"delta_e{n}", f"EN - Doctor Who - S01E0{n}", day + timedelta(hours=n))
+    for n in range(2):
+        _event(file_db, "delta", "delta_slot", "(SLOT 6) | hockey: Bears vs Owls", day + timedelta(hours=n))
+    _play(file_db, "delta", "ib", 0, title="Innocent Blood")     # History cleared: count is 0
+    _event(file_db, "delta", _channel_id(file_db, "ib"), "EN - Innocent Blood", day)
+    ed = _analytics(qapp, file_db)
+    try:
+        texts = _texts(ed._analytics_tab._viewing)
+        assert "Doctor Who" in texts and "3 plays" in texts
+        assert "(SLOT 6) | hockey: Bears vs Owls" in texts and "2 plays" in texts
+        assert "(SLOT 6) | wrestling tonight" not in texts
+        assert "Innocent Blood" in texts
     finally:
         destroy_widget(ed)
 
@@ -392,10 +444,15 @@ def test_what_you_watch_counts_recent_episodes_and_favourites(qapp, file_db):
     with file_db.session_scope() as s:
         fav = s.query(ChannelDB).filter_by(provider_id="delta", content_key="film3").first()
         fav.is_favorite = True
+        for sid in ("s1", "s2"):
+            s.add(ChannelDB(id=f"delta_{sid}", source_id=sid, provider_id="delta", name=sid,
+                            media_type="series", content_key=sid))
         for n in range(4):
             s.add(EpisodeDB(id=f"e{n}", season_id="x", series_id="s1" if n < 3 else "s2",
                             provider_id="delta", episode_id=f"e{n}", episode_num=n, season_num=1,
-                            title=f"Ep {n}", play_count=1))
+                            title=f"Ep {n}"))
+    for n in range(4):
+        _event(file_db, "delta", f"e{n}", f"Ep {n}", datetime.utcnow() - timedelta(hours=n))
     ed = _analytics(qapp, file_db)
     try:
         texts = _texts(ed._analytics_tab._viewing)
@@ -414,6 +471,7 @@ def test_clicking_a_most_played_title_opens_it_in_search(qapp, file_db):
     _play(file_db, "delta", "fut", 12, title="Futurama", media="series")
     _play(file_db, "delta", "fut", 7, title="Futurama", media="series")   # a second row, same title
     _play(file_db, "birch", "fut", 3, title="Futurama", media="series")  # another source's copy
+    _event(file_db, "delta", _channel_id(file_db, "fut"), "Futurama", datetime(2026, 11, 1))
     ed = _analytics(qapp, file_db)
     try:
         got = []
