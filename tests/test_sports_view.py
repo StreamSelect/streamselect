@@ -158,3 +158,41 @@ def test_recommended_opens_from_a_gear_on_its_sidebar_header(qapp, owned_widgets
     sec.openViewRequested.connect(lambda: opened.append(True))
     gear.click()
     assert opened == [True]
+
+
+def test_before_the_finder_has_looked_it_says_so_instead_of_zero(db, qapp, owned_widgets):
+    """Owner, 2026-11-12: on a fresh launch the view said 0 games, then 5 appeared.
+    The table is empty until the first finder run; until then it says it is looking."""
+    from streamselect.core.config import Config
+    from streamselect.gui.sidebar.base import GroupHeading
+    from streamselect.gui.sports_view import SportsView
+
+    pending = []
+    view = owned_widgets.own(SportsView(db, Config(), lambda fn, cb, **_: pending.append((fn, cb)),
+                                        clock=lambda: NOW))
+    view.resize(800, 600)
+    view.show()
+    view.on_activate()
+    qapp.processEvents()
+
+    def texts():
+        return [w.text() for w in view.findChildren(QLabel) if w.isVisible()]
+
+    assert "Loading games…" in texts()                       # the read has not come back
+    view.set_finding(True)
+    fn, cb = pending.pop()
+    with db.session_scope(commit=False) as s:
+        cb(fn(RepositoryFactory(s)))                         # an empty table comes back
+    qapp.processEvents()
+    assert "Finding games in your channel listings…" in texts()
+    assert not [h for h in view.findChildren(GroupHeading) if h.isVisible()], "no 'On now 0'"
+
+    _seed_db(db)
+    refresh_games(db, NOW)
+    view.finished_finding()
+    assert "Finding games in your channel listings…" in texts(), "no flash of the old list"
+    fn, cb = pending.pop()
+    with db.session_scope(commit=False) as s:
+        cb(fn(RepositoryFactory(s)))
+    qapp.processEvents()
+    assert len(view.cards) == 2 and "Finding games in your channel listings…" not in texts()

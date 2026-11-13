@@ -24,6 +24,8 @@ class GameTracker(QObject):
 
     #: Emitted on the main thread after a run stored its games: league key -> Level 1 count.
     games_updated = pyqtSignal(object)
+    #: Emitted when a run starts, so an open view can say it is looking rather than "0".
+    finding_started = pyqtSignal()
 
     def __init__(self, db, parent=None):
         super().__init__(parent)
@@ -33,6 +35,12 @@ class GameTracker(QObject):
         self._running = False
         self._again = False
         self._closed = False
+        self.has_run = False        # a run has finished this session
+
+    @property
+    def busy(self) -> bool:
+        """A run is in flight (or queued to run again)."""
+        return self._running
 
     def request(self, *_args) -> None:
         """Run the finder now, or once more after the run in flight."""
@@ -43,15 +51,18 @@ class GameTracker(QObject):
                 self._again = True
                 return
             self._running = True
+        self.finding_started.emit()
         self._pool.submit(self._run)
 
     def _run(self) -> None:
         while True:
             try:
                 counts = refresh_games(self._db)
+                self.has_run = True
                 self.games_updated.emit(counts)
             except Exception:
                 logger.exception("Game finder run failed")
+                self.games_updated.emit({})    # a view waiting on "finding" must not wait forever
             with self._lock:
                 if not self._again or self._closed:
                     self._running = False

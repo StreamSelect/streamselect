@@ -29,7 +29,7 @@ from streamselect.core.games.read import (
 )
 from streamselect.core.games.store import enabled_leagues
 from streamselect.core.repositories.provider import ProviderRepository
-from streamselect.gui import cursor_affordance
+from streamselect.gui import cursor_affordance, icons
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
 from streamselect.gui.content_view import ContentView
@@ -69,7 +69,7 @@ class GameCard(QFrame):
         top = QHBoxLayout()
         top.setContentsMargins(0, 0, 0, 0)
         elapsed = fmt_duration(game.start_utc, now)
-        self.tag = QLabel(f"● LIVE · {elapsed} in" if state == ON_NOW
+        self.tag = QLabel(f"{icons.status_dot_icon} LIVE · {elapsed} in" if state == ON_NOW
                           else f"LIKELY ENDING · {elapsed} in")
         _theme.style(self.tag, "GAME_LIVE_TAG" if state == ON_NOW else "TEXT_SM_MUTED")
         top.addWidget(self.tag)
@@ -119,6 +119,7 @@ class SportsView(ContentView):
         self._games: list[GameDTO] = []
         self._selected: Optional[tuple] = None
         self._loaded = False
+        self._finding = False
         self.settings = next((s for s in enabled_leagues() if s.sport == SPORT), None)
 
         self._tick = QTimer(self)
@@ -138,6 +139,7 @@ class SportsView(ContentView):
         self._layout.setSpacing(8)
         self.cards: list[GameCard] = []
         self.feed_buttons: list[QPushButton] = []
+        self._render()          # "Loading games…" until the first read comes back
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -155,6 +157,23 @@ class SportsView(ContentView):
             return load_games(repos.session, SPORT, hidden, min_level=1, max_level=1)
         self._run_query(query, self._on_games, token_ref=self._token, on_error=self._on_error)
 
+    def set_finding(self, on: bool) -> None:
+        """The game finder has started looking (True) — say so instead of a premature count.
+
+        ``False`` only records it; the next render shows the new state, so a view
+        that is re-reading never flashes the OLD (empty) list in between.
+        """
+        if on != self._finding:
+            self._finding = on
+            if on:
+                self._render()
+
+    def finished_finding(self) -> None:
+        """The finder stored its games: re-read, and drop "finding" when they arrive."""
+        self._finding = False
+        if self.isVisible():
+            self.reload()
+
     def _on_games(self, games: list[GameDTO]) -> None:
         self._games = list(games or [])
         self._loaded = True
@@ -171,6 +190,7 @@ class SportsView(ContentView):
             item = self._layout.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()            # now: deleteLater waits for the event loop
                 w.deleteLater()
             elif item.layout() is not None:
                 QWidget().setLayout(item.layout())
@@ -179,6 +199,13 @@ class SportsView(ContentView):
     def _render(self, error: bool = False) -> None:
         self._clear()
         if not self._loaded:
+            self._message("Loading games…", "")
+            return
+        if self._finding and not self._games:
+            # Never "0 games" before the finder has looked: on a fresh launch the
+            # table is empty until the first run stores what it found.
+            self._message("Finding games in your channel listings…",
+                          "This takes a few seconds after the app starts or a source refreshes.")
             return
         if error:
             self._message("Games could not be loaded", "The game list will try again at the next refresh.")
@@ -194,6 +221,10 @@ class SportsView(ContentView):
         on_now.sort(key=lambda gs: gs[0].start_utc, reverse=True)   # most recently started first
 
         self._layout.addWidget(GroupHeading("On now", len(on_now)))
+        if self._finding:
+            looking = QLabel("Looking for new games…")
+            _theme.style(looking, "TEXT_SM_MUTED")
+            self._layout.addWidget(looking)
         if on_now:
             grid_host = QWidget()
             grid = FlowLayout(grid_host, spacing=10)

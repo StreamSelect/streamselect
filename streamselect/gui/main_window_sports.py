@@ -23,10 +23,11 @@ class _SportsViewMixin:
             view.channelSelected.connect(self.show_channel_details_by_id)
             view.setVisible(False)
             self._list_layout.addWidget(view)
-            # New games stored (a refresh drained, or the guide refreshed): re-read
-            # if the view is on screen; an unseen view re-reads on its next activate.
-            self.game_tracker.games_updated.connect(
-                lambda _counts: view.reload() if view.isVisible() else None)
+            # A run starting says "finding" instead of a premature 0; new games stored
+            # re-read on screen (an unseen view re-reads on its next activate).
+            tracker = self.game_tracker
+            tracker.finding_started.connect(lambda: view.set_finding(True))
+            tracker.games_updated.connect(lambda _counts: view.finished_finding())
         return view
 
     def switch_to_sports_view(self) -> None:
@@ -36,6 +37,10 @@ class _SportsViewMixin:
         self.view_mode = "sports"
         self._hide_all_content_views()
         view = self._ensure_sports_view()
+        tracker = self.game_tracker
+        if not tracker.has_run and not tracker.busy:
+            tracker.request()          # opened before the first run after launch: run it now
+        view.set_finding(tracker.busy)
         view.setVisible(True)
         self.stats_label.setText("Sports")
         view.on_activate()
