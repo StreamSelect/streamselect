@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from streamselect.core.epg_utils import browse_day_separator_label, fmt_time, now_utc, to_local
+from streamselect.core.epg_utils import browse_day_separator_label, fmt_time, now_utc, past_day_label, to_local
 from streamselect.core.games.read import (
     event_is_live as event_live,
     ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, arrange_feeds, best_feed, game_key, game_state,
@@ -285,8 +285,24 @@ class SportsView(ContentView):
             key = f"{sport}:{FINISHED}"
             self._layout.addWidget(self._header(key, "Finished", len(finished), foldable=True))
             if key not in folded:
-                for g, _ in sorted(finished, key=lambda gs: gs[0].start_utc, reverse=True):
-                    self._game_row(g, playable=True)
+                done = sorted((g for g, _ in finished), key=lambda g: g.start_utc, reverse=True)
+                by_day: dict = {}
+                for g in done:
+                    by_day.setdefault(to_local(g.start_utc).date(), []).append(g)
+                if len(by_day) == 1:
+                    for g in done:
+                        self._game_row(g, playable=True)
+                else:
+                    # Games that finished on different days: one sub-section per day,
+                    # most recent first (owner, 2026-11-13).
+                    for day, gs in by_day.items():
+                        sub = f"{sport}:{FINISHED}:{day.isoformat()}"
+                        self._layout.addWidget(self._header(
+                            sub, past_day_label(gs[0].start_utc, now), len(gs),
+                            foldable=True, sub=True))
+                        if sub not in folded:
+                            for g in gs:
+                                self._game_row(g, playable=True)
 
     def _message(self, headline: str, body: str) -> None:
         h = QLabel(headline)
@@ -299,17 +315,22 @@ class SportsView(ContentView):
             self._layout.addWidget(b)
 
     def _header(self, key: str, label: str, count: int, *, foldable: bool,
-                controls: Optional[QWidget] = None) -> QWidget:
+                controls: Optional[QWidget] = None, sub: bool = False) -> QWidget:
         """A section header on the sidebar's header band (SECTION_HEADER_TINT).
 
         A foldable one folds on a click ANYWHERE on the band — caret, label or empty
         space (owner report: only the label worked, and the caret did nothing). It is
         the sidebar's own ``_ClickableHeader``; the heading inside stays passive so
         one click is one toggle.
+
+        ``sub`` is a heading INSIDE a section (Finished's days): indented, on no band
+        of its own, so it reads as part of the section above it.
         """
         tip = ("Show these games" if key in self._folded() else "Fold these games") if foldable else ""
         if foldable:
-            band = _ClickableHeader()
+            band = _ClickableFrame() if sub else _ClickableHeader()
+            if sub:
+                cursor_affordance.set_clickable(band)
             band.setToolTip(tip)
             band.clicked.connect(lambda k=key: self._toggle_fold(k))
         else:
@@ -318,7 +339,7 @@ class SportsView(ContentView):
             band.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             _theme.style(band, "SECTION_HEADER_TINT")
         h = QHBoxLayout(band)
-        h.setContentsMargins(6, 3, 6, 3)
+        h.setContentsMargins(22 if sub else 6, 3, 6, 3)
         h.setSpacing(6)
         if foldable:
             caret = QLabel()

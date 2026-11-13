@@ -20,6 +20,7 @@ from streamselect.core.games.read import (
 )
 from streamselect.core.games.store import enabled_leagues, refresh_games
 from streamselect.core.repositories import RepositoryFactory
+from streamselect.gui.sidebar.base import GroupHeading
 from tests.test_game_finder import NOW, START, _seed_db
 
 HOCKEY = next(s for s in enabled_leagues() if s.sport == "hockey")
@@ -333,6 +334,50 @@ def test_on_now_folds_like_the_other_sections(games_db, qapp, owned_widgets):
     _settle(qapp)
     assert "hockey:on_now" in view._folded() and view.cards == [], "folded: no cards"
     assert "hockey:on_now" in view.headers, "the header stays to unfold it"
+
+
+def _copy_game_a_day_earlier(db, team_a: str) -> None:
+    from sqlalchemy import select
+
+    from streamselect.core.games.models import GameDB, GameFeedDB
+    with db.session_scope() as s:
+        g = s.execute(select(GameDB).where(GameDB.team_a == team_a, GameDB.level == 1)).scalars().first()
+        new = GameDB(sport=g.sport, league=g.league, team_a=g.team_a, team_b="Ottawa Senators",
+                     start_utc=g.start_utc - timedelta(days=1), level=1, replay=False, collections=2)
+        s.add(new)
+        s.flush()
+        for f in s.execute(select(GameFeedDB).where(GameFeedDB.game_id == g.id)).scalars():
+            s.add(GameFeedDB(game_id=new.id, channel_id=f.channel_id, source=f.source,
+                             collection=f.collection, name=f.name, from_guide=f.from_guide,
+                             time_from=f.time_from))
+
+
+def test_finished_games_from_different_days_get_a_sub_section_per_day(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-13: Finished showed times with no day, so games from two days read as one."""
+    _copy_game_a_day_earlier(games_db, "Buffalo Sabres")
+    view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=5))
+    view._toggle_fold("hockey:finished")
+    _settle(qapp)
+    days = [k for k in view.headers if k.startswith("hockey:finished:")]
+    assert len(days) == 2, sorted(view.headers)
+    tops = [view.headers[k].mapTo(view, QPoint(0, 0)).y() for k in days]
+    labels = [view.headers[k].findChild(GroupHeading).label.text() for k in days]
+    assert tops == sorted(tops) and days == sorted(days, reverse=True), "most recent day first"
+    assert "Tonight" not in " ".join(labels), labels
+    finished = view.headers["hockey:finished"]
+    assert all(view.headers[k].findChild(GroupHeading).mapTo(view, QPoint(0, 0)).x()
+               > finished.findChild(GroupHeading).mapTo(view, QPoint(0, 0)).x() for k in days), (
+        "a day sits indented inside Finished")
+    view._toggle_fold(days[1])
+    _settle(qapp)
+    assert days[1] in view._folded() and days[1] in view.headers
+
+
+def test_finished_games_all_from_one_day_have_no_sub_section(games_db, qapp, owned_widgets):
+    view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=5))
+    view._toggle_fold("hockey:finished")
+    _settle(qapp)
+    assert not [k for k in view.headers if k.startswith("hockey:finished:")] and view.rows
 
 
 def test_a_remembered_finished_fold_from_before_sport_segments_carries_over(games_db, qapp, owned_widgets):

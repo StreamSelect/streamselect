@@ -357,6 +357,24 @@ def scrubber_bounds(min_start: datetime | None, max_start: datetime | None,
     return left, right
 
 
+def past_day_label(dt: datetime, _now: datetime | None = None) -> str:
+    """A day heading for something that already happened, in local time.
+
+    The backward-looking sibling of :func:`browse_day_separator_label` (which reads
+    today as "Tonight"): ``"Today · Fri Nov 13"``, ``"Yesterday · Thu Nov 12"``,
+    else the bare ``"Wed Nov 11"``.
+    """
+    now = _now or now_utc()
+    local = to_local(dt)
+    delta = (to_local(now).date() - local.date()).days
+    date = weekday_date_text(local)
+    if delta == 0:
+        return f"Today · {date}"
+    if delta == 1:
+        return f"Yesterday · {date}"
+    return date
+
+
 def scrubber_label(dt: datetime, _now: datetime | None = None) -> str:
     """Format a UTC-naive scrubber position as a local day-context tick label.
 
