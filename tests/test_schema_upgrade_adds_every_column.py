@@ -205,6 +205,16 @@ ORIGINAL_COLUMNS: dict[str, frozenset[str]] = {
     }),
     "playback_weekly": frozenset({"provider_id", "week_start", "outcome", "count"}),
     "connection_holds": frozenset({"id", "provider_id", "refused_at", "seconds"}),
+    # Created whole by create_all() (the game finder, hockey first) — no ALTERs.
+    "games": frozenset({
+        "id", "sport", "league", "team_a", "team_b", "start_utc", "level", "replay",
+        "collections", "found_at",
+    }),
+    "game_feeds": frozenset({
+        "id", "game_id", "channel_id", "source", "collection", "name", "from_guide",
+        "time_from", "start_utc", "counts",
+    }),
+    "game_finder_memory": frozenset({"finder", "memory", "updated_at"}),
     "tags": frozenset({
         "id", "type", "value",
     }),

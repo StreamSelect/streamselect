@@ -51,6 +51,7 @@ from streamselect.core.catalog_refresh import (
     live_refresh_due,
 )
 from streamselect.core.repositories import RepositoryFactory
+from streamselect.gui.game_tracker import GAME_TRACKER_LAUNCH_DELAY_MS, GameTracker
 
 #: Hourly tick interval, in milliseconds — see _maybe_auto_refresh_catalogs.
 CATALOG_REFRESH_TICK_MS = 60 * 60 * 1000
@@ -91,6 +92,14 @@ class _CatalogRefreshTickMixin:
         self._register_cleanable(
             "live_refresh_timer", self._live_refresh_timer.stop
         )
+
+        # Games (two sides + a start) are re-found from the stored listings
+        # whenever they change: a drained refresh queue or a guide refresh.
+        self.game_tracker = GameTracker(self.db, parent=self)
+        self._register_cleanable("game_tracker", self.game_tracker.shutdown)
+        self.refresh_queue_manager.all_refreshes_finished.connect(self.game_tracker.request)
+        self.epg_manager.refresh_finished.connect(self.game_tracker.request)
+        QTimer.singleShot(GAME_TRACKER_LAUNCH_DELAY_MS, self.game_tracker.request)
 
     def _mark_catalog_refreshed(self, provider_id: str | None, kind: str = "full") -> None:
         """Stamp the refresh timestamp(s) on a SUCCESSFUL refresh (SPORT-7/LIVE-1).

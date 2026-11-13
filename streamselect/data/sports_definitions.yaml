@@ -218,3 +218,17 @@ league_keywords:
     - super rugby
   WWE:
     - wwe
+
+# game_finder_leagues:
+#   Sport -> league -> the starting words for finding that league's GAMES (two sides
+#   + a start), matched as whole words against channel names, collection names and
+#   guide titles. Only league words: no source, collection or channel name ever goes
+#   here. Each league is found ON ITS OWN: one pass over several leagues mixes their
+#   team names (a college side read as a minor-league team) and a bare sport word
+#   pulls in other sports ("HOCKEY" matched field hockey). A league is listed only
+#   after it passes the method's test: zero false Level 1 games over 4+ snapshots,
+#   checked against an official schedule.
+game_finder_leagues:
+  hockey:
+    NHL:
+      - NHL

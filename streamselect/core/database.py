@@ -1339,8 +1339,8 @@ class Database:
         logger.info("Database connection closed")
 
 
-# Models defined beside their concern, registered on ``Base`` by this import
-# (so ``create_all`` sees them) and re-exported for the existing import sites.
+# Models beside their concern register on ``Base`` by these imports (so ``create_all`` sees them).
+from streamselect.core.games.models import GameDB, GameFeedDB, GameFinderMemoryDB  # noqa: E402
 from streamselect.core.playback_models import PlaybackEventDB, PlaybackWeeklyDB, StreamInfoDB  # noqa: E402
-
-__all__ = ["Base", "Database", "JSONEncoded", "PlaybackEventDB", "PlaybackWeeklyDB", "StreamInfoDB"]
+__all__ = ["Base", "Database", "JSONEncoded", "GameDB", "GameFeedDB", "GameFinderMemoryDB",
+           "PlaybackEventDB", "PlaybackWeeklyDB", "StreamInfoDB"]

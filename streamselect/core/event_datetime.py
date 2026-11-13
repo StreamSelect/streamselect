@@ -232,6 +232,33 @@ def _zone_offset_min(tz_name: "Optional[str]") -> int:
     return _EVENT_TZ_OFFSET_MIN.get((tz_name or "").upper(), 0)
 
 
+#: North American region labels ("8:05 PM ET"): a REGION, not an offset, so the
+#: daylight-saving switch is the zone database's job, never a fixed number here.
+_REGION_ZONES: dict[str, str] = {
+    "ET": "America/New_York", "CT": "America/Chicago",
+    "MT": "America/Denver", "PT": "America/Los_Angeles",
+}
+
+#: Every zone label :func:`zone_label_to_utc` understands, for building a matcher.
+ZONE_LABELS: frozenset[str] = frozenset(_EVENT_TZ_OFFSET_MIN) | frozenset(_REGION_ZONES)
+
+
+def zone_label_to_utc(naive: datetime, label: str) -> "Optional[datetime]":
+    """A wall-clock time stated with a zone label, as UTC-naive; None if unknown.
+
+    The one conversion for a stated label: fixed offsets come from
+    ``_EVENT_TZ_OFFSET_MIN`` (ambiguous labels such as CST are deliberately
+    absent and return None), region labels from the zone database.
+    """
+    key = (label or "").upper()
+    if key in _EVENT_TZ_OFFSET_MIN:
+        return naive - timedelta(minutes=_EVENT_TZ_OFFSET_MIN[key])
+    if key in _REGION_ZONES:
+        aware = naive.replace(tzinfo=ZoneInfo(_REGION_ZONES[key]))
+        return aware.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    return None
+
+
 def _startstop_utc(year: str, month: str, day: str,
                    hour: str, minute: str) -> "Optional[datetime]":
     """One slot-form timestamp: UTC in the name, UTC-naive out.
