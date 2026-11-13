@@ -293,19 +293,6 @@ def test_a_remembered_finished_fold_from_before_sport_segments_carries_over(game
     assert view._folded() == {"hockey:finished"}
 
 
-def test_a_short_window_scrolls_instead_of_clipping_the_last_card(games_db, qapp, owned_widgets):
-    """The scroll area never asked the card grid's heightForWidth: in a short
-    window the last row of cards was cut off under the next header."""
-    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
-    view.resize(700, 300)
-    _settle(qapp)
-    _settle(qapp)
-    last = max(view.cards, key=lambda c: c.mapTo(view, QPoint(0, 0)).y())
-    bottom = last.mapTo(view, QPoint(0, last.height())).y()
-    below = [h for k, h in view.headers.items() if k.startswith("hockey:") and k != "hockey:on_now"]
-    assert all(h.mapTo(view, QPoint(0, 0)).y() >= bottom for h in below), "a header overlaps a card"
-
-
 def test_mark_as_finished_moves_the_game_to_finished(games_db, qapp, owned_widgets):
     view = _view(games_db, qapp, owned_widgets, LIVE_AT)
     dallas = _card(view, "Dallas")

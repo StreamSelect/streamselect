@@ -50,18 +50,6 @@ SORT_EARLIEST, SORT_LATEST = "earliest", "latest"
 FINISHED = "finished"
 
 
-class _CardGrid(QWidget):
-    """The wrapping card grid. Holds the height its rows need at its width: the scroll
-    area does not ask a layout's heightForWidth, so in a short window it squeezed the
-    grid to one card's height and the last row was cut off under the next header."""
-
-    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
-        need = self.layout().heightForWidth(self.width())
-        if need > 0 and self.minimumHeight() != need:
-            self.setMinimumHeight(need)
-        super().resizeEvent(event)
-
-
 def _game_key(g: GameDTO) -> tuple:
     return (g.league, g.team_a, g.team_b, g.start_utc)
 
@@ -267,7 +255,7 @@ class SportsView(ContentView):
                 self._layout.addWidget(self._card(g, state, now, expanded=True))
             rest = [gs for gs in on_now if gs not in opened]
             if rest:
-                grid_host = _CardGrid()
+                grid_host = QWidget()
                 grid = FlowLayout(grid_host, spacing=10)
                 for g, state in rest:
                     grid.addWidget(self._card(g, state, now))
