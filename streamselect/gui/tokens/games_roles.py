@@ -42,10 +42,6 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
         "GAME_PLAYING": (
             f"color: {_('COLOR_OK')}; font-size: {_('FONT_SM')}; font-weight: bold; letter-spacing: 1px;"
         ),
-        "GAME_PLAYING_NAME": f"color: {_('COLOR_OK')}; font-weight: bold;",
-        "GAME_TITLE": (
-            f"color: {_('COLOR_TEXT_HI')}; font-size: {_('FONT_LG')}; font-weight: 600;"
-        ),
         "GAME_LIVE_TAG": (
             f"color: {_('COLOR_ACCENT')}; font-size: {_('FONT_SM')}; font-weight: bold;"
             " letter-spacing: 1px;"

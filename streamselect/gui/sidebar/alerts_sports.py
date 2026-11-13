@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QHBoxLayout, QListWidgetItem, QWidget
+from loguru import logger
 
 from streamselect.core.epg_utils import is_local_today, now_utc, to_local
 from streamselect.core.games.alerts import load_alerts, waiting_events, watched_game_ids
@@ -94,7 +95,8 @@ class SportsGroupMixin:
                     waiting = waiting_events(games, alerts, now_utc(), settings,
                                              watched_game_ids(session, games))
                     return waiting, (load_watch_history(session) if waiting else {})
-            except Exception:  # noqa: BLE001 — a failed read keeps the last rows
+            except Exception as exc:  # noqa: BLE001 — any failure: keep the last rows
+                logger.warning("Watch Alerts Sports: could not read alerted events: {}", exc)
                 return None
         try:
             future = executor.submit(work)
@@ -163,13 +165,10 @@ class SportsGroupMixin:
         if cid:
             self.alertClicked.emit(cid)
 
-    # ── the section's shared tick and play marker ────────────────────────
-    def _tick(self) -> None:
-        super()._tick()
-        if self.__dict__.get("is_collapsed") or not self.__dict__.get("_sports_rows"):
-            return
-        now = now_utc()
-        for row, _game in self._sports_rows:
+    # ── the section's shared tick and play marker ─────────────────────────
+    def _tick_other_groups(self, now) -> None:
+        """The EPG tick's hook: Sports rows on the same instant as the EPG rows."""
+        for row, _game in self.__dict__.get("_sports_rows", ()):
             row.refresh_time(now)
 
     def set_playing(self, channel_id: str | None) -> None:

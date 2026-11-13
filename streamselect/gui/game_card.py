@@ -79,7 +79,7 @@ class ChannelRow(QWidget):
         row.setSpacing(4)
         if playing:
             mark = QLabel()
-            _theme.style(mark, "GAME_PLAYING_NAME")
+            _theme.style(mark, "ALERT_NEW_MATCH_BADGE")
             _icon_utils.set_label_icon(mark, "play", 12)
             row.addWidget(mark)
         if feed.region:
@@ -94,7 +94,7 @@ class ChannelRow(QWidget):
             row.addWidget(self.report_icon)
         self.name = QLabel(feed.station)
         self.name.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        _theme.style(self.name, "GAME_PLAYING_NAME" if playing else
+        _theme.style(self.name, "ALERT_NEW_MATCH_BADGE" if playing else
                      "TEXT_SM_MUTED" if hidden else "CHANNEL_NAME_LIVE")
         row.addWidget(self.name, 1)
         if feed.from_guide:
@@ -363,7 +363,7 @@ class GameCard(QFrame):
 
         self.title = QLabel(game.title)
         self.title.setWordWrap(True)
-        _theme.style(self.title, "GAME_TITLE")
+        _theme.style(self.title, "PANEL_HEADLINE")
         lay.addWidget(self.title)
         if live:
             stop = game.start_utc + usual_length
@@ -386,7 +386,7 @@ class GameCard(QFrame):
         pl.setSpacing(5)
         if live:
             mark = QLabel()
-            _theme.style(mark, "GAME_PLAYING_NAME" if playing else "GAME_LIVE_TAG")
+            _theme.style(mark, "ALERT_NEW_MATCH_BADGE" if playing else "GAME_LIVE_TAG")
             _icon_utils.set_label_icon(mark, "play", 12)
             pl.addWidget(mark)
             if playing:

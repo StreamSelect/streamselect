@@ -22,6 +22,8 @@ from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
+from loguru import logger
+
 from streamselect.core.epg_utils import browse_day_separator_label, fmt_time, now_utc, past_day_label, to_local
 from streamselect.core.games.read import (
     event_is_live as event_live,
@@ -182,6 +184,11 @@ class SportsView(ContentView):
         self._raw, self._history, self._alerts = list(games or []), dict(history or {}), list(alerts or [])
         self._loaded = True
         self._render()
+
+    def _write_failed(self, what: str, exc: Exception) -> None:
+        """A write raised: log it, and re-read so the view shows what is really stored."""
+        logger.warning("Sports: could not save {}: {}", what, exc)
+        self.reload()
 
     def _on_error(self, _exc: Exception) -> None:
         self._raw, self._loaded = [], True
@@ -542,7 +549,7 @@ class SportsView(ContentView):
         def done(_r) -> None:
             self.reload()
             self.alertsChanged.emit()
-        self._run_query(write, done, commit=True)
+        self._run_query(write, done, commit=True, on_error=lambda exc: self._write_failed("the alert", exc))
 
     def _report(self, game: GameDTO, feed, kind: str) -> None:
         """Record a channel report against its collection, for this league (SV-Q37)."""
@@ -562,4 +569,5 @@ class SportsView(ContentView):
     def _mark_finished(self, game: GameDTO) -> None:
         ended = self._clock()
         self._run_query(lambda repos: mark_finished(repos.session, game, ended),
-                        lambda _r: self.reload(), commit=True)
+                        lambda _r: self.reload(), commit=True,
+                        on_error=lambda exc: self._write_failed("Mark as finished", exc))

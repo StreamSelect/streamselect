@@ -890,6 +890,11 @@ class EpgGroupMixin:
         # goes stale on the same schedule. Same ``now``, so it cannot drift
         # from the rows by a tick.
         self._refresh_upcoming_tail(now)
+        # The section's other time-bound group (Sports) on the same instant.
+        self._tick_other_groups(now)
+
+    def _tick_other_groups(self, now) -> None:
+        """Hook: another group's rows refreshed on the EPG tick's ``now``."""
 
     def _schedule_boundary(self, live_groups: dict, upcoming_only: dict) -> None:
         """Reload once, at the next instant the LIST ITSELF changes.

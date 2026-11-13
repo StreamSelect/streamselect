@@ -27,6 +27,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from streamselect.core.repositories.dtos import ChannelListDTO
+from tests.conftest import ConfigDefaultsFallback
 
 
 # ---------------------------------------------------------------------------
@@ -67,7 +68,7 @@ def _dto(**overrides) -> ChannelListDTO:
 # 1. Settings threshold round-trip
 # ---------------------------------------------------------------------------
 
-class _FakeThresholdConfig:
+class _FakeThresholdConfig(ConfigDefaultsFallback):
     """Minimal config stub with watch_complete_threshold."""
     def __init__(self, threshold: float = 0.9, partial_threshold: float = 0.10):
         self.player_mode = "single-instance"

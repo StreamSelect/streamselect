@@ -20,6 +20,7 @@ import pytest
 
 from streamselect.core.player_manager import PlayerManager
 from streamselect.gui.main_window import MainWindow
+from tests.conftest import ConfigDefaultsFallback
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +301,7 @@ def qapp():
     yield app
 
 
-class _FakeDlgConfig:
+class _FakeDlgConfig(ConfigDefaultsFallback):
     """Minimal SettingsDialog config stub including split_streams_by_source."""
 
     def __init__(self, split: bool = False):

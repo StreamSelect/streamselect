@@ -238,7 +238,7 @@ def _clock_samples(work: list[_L], anchors, memory: Memory, now: datetime, same_
         else:
             diff = ((h * 60 + m) - (a.hour * 60 + a.minute)) % 1440
             diff = diff - 1440 if diff >= 720 else diff
-        game_key = _title(pk) + "@" + a.strftime("%Y-%m-%d %H:%M")
+        game_key = _title(pk) + "@" + a.isoformat(sep=" ", timespec="minutes")   # a key, not a display
         fresh[(L.src.source, L.src.collection)][game_key] = (int(diff), now)
     merged = {k: dict(v) for k, v in memory.clock_samples.items()}
     for k, games in fresh.items():

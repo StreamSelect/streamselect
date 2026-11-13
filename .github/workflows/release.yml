@@ -331,6 +331,10 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
+          # One day: the file is also published to a release (or only handed to
+          # the next job). Kept 90 days, every push's copies filled the 0.5 GB
+          # Actions storage (2026-11-13).
+          retention-days: 1
           # Arch-unique so the two parallel matrix jobs don't collide.
           name: StreamSelect-${{ steps.meta.outputs.version }}-${{ matrix.arch }}-dmg
           path: ${{ steps.dmg.outputs.dmg }}

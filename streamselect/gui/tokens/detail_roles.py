@@ -73,10 +73,6 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
             f" border: none; font-size: {font_md}; padding: 2px 6px; }}"
             f"QPushButton:hover {{ color: {text_hi}; }}"
         ),
-        # "65 versions · 19 regions", right of the section heading.
-        "DETAIL_REGION_SUMMARY": (
-            f"color: {text}; font-size: {font_sm};"
-        ),
         # ── Section headers ──────────────────────────────────────────────
         # The chevron is a target, so it is legible at rest rather than
         # revealing itself on hover: unlike a Play button on one row of

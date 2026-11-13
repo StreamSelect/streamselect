@@ -10,6 +10,7 @@ Play, which plays the channel the event's card would play.
 from __future__ import annotations
 
 from PyQt6.QtCore import QObject, QTimer
+from loguru import logger
 
 from streamselect.core.epg_utils import now_utc
 from streamselect.core.games.alerts import due_notices, expired_event_rules, load_alerts, remove_alerts
@@ -56,7 +57,9 @@ class EventAlertNotifier(QObject):
             hidden = set(ProviderRepository(repos.session).get_hidden_provider_ids())
             games = [g for sp in sports for g in load_games(repos.session, sp, hidden, 1, 2)]
             return games, alerts, load_watch_history(repos.session)
-        self._host._run_query(query, self._on_data, commit=True)
+        # A failed read or rule clean-up is logged; the next poll (30 s) tries again.
+        self._host._run_query(query, self._on_data, commit=True,
+                              on_error=lambda exc: logger.warning("Event alerts: check failed: {}", exc))
 
     def _on_data(self, result) -> None:
         games, alerts, history = result if result else ([], [], {})

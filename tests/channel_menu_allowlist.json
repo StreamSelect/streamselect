@@ -64,6 +64,22 @@
     {
       "entry": "streamselect/gui/playback_menu.py::build_playback_menu",
       "reason": "playback settings, tracks and queue for the window behind the header readout - no channel row involved."
+    },
+    {
+      "entry": "streamselect/gui/game_card.py::AlertBell.build_menu",
+      "reason": "Sports event-alert rules (this event / either team / whenever they meet) - event-shaped, not channel-shaped."
+    },
+    {
+      "entry": "streamselect/gui/game_card.py::ChannelRow._hide_menu",
+      "reason": "hide a COLLECTION from one league's games (the eye on a game's channel row) - league/collection axis, not a channel."
+    },
+    {
+      "entry": "streamselect/gui/game_card.py::ChannelRow.build_context_menu",
+      "reason": "a game's channel row: prefer/hide for this league, report didn't play / wrong content for this game - keyed on the collection and the game. Its one channel-level action (Hide this channel everywhere) should come from the registry: ledger D75."
+    },
+    {
+      "entry": "streamselect/gui/game_card.py::GameCard.contextMenuEvent",
+      "reason": "game card menu (Mark as finished) - game-shaped, not channel-shaped."
     }
   ]
 }

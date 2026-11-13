@@ -558,13 +558,10 @@ VECTOR_KEYS: dict[str, str] = {
     "explore": "mdi6.arrow-right",
     "columns": "mdi6.arrow-expand",
     "settings": "mdi6.cog-outline",
-    # The sidebar Recommended header's way into the Recommended view (owner,
-    # 2026-11-12): the view is where the user tunes what gets recommended, so
-    # it wears a gear. Its own role, as "manage" is beside "recipe".
-    "recommended_settings": "mdi6.cog-outline",
     # A channel the user reported in a Sports event (didn't play / wrong content):
-    # a flag — "someone flagged this", not the general "warning" triangle.
-    "reported": "mdi6.flag-outline",
+    # a flag — "someone flagged this", not the general "warning" triangle; the
+    # variant flag, since the plain one is already qa_flag's.
+    "reported": "mdi6.flag-variant-outline",
     "tools": "mdi6.wrench-outline",
     "split": "mdi6.view-split-vertical",
     # Universal disclosure convention: closed shows a RIGHT chevron, open shows

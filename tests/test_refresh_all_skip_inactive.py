@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
+from tests.conftest import ConfigDefaultsFallback
 
 
 # ---------------------------------------------------------------------------
@@ -353,7 +354,7 @@ def test_settings_checkbox_saves_to_config(qapp):
 def _minimal_config(*, refresh_all_includes_inactive: bool = True):
     """Minimal config stub that satisfies _load_values and _save_values."""
 
-    class _Cfg:
+    class _Cfg(ConfigDefaultsFallback):
         player_mode = "single-instance"
         autoplay_season_episodes = True
         playback_resume_mode = "resume"

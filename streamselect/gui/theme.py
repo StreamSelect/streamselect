@@ -1093,14 +1093,6 @@ def _build_semantic_constants() -> dict[str, object]:
         " letter-spacing: 2px; padding: 6px 4px 4px 4px;"
     )
 
-    # A facet row in the pantry — idle state
-    RECIPE_FACET_ROW = (
-        "QPushButton { border: none; background: transparent;"
-        " color: " + COLOR_RECIPE_TEXT + "; font-size: " + FONT_MD + ";"
-        " text-align: left; padding: 5px 8px; border-radius: " + RADIUS_SM + "; }"
-        "QPushButton:hover { background: " + OVERLAY_05 + "; }"
-    )
-
     # A facet row in the pantry — selected/active state
     RECIPE_FACET_ROW_SELECTED = (
         "QPushButton { border: none; background: " + OVERLAY_RECIPE_SELECTED + ";"
@@ -1109,12 +1101,9 @@ def _build_semantic_constants() -> dict[str, object]:
         " border-left: 2px solid " + COLOR_FACET_REGION + "; }"
     )
 
-    # Center stage header (facet name + count subtitle)
+    # Center stage header (facet name)
     RECIPE_STAGE_HDR = (
         "font-size: " + FONT_2XL + "; font-weight: bold; color: " + COLOR_RECIPE_TEXT + ";"
-    )
-    RECIPE_STAGE_SUBTITLE = (
-        "font-size: " + FONT_MD + "; color: " + COLOR_RECIPE_MUTED + ";"
     )
 
     # Right recipe rail background

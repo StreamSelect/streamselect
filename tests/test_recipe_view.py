@@ -820,10 +820,8 @@ def test_recipe_semantic_constants_non_empty():
     constants = [
         "RECIPE_PANTRY_BG",
         "RECIPE_PANTRY_HDR",
-        "RECIPE_FACET_ROW",
         "RECIPE_FACET_ROW_SELECTED",
         "RECIPE_STAGE_HDR",
-        "RECIPE_STAGE_SUBTITLE",
         "RECIPE_RAIL_BG",
         "RECIPE_RAIL_HDR",
         "RECIPE_EDITORIAL_NAME",

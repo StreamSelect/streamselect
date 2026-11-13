@@ -104,7 +104,7 @@ class RecommendedSection(CollapsibleSection):
         header, boxed like the other header buttons (``PANEL_BTN``).
         """
         self.open_view_button = _icon_utils.icon_button(
-            "recommended_settings",
+            "settings",                       # the app's gear: this opens where Recommended is tuned
             "Open Recommended: what it has learned you like, and why titles are picked",
             style="PANEL_BTN", px=14)
         self.open_view_button.setFixedSize(22, 20)  # structural — matches the other header buttons

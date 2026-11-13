@@ -40,6 +40,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from tests.conftest import wire_status_method, wire_streaming_db
+from tests.conftest import ConfigDefaultsFallback
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +113,7 @@ def _submitted_start_seconds(host) -> int:
 # 1–4. Settings dialog load/save
 # ---------------------------------------------------------------------------
 
-class _FakeSettingsConfig:
+class _FakeSettingsConfig(ConfigDefaultsFallback):
     """Minimal config stub for SettingsDialog playback-tab tests."""
 
     def __init__(self, playback_resume_mode: str = "resume"):

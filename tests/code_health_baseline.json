@@ -23,7 +23,7 @@
     "streamselect/gui/qa_checklist_window.py": 2450,
     "streamselect/gui/settings_dialog_tabs.py": 1107,
     "streamselect/gui/sidebar/base.py": 1420,
-    "streamselect/gui/theme.py": 2415
+    "streamselect/gui/theme.py": 2408
   },
   "get_session_calls": 68
 }

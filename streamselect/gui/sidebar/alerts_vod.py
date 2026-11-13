@@ -506,6 +506,9 @@ class MoviesSeriesMixin:
             else:
                 self.title_label.setToolTip("")
             self._clear_all_btn.setVisible(clearable > 0)
+            # The per-kind header badges (NK-1) read the same counters: update them
+            # now, not a layout pass later.
+            self._refresh_news_badges()
         except (AttributeError, RuntimeError):
             return  # header not built (e.g. __new__ test stub) — nothing to update
 

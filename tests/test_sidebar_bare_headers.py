@@ -96,7 +96,9 @@ class TestTheHeadersAreBare:
         html = section.title_label.text()
         assert html == "<b>Watch Alerts</b>", html
         assert _theme.COLOR_OK not in html, "the green state dot is back in the title"
-        assert "2" in section._status_label.text(), "the count lost its pill"
+        # The count is a filled badge per kind now (NK-1): movies, here, with no "+".
+        movies = section._news_badges["movies"]
+        assert movies.isVisibleTo(section) and movies.text() == "2", "the count lost its pill"
 
     def test_the_dot_builder_is_gone_entirely(self):
         """Not merely unused — a second title builder is how the five drifted."""
