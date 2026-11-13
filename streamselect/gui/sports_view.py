@@ -100,7 +100,7 @@ class SportsView(ContentView):
         self._layout.setContentsMargins(16, 12, 16, 16)
         self._layout.setSpacing(8)
         self.cards: list[GameCard] = []
-        self.rows: list[QPushButton] = []
+        self.rows: list[QWidget] = []          # a QPushButton, or a QLabel for an earlier day's finished game
         self.headers: dict[str, QWidget] = {}
         self._render()          # "Loading games…" until the first read comes back
 
@@ -289,9 +289,10 @@ class SportsView(ContentView):
                 by_day: dict = {}
                 for g in done:
                     by_day.setdefault(to_local(g.start_utc).date(), []).append(g)
+                today = to_local(now).date()
                 if len(by_day) == 1:
                     for g in done:
-                        self._game_row(g, playable=True)
+                        self._game_row(g, playable=True, openable=to_local(g.start_utc).date() == today)
                 else:
                     # Games that finished on different days: one sub-section per day,
                     # most recent first (owner, 2026-11-13).
@@ -302,7 +303,7 @@ class SportsView(ContentView):
                             foldable=True, sub=True))
                         if sub not in folded:
                             for g in gs:
-                                self._game_row(g, playable=True)
+                                self._game_row(g, playable=True, openable=day == today)
 
     def _message(self, headline: str, body: str) -> None:
         h = QLabel(headline)
@@ -426,21 +427,33 @@ class SportsView(ContentView):
             lst.hidden_button.clicked.connect(lambda _=False, k=_game_key(g): self._toggle_show_hidden(k))
         return lst
 
-    def _game_row(self, g: GameDTO, *, playable: bool) -> None:
-        """A later or finished game: one row; click opens its channel list beneath it (SV-Q23)."""
+    def _game_row(self, g: GameDTO, *, playable: bool, openable: bool = True) -> None:
+        """A later or finished game: one row; click opens its channel list beneath it (SV-Q23).
+
+        ``openable=False`` is a game that finished on an earlier day: its channels have
+        moved on, so the row is plain text with no list to open (owner, 2026-11-13).
+        """
         when = fmt_time(g.start_utc)
-        row = QPushButton(f"{when}    {g.title}    ·  {g.league}")
-        _theme.style(row, "GAME_FEED_ROW")
+        text = f"{when}    {g.title}    ·  {g.league}"
+        is_open = openable and _game_key(g) == self._open
+        if openable:
+            row = QPushButton(text)
+            _theme.style(row, "GAME_FEED_ROW")
+            row.setToolTip("Fold its channel list" if is_open else "List every channel that will show this game")
+            row.clicked.connect(lambda _=False, game=g: self._toggle_open(game))
+        else:
+            row = QLabel(text)
+            _theme.style(row, "GAME_ROW_PAST")
+            row.setToolTip("Finished on an earlier day")
         row.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        is_open = _game_key(g) == self._open
-        row.setToolTip("Fold its channel list" if is_open else "List every channel that will show this game")
-        row.clicked.connect(lambda _=False, game=g: self._toggle_open(game))
         line = QWidget()
         h = QHBoxLayout(line)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(4)
         h.addWidget(row, 1)
-        bell = AlertBell(g, alerts_for(g, self._alerts))
+        # A finished game's bell offers only team and matchup alerts: "this game"
+        # means nothing once it is over (owner, 2026-11-13).
+        bell = AlertBell(g, alerts_for(g, self._alerts), over=playable)
         bell.toggled_rule.connect(self._set_alert)
         if bell.covering and not playable:
             on = QLabel("ALERT ON")            # words with the colour (B2)

@@ -233,15 +233,21 @@ class AlertBell(QPushButton):
     ``alert`` bell in the accent. Click toggles an alert for THIS event;
     right-click offers this event / every event of either side / whenever these
     two meet, each a check item.
+
+    ``over``: the event has finished. "This event" means nothing then, but a team or
+    matchup alert does (owner, 2026-11-13), so the bell offers only those, and a
+    click opens that menu.
     """
 
     toggled_rule = pyqtSignal(object, str, str, bool)   # GameDTO, kind, side, on
 
-    def __init__(self, game: GameDTO, covering: list, parent=None):
+    def __init__(self, game: GameDTO, covering: list, parent=None, *, over: bool = False):
         super().__init__(parent)
         from streamselect.core.games.alerts import EITHER_SIDE, THESE_TWO, THIS_EVENT, rule_for
         self.game = game
-        self.covering = list(covering)
+        self._over = over
+        # Over: a one-event rule still on file for it (until it expires) lights nothing.
+        self.covering = [a for a in covering if not (over and a.event)]
         self.setFlat(True)
         self.setFixedWidth(26)
         on = bool(self.covering)
@@ -249,10 +255,14 @@ class AlertBell(QPushButton):
             _icon_utils.set_button_icon(self, "alert", color=_theme.COLOR_ACCENT)
         else:
             _icon_utils.set_button_icon(self, "monitor_off")
-        self.setToolTip("Alert set — click to stop alerting for this event; right-click for more"
-                        if on else "Alert me before this event starts (right-click for more)")
-        self._kinds = [(THIS_EVENT, "", "Alert me for this event"),
-                       (EITHER_SIDE, game.team_a, f"Alert me for every {game.team_a} event"),
+        if over:
+            self.setToolTip("Alerting for these teams' events — click to change" if on
+                            else "Alert me for these teams' next events")
+        else:
+            self.setToolTip("Alert set — click to stop alerting for this event; right-click for more"
+                            if on else "Alert me before this event starts (right-click for more)")
+        self._kinds = [] if over else [(THIS_EVENT, "", "Alert me for this event")]
+        self._kinds += [(EITHER_SIDE, game.team_a, f"Alert me for every {game.team_a} event"),
                        (EITHER_SIDE, game.team_b, f"Alert me for every {game.team_b} event"),
                        (THESE_TWO, "", f"Alert me whenever {game.team_a} meet {game.team_b}")]
         self._rule_for = rule_for
@@ -265,7 +275,7 @@ class AlertBell(QPushButton):
 
     def _toggle_this(self) -> None:
         from streamselect.core.games.alerts import THIS_EVENT
-        if self.covering and not self._has(THIS_EVENT, ""):
+        if self._over or (self.covering and not self._has(THIS_EVENT, "")):
             self.build_menu().exec(self.mapToGlobal(QPoint(0, self.height())))
             return
         self.toggled_rule.emit(self.game, THIS_EVENT, "", not self._has(THIS_EVENT, ""))

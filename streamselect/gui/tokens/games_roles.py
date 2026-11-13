@@ -57,6 +57,12 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
             f" font-size: {_('FONT_MD')}; }}"
             f"QPushButton:hover {{ background: {_('OVERLAY_ACCENT_35')}; color: {_('COLOR_TEXT_HI')}; }}"
         ),
+        # A finished game from an earlier day: the same line as GAME_FEED_ROW, but plain
+        # text — its channels have moved on, so nothing to open (owner, 2026-11-13).
+        "GAME_ROW_PAST": (
+            f"color: {_('COLOR_TEXT')}; padding: 5px 8px; font-size: {_('FONT_MD')};"
+            f" background: transparent;"
+        ),
         # "EPG": this listing came from the programme guide, which is less reliable.
         "GAME_GUIDE_CHIP": (
             f"color: {_('COLOR_MUTED_2')}; border: 1px solid {_('COLOR_BORDER')};"

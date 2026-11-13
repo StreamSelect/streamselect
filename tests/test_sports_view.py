@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import QLabel, QPushButton
 from streamselect.core.games.read import (
     ENDING, ON_NOW, OVER, UPCOMING, GameDTO, GameFeedDTO, arrange_feeds, game_state, load_games,
 )
+from streamselect.core.epg_utils import to_local
 from streamselect.core.games.store import enabled_leagues, refresh_games
 from streamselect.core.repositories import RepositoryFactory
 from streamselect.gui.sidebar.base import GroupHeading
@@ -371,6 +372,41 @@ def test_finished_games_from_different_days_get_a_sub_section_per_day(games_db, 
     view._toggle_fold(days[1])
     _settle(qapp)
     assert days[1] in view._folded() and days[1] in view.headers
+
+
+def test_only_todays_finished_games_open_a_channel_list(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-13: a game that finished on an earlier day has no channels worth
+    opening; one that finished today might still be on (it ran late)."""
+    _copy_game_a_day_earlier(games_db, "Buffalo Sabres")
+    later = START + timedelta(hours=4)          # every game over; still START's local day
+    assert to_local(later).date() == to_local(START).date()
+    view = _view(games_db, qapp, owned_widgets, later)
+    view._toggle_fold("hockey:finished")
+    _settle(qapp)
+    today = to_local(later).date()
+    past = [r for r in view.rows if "Ottawa Senators" in r.text()]
+    same_day = [r for r in view.rows if "Ottawa Senators" not in r.text()]
+    assert past and same_day
+    earlier_day_rows_are_today = to_local(START - timedelta(days=1)).date() == today
+    assert not earlier_day_rows_are_today
+    assert all(isinstance(r, QLabel) for r in past), "an earlier day's game is plain text"
+    assert all(isinstance(r, QPushButton) for r in same_day), "today's still open their channels"
+    same_day[0].click()
+    _settle(qapp)
+    assert view._open is not None, "today's finished game opens its channel list"
+
+
+def test_a_finished_games_bell_offers_only_team_and_matchup_alerts(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-13: an alert for a game that is over has no point, but an alert
+    for its teams does."""
+    view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=4))
+    view._toggle_fold("hockey:finished")
+    _settle(qapp)
+    row = next(r for r in view.rows if "Sabres" in r.text())
+    labels = [a.text() for a in row.bell.build_menu().actions()]
+    assert labels and not any("this event" in t for t in labels), labels
+    assert any("every Buffalo Sabres event" in t for t in labels)
+    assert any("whenever" in t for t in labels)
 
 
 def test_finished_games_all_from_one_day_have_no_sub_section(games_db, qapp, owned_widgets):
