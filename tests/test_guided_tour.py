@@ -156,12 +156,22 @@ def _legend_stop(tour):
 
 
 def _mark_colour(label):
-    from PyQt6.QtGui import QColor
-    image = label.pixmap().toImage()
-    inked = [QColor(image.pixel(x, y)) for x in range(image.width())
-             for y in range(image.height()) if QColor.fromRgba(image.pixel(x, y)).alpha() > 200]
-    assert inked, f"{label.objectName()} draws nothing"
-    return inked[len(inked) // 2].name()
+    """The colour the mark is drawn in: its most common most-opaque pixel.
+
+    Read as straight (not premultiplied) ARGB, from the most opaque pixels. On
+    macOS the pixmap is premultiplied and high-DPI, so an edge pixel at ~84%
+    alpha read back darker (#8d96a2 for #a7b2c0) and failed the release run.
+    """
+    from collections import Counter
+
+    from PyQt6.QtGui import QColor, QImage
+    image = label.pixmap().toImage().convertToFormat(QImage.Format.Format_ARGB32)
+    pixels = [QColor.fromRgba(image.pixel(x, y)) for x in range(image.width())
+              for y in range(image.height())]
+    top = max((c.alpha() for c in pixels), default=0)
+    assert top > 200, f"{label.objectName()} draws nothing"
+    solid = [c.name() for c in pixels if c.alpha() >= top - 8]
+    return Counter(solid).most_common(1)[0][0]
 
 
 def test_the_row_kinds_stop_shows_each_mark_as_the_list_paints_it(host, qapp):
