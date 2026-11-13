@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QPushButton, QSizePolicy, QAbstractScrollArea, QListWidget, QTreeWidget
 
-from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
+from PyQt6.QtCore import QPoint, Qt, QSize, QTimer, pyqtSignal
 
 from streamselect.gui import cursor_affordance
 from streamselect.gui.chip_row import CHIP_NEWS, _news_chip_style, chip_widget
@@ -235,6 +235,7 @@ class WatchAlertsSection(
         room for five rows.
         """
         return (
+            self.__dict__.get("_sports_list"),
             self.__dict__.get("_vod_list"),
             self.__dict__.get("_retry_list"),
         )
@@ -262,6 +263,7 @@ class WatchAlertsSection(
         """
         super().reapply_row_budget()
         for view in (self.__dict__.get("alerts_tree"),
+                     self.__dict__.get("_sports_list"),
                      self.__dict__.get("_vod_list"),
                      self.__dict__.get("_retry_list")):
             if view is not None:
@@ -565,7 +567,18 @@ class WatchAlertsSection(
             elif kind == "series" and self._series_collapsed:
                 self._toggle_series_group()
             target = self.__dict__.get("_vod_headings", {}).get(kind) or self._vod_list
-        QTimer.singleShot(0, lambda: self.content_scroll.ensureWidgetVisible(target, 0, 0))
+        QTimer.singleShot(0, lambda: self._scroll_to_top(target))
+
+    def _scroll_to_top(self, target: QWidget) -> None:
+        """Scroll so *target* is at the TOP of the section, its rows below it.
+
+        Not ``ensureWidgetVisible``: scrolling down, that moves only far enough to
+        show the widget, which leaves a group's heading on the bottom edge with
+        every row of it out of sight (owner report).
+        """
+        self.reapply_row_budget()
+        y = target.mapTo(self.content_widget, QPoint(0, 0)).y()
+        self.content_scroll.verticalScrollBar().setValue(y)
 
     # ------------------------------------------------------------------
     # Retry helpers

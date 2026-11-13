@@ -25,6 +25,9 @@ ENTRY = WhatsNewEntry(
         "With a sports alert waiting, the Watch Alerts header shows a green badge with the "
         "sports icon and a number, with no plus sign. Collapse the Sports group, then click the "
         "badge: the group opens.",
+        "Make Watch Alerts short enough to scroll, then click the series badge: the Series "
+        "heading moves to the top of the section with its rows below it. The Sports group ends "
+        "right after its last row, with no blank space before the next group.",
         "Tools ▸ Take the tour: a Watch Alerts stop lists the movie, series and sports badges "
         "with their icons.",
     ),

@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import timedelta
 
 import pytest
+from PyQt6.QtCore import QPoint
 from PyQt6.QtWidgets import QPushButton
 
 from streamselect.core.games.alerts import (
@@ -172,3 +173,36 @@ def test_a_bell_rule_for_either_side_lists_every_game_of_that_team(section, game
     with games_db.session_scope() as s:
         assert [a.sides for a in load_alerts(s)] == [(g.team_a,)]
     assert section._sports_list.count() >= 1
+
+
+def _series(cid, title, unseen):
+    return {"series_channel_id": cid, "source_id": "s", "provider_id": "p1", "title": title,
+            "display_title": title, "unseen_new": unseen, "baseline_episode_count": 10,
+            "last_checked": None}
+
+
+def test_the_sports_list_is_as_tall_as_its_rows(section, games_db, qapp):
+    _alert_sabres(games_db)
+    section.load()
+    section.reapply_row_budget()
+    qapp.processEvents()
+    lst = section._sports_list
+    rows = sum(lst.sizeHintForRow(i) for i in range(lst.count()))
+    assert rows > 0 and lst.height() <= rows + 2 * lst.frameWidth() + 4, (
+        f"list {lst.height()}px for {rows}px of rows: blank space under Sports")
+
+
+def test_a_badge_scrolls_its_group_heading_to_the_top(section, games_db, qapp):
+    _alert_sabres(games_db)
+    section.config.monitored_series = [_series(f"s{i}", f"Show {i}", 3) for i in range(8)]
+    section.refresh_vod_rules()
+    section.load()
+    section.resize(300, 180)
+    for _ in range(3):
+        qapp.processEvents()
+    section._news_badges["series"].click()
+    for _ in range(3):
+        qapp.processEvents()
+    heading = section._vod_headings["series"]
+    top = heading.mapTo(section.content_scroll.viewport(), QPoint(0, 0)).y()
+    assert abs(top) <= 2, f"the Series heading sits {top}px down the view, not at its top"
