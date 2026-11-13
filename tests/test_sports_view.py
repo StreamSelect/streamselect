@@ -284,6 +284,57 @@ def test_each_sport_is_its_own_segment_with_a_header_that_folds(games_db, qapp, 
     assert view.cards == [] and "hockey:on_now" not in view.headers, "the whole segment folds"
 
 
+def test_a_click_anywhere_on_the_sport_header_folds_it(games_db, qapp, owned_widgets):
+    """Owner report: only the word "Hockey" folded the segment, not the rest of its header."""
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    band = view.headers["sport:hockey"]
+    spot = QPoint(band.width() - 20, band.height() // 2)        # empty space at the right
+    QTest.mouseClick(band, Qt.MouseButton.LeftButton, pos=spot)
+    _settle(qapp)
+    assert "sport:hockey" in view._folded() and view.cards == []
+    band = view.headers["sport:hockey"]
+    meta = next(lb for lb in band.findChildren(QLabel) if "NHL" in lb.text())
+    QTest.mouseClick(meta, Qt.MouseButton.LeftButton)
+    _settle(qapp)
+    assert "sport:hockey" not in view._folded() and view.cards, "a click on the league line opens it"
+
+
+def test_a_section_header_folds_from_its_caret_its_label_or_empty_space_once_per_click(
+        games_db, qapp, owned_widgets):
+    """Owner report: clicking the caret did nothing; only the label folded the section."""
+    view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=5))
+    key = "hockey:finished"                       # foldable; starts folded (SV-Q21)
+    assert key in view.headers and key in view._folded()
+    view._toggle_fold(key)
+    _settle(qapp)
+
+    def click(widget, pos=None):
+        QTest.mouseClick(widget, Qt.MouseButton.LeftButton, pos=pos or widget.rect().center())
+        _settle(qapp)
+
+    band = view.headers[key]
+    caret = band.findChildren(QLabel)[0]                         # the first thing on the band
+    assert caret.mapTo(band, QPoint(0, 0)).x() < 20, "the caret leads the band"
+    click(caret)
+    assert key in view._folded(), "the caret folds"
+    click(view.headers[key], QPoint(view.headers[key].width() - 10, 8))
+    assert key not in view._folded(), "empty space unfolds"
+    from streamselect.gui.sidebar.base import GroupHeading
+    click(view.headers[key].findChild(GroupHeading))
+    assert key in view._folded(), "the label folds, exactly once per click"
+
+
+def test_on_now_folds_like_the_other_sections(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-13: On now folds too."""
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    assert view.cards, "games on now show as cards"
+    band = view.headers["hockey:on_now"]
+    QTest.mouseClick(band, Qt.MouseButton.LeftButton, pos=QPoint(8, band.height() // 2))
+    _settle(qapp)
+    assert "hockey:on_now" in view._folded() and view.cards == [], "folded: no cards"
+    assert "hockey:on_now" in view.headers, "the header stays to unfold it"
+
+
 def test_a_remembered_finished_fold_from_before_sport_segments_carries_over(games_db, qapp, owned_widgets):
     from streamselect.core.config import Config
     from streamselect.gui.sports_view import SportsView

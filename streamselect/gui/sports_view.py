@@ -31,6 +31,7 @@ from streamselect.core.games.read import (
 from streamselect.core.games.alerts import add_alert, alerts_for, load_alerts, remove_alerts, rule_for
 from streamselect.core.games.store import enabled_leagues, sport_settings
 from streamselect.core.repositories.provider import ProviderRepository
+from streamselect.gui import cursor_affordance
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
@@ -40,7 +41,8 @@ from streamselect.gui.flow_layout import FlowLayout
 from streamselect.gui.game_card import (
     HIDE_CHANNEL, HIDE_COLLECTION, HIDE_EVERYWHERE, AlertBell, ChannelList, GameCard,
 )
-from streamselect.gui.sidebar.base import GroupHeading
+from streamselect.gui.sidebar.base import GroupHeading, _ClickableHeader
+from streamselect.gui.similar_lightbox_card import _ClickableFrame
 
 #: Sports are not named here: every sport with a league in ``game_finder_leagues``
 #: gets its own section (owner, 2026-11-13: hockey is one segment, not the view).
@@ -247,8 +249,11 @@ class SportsView(ContentView):
             (on_now if state in (ON_NOW, ENDING) else later if state == UPCOMING else finished).append((g, state))
         on_now.sort(key=lambda gs: gs[0].start_utc, reverse=self.sort_order == SORT_LATEST)
 
-        self._layout.addWidget(self._header(f"{sport}:on_now", "On now", len(on_now), foldable=False))
-        if on_now:
+        on_key = f"{sport}:on_now"
+        self._layout.addWidget(self._header(on_key, "On now", len(on_now), foldable=True))
+        if on_key in self._folded():
+            pass                             # folded like any other section (owner, 2026-11-13)
+        elif on_now:
             opened = [gs for gs in on_now if _game_key(gs[0]) == self._open]
             for g, state in opened:          # the open game spans the full width, first (SV-Q17)
                 self._layout.addWidget(self._card(g, state, now, expanded=True))
@@ -295,11 +300,23 @@ class SportsView(ContentView):
 
     def _header(self, key: str, label: str, count: int, *, foldable: bool,
                 controls: Optional[QWidget] = None) -> QWidget:
-        """A section header on the sidebar's header band (SECTION_HEADER_TINT); folds on click."""
-        band = QWidget()
-        band.setObjectName("sectionHeader")
-        band.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        _theme.style(band, "SECTION_HEADER_TINT")
+        """A section header on the sidebar's header band (SECTION_HEADER_TINT).
+
+        A foldable one folds on a click ANYWHERE on the band — caret, label or empty
+        space (owner report: only the label worked, and the caret did nothing). It is
+        the sidebar's own ``_ClickableHeader``; the heading inside stays passive so
+        one click is one toggle.
+        """
+        tip = ("Show these games" if key in self._folded() else "Fold these games") if foldable else ""
+        if foldable:
+            band = _ClickableHeader()
+            band.setToolTip(tip)
+            band.clicked.connect(lambda k=key: self._toggle_fold(k))
+        else:
+            band = QWidget()
+            band.setObjectName("sectionHeader")
+            band.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            _theme.style(band, "SECTION_HEADER_TINT")
         h = QHBoxLayout(band)
         h.setContentsMargins(6, 3, 6, 3)
         h.setSpacing(6)
@@ -307,11 +324,7 @@ class SportsView(ContentView):
             caret = QLabel()
             _icon_utils.set_label_icon(caret, "expand" if key in self._folded() else "collapse", 12)
             h.addWidget(caret)
-        heading = GroupHeading(label, count, interactive=foldable,
-                               tooltip=("Show these games" if key in self._folded() else "Fold these games")
-                               if foldable else "")
-        if foldable:
-            heading.clicked.connect(lambda k=key: self._toggle_fold(k))
+        heading = GroupHeading(label, count, tooltip=tip)
         h.addWidget(heading, 1)
         if controls is not None:
             h.addWidget(controls)
@@ -321,7 +334,11 @@ class SportsView(ContentView):
     def _sport_header(self, sport: str, games: list, live: int) -> QWidget:
         """The sport's own header: its name, its leagues, how many are live; folds the segment."""
         key = f"sport:{sport}"
-        band = QWidget()
+        # The whole band folds, not just the name (owner report: only the word worked).
+        band = _ClickableFrame()
+        cursor_affordance.set_clickable(band)
+        band.setToolTip(f"Show {sport}" if key in self._folded() else f"Fold {sport}")
+        band.clicked.connect(lambda k=key: self._toggle_fold(k))
         h = QHBoxLayout(band)
         h.setContentsMargins(2, 10, 6, 2)
         h.setSpacing(8)
@@ -332,11 +349,8 @@ class SportsView(ContentView):
         _theme.style(glyph, "PANEL_HEADLINE")
         _icon_utils.set_label_icon(glyph, f"sport_{sport}", 18)
         h.addWidget(glyph)
-        name = QPushButton(sport.title())
-        name.setFlat(True)
+        name = QLabel(sport.title())
         _theme.style(name, "PANEL_HEADLINE")
-        name.setToolTip(f"Show {sport}" if key in self._folded() else f"Fold {sport}")
-        name.clicked.connect(lambda _=False, k=key: self._toggle_fold(k))
         h.addWidget(name)
         leagues = sorted({g.league for g in games} or {s.league for s in enabled_leagues() if s.sport == sport})
         meta = QLabel(" · ".join(leagues) + (f" · {live} live" if live else ""))
