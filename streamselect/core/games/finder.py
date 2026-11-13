@@ -51,6 +51,12 @@ class SportSettings:
     window_ahead: timedelta = timedelta(hours=36)
     #: A teamless guide programme joins a game only when exactly one game starts this close.
     teamless_guide_within: timedelta = timedelta(minutes=15)
+    #: Nothing says a game has ended, so "on now" is a length. Hockey: the guide's
+    #: live slots ran 150-190 min, and on 2026-11-12 every game was over within
+    #: 3h12 (one went to overtime). Past usual_length a game is "likely ending";
+    #: past long_limit it is over.
+    usual_length: timedelta = timedelta(hours=2, minutes=45)
+    long_limit: timedelta = timedelta(hours=3, minutes=30)
 
 
 #: A collection's zone-less time agrees with an anchor within this many minutes

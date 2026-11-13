@@ -70,10 +70,10 @@ TIPS: dict[str, Tip] = {
         "Watchlist keeps the shows you follow, On Now shows what's airing, and "
         "Browse lists the schedule.",
     ),
-    "view_recommended": Tip(
-        "Recommended",
-        "Picks based on what you like, watch and favourite. The more you rate, "
-        "the better it gets: like or dislike titles from their details.",
+    "view_sports": Tip(
+        "Sports",
+        "Games on right now, each with every channel showing it, then what's on "
+        "later. Click a game to list its channels; double-click to play the best one.",
     ),
     "view_discover": Tip(
         "Discover",
@@ -93,7 +93,7 @@ TIPS: dict[str, Tip] = {
 #: chip it rings (the chip the user just clicked).
 VIEW_TIPS: dict[str, tuple[str, str]] = {
     "epg": ("view_epg", "epg_chip"),
-    "preferences": ("view_recommended", "prefs_chip"),
+    "sports": ("view_sports", "sports_chip"),
     "discover": ("view_discover", "discover_chip"),
     "recipe": ("view_recipe", "recipe_chip"),
 }

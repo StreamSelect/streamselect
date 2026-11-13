@@ -69,7 +69,7 @@ from streamselect.gui.tokens import chip_roles as _chip_roles
 from streamselect.gui.tokens import detail_roles as _detail_roles
 from streamselect.gui.tokens import progress_roles as _progress_roles
 from streamselect.gui.tokens import state_roles as _state_roles
-from streamselect.gui.tokens import tour_roles as _tour_roles
+from streamselect.gui.tokens import games_roles as _games_roles, tour_roles as _tour_roles
 
 
 # ── 1. Design tokens ────────────────────────────────────────────────────────────
@@ -1793,7 +1793,7 @@ globals().update(_build_semantic_constants())
 # way tokens/scales.py keeps the radius and spacing scales out of this file.
 # This call and apply_theme's rebuild both read this ONE tuple, or a switch strands them.
 _ROLE_GROUPS = (_analytics_roles, _chip_roles, _detail_roles, _progress_roles, _state_roles,
-                _tour_roles)
+                _tour_roles, _games_roles)
 for _group in _ROLE_GROUPS:
     globals().update(_group.build(globals()))
 

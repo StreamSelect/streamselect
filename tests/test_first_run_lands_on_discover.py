@@ -99,7 +99,7 @@ def _nav_host() -> _NavMixin:
     wire_status_method(host)
     host.search_chip = MagicMock()
     host.search_chip.is_enabled.return_value = False
-    for chip in ("epg_chip", "prefs_chip", "discover_chip"):
+    for chip in ("epg_chip", "sports_chip", "discover_chip"):
         setattr(host, chip, MagicMock())
     host._epg_count_token = [0]
     host.load_channels = MagicMock()

@@ -131,8 +131,8 @@ class _Window(_MenuActionsMixin, _NavMixin, QMainWindow):
     def switch_to_epg_view(self) -> None:
         self._record("epg")
 
-    def switch_to_preferences_view(self) -> None:
-        self._record("preferences")
+    def switch_to_sports_view(self) -> None:
+        self._record("sports")
 
     def switch_to_discover_view(self) -> None:
         self._record("discover")
@@ -287,7 +287,7 @@ class TestViewSwitching:
         assert not win.discover_chip.is_enabled()
 
     @pytest.mark.parametrize("n,expected", [
-        (Qt.Key.Key_3, "preferences"),
+        (Qt.Key.Key_3, "sports"),
         (Qt.Key.Key_4, "discover"),
         (Qt.Key.Key_5, "recipe"),
     ])

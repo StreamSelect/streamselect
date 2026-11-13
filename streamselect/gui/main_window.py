@@ -87,6 +87,7 @@ from streamselect.metadata_providers.omdb import OMDbProvider
 from streamselect.gui.migration_progress_widget import MigrationProgressWidget
 from streamselect.gui.refresh_queue_manager import RefreshQueueManager
 from streamselect.gui.catalog_refresh_tick import _CatalogRefreshTickMixin
+from streamselect.gui.main_window_sports import _SportsViewMixin
 
 import streamselect.whats_new as _whats_new
 
@@ -151,7 +152,7 @@ def _tab_btn_sheet(extra: str) -> str:
 _SHUTDOWN_POOL_WAIT_S = 8.0
 
 
-class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixin, _ProviderConnectivityMixin, _SeriesMixin, _SeriesPlaybackMixin, _ChannelListMixin, _StreamingMixin, _QueueEndPromptMixin, _OverlaysMixin, _NavMixin, _MetadataMixin, _ExclusionActionsMixin, _FavoritesMixin, _DownloadsMixin, _UpdatesMixin, _StyleMenuMixin, _StatusMixin, _AsyncMixin, _AppHeaderMixin, _FilterChipHostMixin, _SearchPostersMixin, _MenuBarRevealMixin, _MenuActionsMixin, _AlertsMixin, _CatalogRefreshTickMixin,
+class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixin, _ProviderConnectivityMixin, _SeriesMixin, _SeriesPlaybackMixin, _ChannelListMixin, _StreamingMixin, _QueueEndPromptMixin, _OverlaysMixin, _NavMixin, _MetadataMixin, _ExclusionActionsMixin, _FavoritesMixin, _DownloadsMixin, _UpdatesMixin, _StyleMenuMixin, _StatusMixin, _AsyncMixin, _AppHeaderMixin, _FilterChipHostMixin, _SearchPostersMixin, _MenuBarRevealMixin, _MenuActionsMixin, _AlertsMixin, _CatalogRefreshTickMixin, _SportsViewMixin,
                  QMainWindow):
     """Main application window"""
     
@@ -1044,6 +1045,7 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
             section.itemDoubleClicked.connect(self.play_channel_by_id)
             section.channelMiddleClicked.connect(self._dispatch_middle_click)
             section.channelContextMenuRequested.connect(self._on_rec_channel_context_menu)
+            section.openViewRequested.connect(self.switch_to_preferences_view)
             return section
 
         elif section_id == "downloads" and _gates.capture_enabled():
@@ -1167,7 +1169,6 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
             note = getattr(widget, "note_user_height", None)
             if callable(note) and widget.isVisible() and not widget.is_collapsed:
                 note(widget.height())
-
 
     def _resolve_vod_rule(self, rule_created: str) -> tuple[str, str]:
         """Return ``(text, match_type)`` for a watch-for rule id, or ``('', 'any')``."""
@@ -1583,7 +1584,6 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
         self.epg_view.setVisible(False)
         self._list_layout.addWidget(self.epg_view)
 
-        # Preferences view (hidden by default)
         self.preferences_view = PreferencesView(self.db, self.config, self)
         self.preferences_view.playRequested.connect(self.play_channel_by_id)
         self.preferences_view.channelSelected.connect(self.show_channel_details_by_id)

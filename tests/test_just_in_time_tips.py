@@ -265,7 +265,7 @@ def test_a_cast_name_scrolled_out_of_view_waits_then_is_ringed_where_it_is(host,
 
 @pytest.mark.parametrize("view, chip, title", [
     ("discover", "discover_chip", "Discover"), ("recipe", "recipe_chip", "Recipe"),
-    ("epg", "epg_chip", "EPG"), ("preferences", "prefs_chip", "Recommended"),
+    ("epg", "epg_chip", "EPG"), ("sports", "sports_chip", "Sports"),
 ])
 def test_each_view_explains_itself_once_on_its_chip(host, qapp, view, chip, title):
     from streamselect.gui.just_in_time_tips import offer_view_tip

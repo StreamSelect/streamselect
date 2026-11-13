@@ -128,7 +128,7 @@ def _make_host() -> _NavMixin:
     host.search_chip        = MagicMock()
     host.search_chip.is_enabled.return_value = False
     host.epg_chip           = MagicMock()
-    host.prefs_chip         = MagicMock()
+    host.sports_chip         = MagicMock()
     host.discover_chip      = MagicMock()
     host._epg_count_token   = [0]
 

@@ -475,7 +475,7 @@ def _nav_host(key: str):
         "epg_view", "discover_view", "preferences_view", "channels_list",
         "series_tree", "provider_editor", "search_controls", "_hidden_banner",
         "back_button", "breadcrumb_label", "stats_label",
-        "search_chip", "epg_chip", "prefs_chip", "discover_chip",
+        "search_chip", "epg_chip", "sports_chip", "discover_chip",
     ):
         setattr(host, name, MagicMock())
     view = MagicMock()

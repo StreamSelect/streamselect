@@ -34,6 +34,7 @@ CONTENT_VIEW_ATTRS: tuple[str, ...] = (
     "discover_view",
     "provider_editor",
     "recipe_view",
+    "sports_view",
     "missing_tmdb_view",
     "reconnect_engaged_view",
     "metadata_enrichment_view",
@@ -53,7 +54,8 @@ _NAV_VIEW_TARGETS: dict[str, tuple[str, str | None]] = {
     "discover": ("switch_to_discover_view", "discover_chip"),
     "recipe": ("switch_to_recipe_view", "recipe_chip"),
     "epg": ("switch_to_epg_view", "epg_chip"),
-    "preferences": ("switch_to_preferences_view", "prefs_chip"),
+    "sports": ("switch_to_sports_view", "sports_chip"),
+    "preferences": ("switch_to_preferences_view", None),   # opened from the sidebar gear
     "history": ("switch_to_full_history_view", None),
 }
 
@@ -63,12 +65,9 @@ _NAV_VIEW_TARGETS: dict[str, tuple[str, str | None]] = {
 #: name to the CURRENT ``_NAV_VIEW_TARGETS`` key it should resolve to, so a
 #: legacy deep link lands on something coherent instead of silently no-oping.
 #:
-#: "sports"/"events" -> "list": the Sports and Events views were retired
-#: (user report: "it's better the channels are just in search results flagged as
-#: live") — live sports channels are found in the list/search view now, so
-#: that is where their old deep links land.
+#: "events" -> "list": the Events view was retired; its live channels are found
+#: in the list/search view. ("sports" came back as a view of found games.)
 _RETIRED_NAV_VIEW_TARGETS: dict[str, str] = {
-    "sports": "list",
     "events": "list",
 }
 
@@ -316,6 +315,7 @@ class _NavMixin:
         self.__dict__.pop("_first_source_pending", None)
         self.view_mode = "preferences"
         self._hide_all_content_views()
+        self._deactivate_view_chips()      # opened from the sidebar gear: no top-bar view is lit
         self.preferences_view.setVisible(True)
         self.stats_label.setText("Preference dashboard")
         self.preferences_view.on_activate()
@@ -456,7 +456,7 @@ class _NavMixin:
         A RETIRED name (``_RETIRED_NAV_VIEW_TARGETS`` — a view that used to
         exist and is gone) resolves to whatever current target replaces it,
         rather than no-oping: an old What's New entry's ``test_steps`` is an
-        append-only historical record and still says ``view:sports``, and a
+        append-only historical record and still says ``view:events``, and a
         "Go ▸" button that silently does nothing reads as a bug, not history.
         """
         from streamselect.gui.explore_view import EXPLORE_SOURCES
@@ -603,13 +603,6 @@ class _NavMixin:
         if self.epg_chip.is_enabled():
             self._deactivate_view_chips(self.epg_chip)
             self.switch_to_epg_view()
-        else:
-            self.switch_to_list_view()
-
-    def on_preferences_view_toggle(self) -> None:
-        if self.prefs_chip.is_enabled():
-            self._deactivate_view_chips(self.prefs_chip)
-            self.switch_to_preferences_view()
         else:
             self.switch_to_list_view()
 

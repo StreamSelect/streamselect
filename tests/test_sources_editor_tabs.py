@@ -434,7 +434,7 @@ def test_sources_strip_toggle_closes_and_deactivates_when_already_active():
     me.sources_manager_view = MagicMock()
     me.search_chip = MagicMock()
     me.epg_chip = MagicMock()
-    me.prefs_chip = MagicMock()
+    me.sports_chip = MagicMock()
     me.discover_chip = MagicMock()
     me.search_input = MagicMock()
     me.status_bar = MagicMock()

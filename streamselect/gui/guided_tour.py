@@ -95,8 +95,9 @@ TOUR_STOPS: tuple[TourStop, ...] = (
     TourStop("The top bar",
              "Switch views here. Know what you want? Use Search. Want to "
              "browse? Use Discover. Want to narrow everything down by what "
-             "you choose? Use Recipe. EPG is the TV guide, and Recommended "
-             "learns from what you like. The lit one is where you are.",
+             "you choose? Use Recipe. EPG is the TV guide, and Sports shows "
+             "the games on right now and what's on later. The lit one is where "
+             "you are.",
              _attr("_nav_track")),
     TourStop("Exclusions",
              "Hide what you never want to see — regions, languages, "
@@ -105,7 +106,8 @@ TOUR_STOPS: tuple[TourStop, ...] = (
              _attr("_filter_chip")),
     TourStop("Your lists",
              "Watch Alerts, Recommended, Watch Queue, Favorites and History. "
-             "They fill up as you watch, save and rate.",
+             "They fill up as you watch, save and rate. The gear on Recommended "
+             "opens what it has learned you like.",
              _attr("sidebar_splitter")),
     TourStop("Sources",
              "Where everything comes from. Click here to add, edit or refresh "

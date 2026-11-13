@@ -16,6 +16,7 @@ from streamselect.gui.chip_row import (
 )
 from streamselect.gui.sidebar.base import SectionAction, CollapsibleSection, make_seamless
 from streamselect.gui import deferred_config_save as _cfgsave
+from streamselect.gui import icon_utils as _icon_utils
 
 # Re-exported for callers/tests that import the title label from this module; the
 # canonical definition now lives in ``streamselect.gui.chip_row`` (shared by every
@@ -75,6 +76,7 @@ class RecommendedSection(CollapsibleSection):
     itemDoubleClicked         = pyqtSignal(str)        # channel_id
     channelMiddleClicked      = pyqtSignal(str)        # channel_id — configured middle-click play
     channelContextMenuRequested = pyqtSignal(str, int, int)  # channel_id, gx, gy
+    openViewRequested         = pyqtSignal()           # header gear: open the Recommended view
     _rec_data_ready           = pyqtSignal(object)     # list[ScoredCandidate] | None
 
     def __init__(self, config, db, parent=None):
@@ -93,6 +95,21 @@ class RecommendedSection(CollapsibleSection):
     # wiring for one control is exactly what _add_header_actions exists to
     # avoid. Refresh now lives in the ⋯ overflow with every other section's
     # occasional action, so the base header serves this section unchanged.
+
+    def _add_header_actions(self, header_layout) -> None:
+        """A gear that opens the Recommended view (owner, 2026-11-12).
+
+        The view left the top bar for Sports; it is where the user sees and
+        tunes what gets recommended, so its way in sits on this section's own
+        header, boxed like the other header buttons (``PANEL_BTN``).
+        """
+        self.open_view_button = _icon_utils.icon_button(
+            "recommended_settings",
+            "Open Recommended: what it has learned you like, and why titles are picked",
+            style="PANEL_BTN", px=14)
+        self.open_view_button.setFixedSize(22, 20)  # structural — matches the other header buttons
+        self.open_view_button.clicked.connect(self.openViewRequested)
+        header_layout.addWidget(self.open_view_button)
 
     def overflow_actions(self):
         return [
