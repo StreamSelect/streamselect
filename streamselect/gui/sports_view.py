@@ -164,7 +164,9 @@ class SportsView(ContentView):
         if channel_id != self._playing:
             self._playing = channel_id
             if self._loaded:
-                self._render()
+                # Re-read, not just re-draw: the play log just changed, and the order
+                # of each game's channels follows what was last watched.
+                self.reload()
 
     def _on_games(self, result) -> None:
         games, history = result if result else ([], {})

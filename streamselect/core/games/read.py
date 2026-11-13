@@ -8,11 +8,12 @@ vanish now, not at the next refresh.
 
 from __future__ import annotations
 
+import unicodedata
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from streamselect.core.category_headings import split_head
 from streamselect.core.database import ChannelDB
@@ -49,7 +50,9 @@ class GameFeedDTO:
     def station(self) -> str:
         """The collection without its region head: "US| ESPN+ PPV VIP" -> "ESPN+ PPV VIP",
         "SWEDEN TELIA PLAY" -> "TELIA PLAY" (category_headings / region_codes)."""
-        c = self.channel_collection or self.collection
+        # NFKC folds the superscript letters some collections use ("NORWAY ᴳᴼᴸᴰ ᴿᴬᵂ"),
+        # which otherwise render tiny — the same folding the finder reads names with.
+        c = unicodedata.normalize("NFKC", self.channel_collection or self.collection)
         return split_head(c)[1] or (leading_country(c) or ("", c))[1] or c
 
 
@@ -113,8 +116,15 @@ def best_feed(game: GameDTO) -> Optional[GameFeedDTO]:
     return feeds[0] if feeds else None
 
 
-#: collection key -> (last play, seconds watched, plays) from the play log.
-WatchHistory = dict[str, tuple[datetime, int, int]]
+#: collection key -> (last WATCHED play or None, seconds watched, plays) from the play log.
+WatchHistory = dict[str, tuple[Optional[datetime], int, int]]
+
+#: A play shorter than this is a bail, not a choice: it does not make its collection
+#: "the one you last watched". Owner, 2026-11-12: a 27 s try of one channel took over
+#: a game whose card should have offered the channel then watched for minutes; the play
+#: log separates bails (seconds) from watches (minutes) cleanly. A play still running
+#: (no seconds yet) counts as watched.
+WATCHED_MIN_SECONDS = 60
 
 
 def arrange_feeds(game: GameDTO, prefs: dict, history: WatchHistory) -> GameDTO:
@@ -131,11 +141,11 @@ def arrange_feeds(game: GameDTO, prefs: dict, history: WatchHistory) -> GameDTO:
     for f in game.feeds:
         (gone if f.channel_id in hidden_ids or f.collection_key in hidden_colls else keep).append(f)
     preferred = prefs.get("preferred")
-    watched = [f.collection_key for f in keep if f.collection_key in history]
+    watched = [f.collection_key for f in keep if history.get(f.collection_key, (None,))[0] is not None]
     last = max(watched, key=lambda k: history[k][0]) if watched else None
 
     def key(f: GameFeedDTO):
-        last_play, secs, plays = history.get(f.collection_key, (None, 0, 0))
+        _last, secs, plays = history.get(f.collection_key, (None, 0, 0))
         return (f.collection_key != preferred, f.collection_key != last, -secs, -plays,
                 _FEED_RANK.get(f.time_from, 2))
     return replace(game, feeds=tuple(sorted(keep, key=key)), hidden=tuple(gone))
@@ -148,9 +158,15 @@ def mark_finished(session, game: GameDTO, ended_at: datetime) -> None:
 
 
 def load_watch_history(session) -> WatchHistory:
-    """Plays that showed a picture, grouped by the played channel's source and collection."""
+    """Plays that showed a picture, grouped by the played channel's source and collection.
+
+    The "last watched" time counts only plays of at least :data:`WATCHED_MIN_SECONDS`
+    (or still running); minutes and plays count everything that showed a picture.
+    """
+    watched = PlaybackEventDB.seconds_watched.is_(None) | (PlaybackEventDB.seconds_watched >= WATCHED_MIN_SECONDS)
     rows = session.execute(
-        select(ChannelDB.provider_id, ChannelDB.category, func.max(PlaybackEventDB.started_at),
+        select(ChannelDB.provider_id, ChannelDB.category,
+               func.max(case((watched, PlaybackEventDB.started_at), else_=None)),
                func.coalesce(func.sum(PlaybackEventDB.seconds_watched), 0), func.count())
         .join(ChannelDB, ChannelDB.id == PlaybackEventDB.channel_id)
         .where(PlaybackEventDB.outcome.in_(("started", "dropped")))

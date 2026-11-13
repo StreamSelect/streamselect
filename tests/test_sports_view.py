@@ -101,6 +101,28 @@ def test_feeds_order_preferred_then_last_watched_then_minutes_and_hidden_are_cou
     assert {f.channel_id for f in gone.hidden} == {"b", "c"}
 
 
+def test_a_short_bail_is_not_the_channel_you_last_watched(games_db):
+    """Owner, 2026-11-12: a 27 s try of one channel took over a card whose channel
+    should have been the one then watched for minutes."""
+    from streamselect.core.games.read import load_watch_history
+    from streamselect.core.playback_models import PlaybackEventDB
+    with games_db.session_scope() as s:
+        s.add(PlaybackEventDB(provider_id="p1", channel_id="b1", outcome="started",
+                              started_at=datetime(2026, 11, 13, 1, 30), seconds_watched=600))
+        s.add(PlaybackEventDB(provider_id="p2", channel_id="c1", outcome="started",
+                              started_at=datetime(2026, 11, 13, 1, 40), seconds_watched=27))
+    with games_db.session_scope(commit=False) as s:
+        history = load_watch_history(s)
+        sabres = next(g for g in load_games(s, "hockey", set(), 1, 1) if g.team_a == "Buffalo Sabres")
+    assert history["p2|COLL CLOCK"][0] is None, "a bail sets no last-watched time"
+    assert arrange_feeds(sabres, {}, history).playable[0].channel_id == "b1"
+
+
+def test_a_station_written_in_superscript_letters_reads_as_normal_letters():
+    feed = GameFeedDTO("x", "x", "x", False, "", "p", "NORWAY ᴳᴼᴸᴰ ᴿᴬᵂ")
+    assert feed.station == "GOLD RAW"
+
+
 def test_a_switched_off_source_drops_out_at_read_time(games_db):
     with games_db.session_scope(commit=False) as s:
         sabres = next(g for g in load_games(s, "hockey", {"p2"}, 1, 1) if g.team_a == "Buffalo Sabres")
