@@ -1,14 +1,15 @@
-"""The Sports view: what is playing now, then what is on later, from stored games.
+"""The Sports view: the games on now, then later, then finished — from stored games.
 
-Layout is the settled Sports Desk direction (Variant C), narrowed to games:
-every game on now is a card; later games are one-line rows under day
-headings; finished games sit dimmed at the foot. Selecting a game lists every
-channel that carries it ("Watch on"), each playable, with a guide-only listing
-marked EPG. Double-clicking a game, or its play button, plays its best feed.
+Design: The Sports Desk rev 3 (SV-Q17-Q36, all answered 2026-11-12). Every
+game on now is a card (``game_card.GameCard``); later and finished games are
+rows under day / Finished headings, and any game opens the same channel list.
+Section headers sit on the sidebar's header band and fold (Finished starts
+folded); the sort order, the "Less certain games" toggle and the folds are
+remembered (``Config.sports_view_state``). The user's preferred channel and
+hidden channels are kept per league (``Config.game_channel_prefs``).
 
 Reads only what the game finder stored (``core/games``) through the host's
-``_run_query`` seam; it never parses a channel name. Only confirmed games
-(Level 1: two or more independent collections agree) are shown for now.
+``_run_query`` seam; it never parses a channel name.
 """
 
 from __future__ import annotations
@@ -16,98 +17,48 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Callable, Optional
 
-from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
-from streamselect.core.epg_utils import (
-    browse_day_separator_label, fmt_duration, fmt_time, now_utc, to_local,
-)
+from streamselect.core.epg_utils import browse_day_separator_label, fmt_time, now_utc, to_local
 from streamselect.core.games.read import (
-    ENDING, ON_NOW, OVER, UPCOMING, GameDTO, best_feed, game_state, load_games,
+    ENDING, ON_NOW, UPCOMING, GameDTO, arrange_feeds, best_feed, game_state, load_games,
+    load_watch_history, mark_finished,
 )
 from streamselect.core.games.store import enabled_leagues
 from streamselect.core.repositories.provider import ProviderRepository
-from streamselect.gui import cursor_affordance, icons
+from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
+from streamselect.gui.chips import ToggleChip
 from streamselect.gui.content_view import ContentView
 from streamselect.gui.flow_layout import FlowLayout
+from streamselect.gui.game_card import (
+    HIDE_CHANNEL, HIDE_COLLECTION, HIDE_EVERYWHERE, ChannelList, GameCard,
+)
 from streamselect.gui.sidebar.base import GroupHeading
 
 #: The sport this view shows. Hockey first (the method doc); others join once a
 #: league of theirs passes the method's test and is listed in game_finder_leagues.
 SPORT = "hockey"
-#: Re-render this often while open: "1h 12m in" and on-now/finished move with the clock.
+#: Re-render this often while open: progress bars and on-now/finished move with the clock.
 TICK_MS = 60_000
-CARD_WIDTH = 300
+SORT_EARLIEST, SORT_LATEST = "earliest", "latest"
+FINISHED = "finished"
 
 
 def _game_key(g: GameDTO) -> tuple:
     return (g.league, g.team_a, g.team_b, g.start_utc)
 
 
-class GameCard(QFrame):
-    """One game on now: LIVE and how long in, the teams, league and channel count."""
-
-    selected = pyqtSignal(object)      # GameDTO
-    play = pyqtSignal(object)          # GameDTO
-
-    def __init__(self, game: GameDTO, state: str, now: datetime, parent=None):
-        super().__init__(parent)
-        self.game = game
-        self.setObjectName("gameCard")
-        self.setFixedWidth(CARD_WIDTH)
-        _theme.style(self, "GAME_CARD")
-        cursor_affordance.set_clickable(self, True)
-        self.setToolTip("Select to list every channel showing this game; double-click to play")
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 10, 12, 10)
-        lay.setSpacing(4)
-
-        top = QHBoxLayout()
-        top.setContentsMargins(0, 0, 0, 0)
-        elapsed = fmt_duration(game.start_utc, now)
-        self.tag = QLabel(f"{icons.status_dot_icon} LIVE · {elapsed} in" if state == ON_NOW
-                          else f"LIKELY ENDING · {elapsed} in")
-        _theme.style(self.tag, "GAME_LIVE_TAG" if state == ON_NOW else "TEXT_SM_MUTED")
-        top.addWidget(self.tag)
-        top.addStretch(1)
-        self.play_button = _icon_utils.icon_button("episode", "Play this game's best channel")
-        self.play_button.clicked.connect(lambda: self.play.emit(self.game))
-        top.addWidget(self.play_button)
-        lay.addLayout(top)
-
-        self.title = QLabel(game.title)
-        self.title.setWordWrap(True)
-        _theme.style(self.title, "GAME_TITLE")
-        lay.addWidget(self.title)
-        n = len(game.playable)
-        self.meta = QLabel(f"{game.league} · {n} channel{'' if n == 1 else 's'}"
-                           f" · started {fmt_time(game.start_utc)}")
-        _theme.style(self.meta, "TEXT_SM_MUTED")
-        lay.addWidget(self.meta)
-
-    def set_selected(self, on: bool) -> None:
-        self.setProperty("selected", "true" if on else "false")
-        self.style().unpolish(self)
-        self.style().polish(self)
-
-    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt API)
-        self.selected.emit(self.game)
-        super().mousePressEvent(event)
-
-    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 (Qt API)
-        self.play.emit(self.game)
-        super().mouseDoubleClickEvent(event)
-
-
 class SportsView(ContentView):
-    """Games on now as cards, later games as rows, finished games dimmed."""
+    """Games on now as cards, later and finished games as rows; see the module docstring."""
 
-    playRequested = pyqtSignal(str)      # channel id
-    channelSelected = pyqtSignal(str)    # channel id: the details pane follows the selection
+    playRequested = pyqtSignal(str)           # channel id
+    channelSelected = pyqtSignal(str)         # channel id: the details pane follows an opened game
+    hideEverywhereRequested = pyqtSignal(str)  # channel id: the app's own Hide
 
     def __init__(self, db, config, run_query: Callable, parent=None, *,
                  clock: Callable[[], datetime] = now_utc):
@@ -116,8 +67,11 @@ class SportsView(ContentView):
         self._db = db
         self._run_query = run_query
         self._token: list[int] = [0]
-        self._games: list[GameDTO] = []
-        self._selected: Optional[tuple] = None
+        self._raw: list[GameDTO] = []
+        self._history: dict = {}
+        self._open: Optional[tuple] = None
+        self._show_hidden: set[tuple] = set()
+        self._playing: Optional[str] = None
         self._loaded = False
         self._finding = False
         self.settings = next((s for s in enabled_leagues() if s.sport == SPORT), None)
@@ -131,6 +85,8 @@ class SportsView(ContentView):
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
+        # The centre panel never scrolls sideways: cards wrap, long names elide.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         outer.addWidget(scroll)
         self._body = QWidget()
         scroll.setWidget(self._body)
@@ -138,8 +94,34 @@ class SportsView(ContentView):
         self._layout.setContentsMargins(16, 12, 16, 16)
         self._layout.setSpacing(8)
         self.cards: list[GameCard] = []
-        self.feed_buttons: list[QPushButton] = []
+        self.rows: list[QPushButton] = []
+        self.headers: dict[str, QWidget] = {}
         self._render()          # "Loading games…" until the first read comes back
+
+    # ── remembered state ───────────────────────────────────────────────────
+
+    def _state(self) -> dict:
+        return self.config.sports_view_state
+
+    def _save(self) -> None:
+        _cfgsave.save_soon(self)
+
+    def _prefs(self, league_key: str) -> dict:
+        return self.config.game_channel_prefs.setdefault(league_key, {})
+
+    @property
+    def sort_order(self) -> str:
+        return self._state().get("sort", SORT_EARLIEST)
+
+    @property
+    def less_certain(self) -> bool:
+        return bool(self._state().get("less_certain", False))
+
+    def _folded(self) -> set[str]:
+        st = self._state()
+        if "folded" not in st:
+            st["folded"] = [FINISHED]          # Finished starts folded (SV-Q21)
+        return set(st["folded"])
 
     # ── lifecycle ──────────────────────────────────────────────────────────
 
@@ -151,10 +133,13 @@ class SportsView(ContentView):
         self._tick.stop()
 
     def reload(self) -> None:
-        """Re-read the stored games off the UI thread, then render."""
+        """Re-read the stored games and the play log off the UI thread, then render."""
+        top = 2 if self.less_certain else 1
+
         def query(repos):
             hidden = set(ProviderRepository(repos.session).get_hidden_provider_ids())
-            return load_games(repos.session, SPORT, hidden, min_level=1, max_level=1)
+            return (load_games(repos.session, SPORT, hidden, min_level=1, max_level=top),
+                    load_watch_history(repos.session))
         self._run_query(query, self._on_games, token_ref=self._token, on_error=self._on_error)
 
     def set_finding(self, on: bool) -> None:
@@ -174,16 +159,32 @@ class SportsView(ContentView):
         if self.isVisible():
             self.reload()
 
-    def _on_games(self, games: list[GameDTO]) -> None:
-        self._games = list(games or [])
+    def set_playing(self, channel_id: Optional[str]) -> None:
+        """The channel now playing (the host's player poll), or None."""
+        if channel_id != self._playing:
+            self._playing = channel_id
+            if self._loaded:
+                self._render()
+
+    def _on_games(self, result) -> None:
+        games, history = result if result else ([], {})
+        self._raw, self._history = list(games or []), dict(history or {})
         self._loaded = True
         self._render()
 
     def _on_error(self, _exc: Exception) -> None:
-        self._games, self._loaded = [], True
+        self._raw, self._loaded = [], True
         self._render(error=True)
 
     # ── rendering ──────────────────────────────────────────────────────────
+
+    def _games(self) -> list[GameDTO]:
+        out = []
+        for g in self._raw:
+            g = arrange_feeds(g, self._prefs(g.league_key), self._history)
+            if g.playable:
+                out.append(g)
+        return out
 
     def _clear(self) -> None:
         while self._layout.count():
@@ -194,14 +195,15 @@ class SportsView(ContentView):
                 w.deleteLater()
             elif item.layout() is not None:
                 QWidget().setLayout(item.layout())
-        self.cards, self.feed_buttons = [], []
+        self.cards, self.rows, self.headers = [], [], {}
 
     def _render(self, error: bool = False) -> None:
         self._clear()
         if not self._loaded:
             self._message("Loading games…", "")
             return
-        if self._finding and not self._games:
+        games = self._games() if not error else []
+        if self._finding and not games:
             # Never "0 games" before the finder has looked: on a fresh launch the
             # table is empty until the first run stores what it found.
             self._message("Finding games in your channel listings…",
@@ -215,53 +217,51 @@ class SportsView(ContentView):
             return
         now = self._clock()
         on_now, later, finished = [], [], []
-        for g in self._games:
+        for g in games:
             state = game_state(g, now, self.settings)
             (on_now if state in (ON_NOW, ENDING) else later if state == UPCOMING else finished).append((g, state))
-        on_now.sort(key=lambda gs: gs[0].start_utc, reverse=True)   # most recently started first
+        on_now.sort(key=lambda gs: gs[0].start_utc, reverse=self.sort_order == SORT_LATEST)
+        folded = self._folded()
 
-        self._layout.addWidget(GroupHeading("On now", len(on_now)))
+        self._layout.addWidget(self._header("on_now", "On now", len(on_now), foldable=False,
+                                            controls=self._on_now_controls()))
         if self._finding:
             looking = QLabel("Looking for new games…")
             _theme.style(looking, "TEXT_SM_MUTED")
             self._layout.addWidget(looking)
         if on_now:
-            grid_host = QWidget()
-            grid = FlowLayout(grid_host, spacing=10)
-            for g, state in on_now:
-                card = GameCard(g, state, now)
-                card.selected.connect(self._select)
-                card.play.connect(self._play_best)
-                card.set_selected(_game_key(g) == self._selected)
-                grid.addWidget(card)
-                self.cards.append(card)
-            self._layout.addWidget(grid_host)
+            opened = [gs for gs in on_now if _game_key(gs[0]) == self._open]
+            for g, state in opened:          # the open game spans the full width, first (SV-Q17)
+                self._layout.addWidget(self._card(g, state, now, expanded=True))
+            rest = [gs for gs in on_now if gs not in opened]
+            if rest:
+                grid_host = QWidget()
+                grid = FlowLayout(grid_host, spacing=10)
+                for g, state in rest:
+                    grid.addWidget(self._card(g, state, now))
+                self._layout.addWidget(grid_host)
         else:
             nxt = later[0][0] if later else None
             self._message(f"No {SPORT} games on right now",
                           f"Next: {nxt.title}, {browse_day_separator_label(nxt.start_utc, now).split(' · ')[0]}"
                           f" at {fmt_time(nxt.start_utc)}." if nxt else "No games are listed yet.")
 
-        chosen = next((g for g in self._games if _game_key(g) == self._selected), None)
-        if chosen is not None and game_state(chosen, now, self.settings) != OVER:
-            self._feeds_panel(chosen)
-
-        day = None
-        for g, _state in later:
-            label = browse_day_separator_label(g.start_utc, now)
-            if to_local(g.start_utc).date() != day:
-                day = to_local(g.start_utc).date()
-                self._layout.addWidget(GroupHeading(label, sum(
-                    1 for x, _ in later if to_local(x.start_utc).date() == day)))
-            self._layout.addWidget(self._row(g, fmt_time(g.start_utc)))
+        days: dict = {}
+        for g, _ in later:
+            days.setdefault(to_local(g.start_utc).date(), []).append(g)
+        for day, gs in days.items():
+            key = f"day:{day.isoformat()}"
+            self._layout.addWidget(self._header(key, browse_day_separator_label(gs[0].start_utc, now),
+                                                len(gs), foldable=True))
+            if key not in folded:
+                for g in gs:
+                    self._game_row(g, playable=False)
 
         if finished:
-            self._layout.addWidget(GroupHeading("Finished", len(finished)))
-            for g, _state in sorted(finished, key=lambda gs: gs[0].start_utc, reverse=True):
-                row = self._row(g, fmt_time(g.start_utc))
-                row.setEnabled(False)
-                row.setToolTip("This game has ended")
-                self._layout.addWidget(row)
+            self._layout.addWidget(self._header(FINISHED, "Finished", len(finished), foldable=True))
+            if FINISHED not in folded:
+                for g, _ in sorted(finished, key=lambda gs: gs[0].start_utc, reverse=True):
+                    self._game_row(g, playable=True)
         self._layout.addStretch(1)
 
     def _message(self, headline: str, body: str) -> None:
@@ -274,48 +274,148 @@ class SportsView(ContentView):
             _theme.style(b, "PANEL_BODY")
             self._layout.addWidget(b)
 
-    def _row(self, g: GameDTO, when: str) -> QPushButton:
-        n = len(g.playable)
-        row = QPushButton(f"{when}    {g.title}    ·  {g.league} · {n} channel{'' if n == 1 else 's'}")
-        _theme.style(row, "GAME_FEED_ROW")
-        row.setToolTip("List every channel showing this game")
-        row.clicked.connect(lambda _=False, game=g: self._select(game))
-        return row
+    def _header(self, key: str, label: str, count: int, *, foldable: bool,
+                controls: Optional[QWidget] = None) -> QWidget:
+        """A section header on the sidebar's header band (SECTION_HEADER_TINT); folds on click."""
+        band = QWidget()
+        band.setObjectName("sectionHeader")
+        band.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        _theme.style(band, "SECTION_HEADER_TINT")
+        h = QHBoxLayout(band)
+        h.setContentsMargins(6, 3, 6, 3)
+        h.setSpacing(6)
+        if foldable:
+            caret = QLabel()
+            _icon_utils.set_label_icon(caret, "expand" if key in self._folded() else "collapse", 12)
+            h.addWidget(caret)
+        heading = GroupHeading(label, count, interactive=foldable,
+                               tooltip=("Show these games" if key in self._folded() else "Fold these games")
+                               if foldable else "")
+        if foldable:
+            heading.clicked.connect(lambda k=key: self._toggle_fold(k))
+        h.addWidget(heading, 1)
+        if controls is not None:
+            h.addWidget(controls)
+        self.headers[key] = band
+        return band
 
-    def _feeds_panel(self, g: GameDTO) -> None:
-        self._layout.addWidget(GroupHeading(f"Watch on · {g.title}", len(g.playable)))
-        for f in g.playable:
-            line = QWidget()
-            h = QHBoxLayout(line)
-            h.setContentsMargins(0, 0, 0, 0)
-            h.setSpacing(6)
-            btn = QPushButton(f"{f.name}    —  {f.collection}")
-            _theme.style(btn, "GAME_FEED_ROW")
-            btn.setToolTip("Play this channel")
-            btn.setProperty("channel_id", f.channel_id)
-            btn.clicked.connect(lambda _=False, cid=f.channel_id: self.playRequested.emit(cid))
-            h.addWidget(btn, 1)
-            if f.from_guide:
-                chip = QLabel("EPG")
-                chip.setToolTip("Found in the programme guide, which is less reliable than channel names")
-                _theme.style(chip, "GAME_GUIDE_CHIP")
-                h.addWidget(chip)
-            self.feed_buttons.append(btn)
-            self._layout.addWidget(line)
+    def _on_now_controls(self) -> QWidget:
+        box = QWidget()
+        h = QHBoxLayout(box)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        self.sort_button = QPushButton("Earliest first" if self.sort_order == SORT_EARLIEST else "Latest first")
+        self.sort_button.setFlat(True)
+        _icon_utils.set_button_icon(self.sort_button, "sort")
+        _theme.style(self.sort_button, "LINK_BTN_SM")
+        self.sort_button.setToolTip("Order the games on now by when they started — click to reverse")
+        self.sort_button.clicked.connect(self._toggle_sort)
+        h.addWidget(self.sort_button)
+        self.less_certain_chip = ToggleChip("Less certain games", enabled=self.less_certain)
+        self.less_certain_chip.setToolTip("Also show games only one collection lists (dashed outline)")
+        self.less_certain_chip.toggled_changed.connect(self._toggle_less_certain)
+        h.addWidget(self.less_certain_chip)
+        return box
+
+    def _card(self, g: GameDTO, state: str, now: datetime, *, expanded: bool = False) -> GameCard:
+        channels = self._channel_list(g) if expanded else None
+        card = GameCard(g, state, now, self.settings.usual_length, expanded=expanded,
+                        playing_id=self._playing, channels=channels)
+        card.play.connect(self.playRequested)
+        card.toggled.connect(self._toggle_open)
+        card.finished.connect(self._mark_finished)
+        self.cards.append(card)
+        return card
+
+    def _channel_list(self, g: GameDTO) -> ChannelList:
+        lst = ChannelList(g, preferred_key=self._prefs(g.league_key).get("preferred"),
+                          playing_id=self._playing, show_hidden=_game_key(g) in self._show_hidden)
+        lst.play.connect(self.playRequested)
+        lst.prefer.connect(self._set_preferred)
+        lst.hide.connect(self._hide)
+        lst.unhide.connect(self._unhide)
+        if lst.hidden_button is not None:
+            lst.hidden_button.clicked.connect(lambda _=False, k=_game_key(g): self._toggle_show_hidden(k))
+        return lst
+
+    def _game_row(self, g: GameDTO, *, playable: bool) -> None:
+        """A later or finished game: one row; click opens its channel list beneath it (SV-Q23)."""
+        when = fmt_time(g.start_utc)
+        row = QPushButton(f"{when}    {g.title}    ·  {g.league}")
+        _theme.style(row, "GAME_FEED_ROW")
+        row.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        is_open = _game_key(g) == self._open
+        row.setToolTip("Fold its channel list" if is_open else "List every channel that will show this game")
+        row.clicked.connect(lambda _=False, game=g: self._toggle_open(game))
+        self._layout.addWidget(row)
+        self.rows.append(row)
+        if is_open:
+            self._layout.addWidget(self._channel_list(g))
 
     # ── actions ────────────────────────────────────────────────────────────
 
-    def _select(self, game: GameDTO) -> None:
+    def _toggle_open(self, game: GameDTO) -> None:
         key = _game_key(game)
-        if key == self._selected:
-            return
-        self._selected = key
-        feed = best_feed(game)
-        if feed is not None:
-            self.channelSelected.emit(feed.channel_id)
-        QTimer.singleShot(0, self._render)    # not inside the clicked card's own event
+        self._open = None if key == self._open else key
+        if self._open is not None:
+            feed = best_feed(game)
+            if feed is not None:
+                self.channelSelected.emit(feed.channel_id)
+        QTimer.singleShot(0, self._render)    # not inside the clicked widget's own event
 
-    def _play_best(self, game: GameDTO) -> None:
-        feed = best_feed(game)
-        if feed is not None:
-            self.playRequested.emit(feed.channel_id)
+    def _toggle_fold(self, key: str) -> None:
+        folded = self._folded()
+        folded.symmetric_difference_update({key})
+        self._state()["folded"] = sorted(folded)
+        self._save()
+        QTimer.singleShot(0, self._render)
+
+    def _toggle_sort(self) -> None:
+        self._state()["sort"] = SORT_LATEST if self.sort_order == SORT_EARLIEST else SORT_EARLIEST
+        self._save()
+        QTimer.singleShot(0, self._render)
+
+    def _toggle_less_certain(self, on: bool) -> None:
+        self._state()["less_certain"] = bool(on)
+        self._save()
+        self.reload()
+
+    def _toggle_show_hidden(self, key: tuple) -> None:
+        self._show_hidden.symmetric_difference_update({key})
+        QTimer.singleShot(0, self._render)
+
+    def _set_preferred(self, game: GameDTO, feed) -> None:
+        prefs = self._prefs(game.league_key)
+        if feed is None:
+            prefs.pop("preferred", None)
+        else:
+            prefs["preferred"] = feed.collection_key
+        self._save()
+        QTimer.singleShot(0, self._render)
+
+    def _hide(self, game: GameDTO, feed, scope: str) -> None:
+        if scope == HIDE_EVERYWHERE:
+            self.hideEverywhereRequested.emit(feed.channel_id)
+            return
+        prefs = self._prefs(game.league_key)
+        field, value = (("hidden_channels", feed.channel_id) if scope == HIDE_CHANNEL
+                        else ("hidden_collections", feed.collection_key))
+        if scope in (HIDE_CHANNEL, HIDE_COLLECTION) and value not in prefs.setdefault(field, []):
+            prefs[field].append(value)
+        if prefs.get("preferred") == feed.collection_key and scope == HIDE_COLLECTION:
+            prefs.pop("preferred")
+        self._save()
+        QTimer.singleShot(0, self._render)
+
+    def _unhide(self, game: GameDTO, feed) -> None:
+        prefs = self._prefs(game.league_key)
+        for field, value in (("hidden_channels", feed.channel_id), ("hidden_collections", feed.collection_key)):
+            if value in prefs.get(field, []):
+                prefs[field].remove(value)
+        self._save()
+        QTimer.singleShot(0, self._render)
+
+    def _mark_finished(self, game: GameDTO) -> None:
+        ended = self._clock()
+        self._run_query(lambda repos: mark_finished(repos.session, game, ended),
+                        lambda _r: self.reload(), commit=True)

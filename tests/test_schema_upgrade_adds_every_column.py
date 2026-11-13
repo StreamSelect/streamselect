@@ -215,6 +215,7 @@ ORIGINAL_COLUMNS: dict[str, frozenset[str]] = {
         "time_from", "start_utc", "counts",
     }),
     "game_finder_memory": frozenset({"finder", "memory", "updated_at"}),
+    "game_ends": frozenset({"league_key", "team_a", "team_b", "start_utc", "ended_at"}),
     "tags": frozenset({
         "id", "type", "value",
     }),

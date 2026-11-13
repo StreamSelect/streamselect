@@ -460,6 +460,7 @@ def test_enter_on_an_empty_box_does_nothing(window):
 @pytest.mark.parametrize("view", [
     "switch_to_list_view", "switch_to_epg_view", "switch_to_preferences_view",
     "switch_to_discover_view", "switch_to_recipe_view", "switch_to_sources_manager",
+    "switch_to_sports_view",
 ])
 def test_every_visible_button_explains_itself(window, view, qapp):
     """The tour ends on "Hover over any button to see what it does": every

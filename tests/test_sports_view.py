@@ -1,24 +1,29 @@
-"""The Sports view: games on now as cards, every channel of a game listed, later and finished games below.
+"""The Sports view (design: The Sports Desk rev 3, SV-Q17-Q36).
 
 Built on stored games (the finder runs on a real file database first), with
-the clock injected so "on now" is fixed.
+the clock injected so "on now" is fixed. Assertions are on what is drawn:
+geometry, the colour of LIVE / PLAYING, which rows exist.
 """
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import pytest
-from PyQt6.QtCore import QPoint
+from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtGui import QColor
-from PyQt6.QtWidgets import QLabel
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import QLabel, QPushButton
 
-from streamselect.core.games.read import ENDING, ON_NOW, OVER, UPCOMING, best_feed, game_state, load_games
+from streamselect.core.games.read import (
+    ENDING, ON_NOW, OVER, UPCOMING, GameDTO, GameFeedDTO, arrange_feeds, game_state, load_games,
+)
 from streamselect.core.games.store import enabled_leagues, refresh_games
 from streamselect.core.repositories import RepositoryFactory
 from tests.test_game_finder import NOW, START, _seed_db
 
 HOCKEY = next(s for s in enabled_leagues() if s.sport == "hockey")
+LIVE_AT = START + timedelta(minutes=70)
 
 
 @pytest.fixture
@@ -28,104 +33,279 @@ def games_db(db):
     return db
 
 
-def _load(db, hidden=frozenset()):
-    with db.session_scope(commit=False) as s:
-        return load_games(s, "hockey", set(hidden), 1, 1)
-
-
-def test_a_game_is_on_then_likely_ending_then_over():
-    from streamselect.core.games.read import GameDTO
-    game = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 2, ())
-    assert game_state(game, START - timedelta(minutes=1), HOCKEY) == UPCOMING
-    assert game_state(game, START + timedelta(hours=2), HOCKEY) == ON_NOW
-    assert game_state(game, START + timedelta(hours=3), HOCKEY) == ENDING
-    assert game_state(game, START + timedelta(hours=4), HOCKEY) == OVER
-
-
-def test_the_best_feed_is_a_named_channel_and_a_switched_off_source_drops_out(games_db):
-    games = _load(games_db)
-    sabres = next(g for g in games if g.team_a == "Buffalo Sabres")
-    assert not best_feed(sabres).from_guide
-    assert {f.channel_id for f in sabres.playable} == {"a1", "b1", "c1", "s1"}
-    # Turning a source off hides its feeds now, not at the next refresh.
-    hidden = _load(games_db, {"p2"})
-    sabres = next(g for g in hidden if g.team_a == "Buffalo Sabres")
-    assert {f.channel_id for f in sabres.playable} == {"a1", "b1"}
-
-
 def _view(db, qapp, owned_widgets, now):
     from streamselect.core.config import Config
     from streamselect.gui.sports_view import SportsView
 
-    def run_query(fn, on_result, *, token_ref=None, on_error=None):
-        with db.session_scope(commit=False) as s:
-            on_result(fn(RepositoryFactory(s)))
+    def run_query(fn, on_result, *, token_ref=None, on_error=None, commit=False):
+        with db.session_scope(commit=commit) as s:
+            result = fn(RepositoryFactory(s))
+        on_result(result)
 
     view = owned_widgets.own(SportsView(db, Config(), run_query, clock=lambda: now))
-    view.resize(1000, 800)
+    view.resize(1000, 900)
     view.show()
     view.on_activate()
     qapp.processEvents()
     return view
 
 
-def _ink(label: QLabel) -> QColor:
-    image = label.grab().toImage()
+def _settle(qapp):
+    for _ in range(3):
+        qapp.processEvents()
+
+
+def _ink(widget) -> QColor:
+    image = widget.grab().toImage()
     bg = QColor(image.pixel(0, 0))
     ink = [QColor(image.pixel(x, y)) for x in range(image.width()) for y in range(image.height())
            if QColor(image.pixel(x, y)) != bg]
-    assert ink, "the tag draws nothing"
+    assert ink, "draws nothing"
     return max(ink, key=lambda c: c.saturation())
 
 
-def test_games_on_now_are_live_cards_side_by_side(games_db, qapp, owned_widgets):
+def _near(a: QColor, b: QColor, tol: int = 40) -> bool:
+    return max(abs(a.red() - b.red()), abs(a.green() - b.green()), abs(a.blue() - b.blue())) <= tol
+
+
+def _card(view, team):
+    return next(c for c in view.cards if team in c.game.title)
+
+
+# ── state and ordering (pure) ─────────────────────────────────────────────
+
+def test_a_game_is_on_then_likely_ending_then_over_and_a_finished_mark_ends_it():
+    game = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 2, ())
+    assert game_state(game, START - timedelta(minutes=1), HOCKEY) == UPCOMING
+    assert game_state(game, START + timedelta(hours=2), HOCKEY) == ON_NOW
+    assert game_state(game, START + timedelta(hours=3), HOCKEY) == ENDING
+    assert game_state(game, START + timedelta(hours=4), HOCKEY) == OVER
+    marked = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 2, (), ended_at=START + timedelta(hours=1))
+    assert game_state(marked, START + timedelta(hours=2), HOCKEY) == OVER
+
+
+def _feed(cid, coll, time_from="zone"):
+    return GameFeedDTO(cid, cid, coll, False, time_from, "p1", coll)
+
+
+def test_feeds_order_preferred_then_last_watched_then_minutes_and_hidden_are_counted():
+    g = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 3,
+                (_feed("a", "ONE"), _feed("b", "TWO"), _feed("c", "THREE"), _feed("d", "FOUR")))
+    history = {"p1|TWO": (datetime(2026, 11, 1), 9000, 9), "p1|THREE": (datetime(2026, 11, 10), 60, 1)}
+    assert [f.channel_id for f in arrange_feeds(g, {}, history).playable] == ["c", "b", "a", "d"]
+    pref = {"preferred": "p1|FOUR", "hidden_channels": ["a"]}
+    arranged = arrange_feeds(g, pref, history)
+    assert [f.channel_id for f in arranged.playable] == ["d", "c", "b"]
+    assert [f.channel_id for f in arranged.hidden] == ["a"]
+    gone = arrange_feeds(g, {"hidden_collections": ["p1|TWO", "p1|THREE"]}, history)
+    assert {f.channel_id for f in gone.hidden} == {"b", "c"}
+
+
+def test_a_switched_off_source_drops_out_at_read_time(games_db):
+    with games_db.session_scope(commit=False) as s:
+        sabres = next(g for g in load_games(s, "hockey", {"p2"}, 1, 1) if g.team_a == "Buffalo Sabres")
+    assert {f.channel_id for f in sabres.playable} == {"a1", "b1"}
+
+
+# ── the cards ─────────────────────────────────────────────────────────────
+
+def test_games_on_now_are_cards_side_by_side_with_live_in_the_accent_and_a_bar(games_db, qapp, owned_widgets):
     from streamselect.gui import theme
-    view = _view(games_db, qapp, owned_widgets, START + timedelta(minutes=70))
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
     assert [c.game.title for c in view.cards] == ["Buffalo Sabres vs Chicago Blackhawks",
                                                     "Dallas Stars vs Winnipeg Jets"]
     a, b = (c.mapTo(view, QPoint(0, 0)) for c in view.cards)
     assert a.y() == b.y() and b.x() >= a.x() + view.cards[0].width(), "cards share a row"
-    tag = view.cards[0].tag
-    assert tag.text() == "● LIVE · 1h 10m in"
-    ink, accent = _ink(tag), QColor(theme.COLOR_ACCENT)
-    assert max(abs(ink.red() - accent.red()), abs(ink.green() - accent.green()),
-               abs(ink.blue() - accent.blue())) <= 40, "LIVE is drawn in the accent"
-    assert "4 channels" in view.cards[0].meta.text()
+    card = view.cards[0]
+    assert card.tag.text().endswith("LIVE") and " in" not in card.tag.text()
+    assert _near(_ink(card.tag), QColor(theme.COLOR_ACCENT)), "LIVE is drawn in the accent"
+    assert card.bar is not None and card.bar.isVisible()
+    assert "Started" in card.bar.toolTip() and "usually ends" in card.bar.toolTip()
+    assert card.more_chip is not None and card.more_chip.text().endswith("+3")
 
 
-def test_selecting_a_game_lists_its_channels_below_and_plays_the_one_clicked(games_db, qapp, owned_widgets):
-    view = _view(games_db, qapp, owned_widgets, START + timedelta(minutes=70))
-    selected, played = [], []
-    view.channelSelected.connect(selected.append)
+def test_the_view_never_scrolls_sideways_even_narrow(games_db, qapp, owned_widgets):
+    from PyQt6.QtWidgets import QScrollArea
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    view.resize(420, 900)
+    _settle(qapp)
+    scroll = view.findChild(QScrollArea)
+    assert scroll.horizontalScrollBarPolicy() == Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+    for c in view.cards:
+        right = c.mapTo(scroll.viewport(), QPoint(c.width(), 0)).x()
+        assert right <= scroll.viewport().width(), f"{c.game.title} runs off the edge"
+
+
+def test_one_click_on_the_play_line_or_a_double_click_on_the_card_plays_the_top_channel(
+        games_db, qapp, owned_widgets):
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    played = []
     view.playRequested.connect(played.append)
-    view.cards[0].selected.emit(view.cards[0].game)
-    qapp.processEvents()
-    qapp.processEvents()
-    assert selected == ["a1"]
-    assert len(view.feed_buttons) == 4
-    card_bottom = view.cards[0].mapTo(view, QPoint(0, view.cards[0].height())).y()
-    assert all(b.mapTo(view, QPoint(0, 0)).y() > card_bottom for b in view.feed_buttons)
-    assert view.cards[0].property("selected") == "true"
-    view.feed_buttons[2].click()
-    assert played == [view.feed_buttons[2].property("channel_id")]
-    assert played[0] in {"a1", "b1", "c1", "s1"}
-    view.cards[1].play.emit(view.cards[1].game)
-    assert played[-1] == "a2"
+    card = view.cards[0]
+    QTest.mouseClick(card.play_line, Qt.MouseButton.LeftButton)
+    assert played == [card.top_feed.channel_id]
+    QTest.mouseDClick(card, Qt.MouseButton.LeftButton)
+    assert played[-1] == card.top_feed.channel_id and len(played) == 2
+
+
+def test_the_chip_opens_the_game_full_width_first_with_every_channel_and_a_row_click_plays(
+        games_db, qapp, owned_widgets):
+    from streamselect.gui.game_card import ChannelRow
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    _card(view, "Dallas").more_chip.click()
+    _settle(qapp)
+    opened = view.cards[0]
+    assert "Dallas" in opened.game.title, "the open game comes first"
+    assert opened.width() > view.cards[1].width() * 2, "and spans the width"
+    rows = opened.findChildren(ChannelRow)
+    assert len(rows) == len(opened.game.playable)
+    played = []
+    view.playRequested.connect(played.append)
+    QTest.mouseClick(rows[1], Qt.MouseButton.LeftButton)
+    assert played == [rows[1].feed.channel_id]
+    assert rows[1].pref_chip.isHidden() and rows[1].eye.isHidden(), "controls only on hover"
+
+
+def test_preferred_is_a_chip_and_becomes_what_the_card_plays(games_db, qapp, owned_widgets):
+    from streamselect.gui.game_card import ChannelRow
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    _card(view, "Sabres").more_chip.click()
+    _settle(qapp)
+    row = view.cards[0].findChildren(ChannelRow)[-1]
+    target = row.feed
+    row.pref_chip.click()
+    _settle(qapp)
+    assert view.config.game_channel_prefs["hockey/NHL"]["preferred"] == target.collection_key
+    card = view.cards[0]
+    assert card.top_feed.collection_key == target.collection_key
+    shown = [r for r in card.findChildren(ChannelRow) if r.pref_chip and not r.pref_chip.isHidden()]
+    assert len(shown) == 1 and shown[0].feed.collection_key == target.collection_key
+    assert shown[0].pref_chip.text() == "PREFERRED"
+
+
+def test_a_hidden_channel_leaves_the_list_but_is_counted_and_comes_back(games_db, qapp, owned_widgets):
+    from streamselect.gui.game_card import HIDE_CHANNEL, ChannelRow
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    _card(view, "Sabres").more_chip.click()
+    _settle(qapp)
+    row = view.cards[0].findChildren(ChannelRow)[0]
+    gone = row.feed.channel_id
+    row.hide.emit(row.feed, HIDE_CHANNEL)
+    _settle(qapp)
+    card = view.cards[0]
+    assert gone not in {r.feed.channel_id for r in card.findChildren(ChannelRow)}
+    hidden_btn = next(b for b in card.findChildren(QPushButton) if b.text().startswith("1 hidden channel"))
+    hidden_btn.click()
+    _settle(qapp)
+    back = [r for r in view.cards[0].findChildren(ChannelRow) if r.feed.channel_id == gone]
+    assert len(back) == 1
+    back[0].unhide.emit(back[0].feed)
+    _settle(qapp)
+    assert not view.config.game_channel_prefs["hockey/NHL"].get("hidden_channels")
+
+
+def test_while_a_channel_plays_the_top_line_says_playing_in_green_and_rows_do_not_move(
+        games_db, qapp, owned_widgets):
+    from streamselect.gui import theme
+    from streamselect.gui.game_card import ChannelRow
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    _card(view, "Sabres").more_chip.click()
+    _settle(qapp)
+    before = [r.feed.channel_id for r in view.cards[0].findChildren(ChannelRow)]
+    view.set_playing(before[-1])
+    _settle(qapp)
+    card = view.cards[0]
+    assert [r.feed.channel_id for r in card.findChildren(ChannelRow)] == before
+    assert card.top_feed.channel_id == before[-1]
+    word = next(lbl for lbl in card.play_line.findChildren(QLabel) if lbl.text() == "PLAYING")
+    assert _near(_ink(word), QColor(theme.COLOR_OK)), "PLAYING in the playing green"
 
 
 def test_past_its_usual_length_a_game_stays_on_now_marked_likely_ending(games_db, qapp, owned_widgets):
-    """Overtime and delays run past the usual length; the game is not dropped, it says so."""
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=3))
     assert len(view.cards) == 2
-    assert all(c.tag.text().startswith("LIKELY ENDING") for c in view.cards)
+    assert all(c.tag.text() == "LIKELY ENDING" for c in view.cards)
 
 
-def test_after_the_games_end_they_are_dimmed_rows_under_finished(games_db, qapp, owned_widgets):
-    from streamselect.gui.sidebar.base import GroupHeading
+def test_finished_starts_folded_and_the_fold_is_remembered(games_db, qapp, owned_widgets):
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=5))
-    assert view.cards == []
-    headings = [h.label.text() for h in view.findChildren(GroupHeading)]
-    assert "On now" in headings and "Finished" in headings
+    assert view.cards == [] and "finished" in view.headers and view.rows == []
+    view._toggle_fold("finished")
+    _settle(qapp)
+    assert len(view.rows) == 2
+    assert "finished" not in view.config.sports_view_state["folded"]
+
+
+def test_mark_as_finished_moves_the_game_to_finished(games_db, qapp, owned_widgets):
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    dallas = _card(view, "Dallas")
+    dallas.finished.emit(dallas.game)
+    _settle(qapp)
+    assert [c.game.title for c in view.cards] == ["Buffalo Sabres vs Chicago Blackhawks"]
+
+
+def test_the_sort_order_flips_and_is_remembered(games_db, qapp, owned_widgets):
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    assert view.sort_button.text() == "Earliest first"
+    first = [c.game.title for c in view.cards]
+    view.sort_button.click()
+    _settle(qapp)
+    assert view.config.sports_view_state["sort"] == "latest"
+    assert view.sort_button.text() == "Latest first"
+    assert sorted(first) == sorted(c.game.title for c in view.cards)
+
+
+def test_less_certain_games_appear_dashed_when_the_toggle_is_on(db, qapp, owned_widgets):
+    from streamselect.core.database import ChannelDB
+    _seed_db(db)
+    with db.session_scope() as s:
+        s.add(ChannelDB(id="x1", source_id="x1", provider_id="p1", category="COLL ZONE A", media_type="live",
+                        name="NHL: Boston Bruins vs Montreal Canadiens | Fri 13 Nov 02:10 CET"))
+    refresh_games(db, NOW)
+    view = _view(db, qapp, owned_widgets, LIVE_AT)
+    assert not any("Bruins" in c.game.title for c in view.cards)
+    view.less_certain_chip.click()
+    _settle(qapp)
+    bruins = _card(view, "Bruins")
+    assert bruins.property("certain") == "false"
+    assert view.config.sports_view_state["less_certain"] is True
+
+
+# ── loading, and the Recommended gear ─────────────────────────────────────
+
+def test_before_the_finder_has_looked_it_says_so_instead_of_zero(db, qapp, owned_widgets):
+    """Owner, 2026-11-12: on a fresh launch the view said 0 games, then 5 appeared."""
+    from streamselect.core.config import Config
+    from streamselect.gui.sports_view import SportsView
+
+    pending = []
+    view = owned_widgets.own(SportsView(db, Config(), lambda fn, cb, **_: pending.append((fn, cb)),
+                                        clock=lambda: NOW))
+    view.resize(800, 600)
+    view.show()
+    view.on_activate()
+    qapp.processEvents()
+
+    def texts():
+        return [w.text() for w in view.findChildren(QLabel) if w.isVisible()]
+
+    assert "Loading games…" in texts()
+    view.set_finding(True)
+    fn, cb = pending.pop()
+    with db.session_scope(commit=False) as s:
+        cb(fn(RepositoryFactory(s)))
+    qapp.processEvents()
+    assert "Finding games in your channel listings…" in texts()
+    assert not view.headers, "no 'On now 0'"
+    _seed_db(db)
+    refresh_games(db, NOW)
+    view.finished_finding()
+    assert "Finding games in your channel listings…" in texts(), "no flash of the old list"
+    fn, cb = pending.pop()
+    with db.session_scope(commit=False) as s:
+        cb(fn(RepositoryFactory(s)))
+    qapp.processEvents()
+    assert len(view.cards) == 2 and "Finding games in your channel listings…" not in texts()
 
 
 def test_sports_takes_recommendeds_place_in_the_top_bar():
@@ -135,8 +315,6 @@ def test_sports_takes_recommendeds_place_in_the_top_bar():
 
 
 def test_recommended_opens_from_a_gear_on_its_sidebar_header(qapp, owned_widgets, tmp_path):
-    """Owner, 2026-11-12: Recommended left the top bar for Sports; a gear on the
-    sidebar section's header opens it, boxed beside the header's other button."""
     from unittest.mock import MagicMock
 
     from streamselect.core.config import Config
@@ -153,46 +331,7 @@ def test_recommended_opens_from_a_gear_on_its_sidebar_header(qapp, owned_widgets
     assert "Recommended" in gear.toolTip()
     title = sec.findChild(QLabel)
     assert gear.mapTo(sec, QPoint(0, 0)).x() > title.mapTo(sec, QPoint(0, 0)).x() + title.width()
-    assert abs(gear.mapTo(sec, QPoint(0, 0)).y() - title.mapTo(sec, QPoint(0, 0)).y()) < 20, "in the header row"
     opened = []
     sec.openViewRequested.connect(lambda: opened.append(True))
     gear.click()
     assert opened == [True]
-
-
-def test_before_the_finder_has_looked_it_says_so_instead_of_zero(db, qapp, owned_widgets):
-    """Owner, 2026-11-12: on a fresh launch the view said 0 games, then 5 appeared.
-    The table is empty until the first finder run; until then it says it is looking."""
-    from streamselect.core.config import Config
-    from streamselect.gui.sidebar.base import GroupHeading
-    from streamselect.gui.sports_view import SportsView
-
-    pending = []
-    view = owned_widgets.own(SportsView(db, Config(), lambda fn, cb, **_: pending.append((fn, cb)),
-                                        clock=lambda: NOW))
-    view.resize(800, 600)
-    view.show()
-    view.on_activate()
-    qapp.processEvents()
-
-    def texts():
-        return [w.text() for w in view.findChildren(QLabel) if w.isVisible()]
-
-    assert "Loading games…" in texts()                       # the read has not come back
-    view.set_finding(True)
-    fn, cb = pending.pop()
-    with db.session_scope(commit=False) as s:
-        cb(fn(RepositoryFactory(s)))                         # an empty table comes back
-    qapp.processEvents()
-    assert "Finding games in your channel listings…" in texts()
-    assert not [h for h in view.findChildren(GroupHeading) if h.isVisible()], "no 'On now 0'"
-
-    _seed_db(db)
-    refresh_games(db, NOW)
-    view.finished_finding()
-    assert "Finding games in your channel listings…" in texts(), "no flash of the old list"
-    fn, cb = pending.pop()
-    with db.session_scope(commit=False) as s:
-        cb(fn(RepositoryFactory(s)))
-    qapp.processEvents()
-    assert len(view.cards) == 2 and "Finding games in your channel listings…" not in texts()

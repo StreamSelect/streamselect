@@ -1253,24 +1253,22 @@ class _StreamingMixin(_WatchCaptureMixin):
         self._playback_health_label.show()
 
     def _notify_details_playing(self, channel_id: str | None, position_seconds: float) -> None:
-        """Forward the live play-state to the details pane (main thread).
+        """Forward the live play-state to every "currently playing" mark (main thread).
 
-        Thin guard around ``details_pane.set_playing`` so the playback-health poll
-        can light/clear the "currently playing" indicator without caring whether
-        the pane exists yet during early startup.
+        One poll feeds the details pane, the Watch Alerts sidebar and the Sports
+        view, so their marks cannot disagree; each may not exist yet at startup.
 
         Args:
-            channel_id: The channel now playing in the polled window, or None when
-                nothing is playing (clears the indicator).
+            channel_id: The channel now playing, or None when nothing plays (clears).
             position_seconds: Current playback position in seconds.
         """
         pane = self.__dict__.get("details_pane")
         if pane is not None:
             pane.set_playing(channel_id, position_seconds)
-        # The sidebar reads the SAME signal rather than tracking playback
-        # itself, so its play marker and the pane's indicator cannot disagree.
-        # Reached through sidebar_sections, which is how every other caller
-        # gets at it (_refresh_vod_alerts_section) — there is no attribute.
+        sports = self.__dict__.get("sports_view")
+        if sports is not None:
+            sports.set_playing(channel_id)
+        # Reached through sidebar_sections, as every caller does (there is no attribute).
         sections = self.__dict__.get("sidebar_sections") or {}
         alerts = sections.get("alerts")
         if alerts is not None and hasattr(alerts, "set_playing"):

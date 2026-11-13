@@ -64,3 +64,19 @@ class GameFinderMemoryDB(Base):
     finder     = Column(String, primary_key=True)
     memory     = Column(JSONEncoded, nullable=False)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+class GameEndDB(Base):
+    """A game the user marked finished (Sports, right-click → Mark as finished).
+
+    Keyed by the game itself, not ``games.id``: the games table is rebuilt on
+    every finder run. Each row is also a measured game length for its league —
+    the data that will replace ``SportSettings.usual_length`` over time.
+    """
+    __tablename__ = "game_ends"
+
+    league_key = Column(String, primary_key=True)    # "hockey/NHL"
+    team_a     = Column(String, primary_key=True)
+    team_b     = Column(String, primary_key=True)
+    start_utc  = Column(DateTime, primary_key=True)
+    ended_at   = Column(DateTime, nullable=False)    # UTC, when the user marked it

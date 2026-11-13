@@ -1410,6 +1410,10 @@ class Config(BaseModel):
     # once by _migrate_live_refresh_mode().
     live_refresh_mode: str = "manual"
     live_refresh_mode_version: int = 0  # 0 = _migrate_live_refresh_mode not yet applied
+    # Sports view (gui/sports_view.py): "sort" earliest|latest, "less_certain" bool, "folded" [section keys].
+    sports_view_state: dict = Field(default_factory=dict)
+    # Per league ("hockey/NHL"): "preferred" collection key, "hidden_channels" ids, "hidden_collections" keys.
+    game_channel_prefs: dict = Field(default_factory=dict)
 
     # Series monitor — user-opted series tracked for new episode arrivals.
     # Each entry is a plain dict:

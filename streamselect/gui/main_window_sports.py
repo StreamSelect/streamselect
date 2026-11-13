@@ -21,6 +21,8 @@ class _SportsViewMixin:
             view = self.sports_view = SportsView(self.db, self.config, self._run_query, self)
             view.playRequested.connect(self.play_channel_by_id)
             view.channelSelected.connect(self.show_channel_details_by_id)
+            # The card's "Hide this channel everywhere…" is the app's own Hide.
+            view.hideEverywhereRequested.connect(lambda cid: self._bulk_hide_channels([cid]))
             view.setVisible(False)
             self._list_layout.addWidget(view)
             # A run starting says "finding" instead of a premature 0; new games stored

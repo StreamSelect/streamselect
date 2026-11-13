@@ -25,7 +25,24 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
             f" border: 1px solid {_('COLOR_BORDER')}; border-radius: {_('RADIUS_MD')}; }}"
             f"QFrame#gameCard:hover {{ border-color: {_('COLOR_ACCENT')}; }}"
             f"QFrame#gameCard[selected=\"true\"] {{ border: 2px solid {_('COLOR_ACCENT')}; }}"
+            # Only one collection lists it (Level 2): dashed, the app's "guessed" mark.
+            f"QFrame#gameCard[certain=\"false\"] {{ border-style: dashed; }}"
         ),
+        # The card's "▶ [US] STATION" line: one click plays, so it lights on hover.
+        "GAME_PLAY_LINE": (
+            f"QFrame#gamePlayLine {{ border-radius: {_('RADIUS_SM')}; }}"
+            f"QFrame#gamePlayLine:hover {{ background: {_('OVERLAY_ACCENT_35')}; }}"
+        ),
+        # One channel in an open card: clicking its name plays it.
+        "GAME_CHANNEL_ROW": (
+            f"QWidget#gameChannelRow {{ border-radius: {_('RADIUS_SM')}; }}"
+            f"QWidget#gameChannelRow:hover {{ background: {_('OVERLAY_10')}; }}"
+        ),
+        # PLAYING, in the details pane's playing colour (DETAIL_PLAY_BTN_PLAYING).
+        "GAME_PLAYING": (
+            f"color: {_('COLOR_OK')}; font-size: {_('FONT_SM')}; font-weight: bold; letter-spacing: 1px;"
+        ),
+        "GAME_PLAYING_NAME": f"color: {_('COLOR_OK')}; font-weight: bold;",
         "GAME_TITLE": (
             f"color: {_('COLOR_TEXT_HI')}; font-size: {_('FONT_LG')}; font-weight: 600;"
         ),

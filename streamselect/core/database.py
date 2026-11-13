@@ -1340,7 +1340,7 @@ class Database:
 
 
 # Models beside their concern register on ``Base`` by these imports (so ``create_all`` sees them).
-from streamselect.core.games.models import GameDB, GameFeedDB, GameFinderMemoryDB  # noqa: E402
+from streamselect.core.games.models import GameDB, GameEndDB, GameFeedDB, GameFinderMemoryDB  # noqa: E402
 from streamselect.core.playback_models import PlaybackEventDB, PlaybackWeeklyDB, StreamInfoDB  # noqa: E402
-__all__ = ["Base", "Database", "JSONEncoded", "GameDB", "GameFeedDB", "GameFinderMemoryDB",
+__all__ = ["Base", "Database", "JSONEncoded", "GameDB", "GameEndDB", "GameFeedDB", "GameFinderMemoryDB",
            "PlaybackEventDB", "PlaybackWeeklyDB", "StreamInfoDB"]
