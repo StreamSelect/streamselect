@@ -17,7 +17,7 @@ from sqlalchemy import case, func, select
 
 from streamselect.core.category_headings import split_head
 from streamselect.core.database import ChannelDB
-from streamselect.core.event_datetime import event_is_on_now
+from streamselect.core.event_datetime import DEFAULT_EVENT_DURATION, event_is_on_now
 from streamselect.core.games.finder import SportSettings
 from streamselect.core.games.models import GameDB, GameEndDB, GameFeedDB
 from streamselect.core.playback_models import PlaybackEventDB
@@ -125,6 +125,7 @@ WatchHistory = dict[str, tuple[Optional[datetime], int, int]]
 #: log separates bails (seconds) from watches (minutes) cleanly. A play still running
 #: (no seconds yet) counts as watched.
 WATCHED_MIN_SECONDS = 60
+_PLAY_CAP_S = int(DEFAULT_EVENT_DURATION.total_seconds())
 
 
 def arrange_feeds(game: GameDTO, prefs: dict, history: WatchHistory) -> GameDTO:
@@ -167,7 +168,10 @@ def load_watch_history(session) -> WatchHistory:
     rows = session.execute(
         select(ChannelDB.provider_id, ChannelDB.category,
                func.max(case((watched, PlaybackEventDB.started_at), else_=None)),
-               func.coalesce(func.sum(PlaybackEventDB.seconds_watched), 0), func.count())
+               # One play counts at most one event's length: rows stored before ledger D73's
+               # fix can hold a broadcast-clock jump (one read 92,693 s).
+               func.coalesce(func.sum(func.min(PlaybackEventDB.seconds_watched, _PLAY_CAP_S)), 0),
+               func.count())
         .join(ChannelDB, ChannelDB.id == PlaybackEventDB.channel_id)
         .where(PlaybackEventDB.outcome.in_(("started", "dropped")))
         .group_by(ChannelDB.provider_id, ChannelDB.category)).all()

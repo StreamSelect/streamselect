@@ -52,17 +52,35 @@ def _host(db):
     return host
 
 
+class _Clock:
+    """A monotonic clock the test moves, so "how long it played" is real time, not position."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+@pytest.fixture()
+def clock():
+    c = _Clock()
+    with patch.object(watch.time, "monotonic", c):
+        yield c
+
+
 def _rows(db):
     with db.session_scope(commit=False) as s:
         return [(r.outcome, r.http_code, r.time_to_picture_ms, r.seconds_watched, r.provider_id)
                 for r in s.query(PlaybackEventDB).order_by(PlaybackEventDB.id)]
 
 
-def test_a_play_that_advances_is_recorded_started_then_gets_its_watched_time(file_db):
+def test_a_play_that_advances_is_recorded_started_then_gets_its_watched_time(file_db, clock):
     host = _host(file_db)
     watch.arm(host, ATTEMPT)
     watch.on_loaded_tick(host, 0.0, False, cache_duration=2.0)
     watch.on_loaded_tick(host, 2.0, False, cache_duration=2.0)     # progress
+    clock.t += 60
     watch.on_loaded_tick(host, 62.0, False, cache_duration=2.0)
     watch.on_idle_tick(host)                                         # closed
     [(outcome, code, ttp, watched, pid)] = _rows(file_db)
@@ -70,15 +88,42 @@ def test_a_play_that_advances_is_recorded_started_then_gets_its_watched_time(fil
     assert ttp is not None and ttp >= 0
 
 
-def test_a_play_cut_mid_film_is_recorded_dropped(file_db):
+def test_a_play_cut_mid_film_is_recorded_dropped(file_db, clock):
     host = _host(file_db)
     watch.arm(host, ATTEMPT)
     watch.on_loaded_tick(host, 0.0, False, cache_duration=2.0, duration=5000.0)
     watch.on_loaded_tick(host, 2.0, False, cache_duration=2.0, duration=5000.0)
+    clock.t += 200
     watch.on_loaded_tick(host, 200.0, False, cache_duration=2.0, duration=5000.0)
     watch.on_player_gone(host, exit_reason=next(iter(STREAM_EXIT_REASONS)))
     [(outcome, _code, _ttp, watched, _pid)] = _rows(file_db)
     assert (outcome, watched) == ("dropped", 200)
+
+
+def test_a_live_timestamp_jump_never_counts_as_time_watched(file_db, clock):
+    """Ledger D73: a 15-minute NHL play was stored as 92,693 s watched — the
+    broadcast's timestamps jumped. Watched time is capped at the real time played."""
+    host = _host(file_db)
+    watch.arm(host, ATTEMPT)
+    watch.on_loaded_tick(host, 100.0, False, cache_duration=2.0)
+    watch.on_loaded_tick(host, 102.0, False, cache_duration=2.0)   # progress
+    clock.t += 900                                                 # 15 minutes of real play
+    watch.on_loaded_tick(host, 93_000.0, False, cache_duration=2.0)  # the stream's clock leapt
+    watch.on_idle_tick(host)
+    [(_outcome, _code, _ttp, watched, _pid)] = _rows(file_db)
+    assert 900 <= watched <= 905
+
+
+def test_a_backward_timestamp_jump_counts_the_real_time(file_db, clock):
+    host = _host(file_db)
+    watch.arm(host, ATTEMPT)
+    watch.on_loaded_tick(host, 5000.0, False, cache_duration=2.0)
+    watch.on_loaded_tick(host, 5002.0, False, cache_duration=2.0)
+    clock.t += 300
+    watch.on_loaded_tick(host, 40.0, False, cache_duration=2.0)    # wrapped back
+    watch.on_idle_tick(host)
+    [(_outcome, _code, _ttp, watched, _pid)] = _rows(file_db)
+    assert 300 <= watched <= 305
 
 
 def test_a_connection_limit_refusal_is_recorded_refused_with_its_code(file_db):

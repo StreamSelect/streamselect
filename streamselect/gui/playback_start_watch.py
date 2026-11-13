@@ -222,6 +222,7 @@ def arm(host: Any, attempt: "Optional[PlayAttempt]" = None) -> None:
     host._health_armed_at = time.monotonic()
     host._health_armed_utc = datetime.utcnow()
     host._health_first_pos = None
+    host._health_progress_at = None
     # PLAY-15: the previous play's DB-write closure, if any, is dropped here —
     # it never progressed, so it must never be recorded.
     host._pending_play_record = None
@@ -330,6 +331,7 @@ def on_loaded_tick(host: Any, time_pos: Any, paused: bool, cache_duration: Any =
         if last is not None and time_pos > last + _PROGRESS_EPSILON:
             host._health_ever_progressed = True
             host._health_first_pos = float(last)
+            host._health_progress_at = time.monotonic()
             _record_outcome(host, "started", time_to_picture_ms=int(
                 (time.monotonic() - host.__dict__.get("_health_armed_at", time.monotonic())) * 1000))
             host._health_last_time_pos = float(time_pos)
@@ -693,6 +695,25 @@ def _record_outcome(host: Any, outcome: str, *, http_code: "int | None" = None,
         http_code=http_code, time_to_picture_ms=time_to_picture_ms), _store)
 
 
+def _watched_seconds(first: "float | None", last: "float | None",
+                     progress_at: "float | None") -> "int | None":
+    """How long a play ran: the position moved, capped at the real time since it began.
+
+    A live stream's position follows the broadcast's own timestamps, which jump
+    (a slot switching programmes, a clock reset): one 15-minute NHL play was stored
+    as 92,693 s watched (ledger D73). The position can never honestly exceed the
+    wall time since playback first advanced (plus one poll of slack); a backward
+    jump falls back to the wall time.
+    """
+    if first is None or last is None:
+        return None
+    moved = last - first
+    if progress_at is None:
+        return max(0, int(moved))
+    wall = time.monotonic() - progress_at + POLL_MS / 1000
+    return int(wall if moved < 0 else min(moved, wall))
+
+
 def _finish_recorded_play(host: Any, outcome: "str | None" = None) -> None:
     """A recorded play ended: store how long it ran (and ``dropped`` if cut). Once."""
     event_id = host.__dict__.pop("_health_event_id", None)
@@ -700,7 +721,7 @@ def _finish_recorded_play(host: Any, outcome: "str | None" = None) -> None:
         return
     first = host.__dict__.get("_health_first_pos")
     last = host.__dict__.get("_health_last_time_pos")
-    watched = int(last - first) if first is not None and last is not None else None
+    watched = _watched_seconds(first, last, host.__dict__.get("_health_progress_at"))
     _write_play(host, lambda repos: repos.playback_events.update(
         event_id, outcome=outcome, seconds_watched=watched))
 
