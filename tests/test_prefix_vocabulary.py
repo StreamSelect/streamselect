@@ -94,12 +94,14 @@ def file_db(tmp_path):
 
 
 def _seed(db):
+    # The unknown tokens are made up so a newly reviewed real prefix can never make
+    # them known (T2, FRQ and MH were used here until the parser learned them).
     from streamselect.core.database import ProviderDB
     with db.session_scope() as s:
         s.add(ProviderDB(id="delta", name="Delta", type="xtream", url="http://t", username="u",
                          password="p", is_active=True))
         rows = [("ENDED", "live", 3), ("BLURAY-DE", "movie", 2), ("WESTERN-DE", "movie", 2),
-                ("T2", "live", 4), ("FRQ", "movie", 5), ("MH", "series", 1), ("FRQ", "series", 2)]
+                ("QZ2", "live", 4), ("ZQX", "movie", 5), ("XQZ", "series", 1), ("ZQX", "series", 2)]
         for prefix, media, n in rows:
             for i in range(n):
                 s.add(ChannelDB(id=str(uuid.uuid4()), source_id=str(uuid.uuid4()), provider_id="delta",
@@ -112,7 +114,7 @@ def test_the_repository_lists_only_unknowns_grouped_live_films_series(file_db):
     with file_db.session_scope() as s:
         stats = RepositoryFactory(s).analytics.unrecognized_prefixes("delta")
         got = [(p.prefix, p.media_type, p.count) for p in stats]
-    assert got == [("T2", "live", 4), ("FRQ", "movie", 5), ("FRQ", "series", 2), ("MH", "series", 1)]
+    assert got == [("QZ2", "live", 4), ("ZQX", "movie", 5), ("ZQX", "series", 2), ("XQZ", "series", 1)]
 
 
 def test_the_tab_shows_a_heading_per_type_in_order(qapp, file_db):
@@ -137,10 +139,10 @@ def test_the_tab_shows_a_heading_per_type_in_order(qapp, file_db):
         assert [h.text() for h in headings] == ["Live channels · 1", "Films · 1", "Series · 2"]
         # The types sit side by side, live → films → series, each row under its heading.
         pos = {lbl.text(): lbl.mapTo(section, lbl.rect().topLeft()) for lbl in labels}
-        pj = sorted((lbl.mapTo(section, lbl.rect().topLeft()) for lbl in labels if lbl.text() == "FRQ"),
+        pj = sorted((lbl.mapTo(section, lbl.rect().topLeft()) for lbl in labels if lbl.text() == "ZQX"),
                     key=lambda p: p.x())
         assert pos["Live channels · 1"].x() < pos["Films · 1"].x() < pos["Series · 2"].x()
-        assert pos["T2"].x() == pos["Live channels · 1"].x() and pos["T2"].y() > pos["Live channels · 1"].y()
+        assert pos["QZ2"].x() == pos["Live channels · 1"].x() and pos["QZ2"].y() > pos["Live channels · 1"].y()
         assert pj[0].x() == pos["Films · 1"].x() and pj[1].x() == pos["Series · 2"].x()
     finally:
         destroy_widget(ed)

@@ -23,7 +23,6 @@ Coverage
 from __future__ import annotations
 
 import uuid
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -119,12 +118,9 @@ def _run_tag_hook(db: Database, provider_id: str, cfg: Config) -> None:
     the private worker method directly — the same way other loader tests work.
     The method only needs ``self.db`` and ``self.provider.id`` / ``self.provider.name``.
     """
-    from streamselect.core.provider_loader import ProviderLoadThread
+    from tests.conftest import make_provider_load_thread
 
-    provider = SimpleNamespace(id=provider_id, name="TestProvider")
-    thread = ProviderLoadThread.__new__(ProviderLoadThread)
-    thread.db = db
-    thread.provider = provider
+    thread = make_provider_load_thread(db, provider_id, "TestProvider")
 
     # Patch Config.load() so the worker uses our isolated config instance.
     # Config is imported inside the method body, so we patch its canonical location.

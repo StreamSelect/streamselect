@@ -2898,7 +2898,8 @@ def _bundled_ui_font():
     _SESSION_QAPP = None                # release ours before finalization runs
 
 
-def make_provider_load_thread(db, provider_id: str, provider_name: str = "Test Source"):
+def make_provider_load_thread(db, provider_id: str, provider_name: str = "Test Source",
+                              kind: str = "full"):
     """A ``ProviderLoadThread`` skeleton for driving its worker-thread methods.
 
     ``__new__`` skips ``QThread.__init__``, which is what makes the object cheap
@@ -2915,11 +2916,14 @@ def make_provider_load_thread(db, provider_id: str, provider_name: str = "Test S
         db: A ``Database`` instance the method should read and write.
         provider_id: The ``ProviderDB.id`` whose channels are in scope.
         provider_name: Only used in log lines.
+        kind: "full" or "live_only", as the refresh queue passes it.
 
     Returns:
-        A ``ProviderLoadThread`` with ``db`` and ``provider`` set.
+        A ``ProviderLoadThread`` built by its real ``__init__``.
     """
-    from unittest.mock import MagicMock
+    from unittest.mock import MagicMock, patch
+
+    from PyQt6.QtCore import QThread
 
     from streamselect.core.provider_loader import ProviderLoadThread
 
@@ -2927,9 +2931,11 @@ def make_provider_load_thread(db, provider_id: str, provider_name: str = "Test S
     provider.id = provider_id
     provider.name = provider_name
 
-    thread = ProviderLoadThread.__new__(ProviderLoadThread)
-    thread.db = db
-    thread.provider = provider
+    # The REAL __init__ runs with only the Qt base patched out: a hand-listed set
+    # of attributes went stale the day __init__ gained ``_media_scope`` (the
+    # live-refresh scope change), and every tagging test read zero tags.
+    with patch.object(QThread, "__init__", lambda self, *a, **k: None):
+        thread = ProviderLoadThread(provider, db, kind=kind)
     return thread
 
 

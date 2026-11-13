@@ -22,7 +22,7 @@ from streamselect.core.repositories.dtos import (
     TitleOverlapDTO,
     ViewingDTO,
 )
-from streamselect.core.content_identity import title_key_expr
+from streamselect.core.content_identity import title_key, title_key_expr
 from streamselect.core.prefix_vocabulary import is_known_prefix
 
 _SAMPLE_NAMES = 5
@@ -189,7 +189,7 @@ class AnalyticsRepository:
         groups: dict[tuple, list] = {}     # [name, media, plays, last, title key, seconds, content key]
         for cid, raw, when, secs in events:
             owner = series.get(cid, cid)
-            name, media, key, ck = rows.get(owner, (raw, "", f"id:{owner}", None))
+            name, media, key, ck = rows.get(owner, (raw, "", title_key(None, owner), None))
             by_name = media in ("live", "")
             group = groups.setdefault((key, raw) if by_name else (key,),
                                       [raw if by_name else name, media, 0, when, key, 0, ck])
