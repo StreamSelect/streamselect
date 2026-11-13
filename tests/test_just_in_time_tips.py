@@ -224,6 +224,45 @@ def test_the_first_title_explains_like_not_interested_and_dislike_then_cast(host
     assert host._tour.hole().contains(QRect(chip.mapTo(host, QPoint(0, 0)), chip.size()))
 
 
+def test_a_cast_name_scrolled_out_of_view_waits_then_is_ringed_where_it_is(host, qapp):
+    """Owner, 2026-11-12: the cast tip sat in the window's top-left corner while
+    the names were at the bottom right of the details pane. The first name was
+    below the pane's scrolled viewport; the ring was cut to nothing and the card
+    fell back to the corner. Now the tip waits, and rings the name once on screen."""
+    from PyQt6.QtWidgets import QScrollArea
+
+    from streamselect.gui.just_in_time_tips import offer_details_tips
+
+    pane = QScrollArea(host)
+    pane.setGeometry(650, 300, 300, 300)
+    inner = QWidget()
+    inner.resize(280, 1200)
+    pane.setWidget(inner)
+    pane._cast = _Cast(inner)
+    pane._cast.chip.setGeometry(10, 1000, 120, 24)     # far below the viewport
+    host.config.tips_seen = ["rating"]
+    host.details_pane = pane
+    pane.show()
+    qapp.processEvents()
+
+    offer_details_tips(host)
+    assert not _wait(qapp, lambda: host.__dict__.get("_tour") is not None, 1.0)
+    assert "people" not in host.config.tips_seen, "an unshown tip is not 'seen'"
+
+    pane.ensureWidgetVisible(pane._cast.chip)
+    qapp.processEvents()
+    offer_details_tips(host)
+    assert _wait(qapp, lambda: host.__dict__.get("_tour") is not None)
+    chip = pane._cast.chip
+    chip_rect = QRect(chip.mapTo(host, QPoint(0, 0)), chip.size())
+    assert host._tour.hole().contains(chip_rect)
+    card = host._tour._card.geometry()
+    # The card sits beside the name it explains: within one card height of it.
+    assert abs(card.center().y() - chip_rect.center().y()) <= card.height() + chip_rect.height()
+    assert card.right() >= pane.geometry().left(), "the card is not in the far corner"
+    host._tour.end()
+
+
 @pytest.mark.parametrize("view, chip, title", [
     ("discover", "discover_chip", "Discover"), ("recipe", "recipe_chip", "Recipe"),
     ("epg", "epg_chip", "EPG"), ("preferences", "prefs_chip", "Recommended"),

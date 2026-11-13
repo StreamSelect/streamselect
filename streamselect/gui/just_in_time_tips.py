@@ -150,7 +150,9 @@ def _show_now(host, key: str, target: QWidget, area=None) -> None:
     if seen(host, key) or host.__dict__.get("_tour") is not None:
         return
     try:
-        ready = host.isVisible() and target.isVisible()
+        # On screen, not merely shown: a cast name scrolled below the details
+        # pane's viewport waits for a later title (an unshown tip is not "seen").
+        ready = host.isVisible() and target.isVisible() and not target.visibleRegion().isEmpty()
     except RuntimeError:        # the target was deleted while we waited
         return
     if not ready:

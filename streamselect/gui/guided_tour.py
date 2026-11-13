@@ -307,6 +307,12 @@ class TourOverlay(QWidget):
                 return None
         else:
             area = _drawn_rect(widget) if stop.tight else widget.rect()
+        # Only the part actually on screen: a target scrolled out of its scroll
+        # area is "visible" to Qt yet maps outside the viewport, and an empty
+        # ring put the card in the window's top-left corner, nowhere near it.
+        area = area.intersected(widget.visibleRegion().boundingRect())
+        if area.isEmpty():
+            return None
         top_left = widget.mapTo(self._host, area.topLeft())
         rect = QRect(top_left, area.size()).adjusted(-_RING_PAD, -_RING_PAD, _RING_PAD, _RING_PAD)
         return rect.intersected(self.rect())
