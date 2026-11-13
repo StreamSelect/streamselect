@@ -371,3 +371,53 @@ def test_recommended_opens_from_a_gear_on_its_sidebar_header(qapp, owned_widgets
     sec.openViewRequested.connect(lambda: opened.append(True))
     gear.click()
     assert opened == [True]
+
+
+# ── channel reports (SV-Q37-Q39) ──────────────────────────────────────────
+
+def test_a_report_counts_thirty_days_more_reports_extend_it_and_a_real_watch_cancels_one():
+    from streamselect.core.games.read import DIDNT_PLAY, report_text
+    g = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 2, ())
+    at = datetime(2026, 11, 1)
+    one = [{"kind": DIDNT_PLAY, "at": at.isoformat()}]
+    assert report_text(one, g, None, at + timedelta(days=29)).startswith("Reported once")
+    assert report_text(one, g, None, at + timedelta(days=31)) == ""
+    two = one + [{"kind": DIDNT_PLAY, "at": at.isoformat()}]
+    assert report_text(two, g, None, at + timedelta(days=59)).startswith("Reported 2 times")
+    # watched for real after the report: one report is cancelled
+    assert report_text(two, g, at + timedelta(days=1), at + timedelta(days=2)).startswith("Reported once")
+    assert report_text(one, g, at + timedelta(days=1), at + timedelta(days=2)) == ""
+
+
+def test_wrong_content_counts_only_for_the_game_it_was_reported_on():
+    from streamselect.core.games.read import WRONG_CONTENT, game_key, report_text
+    g = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 2, ())
+    other = GameDTO(2, "hockey", "NHL", "C", "D", START, 1, False, 2, ())
+    rep = [{"kind": WRONG_CONTENT, "at": START.isoformat(), "game": game_key(g)}]
+    assert report_text(rep, g, None, START) and report_text(rep, other, None, START) == ""
+
+
+def test_reporting_a_channel_puts_it_last_with_its_flag_and_clear_brings_it_back(games_db, qapp, owned_widgets):
+    from streamselect.gui.game_card import ChannelRow
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    _card(view, "Sabres").more_chip.click()
+    _settle(qapp)
+    first = view.cards[0].findChildren(ChannelRow)[0]
+    menu = first.build_context_menu("NHL")
+    texts = [a.text() for a in menu.actions()]
+    assert "Report this channel" in texts and "Didn't play" in texts and "Wrong content" in texts
+    clear = next(a for a in menu.actions() if a.text() == "Clear bad reports")
+    assert not clear.isEnabled(), "nothing to clear yet"
+    next(a for a in menu.actions() if a.text() == "Didn't play").trigger()
+    _settle(qapp)
+    rows = view.cards[0].findChildren(ChannelRow)
+    last = max(rows, key=lambda r: r.mapTo(view, QPoint(0, 0)).y())
+    assert last.feed.channel_id == first.feed.channel_id, "a reported channel is listed last"
+    assert last.report_icon is not None and last.report_icon.isVisibleTo(view)
+    assert "didn't play" in last.report_icon.toolTip()
+    assert all(r.report_icon is None for r in rows if r is not last), "no clutter on other rows"
+    clear = next(a for a in last.build_context_menu("NHL").actions() if a.text() == "Clear bad reports")
+    assert clear.isEnabled()
+    clear.trigger()
+    _settle(qapp)
+    assert all(r.report_icon is None for r in view.cards[0].findChildren(ChannelRow))

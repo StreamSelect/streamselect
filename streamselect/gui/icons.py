@@ -562,6 +562,9 @@ VECTOR_KEYS: dict[str, str] = {
     # 2026-11-12): the view is where the user tunes what gets recommended, so
     # it wears a gear. Its own role, as "manage" is beside "recipe".
     "recommended_settings": "mdi6.cog-outline",
+    # A channel the user reported in a Sports event (didn't play / wrong content):
+    # a flag — "someone flagged this", not the general "warning" triangle.
+    "reported": "mdi6.flag-outline",
     "tools": "mdi6.wrench-outline",
     "split": "mdi6.view-split-vertical",
     # Universal disclosure convention: closed shows a RIGHT chevron, open shows

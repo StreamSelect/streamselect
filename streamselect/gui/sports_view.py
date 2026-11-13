@@ -24,8 +24,8 @@ from PyQt6.QtWidgets import (
 
 from streamselect.core.epg_utils import browse_day_separator_label, fmt_time, now_utc, to_local
 from streamselect.core.games.read import (
-    ENDING, ON_NOW, UPCOMING, GameDTO, arrange_feeds, best_feed, game_state, load_games,
-    load_watch_history, mark_finished,
+    ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, arrange_feeds, best_feed, game_key, game_state,
+    load_games, load_watch_history, mark_finished,
 )
 from streamselect.core.games.store import enabled_leagues
 from streamselect.core.repositories.provider import ProviderRepository
@@ -183,7 +183,7 @@ class SportsView(ContentView):
     def _games(self) -> list[GameDTO]:
         out = []
         for g in self._raw:
-            g = arrange_feeds(g, self._prefs(g.league_key), self._history)
+            g = arrange_feeds(g, self._prefs(g.league_key), self._history, self._clock())
             if g.playable:
                 out.append(g)
         return out
@@ -336,6 +336,8 @@ class SportsView(ContentView):
         lst.prefer.connect(self._set_preferred)
         lst.hideRequested.connect(self._hide)
         lst.unhideRequested.connect(self._unhide)
+        lst.reportRequested.connect(self._report)
+        lst.clearReportsRequested.connect(self._clear_reports)
         if lst.hidden_button is not None:
             lst.hidden_button.clicked.connect(lambda _=False, k=_game_key(g): self._toggle_show_hidden(k))
         return lst
@@ -415,6 +417,21 @@ class SportsView(ContentView):
             if value in prefs.get(field, []):
                 prefs[field].remove(value)
         self._save()
+        QTimer.singleShot(0, self._render)
+
+    def _report(self, game: GameDTO, feed, kind: str) -> None:
+        """Record a channel report against its collection, for this league (SV-Q37)."""
+        entry = {"kind": kind, "at": self._clock().isoformat()}
+        if kind == WRONG_CONTENT:
+            entry["game"] = game_key(game)
+        self._prefs(game.league_key).setdefault("reports", {}).setdefault(feed.collection_key, []).append(entry)
+        self._save()
+        QTimer.singleShot(0, self._render)
+
+    def _clear_reports(self, game: GameDTO, feed) -> None:
+        reports = self._prefs(game.league_key).get("reports") or {}
+        if reports.pop(feed.collection_key, None) is not None:
+            self._save()
         QTimer.singleShot(0, self._render)
 
     def _mark_finished(self, game: GameDTO) -> None:

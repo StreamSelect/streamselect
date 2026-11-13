@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import unicodedata
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional
 
 from sqlalchemy import case, func, select
@@ -39,6 +39,9 @@ class GameFeedDTO:
     channel_collection: str = ""
     region: str = ""
     quality: str = ""
+    #: Set when the user reported this channel's collection (SV-Q37-Q39): the text
+    #: its row's report icon explains itself with. Empty when not reported.
+    report: str = ""
 
     @property
     def collection_key(self) -> str:
@@ -128,7 +131,43 @@ WATCHED_MIN_SECONDS = 60
 _PLAY_CAP_S = int(DEFAULT_EVENT_DURATION.total_seconds())
 
 
-def arrange_feeds(game: GameDTO, prefs: dict, history: WatchHistory) -> GameDTO:
+#: Channel reports (SV-Q37-Q39): "didnt_play" or "wrong_content".
+DIDNT_PLAY, WRONG_CONTENT = "didnt_play", "wrong_content"
+_REPORT_WORDS = {DIDNT_PLAY: "didn't play", WRONG_CONTENT: "wrong content"}
+#: A report counts this long after the latest one, times the number of reports
+#: (owner, SV-Q38: 30 days to start; more reports extend the tracking).
+REPORT_DAYS = 30
+
+
+def game_key(game: GameDTO) -> str:
+    """The game a "wrong content" report names: league, teams and start."""
+    return f"{game.league_key}|{game.team_a}|{game.team_b}|{game.start_utc.isoformat()}"
+
+
+def report_text(reports: list[dict], game: GameDTO, last_watched: Optional[datetime],
+                now: datetime) -> str:
+    """The active report on one collection for one game, as its icon's tooltip; "" if none.
+
+    ``reports``: the stored list for the collection, each ``{"kind", "at", "game"?}``.
+    A real watch (``last_watched``, plays of a minute or more) after the latest
+    report cancels one report — a feed that came back earns its place back. A
+    "wrong content" report counts for its own game; "didn't play" for every game.
+    """
+    relevant = [r for r in reports if r.get("kind") == DIDNT_PLAY
+                or (r.get("kind") == WRONG_CONTENT and r.get("game") == game_key(game))]
+    if not relevant:
+        return ""
+    latest = max(datetime.fromisoformat(r["at"]) for r in relevant)
+    n = len(relevant) - (1 if last_watched is not None and last_watched > latest else 0)
+    if n <= 0 or now > latest + timedelta(days=REPORT_DAYS * n):
+        return ""
+    kinds = sorted({_REPORT_WORDS.get(r.get("kind"), r.get("kind")) for r in relevant})
+    times = "once" if n == 1 else f"{n} times"
+    return f"Reported {times} in {game.league} games: {', '.join(kinds)}. Listed last."
+
+
+def arrange_feeds(game: GameDTO, prefs: dict, history: WatchHistory,
+                  now: Optional[datetime] = None) -> GameDTO:
     """Hide what the user hid for this league, then order the rest (owner, SV-Q27/Q28).
 
     Order: the user's PREFERRED collection; else the collection they last watched
@@ -145,9 +184,16 @@ def arrange_feeds(game: GameDTO, prefs: dict, history: WatchHistory) -> GameDTO:
     watched = [f.collection_key for f in keep if history.get(f.collection_key, (None,))[0] is not None]
     last = max(watched, key=lambda k: history[k][0]) if watched else None
 
+    reports = prefs.get("reports") or {}
+    if now is not None and reports:
+        keep = [replace(f, report=report_text(reports.get(f.collection_key, []), game,
+                                              history.get(f.collection_key, (None,))[0], now))
+                if f.collection_key in reports else f for f in keep]
+
     def key(f: GameFeedDTO):
         _last, secs, plays = history.get(f.collection_key, (None, 0, 0))
-        return (f.collection_key != preferred, f.collection_key != last, -secs, -plays,
+        # A reported channel goes last whatever else it has going for it (SV-Q39).
+        return (bool(f.report), f.collection_key != preferred, f.collection_key != last, -secs, -plays,
                 _FEED_RANK.get(f.time_from, 2))
     return replace(game, feeds=tuple(sorted(keep, key=key)), hidden=tuple(gone))
 
