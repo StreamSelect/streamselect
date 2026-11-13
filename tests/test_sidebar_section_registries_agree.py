@@ -58,7 +58,8 @@ def _factory_ids() -> set[str]:
 
 def _injected_ids() -> set[str]:
     """Ids ``_inject_new_sections`` adds to configs that predate them."""
-    tree = ast.parse((_ROOT / "streamselect/core/config.py").read_text(encoding="utf-8"))
+    # The defining module (moved out of config.py with the other migrations, ledger F68).
+    tree = ast.parse((_ROOT / "streamselect/core/config_migrations.py").read_text(encoding="utf-8"))
     fn = next(n for n in ast.walk(tree)
               if isinstance(n, ast.FunctionDef) and n.name == "_inject_new_sections")
     for node in ast.walk(fn):

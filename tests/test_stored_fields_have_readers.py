@@ -87,6 +87,9 @@ UNIVERSAL_EXCLUDED_NAMES = {"id", "name", "created_at", "updated_at"}
 #: same loop that left ``refresh_schedule`` unwired for months.
 PLUMBING_FILES = {
     "streamselect/core/config.py",
+    # config.py's own methods, split out (ledger F68): still the config's plumbing.
+    "streamselect/core/config_migrations.py",
+    "streamselect/core/config_watch_state.py",
     "streamselect/core/database.py",
     "streamselect/core/profile_store.py",
     "streamselect/core/repositories/dtos.py",
