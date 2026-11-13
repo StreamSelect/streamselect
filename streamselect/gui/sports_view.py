@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
 
 from streamselect.core.epg_utils import browse_day_separator_label, fmt_time, now_utc, to_local
 from streamselect.core.games.read import (
+    event_is_live as event_live,
     ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, arrange_feeds, best_feed, game_key, game_state,
     load_games, load_watch_history, mark_finished,
 )
@@ -41,13 +42,24 @@ from streamselect.gui.game_card import (
 )
 from streamselect.gui.sidebar.base import GroupHeading
 
-#: The sport this view shows. Hockey first (the method doc); others join once a
-#: league of theirs passes the method's test and is listed in game_finder_leagues.
-SPORT = "hockey"
+#: Sports are not named here: every sport with a league in ``game_finder_leagues``
+#: gets its own section (owner, 2026-11-13: hockey is one segment, not the view).
 #: Re-render this often while open: progress bars and on-now/finished move with the clock.
 TICK_MS = 60_000
 SORT_EARLIEST, SORT_LATEST = "earliest", "latest"
 FINISHED = "finished"
+
+
+class _CardGrid(QWidget):
+    """The wrapping card grid. Holds the height its rows need at its width: the scroll
+    area does not ask a layout's heightForWidth, so in a short window it squeezed the
+    grid to one card's height and the last row was cut off under the next header."""
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        need = self.layout().heightForWidth(self.width())
+        if need > 0 and self.minimumHeight() != need:
+            self.setMinimumHeight(need)
+        super().resizeEvent(event)
 
 
 def _game_key(g: GameDTO) -> tuple:
@@ -76,7 +88,10 @@ class SportsView(ContentView):
         self._playing: Optional[str] = None
         self._loaded = False
         self._finding = False
-        self.settings = next((s for s in enabled_leagues() if s.sport == SPORT), None)
+        #: sport -> its settings (the first listed league's lengths), in listed order.
+        self.sports: dict = {}
+        for league in enabled_leagues():
+            self.sports.setdefault(league.sport, league)
 
         self._tick = QTimer(self)
         self._tick.setInterval(TICK_MS)
@@ -120,9 +135,12 @@ class SportsView(ContentView):
         return bool(self._state().get("less_certain", False))
 
     def _folded(self) -> set[str]:
+        """Folded section keys, each ``"<sport>:<section>"`` or ``"sport:<sport>"``."""
         st = self._state()
         if "folded" not in st:
-            st["folded"] = [FINISHED]          # Finished starts folded (SV-Q21)
+            st["folded"] = [f"{sp}:{FINISHED}" for sp in self.sports]   # Finished starts folded (SV-Q21)
+        elif FINISHED in st["folded"]:            # remembered before sports had sections: it was hockey's
+            st["folded"] = [f"hockey:{FINISHED}" if k == FINISHED else k for k in st["folded"]]
         return set(st["folded"])
 
     # ── lifecycle ──────────────────────────────────────────────────────────
@@ -140,8 +158,8 @@ class SportsView(ContentView):
 
         def query(repos):
             hidden = set(ProviderRepository(repos.session).get_hidden_provider_ids())
-            return (load_games(repos.session, SPORT, hidden, min_level=1, max_level=top),
-                    load_watch_history(repos.session), load_alerts(repos.session))
+            games = [g for sp in self.sports for g in load_games(repos.session, sp, hidden, 1, top)]
+            return games, load_watch_history(repos.session), load_alerts(repos.session)
         self._run_query(query, self._on_games, token_ref=self._token, on_error=self._on_error)
 
     def set_finding(self, on: bool) -> None:
@@ -216,37 +234,47 @@ class SportsView(ContentView):
         if error:
             self._message("Games could not be loaded", "The game list will try again at the next refresh.")
             return
-        if self.settings is None:
+        if not self.sports:
             self._message("No sport is set up yet", "")
             return
         now = self._clock()
-        on_now, later, finished = [], [], []
-        for g in games:
-            state = game_state(g, now, self.settings)
-            (on_now if state in (ON_NOW, ENDING) else later if state == UPCOMING else finished).append((g, state))
-        on_now.sort(key=lambda gs: gs[0].start_utc, reverse=self.sort_order == SORT_LATEST)
-        folded = self._folded()
-
-        self._layout.addWidget(self._header("on_now", "On now", len(on_now), foldable=False,
-                                            controls=self._on_now_controls()))
+        self._layout.addWidget(self._toolbar())
         if self._finding:
             looking = QLabel("Looking for new games…")
             _theme.style(looking, "TEXT_SM_MUTED")
             self._layout.addWidget(looking)
+        folded = self._folded()
+        for sport, settings in self.sports.items():
+            mine = [g for g in games if g.sport == sport]
+            live = sum(1 for g in mine if event_live(g, now, settings))
+            self._layout.addWidget(self._sport_header(sport, mine, live))
+            if f"sport:{sport}" not in folded:
+                self._render_sport(sport, settings, mine, now, folded)
+        self._layout.addStretch(1)
+
+    def _render_sport(self, sport: str, settings, games: list, now: datetime, folded: set) -> None:
+        """One sport's segment: On now, the days to come, Finished (keys prefixed by sport)."""
+        on_now, later, finished = [], [], []
+        for g in games:
+            state = game_state(g, now, settings)
+            (on_now if state in (ON_NOW, ENDING) else later if state == UPCOMING else finished).append((g, state))
+        on_now.sort(key=lambda gs: gs[0].start_utc, reverse=self.sort_order == SORT_LATEST)
+
+        self._layout.addWidget(self._header(f"{sport}:on_now", "On now", len(on_now), foldable=False))
         if on_now:
             opened = [gs for gs in on_now if _game_key(gs[0]) == self._open]
             for g, state in opened:          # the open game spans the full width, first (SV-Q17)
                 self._layout.addWidget(self._card(g, state, now, expanded=True))
             rest = [gs for gs in on_now if gs not in opened]
             if rest:
-                grid_host = QWidget()
+                grid_host = _CardGrid()
                 grid = FlowLayout(grid_host, spacing=10)
                 for g, state in rest:
                     grid.addWidget(self._card(g, state, now))
                 self._layout.addWidget(grid_host)
         else:
             nxt = later[0][0] if later else None
-            self._message(f"No {SPORT} games on right now",
+            self._message(f"No {sport} games on right now",
                           f"Next: {nxt.title}, {browse_day_separator_label(nxt.start_utc, now).split(' · ')[0]}"
                           f" at {fmt_time(nxt.start_utc)}." if nxt else "No games are listed yet.")
 
@@ -254,7 +282,7 @@ class SportsView(ContentView):
         for g, _ in later:
             days.setdefault(to_local(g.start_utc).date(), []).append(g)
         for day, gs in days.items():
-            key = f"day:{day.isoformat()}"
+            key = f"{sport}:day:{day.isoformat()}"
             self._layout.addWidget(self._header(key, browse_day_separator_label(gs[0].start_utc, now),
                                                 len(gs), foldable=True))
             if key not in folded:
@@ -262,11 +290,11 @@ class SportsView(ContentView):
                     self._game_row(g, playable=False)
 
         if finished:
-            self._layout.addWidget(self._header(FINISHED, "Finished", len(finished), foldable=True))
-            if FINISHED not in folded:
+            key = f"{sport}:{FINISHED}"
+            self._layout.addWidget(self._header(key, "Finished", len(finished), foldable=True))
+            if key not in folded:
                 for g, _ in sorted(finished, key=lambda gs: gs[0].start_utc, reverse=True):
                     self._game_row(g, playable=True)
-        self._layout.addStretch(1)
 
     def _message(self, headline: str, body: str) -> None:
         h = QLabel(headline)
@@ -303,11 +331,41 @@ class SportsView(ContentView):
         self.headers[key] = band
         return band
 
-    def _on_now_controls(self) -> QWidget:
+    def _sport_header(self, sport: str, games: list, live: int) -> QWidget:
+        """The sport's own header: its name, its leagues, how many are live; folds the segment."""
+        key = f"sport:{sport}"
+        band = QWidget()
+        h = QHBoxLayout(band)
+        h.setContentsMargins(2, 10, 6, 2)
+        h.setSpacing(8)
+        caret = QLabel()
+        _icon_utils.set_label_icon(caret, "expand" if key in self._folded() else "collapse", 14)
+        h.addWidget(caret)
+        glyph = QLabel()                          # the sport's own glyph (icons.VECTOR_KEYS sport_*)
+        _theme.style(glyph, "PANEL_HEADLINE")
+        _icon_utils.set_label_icon(glyph, f"sport_{sport}", 18)
+        h.addWidget(glyph)
+        name = QPushButton(sport.title())
+        name.setFlat(True)
+        _theme.style(name, "PANEL_HEADLINE")
+        name.setToolTip(f"Show {sport}" if key in self._folded() else f"Fold {sport}")
+        name.clicked.connect(lambda _=False, k=key: self._toggle_fold(k))
+        h.addWidget(name)
+        leagues = sorted({g.league for g in games} or {s.league for s in enabled_leagues() if s.sport == sport})
+        meta = QLabel(" · ".join(leagues) + (f" · {live} live" if live else ""))
+        _theme.style(meta, "TEXT_SM_MUTED")
+        h.addWidget(meta)
+        h.addStretch(1)
+        self.headers[key] = band
+        return band
+
+    def _toolbar(self) -> QWidget:
+        """View-wide controls (they apply to every sport): sort order, less certain games."""
         box = QWidget()
         h = QHBoxLayout(box)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(6)
+        h.addStretch(1)
         self.sort_button = QPushButton("Earliest first" if self.sort_order == SORT_EARLIEST else "Latest first")
         self.sort_button.setFlat(True)
         _icon_utils.set_button_icon(self.sort_button, "sort")
@@ -323,7 +381,7 @@ class SportsView(ContentView):
 
     def _card(self, g: GameDTO, state: str, now: datetime, *, expanded: bool = False) -> GameCard:
         channels = self._channel_list(g) if expanded else None
-        card = GameCard(g, state, now, self.settings.usual_length, expanded=expanded,
+        card = GameCard(g, state, now, self.sports[g.sport].usual_length, expanded=expanded,
                         playing_id=self._playing, channels=channels,
                         alerts=alerts_for(g, self._alerts))
         card.bell.toggled_rule.connect(self._set_alert)

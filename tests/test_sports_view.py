@@ -265,11 +265,45 @@ def test_past_its_usual_length_a_game_stays_on_now_marked_likely_ending(games_db
 
 def test_finished_starts_folded_and_the_fold_is_remembered(games_db, qapp, owned_widgets):
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=5))
-    assert view.cards == [] and "finished" in view.headers and view.rows == []
-    view._toggle_fold("finished")
+    assert view.cards == [] and "hockey:finished" in view.headers and view.rows == []
+    view._toggle_fold("hockey:finished")
     _settle(qapp)
     assert len(view.rows) == 2
-    assert "finished" not in view.config.sports_view_state["folded"]
+    assert "hockey:finished" not in view.config.sports_view_state["folded"]
+
+
+def test_each_sport_is_its_own_segment_with_a_header_that_folds(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-13: hockey is one segment of Sports, not the whole view —
+    every sport with a league gets its own header and its own sections."""
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    assert "sport:hockey" in view.headers and "hockey:on_now" in view.headers
+    sport_hdr, on_now = view.headers["sport:hockey"], view.headers["hockey:on_now"]
+    assert sport_hdr.mapTo(view, QPoint(0, 0)).y() < on_now.mapTo(view, QPoint(0, 0)).y()
+    view._toggle_fold("sport:hockey")
+    _settle(qapp)
+    assert view.cards == [] and "hockey:on_now" not in view.headers, "the whole segment folds"
+
+
+def test_a_remembered_finished_fold_from_before_sport_segments_carries_over(games_db, qapp, owned_widgets):
+    from streamselect.core.config import Config
+    from streamselect.gui.sports_view import SportsView
+    cfg = Config()
+    cfg.sports_view_state = {"folded": ["finished"]}
+    view = owned_widgets.own(SportsView(games_db, cfg, lambda fn, cb, **_: None, clock=lambda: LIVE_AT))
+    assert view._folded() == {"hockey:finished"}
+
+
+def test_a_short_window_scrolls_instead_of_clipping_the_last_card(games_db, qapp, owned_widgets):
+    """The scroll area never asked the card grid's heightForWidth: in a short
+    window the last row of cards was cut off under the next header."""
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    view.resize(700, 300)
+    _settle(qapp)
+    _settle(qapp)
+    last = max(view.cards, key=lambda c: c.mapTo(view, QPoint(0, 0)).y())
+    bottom = last.mapTo(view, QPoint(0, last.height())).y()
+    below = [h for k, h in view.headers.items() if k.startswith("hockey:") and k != "hockey:on_now"]
+    assert all(h.mapTo(view, QPoint(0, 0)).y() >= bottom for h in below), "a header overlaps a card"
 
 
 def test_mark_as_finished_moves_the_game_to_finished(games_db, qapp, owned_widgets):

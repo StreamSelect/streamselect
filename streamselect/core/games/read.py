@@ -112,6 +112,11 @@ def game_state(game: GameDTO, now: datetime, settings: SportSettings) -> str:
     return OVER
 
 
+def event_is_live(game: GameDTO, now: datetime, settings: SportSettings) -> bool:
+    """On now or likely ending — what a sport header counts as live."""
+    return game_state(game, now, settings) in (ON_NOW, ENDING)
+
+
 def best_feed(game: GameDTO) -> Optional[GameFeedDTO]:
     """The feed a click on the game plays: the first of :attr:`GameDTO.playable`
     once :func:`arrange_feeds` has ordered them."""
