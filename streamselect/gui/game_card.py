@@ -54,8 +54,8 @@ class ChannelRow(QWidget):
 
     play = pyqtSignal(str)                    # channel id
     prefer = pyqtSignal(object)               # GameFeedDTO, or None to clear
-    hide = pyqtSignal(object, str)            # GameFeedDTO, scope
-    unhide = pyqtSignal(object)               # GameFeedDTO
+    hideRequested = pyqtSignal(object, str)   # GameFeedDTO, scope (never `hide`: that shadows QWidget.hide)
+    unhideRequested = pyqtSignal(object)      # GameFeedDTO
 
     def __init__(self, feed: GameFeedDTO, league: str, *, preferred: bool, playing: bool,
                  hidden: bool = False, parent=None):
@@ -93,7 +93,7 @@ class ChannelRow(QWidget):
             row.addWidget(make_quality_chip(feed.quality, self))
         if hidden:
             self.eye = _icon_utils.icon_button("visibility_toggle", f"Show this channel again in {league} games", px=13)
-            self.eye.clicked.connect(lambda: self.unhide.emit(self.feed))
+            self.eye.clicked.connect(lambda: self.unhideRequested.emit(self.feed))
             row.addWidget(self.eye)
             self.pref_chip = None
             return
@@ -115,10 +115,10 @@ class ChannelRow(QWidget):
         menu = QMenu(self)
         for label, scope in ((f"Hide this channel from {league} games", HIDE_CHANNEL),
                              (f"Hide “{self.feed.station}” from {league} games", HIDE_COLLECTION)):
-            menu.addAction(label).triggered.connect(lambda _=False, s=scope: self.hide.emit(self.feed, s))
+            menu.addAction(label).triggered.connect(lambda _=False, s=scope: self.hideRequested.emit(self.feed, s))
         menu.addSeparator()
         menu.addAction("Hide this channel everywhere…").triggered.connect(
-            lambda: self.hide.emit(self.feed, HIDE_EVERYWHERE))
+            lambda: self.hideRequested.emit(self.feed, HIDE_EVERYWHERE))
         menu.exec(self.eye.mapToGlobal(QPoint(0, self.eye.height())))
 
     # Controls appear on hover only (or when active: your PREFERRED chip stays).
@@ -145,8 +145,8 @@ class ChannelList(QWidget):
 
     play = pyqtSignal(str)
     prefer = pyqtSignal(object, object)       # GameDTO, GameFeedDTO | None
-    hide = pyqtSignal(object, object, str)    # GameDTO, GameFeedDTO, scope
-    unhide = pyqtSignal(object, object)       # GameDTO, GameFeedDTO
+    hideRequested = pyqtSignal(object, object, str)   # GameDTO, GameFeedDTO, scope
+    unhideRequested = pyqtSignal(object, object)      # GameDTO, GameFeedDTO
 
     def __init__(self, game: GameDTO, *, preferred_key: Optional[str], playing_id: Optional[str],
                  show_hidden: bool, parent=None):
@@ -161,7 +161,7 @@ class ChannelList(QWidget):
                            playing=f.channel_id == playing_id)
             r.play.connect(self.play)
             r.prefer.connect(lambda feed: self.prefer.emit(self.game, feed))
-            r.hide.connect(lambda feed, scope: self.hide.emit(self.game, feed, scope))
+            r.hideRequested.connect(lambda feed, scope: self.hideRequested.emit(self.game, feed, scope))
             lay.addWidget(r)
             self.rows.append(r)
         hidden = [f for f in game.hidden if f.channel_id]
@@ -178,7 +178,7 @@ class ChannelList(QWidget):
             if show_hidden:
                 for f in hidden:
                     r = ChannelRow(f, game.league, preferred=False, playing=False, hidden=True)
-                    r.unhide.connect(lambda feed: self.unhide.emit(self.game, feed))
+                    r.unhideRequested.connect(lambda feed: self.unhideRequested.emit(self.game, feed))
                     lay.addWidget(r)
 
 

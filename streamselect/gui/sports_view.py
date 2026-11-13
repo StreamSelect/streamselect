@@ -334,8 +334,8 @@ class SportsView(ContentView):
                           playing_id=self._playing, show_hidden=_game_key(g) in self._show_hidden)
         lst.play.connect(self.playRequested)
         lst.prefer.connect(self._set_preferred)
-        lst.hide.connect(self._hide)
-        lst.unhide.connect(self._unhide)
+        lst.hideRequested.connect(self._hide)
+        lst.unhideRequested.connect(self._unhide)
         if lst.hidden_button is not None:
             lst.hidden_button.clicked.connect(lambda _=False, k=_game_key(g): self._toggle_show_hidden(k))
         return lst

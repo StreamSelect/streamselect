@@ -212,7 +212,7 @@ def test_a_hidden_channel_leaves_the_list_but_is_counted_and_comes_back(games_db
     _settle(qapp)
     row = view.cards[0].findChildren(ChannelRow)[0]
     gone = row.feed.channel_id
-    row.hide.emit(row.feed, HIDE_CHANNEL)
+    row.hideRequested.emit(row.feed, HIDE_CHANNEL)
     _settle(qapp)
     card = view.cards[0]
     assert gone not in {r.feed.channel_id for r in card.findChildren(ChannelRow)}
@@ -221,7 +221,7 @@ def test_a_hidden_channel_leaves_the_list_but_is_counted_and_comes_back(games_db
     _settle(qapp)
     back = [r for r in view.cards[0].findChildren(ChannelRow) if r.feed.channel_id == gone]
     assert len(back) == 1
-    back[0].unhide.emit(back[0].feed)
+    back[0].unhideRequested.emit(back[0].feed)
     _settle(qapp)
     assert not view.config.game_channel_prefs["hockey/NHL"].get("hidden_channels")
 
@@ -241,6 +241,20 @@ def test_while_a_channel_plays_the_top_line_says_playing_in_green_and_rows_do_no
     assert card.top_feed.channel_id == before[-1]
     word = next(lbl for lbl in card.play_line.findChildren(QLabel) if lbl.text() == "PLAYING")
     assert _near(_ink(word), QColor(theme.COLOR_OK)), "PLAYING in the playing green"
+
+
+def test_opening_a_later_game_and_redrawing_does_not_crash(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-12: clicking one of tomorrow's games aborted the app — the
+    channel list's `hide` signal shadowed QWidget.hide(), which the redraw calls."""
+    from streamselect.gui.game_card import ChannelList
+    view = _view(games_db, qapp, owned_widgets, START - timedelta(hours=3))
+    assert view.rows, "the games are still to come"
+    view.rows[0].click()
+    _settle(qapp)
+    assert view.findChildren(ChannelList), "the row opened its channel list"
+    view._render()                       # the redraw that crashed
+    view.rows[0].click()                 # and closing it again
+    _settle(qapp)
 
 
 def test_past_its_usual_length_a_game_stays_on_now_marked_likely_ending(games_db, qapp, owned_widgets):
