@@ -19,6 +19,7 @@ from streamselect.gui.recording_indicators import RECORD_TOOLTIP
 from streamselect.gui.relative_time import humanize_remaining
 from streamselect.gui.chip_row import row_title_label
 from streamselect.gui.sidebar.alerts_rows import SLOT_W, _AlertRow
+from tests.conftest import destroy_widget
 
 NOW = datetime(2026, 8, 26, 12, 0, 0)
 
@@ -232,3 +233,27 @@ def test_clicking_the_rec_slot_only_emits_record_clicked(qapp, tmp_path):
 
     _press(row, row._rec_slot.geometry().center().x())
     assert recorded and not played and not selected
+
+
+def test_the_sources_marker_never_records_when_recording_is_off(tmp_path, qapp, monkeypatch):
+    """Owner report: with capture off, clicking the several-sources marker started a
+    recording. The hidden Record slot was never laid out, so its rect sat over the
+    marker and the click handler checked it first."""
+    from streamselect.core import feature_gates
+    monkeypatch.setattr(feature_gates, "capture_enabled", lambda: False)
+    row = _AlertRow("Two and a Half Men", "in 27m", Config(config_dir=tmp_path),
+                    when=NOW + timedelta(minutes=27), live=False, expandable=True)
+    row.resize(300, 26)
+    row.show()
+    qapp.processEvents()
+    recorded, expanded = [], []
+    row.record_clicked.connect(lambda: recorded.append(1))
+    row.expand_clicked.connect(lambda: expanded.append(1))
+    centre = row._marker.mapTo(row, row._marker.rect().center())
+    press = QMouseEvent(QEvent.Type.MouseButtonPress, QPointF(centre), QPointF(centre),
+                        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton,
+                        Qt.KeyboardModifier.NoModifier)
+    row.mousePressEvent(press)
+    assert recorded == [], "a hidden Record slot took the click"
+    assert expanded == [1], "the marker opens the sources, as it always did"
+    destroy_widget(row)

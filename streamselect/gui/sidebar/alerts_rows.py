@@ -529,7 +529,12 @@ class _AlertRow(_RowShell):
         # The Record slot is its OWN dedicated control (REC-2) — checked
         # first and unconditionally, so a click there never falls through to
         # play/expand/row-click regardless of hover/live state.
-        if self._rec_slot_rect().contains(event.pos()):
+        #
+        # Only while it is SHOWN. With capture off the slot is hidden and never
+        # laid out, so its rect sits at the left edge — over the several-sources
+        # marker — and a click there scheduled a recording in a build with no
+        # recording feature (owner report).
+        if not self._rec_slot.isHidden() and self._rec_slot_rect().contains(event.pos()):
             self.record_clicked.emit()
         # The slot IS the play control while it is offering to play — clicking
         # the triangle starts it. Everything else on the row goes to the row's
