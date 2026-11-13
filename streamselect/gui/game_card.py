@@ -226,6 +226,63 @@ class ChannelList(QWidget):
                     lay.addWidget(r)
 
 
+class AlertBell(QPushButton):
+    """The event's alert bell (SV-Q24-Q26, look B2 — SV-Q25).
+
+    Off: the EPG agenda's slashed bell. On (any rule covers the event): the
+    ``alert`` bell in the accent. Click toggles an alert for THIS event;
+    right-click offers this event / every event of either side / whenever these
+    two meet, each a check item.
+    """
+
+    toggled_rule = pyqtSignal(object, str, str, bool)   # GameDTO, kind, side, on
+
+    def __init__(self, game: GameDTO, covering: list, parent=None):
+        super().__init__(parent)
+        from streamselect.core.games.alerts import EITHER_SIDE, THESE_TWO, THIS_EVENT, rule_for
+        self.game = game
+        self.covering = list(covering)
+        self.setFlat(True)
+        self.setFixedWidth(26)
+        on = bool(self.covering)
+        if on:
+            _icon_utils.set_button_icon(self, "alert", color=_theme.COLOR_ACCENT)
+        else:
+            _icon_utils.set_button_icon(self, "monitor_off")
+        self.setToolTip("Alert set — click to stop alerting for this event; right-click for more"
+                        if on else "Alert me before this event starts (right-click for more)")
+        self._kinds = [(THIS_EVENT, "", "Alert me for this event"),
+                       (EITHER_SIDE, game.team_a, f"Alert me for every {game.team_a} event"),
+                       (EITHER_SIDE, game.team_b, f"Alert me for every {game.team_b} event"),
+                       (THESE_TWO, "", f"Alert me whenever {game.team_a} meet {game.team_b}")]
+        self._rule_for = rule_for
+        self.clicked.connect(self._toggle_this)
+
+    def _has(self, kind: str, side: str) -> bool:
+        want = self._rule_for(kind, self.game, side)
+        return any(a.sides == want.sides and a.mode == want.mode and a.event == want.event
+                   for a in self.covering)
+
+    def _toggle_this(self) -> None:
+        from streamselect.core.games.alerts import THIS_EVENT
+        if self.covering and not self._has(THIS_EVENT, ""):
+            self.build_menu().exec(self.mapToGlobal(QPoint(0, self.height())))
+            return
+        self.toggled_rule.emit(self.game, THIS_EVENT, "", not self._has(THIS_EVENT, ""))
+
+    def build_menu(self) -> QMenu:
+        menu = QMenu(self)
+        for kind, side, label in self._kinds:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(self._has(kind, side))
+            act.triggered.connect(lambda on, k=kind, s=side: self.toggled_rule.emit(self.game, k, s, on))
+        return menu
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        self.build_menu().exec(event.globalPos())
+
+
 class PlayLine(QFrame):
     """The card's "▶ [US] STATION" line; ``clicked`` on a left press when playable."""
 
@@ -255,7 +312,7 @@ class GameCard(QFrame):
 
     def __init__(self, game: GameDTO, state: str, now: datetime, usual_length, *,
                  expanded: bool = False, playing_id: Optional[str] = None,
-                 channels: Optional[ChannelList] = None, parent=None):
+                 channels: Optional[ChannelList] = None, alerts: Optional[list] = None, parent=None):
         super().__init__(parent)
         self.game = game
         self.state = state
@@ -286,6 +343,12 @@ class GameCard(QFrame):
             _theme.style(started, "TEXT_SM_MUTED")
             top.addWidget(started)
         top.addStretch(1)
+        self.bell = AlertBell(game, alerts or [])
+        if self.bell.covering and state == UPCOMING:
+            on = QLabel("ALERT ON")            # words with the colour, never colour alone (B2)
+            _theme.style(on, "GAME_LIVE_TAG")
+            top.addWidget(on)
+        top.addWidget(self.bell)
         lay.addLayout(top)
 
         self.title = QLabel(game.title)

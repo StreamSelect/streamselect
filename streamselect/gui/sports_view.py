@@ -27,6 +27,7 @@ from streamselect.core.games.read import (
     ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, arrange_feeds, best_feed, game_key, game_state,
     load_games, load_watch_history, mark_finished,
 )
+from streamselect.core.games.alerts import add_alert, alerts_for, load_alerts, remove_alerts, rule_for
 from streamselect.core.games.store import enabled_leagues
 from streamselect.core.repositories.provider import ProviderRepository
 from streamselect.gui import deferred_config_save as _cfgsave
@@ -36,7 +37,7 @@ from streamselect.gui.chips import ToggleChip
 from streamselect.gui.content_view import ContentView
 from streamselect.gui.flow_layout import FlowLayout
 from streamselect.gui.game_card import (
-    HIDE_CHANNEL, HIDE_COLLECTION, HIDE_EVERYWHERE, ChannelList, GameCard,
+    HIDE_CHANNEL, HIDE_COLLECTION, HIDE_EVERYWHERE, AlertBell, ChannelList, GameCard,
 )
 from streamselect.gui.sidebar.base import GroupHeading
 
@@ -69,6 +70,7 @@ class SportsView(ContentView):
         self._token: list[int] = [0]
         self._raw: list[GameDTO] = []
         self._history: dict = {}
+        self._alerts: list = []
         self._open: Optional[tuple] = None
         self._show_hidden: set[tuple] = set()
         self._playing: Optional[str] = None
@@ -139,7 +141,7 @@ class SportsView(ContentView):
         def query(repos):
             hidden = set(ProviderRepository(repos.session).get_hidden_provider_ids())
             return (load_games(repos.session, SPORT, hidden, min_level=1, max_level=top),
-                    load_watch_history(repos.session))
+                    load_watch_history(repos.session), load_alerts(repos.session))
         self._run_query(query, self._on_games, token_ref=self._token, on_error=self._on_error)
 
     def set_finding(self, on: bool) -> None:
@@ -169,8 +171,8 @@ class SportsView(ContentView):
                 self.reload()
 
     def _on_games(self, result) -> None:
-        games, history = result if result else ([], {})
-        self._raw, self._history = list(games or []), dict(history or {})
+        games, history, alerts = result if result else ([], {}, [])
+        self._raw, self._history, self._alerts = list(games or []), dict(history or {}), list(alerts or [])
         self._loaded = True
         self._render()
 
@@ -322,7 +324,9 @@ class SportsView(ContentView):
     def _card(self, g: GameDTO, state: str, now: datetime, *, expanded: bool = False) -> GameCard:
         channels = self._channel_list(g) if expanded else None
         card = GameCard(g, state, now, self.settings.usual_length, expanded=expanded,
-                        playing_id=self._playing, channels=channels)
+                        playing_id=self._playing, channels=channels,
+                        alerts=alerts_for(g, self._alerts))
+        card.bell.toggled_rule.connect(self._set_alert)
         card.play.connect(self.playRequested)
         card.toggled.connect(self._toggle_open)
         card.finished.connect(self._mark_finished)
@@ -351,7 +355,20 @@ class SportsView(ContentView):
         is_open = _game_key(g) == self._open
         row.setToolTip("Fold its channel list" if is_open else "List every channel that will show this game")
         row.clicked.connect(lambda _=False, game=g: self._toggle_open(game))
-        self._layout.addWidget(row)
+        line = QWidget()
+        h = QHBoxLayout(line)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(4)
+        h.addWidget(row, 1)
+        bell = AlertBell(g, alerts_for(g, self._alerts))
+        bell.toggled_rule.connect(self._set_alert)
+        if bell.covering and not playable:
+            on = QLabel("ALERT ON")            # words with the colour (B2)
+            _theme.style(on, "GAME_LIVE_TAG")
+            h.addWidget(on)
+        h.addWidget(bell)
+        row.bell = bell
+        self._layout.addWidget(line)
         self.rows.append(row)
         if is_open:
             self._layout.addWidget(self._channel_list(g))
@@ -418,6 +435,18 @@ class SportsView(ContentView):
                 prefs[field].remove(value)
         self._save()
         QTimer.singleShot(0, self._render)
+
+    def _set_alert(self, game: GameDTO, kind: str, side: str, on: bool) -> None:
+        """Add or remove one event-alert rule (SV-Q26), off the UI thread, then re-read."""
+        rule = rule_for(kind, game, side)
+
+        def write(repos):
+            if on:
+                add_alert(repos.session, rule)
+            else:
+                remove_alerts(repos.session, [a.id for a in load_alerts(repos.session)
+                                              if (a.sides, a.mode, a.event) == (rule.sides, rule.mode, rule.event)])
+        self._run_query(write, lambda _r: self.reload(), commit=True)
 
     def _report(self, game: GameDTO, feed, kind: str) -> None:
         """Record a channel report against its collection, for this league (SV-Q37)."""

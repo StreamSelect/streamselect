@@ -421,3 +421,53 @@ def test_reporting_a_channel_puts_it_last_with_its_flag_and_clear_brings_it_back
     clear.trigger()
     _settle(qapp)
     assert all(r.report_icon is None for r in view.cards[0].findChildren(ChannelRow))
+
+
+# ── event alerts: the bell (SV-Q24-Q26, Q42) ──────────────────────────────
+
+def test_an_alert_rule_matches_one_event_either_side_or_the_pair():
+    from streamselect.core.games.alerts import EITHER_SIDE, THESE_TWO, THIS_EVENT, rule_for
+    g = GameDTO(1, "hockey", "NHL", "Buffalo Sabres", "Chicago Blackhawks", START, 1, False, 2, ())
+    later = GameDTO(2, "hockey", "NHL", "Buffalo Sabres", "Chicago Blackhawks", START + timedelta(days=9), 1, False, 2, ())
+    other = GameDTO(3, "hockey", "NHL", "Buffalo Sabres", "Dallas Stars", START, 1, False, 2, ())
+    this = rule_for(THIS_EVENT, g)
+    assert this.matches(g) and not this.matches(later)
+    pair = rule_for(THESE_TWO, g)
+    assert pair.matches(later) and not pair.matches(other)
+    team = rule_for(EITHER_SIDE, g, "Buffalo Sabres")
+    assert team.matches(other) and team.label == "Buffalo Sabres" and team.detail == "every event"
+
+
+def test_the_bell_sets_an_alert_for_this_event_and_lights(games_db, qapp, owned_widgets):
+    from streamselect.core.games.alerts import load_alerts
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    card = _card(view, "Sabres")
+    assert not card.bell.covering
+    card.bell.click()
+    _settle(qapp)
+    with games_db.session_scope(commit=False) as s:
+        [rule] = load_alerts(s)
+    assert rule.event and rule.sides == ("Buffalo Sabres", "Chicago Blackhawks")
+    card = _card(view, "Sabres")
+    assert card.bell.covering and "Alert set" in card.bell.toolTip()
+    assert not _card(view, "Dallas").bell.covering, "only that event"
+    card.bell.click()                       # click again: off
+    _settle(qapp)
+    with games_db.session_scope(commit=False) as s:
+        assert load_alerts(s) == []
+
+
+def test_a_team_alert_lights_every_event_of_that_team_and_says_alert_on_before_it_starts(
+        games_db, qapp, owned_widgets):
+    view = _view(games_db, qapp, owned_widgets, START - timedelta(hours=3))   # both still to come
+    sabres_row = next(r for r in view.rows if "Sabres" in r.text())
+    menu = sabres_row.bell.build_menu()
+    next(a for a in menu.actions() if a.text() == "Alert me for every Buffalo Sabres event").trigger()
+    _settle(qapp)
+    sabres_row = next(r for r in view.rows if "Sabres" in r.text())
+    dallas_row = next(r for r in view.rows if "Dallas" in r.text())
+    assert sabres_row.bell.covering and not dallas_row.bell.covering
+    line = sabres_row.parentWidget()
+    assert any(lbl.text() == "ALERT ON" for lbl in line.findChildren(QLabel))
+    checked = [a.text() for a in sabres_row.bell.build_menu().actions() if a.isChecked()]
+    assert checked == ["Alert me for every Buffalo Sabres event"]
