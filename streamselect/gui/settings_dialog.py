@@ -412,6 +412,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
             live_refresh_idx if live_refresh_idx >= 0
             else self._live_refresh_mode_combo.findData("manual")
         )
+        self._event_alert_lead_spin.setValue(self.config.event_alert_lead_minutes)
 
         # PLAT-1 — Content ▸ Discover shelves. getattr with the model default,
         # so a config written before this field existed loads rather than raises.
@@ -682,6 +683,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
         c.playback_resume_mode = self._resume_mode_combo.currentData() or "resume"
         c.filter_adult_mode = self._adult_mode_combo.currentData() or "hide"
         c.live_refresh_mode = self._live_refresh_mode_combo.currentData() or "manual"
+        c.event_alert_lead_minutes = self._event_alert_lead_spin.value()
         c.discover_platform_shelf_min_titles = self._platform_shelf_min_spin.value()
 
         # Downloads — read live by download_manager.py on every scheduler

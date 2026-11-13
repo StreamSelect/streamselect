@@ -471,3 +471,53 @@ def test_a_team_alert_lights_every_event_of_that_team_and_says_alert_on_before_i
     assert any(lbl.text() == "ALERT ON" for lbl in line.findChildren(QLabel))
     checked = [a.text() for a in sabres_row.bell.build_menu().actions() if a.isChecked()]
     assert checked == ["Alert me for every Buffalo Sabres event"]
+
+
+# ── event alert notices (SV-Q43) ──────────────────────────────────────────
+
+def test_an_alerted_event_is_announced_once_before_and_once_at_its_start():
+    from streamselect.core.games.alerts import THIS_EVENT, due_notices, rule_for
+    g = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 2, ())
+    other = GameDTO(2, "hockey", "NHL", "C", "D", START, 1, False, 2, ())
+    alerts = [rule_for(THIS_EVENT, g)]
+    sent: set = set()
+    early = due_notices([g, other], alerts, START - timedelta(minutes=20), 15, sent)
+    assert early == []
+    lead = due_notices([g, other], alerts, START - timedelta(minutes=14), 15, sent)
+    assert [(t) for _k, _g, t in lead] == ["Starting in 14 minutes"]
+    sent |= {k for k, _g, _t in lead}
+    assert due_notices([g], alerts, START - timedelta(minutes=10), 15, sent) == [], "once"
+    start = due_notices([g], alerts, START + timedelta(minutes=1), 15, sent)
+    assert [t for _k, _g, t in start] == ["Starting now"]
+    assert [t for _k, _g, t in due_notices([g], alerts, START - timedelta(minutes=5), 0, set())] == [], \
+        "a lead of 0 sends only the start notice"
+
+
+def test_the_notifier_shows_the_notice_with_play_on_the_cards_channel(games_db, qapp):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from streamselect.core.config import Config
+    from streamselect.core.games.alerts import THIS_EVENT, add_alert, rule_for
+    from streamselect.core.games.read import load_games
+    from streamselect.gui.event_alert_notifier import EventAlertNotifier
+    with games_db.session_scope() as s:
+        sabres = next(g for g in load_games(s, "hockey", set(), 1, 1) if g.team_a == "Buffalo Sabres")
+        add_alert(s, rule_for(THIS_EVENT, sabres))
+
+    def run_query(fn, cb, **_):
+        with games_db.session_scope(commit=False) as s:
+            res = fn(RepositoryFactory(s))
+        cb(res)
+
+    host = SimpleNamespace(_run_query=run_query, config=Config(), notification_manager=MagicMock())
+    played = []
+    notifier = EventAlertNotifier(host, played.append, clock=lambda: START - timedelta(minutes=10))
+    notifier.check()
+    notifier.check()
+    assert host.notification_manager.show.call_count == 1, "once"
+    kw = host.notification_manager.show.call_args.kwargs
+    assert kw["title"] == "Starting in 10 minutes" and "Buffalo Sabres vs Chicago Blackhawks" in kw["message"]
+    [(label, play)] = kw["actions"]
+    play()
+    assert label == "Play" and played == ["a1"]

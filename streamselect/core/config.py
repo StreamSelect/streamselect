@@ -1415,6 +1415,8 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     sports_view_state: dict = Field(default_factory=dict)
     # Per league ("hockey/NHL"): "preferred" collection key, "hidden_channels" ids, "hidden_collections" keys.
     game_channel_prefs: dict = Field(default_factory=dict)
+    # Event alerts: minutes before the start to notify (0 = only at the start); SV-Q43.
+    event_alert_lead_minutes: int = 15
 
     # Series monitor — user-opted series tracked for new episode arrivals.
     # Each entry is a plain dict:

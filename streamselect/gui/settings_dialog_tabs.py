@@ -40,9 +40,8 @@ _CHANNEL_DENSITY_CHOICES: tuple[tuple[str, str], ...] = (
     ("Compact (one line)", "compact"),
 )
 
-# Sidebar row shape — see streamselect.gui.chip_row. Compact is first AND the default
-# because the sidebar's scarcest resource is vertical space: ~20px a row against
-# comfortable's ~37px, so roughly twice the entries in the same allocation.
+# Sidebar row shape (gui.chip_row). Compact is first AND the default: vertical space is
+# scarcest — ~20px a row against comfortable's ~37px, about twice the entries.
 _SIDEBAR_DENSITY_CHOICES: tuple[tuple[str, str], ...] = (
     ("Compact (one line, with chips)", "compact"),
     ("Comfortable (two lines)", "comfortable"),
@@ -255,8 +254,7 @@ class SettingsTabsMixin:
 
         layout.addWidget(adult_group)
 
-        # LIVE-1: how often the LIVE catalog (get_live_streams only — never
-        # VOD/series) auto-refreshes for every active source.
+        # LIVE-1: how often the LIVE catalog (never VOD/series) auto-refreshes, every source.
         live_group = QGroupBox("Live catalog")
         live_form = QFormLayout(live_group)
         live_form.setSpacing(8)
@@ -275,12 +273,15 @@ class SettingsTabsMixin:
             "A source currently streaming is always skipped and retried later."
         )
         live_form.addRow("Live catalog refresh:", self._live_refresh_mode_combo)
+        self._event_alert_lead_spin = QSpinBox()   # Sports Desk SV-Q43: lead time is a setting
+        self._event_alert_lead_spin.setRange(0, 240)
+        self._event_alert_lead_spin.setSuffix(" minutes before")
+        self._event_alert_lead_spin.setToolTip("An event you set an alert on: tell me this long before it starts,\nand again when it starts. 0 = only when it starts.")
+        live_form.addRow("Event alerts:", self._event_alert_lead_spin)
 
         layout.addWidget(live_group)
 
-        # PLAT-1: the floor a platform clears to earn its own Discover shelf.
-        # A setting, not a constant: the right number is a property of the
-        # library, not of the app.
+        # PLAT-1: the floor a platform clears for its own Discover shelf (a property of the library).
         shelves_group = QGroupBox("Discover shelves")
         shelves_form = QFormLayout(shelves_group)
         shelves_form.setSpacing(8)
@@ -993,8 +994,7 @@ class SettingsTabsMixin:
         sidebar_layout = QVBoxLayout(sidebar_group)
         sidebar_layout.setSpacing(10)
 
-        # A QFormLayout, like every settings group: a hand-rolled label+combo row puts
-        # the control at a different x (tests/test_settings_form_alignment).
+        # A QFormLayout, like every group (a hand-rolled row misaligns: test_settings_form_alignment).
         density_form = QFormLayout()
         density_form.setSpacing(8)
         self._sidebar_density_combo = QComboBox()

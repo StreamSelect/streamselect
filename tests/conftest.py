@@ -1719,6 +1719,8 @@ def wire_settings_content_widgets(dlg) -> None:
     dlg._live_refresh_mode_combo.addItem("Every 30 minutes", userData="30m")
     dlg._live_refresh_mode_combo.addItem("Every hour", userData="1h")
     dlg._live_refresh_mode_combo.addItem("Every 3 hours", userData="3h")
+    dlg._event_alert_lead_spin = QSpinBox()     # Sports event alerts (SV-Q43), as the real one
+    dlg._event_alert_lead_spin.setRange(0, 240)
 
     # PLAT-1 — Content ▸ Discover shelves. Same range/step as the real spin, so
     # a test that round-trips a value through _save_values sees what the dialog
@@ -3521,3 +3523,20 @@ def make_discover_manage_dialog(config, *, titles=None, zones=None):
 
     shelf_widgets = {k: _TitleSource(v) for k, v in (titles or {}).items()}
     return DiscoverManageDialog(MagicMock(), config, shelf_widgets, zones or {})
+
+
+class ConfigDefaultsFallback:
+    """Base for a hand-rolled config stub: any field it does not set reads ``Config``'s default.
+
+    Hand-listed stubs break on every new setting (CLAUDE.md names them as a
+    recurring failure): adding ``event_alert_lead_minutes`` turned 62 Settings
+    tests red through two such stubs. A stub that inherits this keeps its own
+    values and stays complete for every field added later.
+    """
+
+    def __getattr__(self, name):
+        from streamselect.core.config import Config
+        field = Config.model_fields.get(name)
+        if field is None:
+            raise AttributeError(name)
+        return field.default_factory() if field.default_factory is not None else field.default

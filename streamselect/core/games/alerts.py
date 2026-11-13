@@ -100,3 +100,31 @@ def remove_alerts(session, ids: Iterable[str]) -> None:
 def alerts_for(game: GameDTO, alerts: Iterable[EventAlert]) -> list[EventAlert]:
     """The rules that cover *game* (one bell can be lit by several)."""
     return [a for a in alerts if a.matches(game)]
+
+
+#: How long after the start an "it's starting" notice may still fire (a poll can be late).
+START_GRACE = 600
+
+
+def due_notices(games: Iterable[GameDTO], alerts: list[EventAlert], now, lead_minutes: int,
+                sent: set[str]) -> list[tuple[str, GameDTO, str]]:
+    """The notices to send now: ``(notice key, game, title)``, each once (SV-Q43).
+
+    One ``lead_minutes`` before an alerted event starts ("Starting in 15 minutes"),
+    then again at its start ("Starting now"). ``sent`` holds the keys already
+    sent; a lead of 0 sends only the start notice.
+    """
+    from datetime import timedelta
+    out = []
+    for g in games:
+        if not alerts_for(g, alerts):
+            continue
+        key = game_key(g)
+        since_start = (now - g.start_utc).total_seconds()
+        if 0 <= since_start <= START_GRACE and f"start|{key}" not in sent:
+            out.append((f"start|{key}", g, "Starting now"))
+        elif (lead_minutes > 0 and g.start_utc - timedelta(minutes=lead_minutes) <= now < g.start_utc
+              and f"lead|{key}" not in sent):
+            mins = max(1, round((g.start_utc - now).total_seconds() / 60))
+            out.append((f"lead|{key}", g, f"Starting in {mins} minute{'' if mins == 1 else 's'}"))
+    return out

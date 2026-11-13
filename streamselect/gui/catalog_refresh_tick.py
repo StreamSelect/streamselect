@@ -51,6 +51,7 @@ from streamselect.core.catalog_refresh import (
     live_refresh_due,
 )
 from streamselect.core.repositories import RepositoryFactory
+from streamselect.gui.event_alert_notifier import EventAlertNotifier
 from streamselect.gui.game_tracker import GAME_TRACKER_LAUNCH_DELAY_MS, GameTracker
 
 #: Hourly tick interval, in milliseconds — see _maybe_auto_refresh_catalogs.
@@ -100,6 +101,10 @@ class _CatalogRefreshTickMixin:
         self.refresh_queue_manager.all_refreshes_finished.connect(self.game_tracker.request)
         self.epg_manager.refresh_finished.connect(self.game_tracker.request)
         QTimer.singleShot(GAME_TRACKER_LAUNCH_DELAY_MS, self.game_tracker.request)
+        # Event alerts set with the Sports bell: notify before and at the start (SV-Q43).
+        self.event_alert_notifier = EventAlertNotifier(self, self.play_channel_by_id, parent=self)
+        self._register_cleanable("event_alert_notifier", self.event_alert_notifier.shutdown)
+        self.event_alert_notifier.start()
 
     def _mark_catalog_refreshed(self, provider_id: str | None, kind: str = "full") -> None:
         """Stamp the refresh timestamp(s) on a SUCCESSFUL refresh (SPORT-7/LIVE-1).

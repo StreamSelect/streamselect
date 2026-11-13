@@ -17,6 +17,8 @@ test_settings_playback_tab.py — real Qt widgets, module-scoped QApplication fi
 from __future__ import annotations
 
 import pytest
+
+from tests.conftest import ConfigDefaultsFallback
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QLineEdit, QListWidget,
@@ -33,7 +35,7 @@ def qapp():
     yield app
 
 
-class _FakeConfig:
+class _FakeConfig(ConfigDefaultsFallback):
     """Minimal config stub for the tab-layout tests."""
 
     def __init__(self):

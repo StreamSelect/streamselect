@@ -12,6 +12,8 @@ qapp fixture.
 from __future__ import annotations
 
 import pytest
+
+from tests.conftest import ConfigDefaultsFallback
 from PyQt6.QtWidgets import QComboBox, QLineEdit, QCheckBox
 
 from streamselect.gui.settings_dialog import SettingsDialog
@@ -26,7 +28,7 @@ def qapp():
     yield app
 
 
-class _FakeConfig:
+class _FakeConfig(ConfigDefaultsFallback):
     """Minimal config stub covering the fields touched by Playback-tab load/save."""
 
     def __init__(
