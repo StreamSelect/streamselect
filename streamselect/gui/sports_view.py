@@ -29,7 +29,7 @@ from streamselect.core.games.read import (
     load_games, load_watch_history, mark_finished,
 )
 from streamselect.core.games.alerts import add_alert, alerts_for, load_alerts, remove_alerts, rule_for
-from streamselect.core.games.store import enabled_leagues
+from streamselect.core.games.store import enabled_leagues, sport_settings
 from streamselect.core.repositories.provider import ProviderRepository
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui import icon_utils as _icon_utils
@@ -60,6 +60,7 @@ class SportsView(ContentView):
     playRequested = pyqtSignal(str)           # channel id
     channelSelected = pyqtSignal(str)         # channel id: the details pane follows an opened game
     hideEverywhereRequested = pyqtSignal(str)  # channel id: the app's own Hide
+    alertsChanged = pyqtSignal()              # a bell added or removed a rule: Watch Alerts re-reads
 
     def __init__(self, db, config, run_query: Callable, parent=None, *,
                  clock: Callable[[], datetime] = now_utc):
@@ -77,9 +78,7 @@ class SportsView(ContentView):
         self._loaded = False
         self._finding = False
         #: sport -> its settings (the first listed league's lengths), in listed order.
-        self.sports: dict = {}
-        for league in enabled_leagues():
-            self.sports.setdefault(league.sport, league)
+        self.sports: dict = sport_settings()
 
         self._tick = QTimer(self)
         self._tick.setInterval(TICK_MS)
@@ -492,7 +491,10 @@ class SportsView(ContentView):
             else:
                 remove_alerts(repos.session, [a.id for a in load_alerts(repos.session)
                                               if (a.sides, a.mode, a.event) == (rule.sides, rule.mode, rule.event)])
-        self._run_query(write, lambda _r: self.reload(), commit=True)
+        def done(_r) -> None:
+            self.reload()
+            self.alertsChanged.emit()
+        self._run_query(write, done, commit=True)
 
     def _report(self, game: GameDTO, feed, kind: str) -> None:
         """Record a channel report against its collection, for this league (SV-Q37)."""

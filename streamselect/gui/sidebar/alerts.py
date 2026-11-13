@@ -4,6 +4,7 @@ The section itself is the frame — header, content layout, empty state, row
 budget. Each GROUP it shows lives in its own module and is mixed in here:
 
 * :mod:`alerts_epg` — programmes matching your EPG watchlist patterns
+* :mod:`alerts_sports` — events set with the Sports bell, upcoming or live
 * :mod:`alerts_vod` — keyword rules (Movies) and monitored series (Series)
 * :mod:`alerts_monitor` — streams being retried after a failure
 
@@ -19,9 +20,10 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QPushButton, QSizePolicy, QAbstractScrollArea, QListWidget, QTreeWidget
 
-from PyQt6.QtCore import Qt, QSize, pyqtSignal
+from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
 
 from streamselect.gui import cursor_affordance
+from streamselect.gui.chip_row import CHIP_NEWS, _news_chip_style, chip_widget
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
 from streamselect.gui.sidebar.background_refresh import BackgroundRefreshMixin
@@ -30,6 +32,7 @@ from streamselect.gui.sidebar.base import (
 )
 from streamselect.gui.sidebar.alerts_epg import EpgGroupMixin
 from streamselect.gui.sidebar.alerts_monitor import StreamMonitoringMixin
+from streamselect.gui.sidebar.alerts_sports import SportsGroupMixin
 from streamselect.gui.sidebar.alerts_vod import MoviesSeriesMixin
 # Re-exported: this module is the section's public name, and callers (and a
 # fair number of tests) import these from here. Keeping the names available
@@ -47,7 +50,16 @@ from streamselect.gui.sidebar.alerts_common import (  # noqa: F401
     _when,
 )
 
+#: The header's per-kind badges: kind, icon role, (singular, plural) for the tooltip.
+_NEWS_KINDS = (
+    ("movies", "movie", ("movie alert with new matches", "movie alerts with new matches")),
+    ("series", "series", ("series with new episodes", "series with new episodes")),
+    ("sports", "sports", ("sports event coming up or live", "sports events coming up or live")),
+)
+
+
 class WatchAlertsSection(
+    SportsGroupMixin,
     EpgGroupMixin,
     MoviesSeriesMixin,
     StreamMonitoringMixin,
@@ -91,11 +103,13 @@ class WatchAlertsSection(
     seriesMarkSeenRequested = pyqtSignal(str)  # series_channel_id → clear unseen count
     seriesStopRequested = pyqtSignal(str)    # series_channel_id → stop monitoring
     _data_ready = pyqtSignal(object)         # dict | None (None = load failure)
+    _sports_ready = pyqtSignal(object)       # (events, watch history) | None — the Sports group
 
     def __init__(self, config, db, parent=None):
         self.db = db
         super().__init__("Watch Alerts", "alert", config, parent)
         self._init_background_refresh()
+        self._sports_ready.connect(self._on_sports_ready)
         self._start_clock()
 
     def get_section_id(self):
@@ -118,6 +132,7 @@ class WatchAlertsSection(
         # The SAME status widget every other section header uses. Watch Alerts
         # was the one that hand-rolled its count into the title instead.
         hl.addWidget(self.make_status_label())
+        hl.addWidget(self._build_news_badges())
 
         hl.addStretch()
 
@@ -252,6 +267,25 @@ class WatchAlertsSection(
             if view is not None:
                 self.fit_to_rows(view)
 
+    def _make_group_list(self) -> QListWidget:
+        """One group's list, as every list-backed group here is built (Movies & Series,
+        Sports, Stream Monitoring): sized to its rows, no nested scrollbars, seamless.
+
+        R13 mechanism 1 — no nested scrollbars: a scroll area inside the sidebar's
+        own, in a band ~35px tall, is a window too small to read through. Each list
+        shows what fits and sizes to its rows; the slack collects in the section's
+        one trailing stretch.
+        """
+        lst = QListWidget()
+        lst.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        lst.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        lst.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustToContents)
+        lst.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        _theme.style_fn(lst, lambda: f"QListWidget {{ font-size: {_theme.FONT_MD}; }}")
+        make_seamless(lst)
+        lst.hide()
+        return lst
+
     def create_content(self):
         from PyQt6.QtWidgets import QHeaderView
 
@@ -329,6 +363,9 @@ class WatchAlertsSection(
         self._update_epg_toggle_label(0)
         # ── end EPG sub-section ────────────────────────────────────────────
 
+        # ── Sports: time-bound like EPG, so directly under it (owner) ───────
+        self._build_sports_group()
+
         # ── Movies & Series ───────────────────────────────────────────────
         # No wrapper heading. It used to carry one ("Movies & Series (13)"),
         # which read as a PEER of the "Watching for" and "Series" headings it
@@ -342,26 +379,12 @@ class WatchAlertsSection(
         # duplicated the count the section header badge already shows.
         self._series_collapsed = False   # the "Series" group heading toggle
         self._keyword_collapsed = False  # the "Watching for" group heading toggle
-        self._vod_list = QListWidget()
-        # R13 mechanism 1 — no nested scrollbars. This sub-list still had one:
-        # a scroll area inside the sidebar's own, in a band ~35px tall, which is
-        # a window too small to read through. It now shows what fits and ends
-        # with "+N more", like every other list in the rail.
-        self._vod_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._vod_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._vod_list.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustToContents)
-        # Equal stretch with the EPG tree so Movies & Series always gets its fair share
-        # of the section's height (never starved to a sliver) and grows to help fill the
-        # pane instead of leaving a gap.  A long list scrolls within its share.
-        self._vod_list.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        _theme.style_fn(self._vod_list, lambda: f"QListWidget {{ font-size: {_theme.FONT_MD}; }}")
-        make_seamless(self._vod_list)
+        self._vod_list = self._make_group_list()
         cursor_affordance.set_clickable(self._vod_list)
         self._vod_list.itemClicked.connect(self._on_vod_item_clicked)
         self._vod_list.itemDoubleClicked.connect(self._on_vod_item_double_clicked)
         self._vod_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._vod_list.customContextMenuRequested.connect(self._on_vod_context_menu)
-        self._vod_list.hide()
         self.content_layout.addWidget(self._vod_list)
 
         self._update_vod_toggle_label(0)
@@ -397,23 +420,10 @@ class WatchAlertsSection(
         self._retry_hdr_container.hide()
         self.content_layout.addWidget(self._retry_hdr_container)
 
-        self._retry_list = QListWidget()
-        # R13 mechanism 1 — no nested scrollbars. This sub-list still had one:
-        # a scroll area inside the sidebar's own, in a band ~35px tall, which is
-        # a window too small to read through. It now shows what fits and ends
-        # with "+N more", like every other list in the rail.
-        self._retry_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._retry_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        self._retry_list.setSizeAdjustPolicy(QAbstractScrollArea.SizeAdjustPolicy.AdjustToContents)
-        # Matching Expanding + equal stretch so Stream Monitoring shares the pane on the
-        # same footing as the other two sub-lists.
-        self._retry_list.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
-        _theme.style_fn(self._retry_list, lambda: f"QListWidget {{ font-size: {_theme.FONT_MD}; }}")
-        make_seamless(self._retry_list)
+        self._retry_list = self._make_group_list()
         self._retry_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._retry_list.customContextMenuRequested.connect(self._on_retry_context_menu)
         self._retry_list.itemDoubleClicked.connect(self._on_retry_double_clicked)
-        self._retry_list.hide()
 
         self.content_layout.addWidget(self._retry_list)
 
@@ -441,7 +451,8 @@ class WatchAlertsSection(
         if "_retry_list" not in self.__dict__:
             return
         epg = self.__dict__.get("_epg_has_rows", False)
-        has_rows = epg or self._vod_list.count() > 0 or self._retry_list.count() > 0
+        sports = "_sports_list" in self.__dict__ and self._sports_list.count() > 0
+        has_rows = epg or sports or self._vod_list.count() > 0 or self._retry_list.count() > 0
         self.set_empty(not has_rows)
 
     # ------------------------------------------------------------------
@@ -459,17 +470,24 @@ class WatchAlertsSection(
 
 
 
-    def news(self) -> str:
-        """Firing rules plus series with unseen episodes.
+    def news_by_kind(self) -> list[tuple[str, int]]:
+        """``[(kind, count)]`` for what is waiting: firing movie rules, series with
+        unseen episodes (one per series), alerted sports events. Guide programmes
+        never count: they are right now and frequent (watchlist direction 2026-06-28).
 
-        Reads the same two counters the VOD toggle line already keeps, so the
-        header and that line can never disagree about whether anything is new.
+        Reads the same counters the groups' own headings keep, so the header and
+        a heading can never disagree.
         """
         firing = self.__dict__.get("_firing_count")
         if firing is None:
             firing = getattr(self.config, "get_rules_with_new_matches_count",
                              lambda: 0)()
-        total = firing + self.__dict__.get("_series_new_count", 0)
+        return [("movies", firing), ("series", self.__dict__.get("_series_new_count", 0)),
+                ("sports", self.sports_waiting())]
+
+    def news(self) -> str:
+        """The total of :meth:`news_by_kind` — what gives the section its news boost."""
+        total = sum(n for _kind, n in self.news_by_kind())
         # "+2", not "2 new" — the design's header pill. The word is redundant
         # inside a green pill that only ever appears when something is new, and
         # it made the pill wide enough to crowd the buttons beside it.
@@ -488,6 +506,66 @@ class WatchAlertsSection(
 
 
 
+
+    def header_status(self) -> str:
+        """Nothing in the shared slot: the per-kind badges beside it say it (NK-1)."""
+        return ""
+
+    def _build_news_badges(self) -> QWidget:
+        """One green badge per kind with something waiting, led by that kind's icon
+        and no ``+`` (NK-1, NK-4); clicking one jumps to its group (NK-3)."""
+        strip = QWidget()
+        lay = QHBoxLayout(strip)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(4)
+        self._news_badges: dict[str, QPushButton] = {}
+        for kind, _icon, _words in _NEWS_KINDS:
+            chip = chip_widget(CHIP_NEWS, "")
+            chip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+            cursor_affordance.set_clickable(chip)
+            chip.clicked.connect(lambda _=False, k=kind: self.jump_to_group(k))
+            chip.hide()
+            lay.addWidget(chip)
+            self._news_badges[kind] = chip
+
+            def _paint(c=chip, icon=_icon) -> str:
+                _icon_utils.set_button_icon(c, icon, color=_theme.on_fill(_theme.COLOR_OK))
+                c.setIconSize(QSize(11, 11))
+                return _news_chip_style()
+            _theme.style_fn(chip, _paint)
+        return strip
+
+    def _refresh_news_badges(self) -> None:
+        badges = self.__dict__.get("_news_badges")
+        if not badges:
+            return
+        words = {k: w for k, _i, w in _NEWS_KINDS}
+        for kind, n in self.news_by_kind():
+            chip = badges[kind]
+            chip.setText(str(n) if n else "")
+            chip.setVisible(n > 0)
+            singular, plural = words[kind]
+            chip.setToolTip(f"{n} {singular if n == 1 else plural} — click to show them")
+
+    def refresh_header_status(self) -> None:
+        super().refresh_header_status()
+        self._refresh_news_badges()
+
+    def jump_to_group(self, kind: str) -> None:
+        """Open the section and the group *kind* names, then scroll its heading into view."""
+        if self.__dict__.get("is_collapsed"):
+            self.set_collapsed(False)
+        if kind == "sports":
+            if self._sports_collapsed:
+                self._toggle_sports_group()
+            target = self._sports_hdr_container
+        else:
+            if kind == "movies" and self._keyword_collapsed:
+                self._toggle_keyword_group()
+            elif kind == "series" and self._series_collapsed:
+                self._toggle_series_group()
+            target = self.__dict__.get("_vod_headings", {}).get(kind) or self._vod_list
+        QTimer.singleShot(0, lambda: self.content_scroll.ensureWidgetVisible(target, 0, 0))
 
     # ------------------------------------------------------------------
     # Retry helpers

@@ -9,6 +9,8 @@ import pytest
 from PyQt6.QtCore import QPoint, QRect, Qt
 from PyQt6.QtWidgets import QLineEdit, QPushButton, QWidget
 
+from streamselect.gui.guided_tour import TOUR_STOPS
+
 
 class _Host(QWidget):
     """A window carrying the controls the stops look for, at known places."""
@@ -35,7 +37,8 @@ class _Host(QWidget):
         self.sources_strip.setGeometry(0, 390, 200, 400)
         self._sources_lbl = QLineEdit("Sources", self.sources_strip)
         self._sources_lbl.setGeometry(10, 185, 120, 30)
-        self.sidebar_sections = {}
+        self.sidebar_sections = {"alerts": QWidget(self.sidebar_splitter)}
+        self.sidebar_sections["alerts"].setGeometry(0, 0, 200, 120)
         self.picked_themes = []
 
     def _set_theme_from_menu(self, name):
@@ -76,7 +79,7 @@ def test_each_stop_rings_its_real_control(host, stop):
 
 def test_sources_is_ringed_around_what_it_draws_not_its_stretched_box(host):
     tour = _start(host)
-    for _ in range(6):
+    for _ in range(len(TOUR_STOPS) - 1):
         tour.next()
     assert tour._title.text() == "Sources"
     label = host._sources_lbl
@@ -91,7 +94,7 @@ def test_sources_is_ringed_around_what_it_draws_not_its_stretched_box(host):
 def test_a_missing_control_centres_the_card_tall_enough_for_its_text(host, qapp):
     host.sources_strip.hide()
     tour = _start(host)
-    for _ in range(6):
+    for _ in range(len(TOUR_STOPS) - 1):
         tour.next()
     qapp.processEvents()
     assert tour.hole() is None
@@ -127,7 +130,7 @@ def test_keys_step_and_escape_ends_with_where_to_find_it(host, qapp):
 
 def test_the_last_stop_finishes_on_done(host):
     tour = _start(host)
-    for _ in range(6):
+    for _ in range(len(TOUR_STOPS) - 1):
         tour.next()
     assert tour._next_btn.text() == "Done"
     tour._next_btn.click()

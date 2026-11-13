@@ -243,6 +243,8 @@ class MoviesSeriesMixin:
         )
         if on_click is not None:
             heading.clicked.connect(on_click)
+        # Remembered so a header badge can scroll to its group (NK-3).
+        self.__dict__.setdefault("_vod_headings", {})[text.lower()] = heading
         item.setSizeHint(QSize(0, heading.sizeHint().height()))
         self._vod_list.setItemWidget(item, heading)
 
@@ -259,6 +261,7 @@ class MoviesSeriesMixin:
 
         rules = getattr(self.config, "get_vod_watch_alerts", lambda: [])()
         self._vod_list.clear()
+        self._vod_headings = {}
 
         # Re-validate every count against LIVE source state (once, one bounded query):
         # matches on disabled/expired sources never count or show — anywhere.  When no

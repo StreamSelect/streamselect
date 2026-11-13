@@ -12,8 +12,9 @@ from __future__ import annotations
 from PyQt6.QtCore import QObject, QTimer
 
 from streamselect.core.epg_utils import now_utc
-from streamselect.core.games.alerts import due_notices, load_alerts
+from streamselect.core.games.alerts import due_notices, expired_event_rules, load_alerts, remove_alerts
 from streamselect.core.games.read import arrange_feeds, best_feed, load_games, load_watch_history
+from streamselect.core.games.store import sport_settings
 from streamselect.core.repositories.provider import ProviderRepository
 
 POLL_MS = 30_000
@@ -39,13 +40,23 @@ class EventAlertNotifier(QObject):
         self._timer.stop()
 
     def check(self) -> None:
+        now = self._clock()
+        sports = list(sport_settings())
+
         def query(repos):
             alerts = load_alerts(repos.session)
+            # A one-event rule outlives its event by nothing useful: delete it here,
+            # on the poll that already reads the rules.
+            gone = expired_event_rules(alerts, now)
+            if gone:
+                remove_alerts(repos.session, gone)
+                alerts = [a for a in alerts if a.id not in gone]
             if not alerts:
                 return [], [], {}
             hidden = set(ProviderRepository(repos.session).get_hidden_provider_ids())
-            return load_games(repos.session, "hockey", hidden, 1, 2), alerts, load_watch_history(repos.session)
-        self._host._run_query(query, self._on_data)
+            games = [g for sp in sports for g in load_games(repos.session, sp, hidden, 1, 2)]
+            return games, alerts, load_watch_history(repos.session)
+        self._host._run_query(query, self._on_data, commit=True)
 
     def _on_data(self, result) -> None:
         games, alerts, history = result if result else ([], [], {})

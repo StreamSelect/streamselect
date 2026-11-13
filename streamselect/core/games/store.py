@@ -35,6 +35,18 @@ def enabled_leagues() -> tuple[SportSettings, ...]:
         for league, words in (leagues or {}).items() if words)
 
 
+def sport_settings() -> dict[str, SportSettings]:
+    """sport -> its settings (the first listed league's lengths), in listed order.
+
+    The one place a reader gets "the sports there are": the Sports view, the
+    Watch Alerts Sports group and the event-alert notifier all loop over this.
+    """
+    out: dict[str, SportSettings] = {}
+    for league in enabled_leagues():
+        out.setdefault(league.sport, league)
+    return out
+
+
 def _finder_key(s: SportSettings) -> str:
     return f"{s.sport}/{s.league}"
 

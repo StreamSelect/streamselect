@@ -16,12 +16,15 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Iterable
 
 from sqlalchemy import select
 
 from streamselect.core.database import AlertPatternDB
-from streamselect.core.games.read import GameDTO, game_key
+from streamselect.core.games.finder import SportSettings
+from streamselect.core.games.read import OVER, GameDTO, game_key, game_state
+from streamselect.core.playback_models import PlaybackEventDB
 from streamselect.core.watchlist_matching import ALL_WORDS, ANY_WORD
 
 PATTERN_TYPE = "event"
@@ -114,7 +117,6 @@ def due_notices(games: Iterable[GameDTO], alerts: list[EventAlert], now, lead_mi
     then again at its start ("Starting now"). ``sent`` holds the keys already
     sent; a lead of 0 sends only the start notice.
     """
-    from datetime import timedelta
     out = []
     for g in games:
         if not alerts_for(g, alerts):
@@ -127,4 +129,57 @@ def due_notices(games: Iterable[GameDTO], alerts: list[EventAlert], now, lead_mi
               and f"lead|{key}" not in sent):
             mins = max(1, round((g.start_utc - now).total_seconds() / 60))
             out.append((f"lead|{key}", g, f"Starting in {mins} minute{'' if mins == 1 else 's'}"))
+    return out
+
+
+#: A play that began up to this long before an event's start counts as watching it
+#: (tuning in for the warm-up).
+WATCH_EARLY = timedelta(minutes=15)
+#: A one-event rule is deleted this long after its event started: past any event's length.
+EVENT_RULE_KEEP = timedelta(hours=12)
+
+
+def watched_game_ids(session, games: list[GameDTO]) -> set[int]:
+    """Games the user has started watching: a play of one of its channels from
+    :data:`WATCH_EARLY` before its start onward."""
+    by_channel: dict[str, list[GameDTO]] = {}
+    for g in games:
+        for f in g.playable:
+            by_channel.setdefault(f.channel_id, []).append(g)
+    if not by_channel:
+        return set()
+    since = min(g.start_utc for g in games) - WATCH_EARLY
+    rows = session.execute(
+        select(PlaybackEventDB.channel_id, PlaybackEventDB.started_at)
+        .where(PlaybackEventDB.channel_id.in_(list(by_channel)),
+               PlaybackEventDB.started_at >= since,
+               PlaybackEventDB.outcome.in_(("started", "dropped")))).all()
+    return {g.id for cid, at in rows for g in by_channel[cid] if at >= g.start_utc - WATCH_EARLY}
+
+
+def waiting_events(games: Iterable[GameDTO], alerts: list[EventAlert], now: datetime,
+                   settings: dict[str, SportSettings], watched: set[int]) -> list[GameDTO]:
+    """The alerted events Watch Alerts lists: upcoming or live, not watched yet.
+
+    Each event is its own item (two games between the same teams on back-to-back
+    days are two items). One goes by itself when it is over, marked finished, or
+    watched; the rule that matched it stays.
+    """
+    return [g for g in games
+            if g.id not in watched and g.sport in settings and alerts_for(g, alerts)
+            and game_state(g, now, settings[g.sport]) != OVER]
+
+
+def expired_event_rules(alerts: Iterable[EventAlert], now: datetime) -> list[str]:
+    """Ids of one-event rules whose event started more than :data:`EVENT_RULE_KEEP` ago."""
+    out = []
+    for a in alerts:
+        if not a.event:
+            continue
+        try:
+            start = datetime.fromisoformat(a.event.rsplit("|", 1)[1])
+        except (IndexError, ValueError):
+            continue
+        if now - start > EVENT_RULE_KEEP:
+            out.append(a.id)
     return out

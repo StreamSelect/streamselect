@@ -104,9 +104,21 @@ TOUR_STOPS: tuple[TourStop, ...] = (
              "categories, keywords — everywhere at once. Click to turn it on "
              "or off; right-click to change what it hides.",
              _attr("_filter_chip")),
+    TourStop("Watch Alerts",
+             "What you asked to be told about. The green badges in its header "
+             "count what is waiting, one per kind; click one to jump to it. "
+             "TV guide matches show here while they air, but are not counted.",
+             lambda host: (host.__dict__.get("sidebar_sections") or {}).get("alerts"),
+             legend=(("movie", "Movies: alerts with new matches. They stay until "
+                               "you clear them, and wait in Watch Queue too."),
+                     ("series", "Series: shows with new episodes, one per show. "
+                                "The number on each row is its new episodes."),
+                     ("sports", "Sports: games you set the bell on, live or coming "
+                                "up. Each goes by itself once it is over or you "
+                                "start watching."))),
     TourStop("Your lists",
-             "Watch Alerts, Recommended, Watch Queue, Favorites and History. "
-             "They fill up as you watch, save and rate. The gear on Recommended "
+             "Recommended, Watch Queue, Favorites and History, under Watch "
+             "Alerts. They fill up as you watch, save and rate. The gear on Recommended "
              "opens what it has learned you like.",
              _attr("sidebar_splitter")),
     TourStop("Sources",

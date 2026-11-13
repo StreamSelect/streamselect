@@ -23,6 +23,7 @@ class _SportsViewMixin:
             view.channelSelected.connect(self.show_channel_details_by_id)
             # The card's "Hide this channel everywhere…" is the app's own Hide.
             view.hideEverywhereRequested.connect(lambda cid: self._bulk_hide_channels([cid]))
+            view.alertsChanged.connect(self._refresh_sports_alerts)
             view.setVisible(False)
             self._list_layout.addWidget(view)
             # A run starting says "finding" instead of a premature 0; new games stored
@@ -31,6 +32,12 @@ class _SportsViewMixin:
             tracker.finding_started.connect(lambda: view.set_finding(True))
             tracker.games_updated.connect(lambda _counts: view.finished_finding())
         return view
+
+    def _refresh_sports_alerts(self) -> None:
+        """Re-read the Watch Alerts Sports group (a bell changed, or games were re-found)."""
+        section = self.sidebar_sections.get("alerts")
+        if section is not None:
+            section.refresh_sports()
 
     def switch_to_sports_view(self) -> None:
         """Switch the content area to the Sports view."""
