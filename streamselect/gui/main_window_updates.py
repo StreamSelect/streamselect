@@ -47,7 +47,7 @@ class _UpdatesMixin:
 
     def _on_update_available(self, info) -> None:
         """Show the update notice; it stays until one of its answers is picked."""
-        old = getattr(self, "_update_notice_id", None)
+        old = self.__dict__.get("_update_notice_id")
         if old:
             self.notification_manager.dismiss(old)
         self._update_notice_id = self.notification_manager.show(
@@ -96,14 +96,14 @@ class _UpdatesMixin:
             QDesktopServices.openUrl(QUrl(info.release_url or _RELEASES_PAGE))
 
     def _on_update_install_progress(self, percent: int) -> None:
-        notice = getattr(self, "_update_progress_id", None)
+        notice = self.__dict__.get("_update_progress_id")
         if notice:
             self.notification_manager.update_progress(notice, percent, total=100)
 
     def _on_update_install_ready(self, paths) -> None:
         """The new version is staged: start the helper, then quit so it can swap."""
         target, staged = paths
-        notice = getattr(self, "_update_progress_id", None)
+        notice = self.__dict__.get("_update_progress_id")
         try:
             update_installer.launch_helper(target, staged)
         except update_installer.UpdateInstallError as exc:
@@ -116,7 +116,7 @@ class _UpdatesMixin:
         QTimer.singleShot(_QUIT_DELAY_MS, self.close)
 
     def _on_update_install_failed(self, message: str) -> None:
-        notice = getattr(self, "_update_progress_id", None)
+        notice = self.__dict__.get("_update_progress_id")
         if notice:
             self.notification_manager.dismiss(notice)
             self._update_progress_id = None

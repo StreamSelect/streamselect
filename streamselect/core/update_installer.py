@@ -55,6 +55,14 @@ class UpdateInstallError(Exception):
 
 # ── Where the app is installed ───────────────────────────────────────────────
 
+def install_platform() -> str:
+    """"darwin", "win32" or "linux": the platform keys these helpers take, read
+    through ``runtime_env`` (the one home for platform checks)."""
+    if runtime_env.is_macos():
+        return "darwin"
+    return "win32" if runtime_env.is_windows() else "linux"
+
+
 def install_target(executable: Optional[str] = None,
                    platform: Optional[str] = None) -> Optional[Path]:
     """The folder the update replaces, or ``None`` when this build can't self-update.
@@ -63,7 +71,7 @@ def install_target(executable: Optional[str] = None,
     Windows: the one-folder build holding ``StreamSelect.exe``.
     Source runs and Linux return ``None``.
     """
-    platform = platform or sys.platform
+    platform = platform or install_platform()
     if executable is None:
         if not runtime_env.is_frozen():
             return None
@@ -193,7 +201,7 @@ def stage_update(url: str, target: Path, platform: Optional[str] = None,
     Raises:
         UpdateInstallError: on any failure; the staging folder is removed.
     """
-    platform = platform or sys.platform
+    platform = platform or install_platform()
     stage = stage_dir_for(target)
     if stage.exists():
         shutil.rmtree(stage, ignore_errors=True)
@@ -300,7 +308,7 @@ def launch_helper(target: Path, staged: Path, pid: Optional[int] = None,
     Raises:
         UpdateInstallError: if the script can't be written or started.
     """
-    platform = platform or sys.platform
+    platform = platform or install_platform()
     pid = pid if pid is not None else os.getpid()
     scripts = Path(tempfile.mkdtemp(prefix="streamselect-update-"))
     try:

@@ -24,7 +24,6 @@ import json
 import os
 import platform
 import re
-import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -188,7 +187,7 @@ def select_windows_zip_url(assets) -> str:
 
 def installer_url(info: "UpdateInfo", platform: Optional[str] = None) -> str:
     """The asset this platform installs from: the ``.dmg`` or the Windows ``.zip``."""
-    platform = platform or sys.platform
+    platform = platform or update_installer.install_platform()
     if platform == "darwin":
         return info.dmg_url
     if platform == "win32":
