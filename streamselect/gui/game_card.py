@@ -29,13 +29,15 @@ from PyQt6.QtWidgets import (
 )
 
 from streamselect.core.epg_utils import fmt_time
+from streamselect.core.quality_vocab import quality_tooltip
 from streamselect.core.games.read import (
     DIDNT_PLAY, ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, GameFeedDTO,
 )
 from streamselect.gui import cursor_affordance, icons
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
-from streamselect.gui.badge_utils import make_quality_chip, make_region_chip
+from streamselect.gui.badge_utils import make_region_chip
+from streamselect.gui.chip_row import CHIP_QUALITY, chip_widget
 from streamselect.gui.detail_chips import make_chip
 from streamselect.gui.progress_paint import ProgressBar, elapsed_pct
 
@@ -85,7 +87,7 @@ class ChannelRow(QWidget):
     clearReportsRequested = pyqtSignal(object)  # GameFeedDTO
 
     def __init__(self, feed: GameFeedDTO, league: str, *, preferred: bool, playing: bool,
-                 hidden: bool = False, parent=None):
+                 hidden: bool = False, slots: Optional[dict] = None, parent=None):
         super().__init__(parent)
         self.feed = feed
         self._preferred = preferred
@@ -120,13 +122,12 @@ class ChannelRow(QWidget):
         _theme.style(self.name, "ALERT_NEW_MATCH_BADGE" if playing else
                      "TEXT_SM_MUTED" if hidden else "CHANNEL_NAME_LIVE")
         row.addWidget(self.name, 1)
-        if feed.from_guide:
-            epg = QLabel("EPG")
-            epg.setToolTip("Found in the programme guide, which is less reliable than channel names")
-            _theme.style(epg, "GAME_GUIDE_CHIP")
-            row.addWidget(epg)
-        if feed.quality:
-            row.addWidget(make_quality_chip(feed.quality, self))
+        # EPG and quality sit in fixed-width slots the whole list shares, held
+        # even when a row has neither, so both line up down the list (owner,
+        # 2026-11-14). Widths come from ChannelList (``chip_slots``).
+        slots = slots or {}
+        _add_in_slot(row, guide_chip() if feed.from_guide else None, slots.get("epg", 0))
+        _add_in_slot(row, quality_chip(feed.quality) if feed.quality else None, slots.get("quality", 0))
         if hidden:
             self.eye = _icon_utils.icon_button("visibility_toggle", f"Show this channel again in {league} games", px=13)
             self.eye.clicked.connect(lambda: self.unhideRequested.emit(self.feed))
@@ -201,6 +202,52 @@ class ChannelRow(QWidget):
         super().mousePressEvent(event)
 
 
+def guide_chip() -> QLabel:
+    """"EPG": this channel was found through the programme guide."""
+    epg = QLabel("EPG")
+    epg.setToolTip("Found in the programme guide, which is less reliable than channel names")
+    _theme.style(epg, "GAME_GUIDE_CHIP")
+    return epg
+
+
+def quality_chip(token: str) -> QWidget:
+    """The app's one quality chip — tier-coloured text on a neutral hairline, no
+    fill — as the details pane and the sidebar draw it (owner report 2026-11-14:
+    the solid-fill chip here broke the standard)."""
+    chip = chip_widget(CHIP_QUALITY, token.upper())
+    chip.setToolTip(quality_tooltip(token))
+    return chip
+
+
+def chip_slots(feeds) -> dict:
+    """Slot widths for a channel list: the widest EPG and quality chip its rows
+    carry (0 when none does, so a list without EPG keeps no empty column)."""
+    def width(w: QWidget) -> int:
+        w.ensurePolished()
+        out = w.sizeHint().width()
+        w.deleteLater()
+        return out
+    epg = width(guide_chip()) if any(f.from_guide for f in feeds) else 0
+    quality = max((width(quality_chip(f.quality)) for f in feeds if f.quality), default=0)
+    return {"epg": epg, "quality": quality}
+
+
+def _add_in_slot(row: QHBoxLayout, chip: Optional[QWidget], width: int) -> None:
+    """*chip* (or nothing) in a slot *width* wide; no slot when *width* is 0."""
+    if not width:
+        if chip is not None:
+            row.addWidget(chip)
+        return
+    slot = QWidget()
+    slot.setFixedWidth(width)
+    h = QHBoxLayout(slot)
+    h.setContentsMargins(0, 0, 0, 0)
+    if chip is not None:
+        h.addWidget(chip)
+    h.addStretch(1)
+    row.addWidget(slot)
+
+
 class ChannelList(QWidget):
     """Every channel showing a game, then "N hidden channels · show" when some are hidden."""
 
@@ -220,9 +267,10 @@ class ChannelList(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(1)
         self.rows: list[ChannelRow] = []
+        slots = chip_slots([*game.playable, *(game.hidden if show_hidden else ())])
         for f in game.playable:
             r = ChannelRow(f, game.league, preferred=f.collection_key == preferred_key,
-                           playing=f.channel_id == playing_id)
+                           playing=f.channel_id == playing_id, slots=slots)
             r.play.connect(self.play)
             r.prefer.connect(lambda feed: self.prefer.emit(self.game, feed))
             r.hideRequested.connect(lambda feed, scope: self.hideRequested.emit(self.game, feed, scope))
@@ -244,7 +292,8 @@ class ChannelList(QWidget):
             lay.addWidget(self.hidden_button, 0, Qt.AlignmentFlag.AlignLeft)
             if show_hidden:
                 for f in hidden:
-                    r = ChannelRow(f, game.league, preferred=False, playing=False, hidden=True)
+                    r = ChannelRow(f, game.league, preferred=False, playing=False, hidden=True,
+                                   slots=slots)
                     r.unhideRequested.connect(lambda feed: self.unhideRequested.emit(self.game, feed))
                     lay.addWidget(r)
 

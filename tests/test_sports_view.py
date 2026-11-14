@@ -1007,3 +1007,32 @@ def test_finished_titles_start_where_todays_do(games_db, qapp, owned_widgets):
     past = next(r for r in view.rows if isinstance(r, QLabel))
     today = next(r for r in view.rows if isinstance(r, QPushButton))
     assert abs(_text_x(past, view) - _text_x(today, view)) <= 1
+
+
+def test_a_channel_lists_epg_and_quality_chips_line_up_and_quality_is_unfilled(qapp, owned_widgets):
+    """Owner report, 2026-11-14: the quality chips were solid fills in colours the app
+    doesn't use for them, and a row without one let its EPG chip slide right."""
+    from streamselect.gui import theme
+    from streamselect.gui.game_card import ChannelList
+    feeds = (GameFeedDTO("c1", "One", "C", True, "guide", "p", "C1", "US", "HD"),
+             GameFeedDTO("c2", "Two", "C", True, "guide", "p", "C2", "US", ""),
+             GameFeedDTO("c3", "Three", "C", False, "clock", "p", "C3", "US", "RAW"),
+             GameFeedDTO("c4", "Four", "C", False, "clock", "p", "C4", "US", ""))
+    game = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 2, feeds)
+    lst = owned_widgets.own(ChannelList(game, preferred_key=None, playing_id=None, show_hidden=False))
+    lst.resize(600, 200)
+    lst.show()
+    qapp.processEvents()
+
+    def chips(row, text):
+        return [w for w in row.findChildren((QLabel, QPushButton)) if w.text() == text and w.isVisible()]
+    epg_x = {chips(r, "EPG")[0].mapTo(lst, QPoint(0, 0)).x() for r in lst.rows if chips(r, "EPG")}
+    quality_x = {w.mapTo(lst, QPoint(0, 0)).x() for r in lst.rows
+                 for w in chips(r, "HD") + chips(r, "RAW")}
+    assert len(epg_x) == 1, f"EPG chips line up: {epg_x}"
+    assert len(quality_x) == 1, f"quality chips line up, with or without EPG: {quality_x}"
+    hd = chips(lst.rows[0], "HD")[0]
+    img = hd.grab().toImage()
+    inside = QColor(img.pixel(img.width() // 2, 2))
+    assert inside.alpha() == 0 or not _near(inside, QColor(theme.COLOR_QUALITY_HD), 30), "no fill"
+    assert _paints(hd, QColor(theme.COLOR_QUALITY_OUTLINE_HD)), "the tier colour is in the text"
