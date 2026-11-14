@@ -586,7 +586,7 @@ class SportsView(ContentView):
         QTimer.singleShot(0, self._render)
 
     def _unreport(self, game: GameDTO, feed, kind: str) -> None:
-        """Take one report kind back for this channel: every "no picture", or this
+        """Take one report kind back for this channel: every "nothing showing", or this
         game's "not this game" — what the ticked menu item stood for."""
         reports = self._prefs(game.league_key).get(CHANNEL_REPORTS) or {}
         mine = reports.get(feed.channel_id)

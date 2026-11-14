@@ -75,11 +75,11 @@
     },
     {
       "entry": "streamselect/gui/game_card.py::ChannelRow.build_context_menu",
-      "reason": "a game's channel row: prefer/hide for this league, report no picture / not this game - keyed on the collection and the game. Its one channel-level action (Hide this channel everywhere) should come from the registry: ledger D75."
+      "reason": "a game's channel row: prefer/hide for this league, report nothing showing / not this game - keyed on the collection and the game. Its one channel-level action (Hide this channel everywhere) should come from the registry: ledger D75."
     },
     {
       "entry": "streamselect/gui/game_card.py::GameCard.build_context_menu",
-      "reason": "game card menu (Mark as finished; no picture / not this game on the card's own channel, the same reports as its channel rows) - game-shaped, not channel-shaped."
+      "reason": "game card menu (Mark as finished; nothing showing / not this game on the card's own channel, the same reports as its channel rows) - game-shaped, not channel-shaped."
     }
   ]
 }

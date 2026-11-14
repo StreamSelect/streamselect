@@ -558,7 +558,7 @@ VECTOR_KEYS: dict[str, str] = {
     "explore": "mdi6.arrow-right",
     "columns": "mdi6.arrow-expand",
     "settings": "mdi6.cog-outline",
-    # A channel the user reported in a Sports event (no picture / not this game):
+    # A channel the user reported in a Sports event (nothing showing / not this game):
     # a flag — "someone flagged this", not the general "warning" triangle; the
     # variant flag, since the plain one is already qa_flag's.
     "reported": "mdi6.flag-variant-outline",

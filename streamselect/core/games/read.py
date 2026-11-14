@@ -139,10 +139,10 @@ WATCHED_MIN_SECONDS = 60
 _PLAY_CAP_S = int(DEFAULT_EVENT_DURATION.total_seconds())
 
 
-#: Channel reports (SV-Q37-Q39), shown as "No picture" and "Not this game"
+#: Channel reports (SV-Q37-Q39), shown as "Nothing showing" and "Not this game"
 #: (owner, 2026-11-13); the stored kinds keep their first names.
 DIDNT_PLAY, WRONG_CONTENT = "didnt_play", "wrong_content"
-_REPORT_WORDS = {DIDNT_PLAY: "no picture", WRONG_CONTENT: "not this game"}
+_REPORT_WORDS = {DIDNT_PLAY: "nothing showing", WRONG_CONTENT: "not this game"}
 #: Where reports live in ``Config.game_channel_prefs[league]``: keyed by CHANNEL id
 #: (owner, 2026-11-13: "No picture should be specific to a channel/stream not to a
 #: package" — one dead slot in a package of fifteen). Each entry keeps its collection
@@ -181,7 +181,7 @@ def report_text(reports: list[dict], game: GameDTO, last_watched: Optional[datet
     ``reports``: the stored list for the channel, each ``{"kind", "at", "game"?, ...}``.
     A real watch (``last_watched``, plays of a minute or more) after the latest
     report cancels one report — a feed that came back earns its place back. A
-    "not this game" report counts for its own game; "no picture" for every game.
+    "not this game" report counts for its own game; "nothing showing" for every game.
     """
     active, n = active_reports(reports, game, last_watched, now)
     if not active:

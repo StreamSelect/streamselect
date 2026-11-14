@@ -57,13 +57,14 @@ def _keep_space(*widgets: QWidget) -> None:
 def add_report_actions(menu: QMenu, feed: GameFeedDTO, report) -> None:
     """The two channel reports, worded as what the user saw (owner, 2026-11-13).
 
-    "No picture" (``DIDNT_PLAY``): nothing came up — black, an empty window, or it
-    never loaded. "Not this game" (``WRONG_CONTENT``): a picture, but not the game
+    "Nothing showing" (``DIDNT_PLAY``): black, an empty window, or it never loaded —
+    what the user saw, not why: a dead stream and a slot with no game look the same
+    (owner, 2026-11-13: "No picture" read as a broken stream when there was no game). "Not this game" (``WRONG_CONTENT``): a picture, but not the game
     on the card. One wording for a card and a channel row. Each is ticked while it
     counts on ``feed`` (owner: "there's no indication I did anything"); choosing a
     ticked one takes it back. ``report(kind, on)`` emits.
     """
-    for label, kind in (("No picture", DIDNT_PLAY), ("Not this game", WRONG_CONTENT)):
+    for label, kind in (("Nothing showing", DIDNT_PLAY), ("Not this game", WRONG_CONTENT)):
         act = menu.addAction(label)
         act.setCheckable(True)
         act.setChecked(kind in feed.reported)
@@ -433,7 +434,7 @@ class GameCard(QFrame):
             pl.addWidget(self.station, 1)
         # The channel the card plays is reported (reported channels sort last, so every
         # other one is too): the flag says so. The card dims only when every channel
-        # showed no picture — "Not this game" means a channel that works (owner, 2026-11-13).
+        # showed nothing showing — "Not this game" means a channel that works (owner, 2026-11-13).
         self.report_icon = None
         if self.top_feed is not None and self.top_feed.report:
             self.report_icon = QLabel()

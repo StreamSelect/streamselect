@@ -558,17 +558,17 @@ def test_reporting_a_channel_puts_it_last_with_its_flag_and_clear_brings_it_back
     first = view.cards[0].findChildren(ChannelRow)[0]
     menu = first.build_context_menu("NHL")
     texts = [a.text() for a in menu.actions()]
-    assert "No picture" in texts and "Not this game" in texts
+    assert "Nothing showing" in texts and "Not this game" in texts
     assert "Report this channel" not in texts and "Didn't play" not in texts, "the old wording is back"
     clear = next(a for a in menu.actions() if a.text() == "Clear bad reports")
     assert not clear.isEnabled(), "nothing to clear yet"
-    next(a for a in menu.actions() if a.text() == "No picture").trigger()
+    next(a for a in menu.actions() if a.text() == "Nothing showing").trigger()
     _settle(qapp)
     rows = view.cards[0].findChildren(ChannelRow)
     last = max(rows, key=lambda r: r.mapTo(view, QPoint(0, 0)).y())
     assert last.feed.channel_id == first.feed.channel_id, "a reported channel is listed last"
     assert last.report_icon is not None and last.report_icon.isVisibleTo(view)
-    assert "no picture" in last.report_icon.toolTip()
+    assert "nothing showing" in last.report_icon.toolTip()
     assert all(r.report_icon is None for r in rows if r is not last), "no clutter on other rows"
     clear = next(a for a in last.build_context_menu("NHL").actions() if a.text() == "Clear bad reports")
     assert clear.isEnabled()
@@ -586,15 +586,15 @@ def test_a_live_card_reports_its_own_channel_so_a_one_channel_game_can_be_report
     card = _card(view, "Sabres")
     reported = card.top_feed
     texts = [a.text() for a in card.build_context_menu().actions() if not a.isSeparator()]
-    assert texts == ["Mark as finished", "No picture", "Not this game"], texts
-    next(a for a in card.build_context_menu().actions() if a.text() == "No picture").trigger()
+    assert texts == ["Mark as finished", "Nothing showing", "Not this game"], texts
+    next(a for a in card.build_context_menu().actions() if a.text() == "Nothing showing").trigger()
     _settle(qapp)
     _card(view, "Sabres").more_chip.click()
     _settle(qapp)
     rows = _card(view, "Sabres").findChildren(ChannelRow)
     flagged = [r for r in rows if r.report_icon is not None and r.report_icon.isVisibleTo(view)]
     assert [r.feed.channel_id for r in flagged] == [reported.channel_id], "that channel only"
-    assert "no picture" in flagged[0].report_icon.toolTip()
+    assert "nothing showing" in flagged[0].report_icon.toolTip()
     last = max(rows, key=lambda r: r.mapTo(view, QPoint(0, 0)).y())
     assert last is flagged[0], "the card's reported channel drops to the bottom of its list"
 
@@ -607,7 +607,7 @@ def test_only_a_card_that_is_on_has_a_menu(qapp, owned_widgets):
     assert early.build_context_menu() is None
     on = owned_widgets.own(GameCard(g, ON_NOW, START + timedelta(minutes=30), HOCKEY.usual_length))
     assert [a.text() for a in on.build_context_menu().actions() if not a.isSeparator()] == [
-        "Mark as finished", "No picture", "Not this game"], "a one-channel card can report its channel"
+        "Mark as finished", "Nothing showing", "Not this game"], "a one-channel card can report its channel"
 
 
 def test_a_header_tooltip_names_the_list_it_collapses(games_db, qapp, owned_widgets):
@@ -644,7 +644,7 @@ def test_a_card_whose_channel_is_reported_dims_and_flags_it_and_its_menu_is_tick
     from streamselect.core.games.read import DIDNT_PLAY
     from streamselect.gui.game_card import GameCard
     plain = _feed("a", "ONE")
-    bad = replace(plain, report="Reported once in NHL games: no picture. Listed last.", reported=(DIDNT_PLAY,))
+    bad = replace(plain, report="Reported once in NHL games: nothing showing. Listed last.", reported=(DIDNT_PLAY,))
     now = START + timedelta(minutes=30)
 
     def shown(feed):
@@ -661,24 +661,24 @@ def test_a_card_whose_channel_is_reported_dims_and_flags_it_and_its_menu_is_tick
     host_bad, flagged = shown(bad)
     assert ok.report_icon is None and ok.graphicsEffect() is None
     assert flagged.report_icon is not None and flagged.report_icon.isVisibleTo(host_bad)
-    assert "no picture" in flagged.report_icon.toolTip()
+    assert "nothing showing" in flagged.report_icon.toolTip()
     assert _contrast(host_bad, flagged) < _contrast(host_ok, ok) * 0.7, "the reported card is drawn dimmer"
     ticks = {a.text(): a.isChecked() for a in flagged.build_context_menu().actions() if a.isCheckable()}
-    assert ticks == {"No picture": True, "Not this game": False}, ticks
+    assert ticks == {"Nothing showing": True, "Not this game": False}, ticks
     assert not any(a.isChecked() for a in ok.build_context_menu().actions())
 
 
 def test_a_ticked_report_is_taken_back_from_the_same_menu(games_db, qapp, owned_widgets):
     from streamselect.gui.game_card import ChannelRow
     view = _view(games_db, qapp, owned_widgets, LIVE_AT)
-    next(a for a in _card(view, "Sabres").build_context_menu().actions() if a.text() == "No picture").trigger()
+    next(a for a in _card(view, "Sabres").build_context_menu().actions() if a.text() == "Nothing showing").trigger()
     _settle(qapp)
     assert _card(view, "Sabres").graphicsEffect() is None, (
         "another channel still works, so the card plays that one and stays bright")
     _card(view, "Sabres").more_chip.click()
     _settle(qapp)
     row = next(r for r in _card(view, "Sabres").findChildren(ChannelRow) if r.report_icon is not None)
-    item = next(a for a in row.build_context_menu("NHL").actions() if a.text() == "No picture")
+    item = next(a for a in row.build_context_menu("NHL").actions() if a.text() == "Nothing showing")
     assert item.isChecked()
     item.trigger()
     _settle(qapp)
@@ -717,7 +717,7 @@ def test_a_watch_of_that_channel_takes_a_report_back_and_a_sibling_slot_does_not
 
 
 def test_not_this_game_flags_the_card_but_does_not_dim_it(qapp, owned_widgets):
-    """A channel that shows another game works; only "No picture" on every channel dims."""
+    """A channel that shows another game works; only "Nothing showing" on every channel dims."""
     from dataclasses import replace
 
     from streamselect.core.games.read import WRONG_CONTENT
