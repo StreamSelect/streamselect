@@ -143,6 +143,12 @@ _PLAY_CAP_S = int(DEFAULT_EVENT_DURATION.total_seconds())
 #: (owner, 2026-11-13); the stored kinds keep their first names.
 DIDNT_PLAY, WRONG_CONTENT = "didnt_play", "wrong_content"
 _REPORT_WORDS = {DIDNT_PLAY: "no picture", WRONG_CONTENT: "not this game"}
+#: Where reports live in ``Config.game_channel_prefs[league]``: keyed by CHANNEL id
+#: (owner, 2026-11-13: "No picture should be specific to a channel/stream not to a
+#: package" — one dead slot in a package of fifteen). Each entry keeps its collection
+#: too, so reports can be added up per collection later (analytics). The first
+#: collection-keyed store, ``"reports"``, is kept as written and no longer read.
+CHANNEL_REPORTS = "channel_reports"
 #: A report counts this long after the latest one, times the number of reports
 #: (owner, SV-Q38: 30 days to start; more reports extend the tracking).
 REPORT_DAYS = 30
@@ -172,7 +178,7 @@ def report_text(reports: list[dict], game: GameDTO, last_watched: Optional[datet
                 now: datetime) -> str:
     """The active report on one collection for one game, as its icon's tooltip; "" if none.
 
-    ``reports``: the stored list for the collection, each ``{"kind", "at", "game"?}``.
+    ``reports``: the stored list for the channel, each ``{"kind", "at", "game"?, ...}``.
     A real watch (``last_watched``, plays of a minute or more) after the latest
     report cancels one report — a feed that came back earns its place back. A
     "not this game" report counts for its own game; "no picture" for every game.
@@ -203,13 +209,13 @@ def arrange_feeds(game: GameDTO, prefs: dict, history: WatchHistory,
     watched = [f.collection_key for f in keep if history.get(f.collection_key, (None,))[0] is not None]
     last = max(watched, key=lambda k: history[k][0]) if watched else None
 
-    reports = prefs.get("reports") or {}
+    reports = prefs.get(CHANNEL_REPORTS) or {}
     if now is not None and reports:
         def reported(f: GameFeedDTO) -> GameFeedDTO:
-            mine, watched = reports.get(f.collection_key, []), history.get(f.collection_key, (None,))[0]
+            mine, watched = reports.get(f.channel_id, []), history.get(channel_history_key(f.channel_id), (None,))[0]
             return replace(f, report=report_text(mine, game, watched, now),
                            reported=active_reports(mine, game, watched, now)[0])
-        keep = [reported(f) if f.collection_key in reports else f for f in keep]
+        keep = [reported(f) if f.channel_id in reports else f for f in keep]
 
     def key(f: GameFeedDTO):
         _last, secs, plays = history.get(f.collection_key, (None, 0, 0))
@@ -225,8 +231,15 @@ def mark_finished(session, game: GameDTO, ended_at: datetime) -> None:
                             start_utc=game.start_utc, ended_at=ended_at))
 
 
+def channel_history_key(channel_id: Optional[str]) -> str:
+    """One channel's own entry in a ``WatchHistory`` (beside the collection entries):
+    a real watch of THIS channel takes back one of its reports."""
+    return f"channel:{channel_id}"
+
+
 def load_watch_history(session) -> WatchHistory:
-    """Plays that showed a picture, grouped by the played channel's source and collection.
+    """Plays that showed a picture, grouped by the played channel's source and collection,
+    and per channel under ``channel_history_key``.
 
     The "last watched" time counts only plays of at least :data:`WATCHED_MIN_SECONDS`
     (or still running); minutes and plays count everything that showed a picture.
@@ -242,7 +255,16 @@ def load_watch_history(session) -> WatchHistory:
         .join(ChannelDB, ChannelDB.id == PlaybackEventDB.channel_id)
         .where(PlaybackEventDB.outcome.in_(("started", "dropped")))
         .group_by(ChannelDB.provider_id, ChannelDB.category)).all()
-    return {f"{pid}|{cat or ''}": (last, int(secs), int(n)) for pid, cat, last, secs, n in rows}
+    history = {f"{pid}|{cat or ''}": (last, int(secs), int(n)) for pid, cat, last, secs, n in rows}
+    per_channel = session.execute(
+        select(PlaybackEventDB.channel_id,
+               func.max(case((watched, PlaybackEventDB.started_at), else_=None)),
+               func.coalesce(func.sum(func.min(PlaybackEventDB.seconds_watched, _PLAY_CAP_S)), 0),
+               func.count())
+        .where(PlaybackEventDB.outcome.in_(("started", "dropped")))
+        .group_by(PlaybackEventDB.channel_id)).all()
+    history.update({channel_history_key(cid): (last, int(secs), int(n)) for cid, last, secs, n in per_channel})
+    return history
 
 
 def load_games(session, sport: str, hidden_provider_ids: set[str],

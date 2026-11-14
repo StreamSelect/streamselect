@@ -8,8 +8,8 @@ ENTRY = WhatsNewEntry(
     items=(
         "After you report a channel with No picture or Not this game, the menu shows a tick "
         "beside your choice. Choose it again to take the report back.",
-        "When a game has no unreported channel left to play, its card dims and shows a flag "
-        "beside the channel. Hover the flag to see what you reported.",
+        "A card whose channel you reported shows a flag beside the channel; hover it to see "
+        "what you reported. When every channel of the game showed No picture, the card dims.",
     ),
     test_steps=(
         "Open Sports while a game with one channel is on. Right-click its card and choose No "

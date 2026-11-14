@@ -593,7 +593,7 @@ def test_a_live_card_reports_its_own_channel_so_a_one_channel_game_can_be_report
     _settle(qapp)
     rows = _card(view, "Sabres").findChildren(ChannelRow)
     flagged = [r for r in rows if r.report_icon is not None and r.report_icon.isVisibleTo(view)]
-    assert [r.feed.collection_key for r in flagged] == [reported.collection_key]
+    assert [r.feed.channel_id for r in flagged] == [reported.channel_id], "that channel only"
     assert "no picture" in flagged[0].report_icon.toolTip()
     last = max(rows, key=lambda r: r.mapTo(view, QPoint(0, 0)).y())
     assert last is flagged[0], "the card's reported channel drops to the bottom of its list"
@@ -683,6 +683,60 @@ def test_a_ticked_report_is_taken_back_from_the_same_menu(games_db, qapp, owned_
     item.trigger()
     _settle(qapp)
     assert all(r.report_icon is None for r in _card(view, "Sabres").findChildren(ChannelRow))
+
+
+def test_no_picture_is_one_channel_not_its_package(qapp):
+    """Owner, 2026-11-13: two false games sat on two slots of one package; a "No
+    picture" on one slot flagged the whole package, the other slot's game and the
+    working slots of real games with it."""
+    from streamselect.core.games.read import CHANNEL_REPORTS, DIDNT_PLAY
+    slot_11, slot_6 = _feed("slot11", "PACKAGE"), _feed("slot06", "PACKAGE")
+    other = GameDTO(2, "hockey", "NHL", "C", "D", START, 2, False, 1, (slot_6,))
+    prefs = {CHANNEL_REPORTS: {"slot11": [{"kind": DIDNT_PLAY, "at": START.isoformat(),
+                                           "collection": slot_11.collection_key}]}}
+    assert arrange_feeds(other, prefs, {}, START).playable[0].reported == ()
+    mine = GameDTO(1, "hockey", "NHL", "A", "B", START, 2, False, 1, (slot_11,))
+    assert arrange_feeds(mine, prefs, {}, START).playable[0].reported == (DIDNT_PLAY,)
+
+
+def test_a_watch_of_that_channel_takes_a_report_back_and_a_sibling_slot_does_not(games_db):
+    from streamselect.core.games.read import CHANNEL_REPORTS, DIDNT_PLAY, channel_history_key, load_watch_history
+    from streamselect.core.playback_models import PlaybackEventDB
+    with games_db.session_scope() as s:
+        g = next(x for x in load_games(s, "hockey", set(), 1, 2) if x.team_a == "Buffalo Sabres")
+        feed = g.playable[0]
+        s.add(PlaybackEventDB(provider_id="p1", channel_id=feed.channel_id, title="t", outcome="started",
+                              started_at=START + timedelta(hours=1), seconds_watched=600))
+    with games_db.session_scope() as s:
+        history = load_watch_history(s)
+    assert history[channel_history_key(feed.channel_id)][0] == START + timedelta(hours=1)
+    prefs = {CHANNEL_REPORTS: {feed.channel_id: [{"kind": DIDNT_PLAY, "at": START.isoformat()}]}}
+    one = GameDTO(1, "hockey", "NHL", "A", "B", START, 2, False, 1, (feed,))
+    assert arrange_feeds(one, prefs, history, START + timedelta(hours=2)).playable[0].reported == ()
+    assert arrange_feeds(one, prefs, {}, START + timedelta(hours=2)).playable[0].reported == (DIDNT_PLAY,)
+
+
+def test_not_this_game_flags_the_card_but_does_not_dim_it(qapp, owned_widgets):
+    """A channel that shows another game works; only "No picture" on every channel dims."""
+    from dataclasses import replace
+
+    from streamselect.core.games.read import WRONG_CONTENT
+    from streamselect.gui.game_card import GameCard
+    feed = replace(_feed("a", "ONE"), report="Reported once in NHL games: not this game. Listed last.",
+                   reported=(WRONG_CONTENT,))
+    card = owned_widgets.own(GameCard(GameDTO(1, "hockey", "NHL", "A", "B", START, 2, False, 1, (feed,)),
+                                      ON_NOW, START + timedelta(minutes=30), HOCKEY.usual_length))
+    assert card.report_icon is not None and card.graphicsEffect() is None
+
+
+def test_the_card_tooltip_names_its_channel_like_a_channel_row(qapp, owned_widgets):
+    """Two cards from one package read the same; the tooltip says which channel (owner)."""
+    from streamselect.gui.game_card import GameCard, PlayLine
+    feed = GameFeedDTO("slot06", "NHL | 06 - 10pm C @ D", "PACKAGE", False, "clock", "p1", "US| PACKAGE")
+    card = owned_widgets.own(GameCard(GameDTO(1, "hockey", "NHL", "C", "D", START, 2, False, 1, (feed,)),
+                                      ON_NOW, START + timedelta(minutes=30), HOCKEY.usual_length))
+    tip = card.findChild(PlayLine).toolTip()
+    assert "NHL | 06 - 10pm C @ D" in tip and "US| PACKAGE" in tip, tip
 
 
 # ── event alerts: the bell (SV-Q24-Q26, Q42) ──────────────────────────────

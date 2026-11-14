@@ -415,9 +415,15 @@ class GameCard(QFrame):
                 word = QLabel("PLAYING")
                 _theme.style(word, "GAME_PLAYING")
                 pl.addWidget(word)
-            line.setToolTip("Click to play on this channel (double-clicking the card does the same)")
+            tip = "Click to play on this channel (double-clicking the card does the same)"
         else:
-            line.setToolTip("This channel plays the game once it starts")
+            tip = "This channel plays the game once it starts"
+        if self.top_feed is not None:
+            # The channel's own name, as a channel row shows it: two cards from one
+            # package otherwise read the same (owner, 2026-11-13).
+            f = self.top_feed
+            tip += f"\n{f.name}\n{f.channel_collection or f.collection}"
+        line.setToolTip(tip)
         if self.top_feed is not None:
             if self.top_feed.region:
                 pl.addWidget(make_region_chip(self.top_feed.region))
@@ -425,8 +431,9 @@ class GameCard(QFrame):
             self.station.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             _theme.style(self.station, "CHANNEL_NAME_LIVE" if live else "TEXT_SM_MUTED")
             pl.addWidget(self.station, 1)
-        # The channel the card plays is reported, and every other one with it (reported
-        # channels sort last): the flag says so and the card dims (owner, 2026-11-13).
+        # The channel the card plays is reported (reported channels sort last, so every
+        # other one is too): the flag says so. The card dims only when every channel
+        # showed no picture — "Not this game" means a channel that works (owner, 2026-11-13).
         self.report_icon = None
         if self.top_feed is not None and self.top_feed.report:
             self.report_icon = QLabel()
@@ -434,6 +441,7 @@ class GameCard(QFrame):
             _icon_utils.set_label_icon(self.report_icon, "reported", 12)
             self.report_icon.setToolTip(self.top_feed.report)
             pl.addWidget(self.report_icon)
+        if game.playable and all(DIDNT_PLAY in f.reported for f in game.playable):
             dim = QGraphicsOpacityEffect(self)
             dim.setOpacity(REPORTED_OPACITY)
             self.setGraphicsEffect(dim)

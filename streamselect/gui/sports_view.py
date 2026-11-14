@@ -27,7 +27,7 @@ from loguru import logger
 from streamselect.core.epg_utils import browse_day_separator_label, fmt_time, now_utc, past_day_label, to_local
 from streamselect.core.games.read import (
     event_is_live as event_live,
-    ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, arrange_feeds, best_feed, game_key, game_state,
+    CHANNEL_REPORTS, ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, arrange_feeds, best_feed, game_key, game_state,
     load_games, load_watch_history, mark_finished,
 )
 from streamselect.core.games.alerts import add_alert, alerts_for, load_alerts, remove_alerts, rule_for
@@ -573,34 +573,38 @@ class SportsView(ContentView):
         self._run_query(write, done, commit=True, on_error=lambda exc: self._write_failed("the alert", exc))
 
     def _report(self, game: GameDTO, feed, kind: str) -> None:
-        """Record a channel report against its collection, for this league (SV-Q37)."""
-        entry = {"kind": kind, "at": self._clock().isoformat()}
+        """Record a report against the channel, for this league (``CHANNEL_REPORTS``);
+        its collection and name ride along, for adding reports up later."""
+        if not feed.channel_id:
+            return
+        entry = {"kind": kind, "at": self._clock().isoformat(),
+                 "collection": feed.collection_key, "name": feed.name}
         if kind == WRONG_CONTENT:
             entry["game"] = game_key(game)
-        self._prefs(game.league_key).setdefault("reports", {}).setdefault(feed.collection_key, []).append(entry)
+        self._prefs(game.league_key).setdefault(CHANNEL_REPORTS, {}).setdefault(feed.channel_id, []).append(entry)
         self._save()
         QTimer.singleShot(0, self._render)
 
     def _unreport(self, game: GameDTO, feed, kind: str) -> None:
-        """Take one report kind back for this collection: every "no picture", or this
+        """Take one report kind back for this channel: every "no picture", or this
         game's "not this game" — what the ticked menu item stood for."""
-        reports = self._prefs(game.league_key).get("reports") or {}
-        mine = reports.get(feed.collection_key)
+        reports = self._prefs(game.league_key).get(CHANNEL_REPORTS) or {}
+        mine = reports.get(feed.channel_id)
         if not mine:
             return
         key = game_key(game)
         keep = [r for r in mine if r.get("kind") != kind
                 or (kind == WRONG_CONTENT and r.get("game") != key)]
         if keep:
-            reports[feed.collection_key] = keep
+            reports[feed.channel_id] = keep
         else:
-            reports.pop(feed.collection_key)
+            reports.pop(feed.channel_id)
         self._save()
         QTimer.singleShot(0, self._render)
 
     def _clear_reports(self, game: GameDTO, feed) -> None:
-        reports = self._prefs(game.league_key).get("reports") or {}
-        if reports.pop(feed.collection_key, None) is not None:
+        reports = self._prefs(game.league_key).get(CHANNEL_REPORTS) or {}
+        if reports.pop(feed.channel_id, None) is not None:
             self._save()
         QTimer.singleShot(0, self._render)
 
