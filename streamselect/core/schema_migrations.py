@@ -83,6 +83,7 @@ COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("channels",     "detected_collection",          "TEXT"),
     ("channels",     "detected_collection_language", "TEXT"),
     ("channels",     "detected_collection_subdub",   "TEXT"),
+    ("channels",     "detected_collection_quality",  "TEXT"),
     # Trailing credits lifted from the name at ingestion — an
     # inference, see ChannelDB.detected_name_cast above.
     ("channels",     "detected_name_cast",           "TEXT"),

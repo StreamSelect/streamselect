@@ -36,7 +36,12 @@ from streamselect.core.migrations.detected_fields_reparse import DetectedFieldsR
 #       subtitle-marker chip) out of detected_collection for every existing
 #       row, via the same update_detected_prefixes() pass that computes the
 #       other detected_* fields.
-CURRENT_VERSION: int = 1
+#   2 — the trailing pass reads a run joined by "&"/"+" ("SPORT HD & HEVC" was
+#       stored as "SPORT HD &") and superscript letters ("VIP ᴿᴬᵂ"), and stores the
+#       quality words it peels as detected_collection_quality (Sports Desk SV-Q68,
+#       2026-11-14). Measured read-only on a real library: 100 collection names,
+#       6,417 channels change.
+CURRENT_VERSION: int = 2
 
 
 class CollectionTokenCleanupBackfillTask(DetectedFieldsReparseBase):

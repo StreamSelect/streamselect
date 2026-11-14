@@ -1016,7 +1016,8 @@ def test_a_channel_lists_epg_and_quality_chips_line_up_and_quality_is_unfilled(q
     from streamselect.gui.game_card import ChannelList
     feeds = (GameFeedDTO("c1", "One", "C", True, "guide", "p", "C1", "US", "HD"),
              GameFeedDTO("c2", "Two", "C", True, "guide", "p", "C2", "US", ""),
-             GameFeedDTO("c3", "Three", "C", False, "clock", "p", "C3", "US", "RAW"),
+             GameFeedDTO("c3", "Three", "C", False, "clock", "p", "C3", "US", "FHD",
+                         package_quality=("RAW",)),
              GameFeedDTO("c4", "Four", "C", False, "clock", "p", "C4", "US", ""))
     game = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 2, feeds)
     lst = owned_widgets.own(ChannelList(game, preferred_key=None, playing_id=None, show_hidden=False))
@@ -1028,7 +1029,11 @@ def test_a_channel_lists_epg_and_quality_chips_line_up_and_quality_is_unfilled(q
         return [w for w in row.findChildren((QLabel, QPushButton)) if w.text() == text and w.isVisible()]
     epg_x = {chips(r, "EPG")[0].mapTo(lst, QPoint(0, 0)).x() for r in lst.rows if chips(r, "EPG")}
     quality_x = {w.mapTo(lst, QPoint(0, 0)).x() for r in lst.rows
-                 for w in chips(r, "HD") + chips(r, "RAW")}
+                 for w in chips(r, "HD") + chips(r, "FHD")}
+    raw_row = lst.rows[2]
+    raw = chips(raw_row, "RAW")[0]
+    assert 0 <= raw.geometry().left() - raw_row.name.geometry().right() <= 12, (
+        "a codec word sits right after the title (owner, 2026-11-14)")
     assert len(epg_x) == 1, f"EPG chips line up: {epg_x}"
     assert len(quality_x) == 1, f"quality chips line up, with or without EPG: {quality_x}"
     hd = chips(lst.rows[0], "HD")[0]
@@ -1163,3 +1168,77 @@ def _ink_x(label, view) -> int:
                for y in range(top.y(), top.y() + label.height())):
             return x
     raise AssertionError("no text drawn")
+
+
+# ── the channel row, rev 8 (SV-Q68-Q80) ───────────────────────────────────
+
+def _row_feed(cid, **kw):
+    base = {"channel_id": cid, "name": cid, "collection": "C", "from_guide": False, "time_from": "clock",
+            "provider_id": "p", "channel_collection": "SWEDEN VIAPLAY PPV VIP", "region": "SWE"}
+    base.update(kw)
+    return GameFeedDTO(**base)
+
+
+def test_a_rows_title_is_the_channel_for_guide_channels_and_the_package_for_events():
+    """Owner, 2026-11-14: "the EPG regular channels should have the regular channel
+    names. Not the package"; a package that is only a country reads as the country."""
+    guide = _row_feed("g", from_guide=True, own_name="V SPORT 1 HD", package="NORWAY SPORT",
+                  channel_collection="NORWAY SPORT HD & HEVC", region="NOR")
+    event = _row_feed("e", own_name="NHL CAROLINA vs SEATTLE (SE)", package="SWEDEN VIAPLAY PPV VIP")
+    country = _row_feed("c", package="DE| GERMANY", channel_collection="DE| GERMANY HEVC", region="DE")
+    assert guide.title == "V SPORT 1 HD"
+    assert event.title == "VIAPLAY PPV VIP"
+    assert country.title == "Germany"
+
+
+def test_one_tier_then_codec_words_and_a_measurement_wins():
+    claimed = _row_feed("a", quality="HD", package_quality=("HD", "HEVC"))
+    assert (claimed.tier, claimed.codecs) == ("HD", ("HEVC",))
+    measured = _row_feed("b", quality="FHD", verified=True, package_quality=("HD", "RAW"))
+    assert (measured.tier, measured.codecs) == ("FHD", ("RAW",))
+
+
+def test_look_alike_rows_get_a_note_that_never_repeats_a_chip():
+    """Owner: "ENG after VIAPLAY PPV VIP is useless … the same information in a worse
+    way than the EN chip"; NBC rows differ by city."""
+    from streamselect.core.games.read import look_alike_details
+    a = _row_feed("a", own_name="NHL CAROLINA vs SEATTLE (ENG)", language="EN")
+    b = _row_feed("b", own_name="NHL CAROLINA vs SEATTLE (SE) Sat 14 Nov 19:04", language="EN")
+    seattle = _row_feed("s", from_guide=True, own_name="NBC 5 SEATTLE WA (KING)", region="US",
+                    channel_collection="US| NBC NETWORK")
+    portland = _row_feed("p", from_guide=True, own_name="NBC 8 PORTLAND OR (KGW)", region="US",
+                     channel_collection="US| NBC NETWORK")
+    same1, same2 = _row_feed("x", own_name="Kraken @ Hurricanes"), _row_feed("y", own_name="Kraken @ Hurricanes")
+    lone = _row_feed("z", package="SWEDEN TELIA PLAY")
+    out = {f.channel_id: f.detail for f in look_alike_details([a, b, seattle, portland, same1, same2, lone])}
+    assert "ENG" not in out["a"] and out["b"] == "SE", out
+    assert out["s"] == "" and out["p"] == "", "their titles already differ"
+    assert (out["x"], out["y"]) == ("#1", "#2")
+    assert out["z"] == ""
+
+
+def test_the_row_puts_language_first_and_region_epg_tier_fps_in_columns(qapp, owned_widgets):
+    from streamselect.gui.game_card import ChannelList
+    feeds = (_row_feed("m", quality="FHD", verified=True, language="EN", fps="30fps"),
+             _row_feed("g", from_guide=True, own_name="TV3 SPORT", region="DEN", quality="HD",
+                   channel_collection="DENMARK SPORT HD & HEVC", package_quality=("HD", "HEVC")),
+             _row_feed("n", region="US", channel_collection="US| NHL PACKAGE"))
+    game = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 2, feeds)
+    lst = owned_widgets.own(ChannelList(game, preferred_key=None, playing_id=None, show_hidden=False))
+    lst.resize(800, 120)
+    lst.show()
+    qapp.processEvents()
+
+    def x_of(row, text):
+        hits = [w for w in row.findChildren((QLabel, QPushButton)) if w.text() == text and w.isVisible()]
+        return hits[0].mapTo(lst, QPoint(0, 0)).x() if hits else None
+    measured, guide, plain = lst.rows
+    assert x_of(measured, "EN") < measured.name.mapTo(lst, QPoint(0, 0)).x(), "a measured language leads"
+    assert x_of(guide, "EN") is None, "never a guessed language"
+    names_x = {r.name.mapTo(lst, QPoint(0, 0)).x() for r in lst.rows}
+    assert len(names_x) == 1, "titles line up: the language column is held on every row"
+    regions = {x_of(r, t) for r, t in ((measured, "SWE"), (guide, "DEN"), (plain, "US"))}
+    assert len(regions) == 1 and regions.pop() > 400, "region is a column at the right"
+    assert x_of(guide, "HEVC") < x_of(guide, "DEN"), "a codec word sits by the title"
+    assert x_of(measured, "FHD") == x_of(guide, "HD"), "tiers form a column"
+    assert x_of(measured, "30fps") > x_of(measured, "FHD")

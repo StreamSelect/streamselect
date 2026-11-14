@@ -53,6 +53,7 @@ from streamselect.core.content_labels import (
 )
 from streamselect.core.quality_vocab import QUALITY_TOKENS
 from streamselect.core.category_headings import headings_by_provider
+from streamselect.core.collection_quality import collection_quality_text
 from streamselect.core.region_codes import (
     AUDIO_LANG_WORD_MAP,
     CODE_FACETS,
@@ -449,34 +450,30 @@ class ChannelIngestionMixin:
                 prefix, region, channel.category, config=config,
                 headings=headings.get(channel.provider_id, frozenset()))
 
-            # ── Category marker (user report: "|EN| ANIME" style leading marker
-            # duplicates channel-name language/subtitle info and crowds the
-            # title). Strips the marker into the clean detected_collection text
-            # and routes the token by kind (see parse_category_marker) — never
-            # guessing beyond a plain language code or a recognized SUB/DUB
-            # compound: a plain code fills detected_prefix ONLY when empty
-            # (mirrors the detected_region fill-empty-only pattern above),
-            # else survives as detected_collection_language UNLESS it merely
-            # repeats the existing prefix; a "CODE-SUB"/"CODE-DUB" compound
-            # routes to the EXISTING detected_audio sub/dub facet AND its own
-            # chip-ready detected_collection_subdub value (e.g. "AR-SUB").
-            # strip_collection_noise_tokens() (channel_name_utils.py) then removes
-            # what merely repeats another chip/icon on the row (rule: its docstring).
+            # ── Category marker (user report: a "|EN| ANIME" leading marker duplicates
+            # the name's language/subtitle info and crowds the title). Strips it into
+            # the clean detected_collection and routes the token by kind (see
+            # parse_category_marker), never guessing beyond a plain language code or a
+            # SUB/DUB compound: a plain code fills detected_prefix ONLY when empty (the
+            # detected_region fill-empty-only pattern above), else survives as
+            # detected_collection_language unless it repeats the prefix; "CODE-SUB"/
+            # "CODE-DUB" feeds the detected_audio sub/dub facet AND its own chip text
+            # detected_collection_subdub ("AR-SUB"). strip_collection_noise_tokens()
+            # then removes what another chip/icon already shows (rule: its docstring).
             new_collection: str | None = None
             new_collection_language: str | None = None
             new_collection_subdub: str | None = None
+            new_collection_quality: str | None = None
             _marker_sub_lang: str | None = None
             _marker_dub_lang: str | None = None
             if channel.category:
                 clean_category, category_marker = parse_category_marker(channel.category)
                 new_collection = clean_category or None
-                # Strip tokens already conveyed elsewhere on the row (quality
-                # chip / media-type icon / subtitle-marker chip) — see
-                # strip_collection_noise_tokens() docstring for the "whole
-                # span must be noise" rule that keeps a real collection name
-                # like "SERIES MANIA" intact. Normalize a fully-noise result
-                # ("") back to None, same as the clean_category line above.
-                new_collection = strip_collection_noise_tokens(new_collection) or None
+                # Strip tokens another chip/icon already shows (its docstring: the
+                # "whole span must be noise" rule keeps "SERIES MANIA" intact), keeping
+                # the quality words it peels ("SPORT HD & HEVC" -> HD, HEVC: SV-Q68).
+                new_collection, peeled = strip_collection_noise_tokens(new_collection, with_quality=True)
+                new_collection, new_collection_quality = new_collection or None, collection_quality_text(peeled)
                 if category_marker is not None:
                     if category_marker.kind == "language":
                         if prefix is None:
@@ -633,6 +630,7 @@ class ChannelIngestionMixin:
                 or new_collection != channel.detected_collection
                 or new_collection_language != channel.detected_collection_language
                 or new_collection_subdub != channel.detected_collection_subdub
+                or new_collection_quality != channel.detected_collection_quality
                 or new_name_cast != channel.detected_name_cast
                 or new_season != channel.detected_season
                 or new_episode != channel.detected_episode
@@ -653,6 +651,7 @@ class ChannelIngestionMixin:
                 channel.detected_collection = new_collection
                 channel.detected_collection_language = new_collection_language
                 channel.detected_collection_subdub = new_collection_subdub
+                channel.detected_collection_quality = new_collection_quality
                 channel.detected_name_cast = new_name_cast
                 channel.detected_name_collection = new_name_collection
                 channel.detected_season = new_season

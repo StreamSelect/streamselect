@@ -394,3 +394,34 @@ class TestCollectionTokenCleanupBackfillTask:
         mgr._run_all([task])
 
         assert cfg.collection_token_cleanup_backfill_version == CURRENT_VERSION
+
+
+# ---------------------------------------------------------------------------
+# 4. SV-Q68 (2026-11-14): a trailing run through "&"/"+", superscripts, and the
+#    quality words it peels kept as detected_collection_quality
+# ---------------------------------------------------------------------------
+
+class TestTrailingQualityRunIsPeeledAndKept:
+
+    @pytest.mark.parametrize("raw,kept,quality", [
+        ("DENMARK SPORT HD & HEVC", "DENMARK SPORT", ("HD", "HEVC")),   # stopped at "&" before
+        ("HR| CROATIA ⱽᴵᴾ ᴿᴬᵂ", "HR| CROATIA ⱽᴵᴾ", ("RAW",)),            # superscript RAW
+        ("FINLAND HD + HEVC", "FINLAND", ("HD", "HEVC")),
+        ("FILMOVI 4K UHD", "FILMOVI", ("4K", "UHD")),
+        ("SPORT & MORE", "SPORT & MORE", ()),                             # a joiner alone is no run
+        ("24K", "24K", ()),
+        ("SERIES MANIA", "SERIES MANIA", ()),
+    ])
+    def test_pure(self, raw, kept, quality):
+        assert strip_collection_noise_tokens(raw, with_quality=True) == (kept, quality)
+        assert strip_collection_noise_tokens(raw) == kept, "the plain form is unchanged in shape"
+
+    def test_stored_at_ingestion(self, file_db):
+        _add_provider(file_db)
+        sport = _add_channel(file_db, name="NOR| V SPORT 1 HD", category="NORWAY SPORT HD & HEVC")
+        plain = _add_channel(file_db, name="Some Channel", category="NETFLIX")
+        _run_ingestion(file_db)
+        ch = _get(file_db, sport)
+        assert ch.detected_collection == "NORWAY SPORT"
+        assert ch.detected_collection_quality == "HD HEVC"
+        assert _get(file_db, plain).detected_collection_quality is None

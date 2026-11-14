@@ -10,6 +10,7 @@ from typing import NamedTuple, Optional
 from streamselect.core.quality_vocab import _Attributes, _AUDIO_NORM, _BRACKET_LANG_NORM, _BRACKET_QUALITY_ALIASES, _collapse_same_rank, _FPS_RE, _SOURCE_QUALITY_NORM, _SUB_DUB_TOKENS, _UNAMBIGUOUS_SUBDUB_MARKERS, AUDIO_CODEC_NORM, ENCODING_NORM, MEDIA_TYPE_TOKENS, QUALITY_TIER_RANK, QUALITY_TOKENS, RESOLUTION_TO_QUALITY, TIER_TOKENS
 from streamselect.core.region_codes import _ALIAS_MAP, _FULL_NAME_TO_CODE, AUDIO_LANG_WORD_MAP, normalize_region_code, PLATFORM_CODES, platform_display, REGION_FULL_NAMES
 from streamselect.core.content_labels import AGE_RATING_PREFIXES
+from streamselect.core.collection_quality import peel_trailing_noise, quality_words
 from streamselect.core.scene_release import _extract_scene_release, _SCENE_EDGE_RE
 
 
@@ -908,7 +909,7 @@ def _is_trailing_noise_token(token: str) -> bool:
     return token.upper() in _TRAILING_NOISE_TOKENS
 
 
-def strip_collection_noise_tokens(collection: str | None) -> str | None:
+def strip_collection_noise_tokens(collection: str | None, *, with_quality: bool = False):
     """Strip provider-category tokens already conveyed elsewhere on the row.
 
     ``detected_collection`` (the comfy-row line-2 chip) is derived from the
@@ -969,10 +970,11 @@ def strip_collection_noise_tokens(collection: str | None) -> str | None:
         The cleaned string; ``None``/``""`` input is returned unchanged;
         stripping every token in pass 2 yields ``""`` (the caller normalizes
         that to ``None`` so no empty chip renders — never re-run at paint
-        time); pass 3 always leaves at least one token.
+        time); pass 3 always leaves at least one token. ``with_quality=True``
+        returns ``(cleaned, quality words removed)`` instead.
     """
     if not collection:
-        return collection
+        return (collection, ()) if with_quality else collection
 
     working = collection
     while True:
@@ -986,19 +988,12 @@ def strip_collection_noise_tokens(collection: str | None) -> str | None:
 
     body_tokens = [t for t in re.split(r"[\s\-/]+", working.strip()) if t]
     if body_tokens and all(_is_collection_noise_token(t) for t in body_tokens):
-        return ""
+        return ("", quality_words(body_tokens)) if with_quality else ""
 
-    # Pass 3: peel a trailing run of quality/sub-dub/multi tokens — never
-    # media-type (see docstring) — one leaf at a time, never past the last
-    # remaining token.
-    while True:
-        leaves = [t for t in re.split(r"[\s\-/]+", working.strip()) if t]
-        if len(leaves) <= 1 or not _is_trailing_noise_token(leaves[-1]):
-            break
-        m = _TRAILING_TOKEN_RE.search(working)
-        working = working[: m.start()].rstrip()
-
-    return working
+    # Pass 3: the trailing run, through "&"/"+" joiners and superscripts — never
+    # media-type (see docstring), never past the last word (collection_quality.py).
+    working, quality = peel_trailing_noise(working, _is_trailing_noise_token)
+    return (working, quality) if with_quality else working
 
 
 def collection_display(collection: str | None, platform_code: str | None = None) -> str | None:

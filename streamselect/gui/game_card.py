@@ -38,7 +38,7 @@ from streamselect.gui import cursor_affordance, icons
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
 from streamselect.gui.badge_utils import make_region_chip
-from streamselect.gui.chip_row import quality_badge
+from streamselect.gui.chip_row import CHIP_LANG, measured_chip, quality_badge
 from streamselect.gui.detail_chips import make_chip
 from streamselect.gui.progress_paint import ProgressBar, elapsed_pct
 
@@ -77,7 +77,8 @@ def add_report_actions(menu: QMenu, feed: GameFeedDTO, report) -> None:
 
 
 class ChannelRow(QWidget):
-    """One channel showing a game: [country] station · EPG · quality · PREFERRED · eye."""
+    """One channel showing a game: language · title · codecs · note · PREFERRED, then the
+    list's columns: region · EPG · tier · FPS · eye (The Sports Desk rev 8)."""
 
     play = pyqtSignal(str)                    # channel id
     prefer = pyqtSignal(object)               # GameFeedDTO, or None to clear
@@ -100,16 +101,21 @@ class ChannelRow(QWidget):
         if not hidden:
             cursor_affordance.set_clickable(self, True)
             self.setToolTip(f"Click to play\n{feed.name}\n{feed.channel_collection or feed.collection}")
+        # The row as designed in The Sports Desk rev 8 (SV-Q68-Q80): what it is on the
+        # left — language (only when measured), title, codec chips, a note when two
+        # rows would read the same, PREFERRED — and what you'll get in columns on the
+        # right that the whole list shares: region, EPG, tier, FPS. Widths come from
+        # ChannelList (``chip_slots``), held even on a row without that chip.
         row = QHBoxLayout(self)
         row.setContentsMargins(4, 1, 2, 1)
         row.setSpacing(4)
+        slots = slots or {}
+        _add_in_slot(row, language_chip(feed.language) if feed.language else None, slots.get("language", 0))
         if playing:
             mark = QLabel()
             _theme.style(mark, "ALERT_NEW_MATCH_BADGE")
             _icon_utils.set_label_icon(mark, "play", 12)
             row.addWidget(mark)
-        if feed.region:
-            row.addWidget(make_region_chip(feed.region, self))
         self.report_icon = None
         if feed.report:
             # One small icon, no chip (owner, SV-Q39); the tooltip says what and how often.
@@ -118,32 +124,37 @@ class ChannelRow(QWidget):
             _icon_utils.set_label_icon(self.report_icon, "reported", 12)
             self.report_icon.setToolTip(feed.report)
             row.addWidget(self.report_icon)
-        self.name = QLabel(feed.station)
-        self.name.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.name = QLabel(feed.title)
         _theme.style(self.name, "ALERT_NEW_MATCH_BADGE" if playing else
                      "TEXT_SM_MUTED" if hidden else "CHANNEL_NAME_LIVE")
-        row.addWidget(self.name, 1)
-        # EPG and quality sit in fixed-width slots the whole list shares, held
-        # even when a row has neither, so both line up down the list (owner,
-        # 2026-11-14). Widths come from ChannelList (``chip_slots``).
-        slots = slots or {}
+        row.addWidget(self.name)
+        for word in feed.codecs:                 # HEVC / RAW right after the title (owner)
+            row.addWidget(quality_chip(word))
+        if feed.detail:
+            note = QLabel(f"· {feed.detail}")
+            _theme.style(note, "TEXT_SM_MUTED")
+            row.addWidget(note)
+        self.pref_chip = None
+        if not hidden:
+            # PREFERRED: one chip, label and button (owner, SV-Q29 follow-up), right
+            # after the name (owner, 2026-11-14).
+            self.pref_chip = make_chip("PREFERRED", "COLOR_TEXT_HI" if preferred else "COLOR_MUTED",
+                                       dashed=not preferred, selected=preferred)
+            self.pref_chip.setToolTip(f"Your preferred channel for {league} games — click to clear"
+                                      if preferred else f"Make this your preferred channel for {league} games")
+            self.pref_chip.clicked.connect(lambda: self.prefer.emit(None if self._preferred else self.feed))
+            self.pref_chip.setVisible(preferred)
+            row.addWidget(self.pref_chip)
+        row.addStretch(1)
+        _add_in_slot(row, make_region_chip(feed.region, self) if feed.region else None, slots.get("region", 0))
         _add_in_slot(row, guide_chip() if feed.from_guide else None, slots.get("epg", 0))
-        _add_in_slot(row, quality_chip(feed.quality, feed.verified) if feed.quality else None,
-                     slots.get("quality", 0))
+        _add_in_slot(row, quality_chip(feed.tier, feed.verified) if feed.tier else None, slots.get("tier", 0))
+        _add_in_slot(row, fps_chip(feed.fps) if feed.fps else None, slots.get("fps", 0))
         if hidden:
             self.eye = _icon_utils.icon_button("visibility_toggle", f"Show this channel again in {league} games", px=13)
             self.eye.clicked.connect(lambda: self.unhideRequested.emit(self.feed))
             row.addWidget(self.eye)
-            self.pref_chip = None
             return
-        # PREFERRED: one chip, label and button (owner, SV-Q29 follow-up).
-        self.pref_chip = make_chip("PREFERRED", "COLOR_TEXT_HI" if preferred else "COLOR_MUTED",
-                                   dashed=not preferred, selected=preferred)
-        self.pref_chip.setToolTip(f"Your preferred channel for {league} games — click to clear" if preferred
-                                  else f"Make this your preferred channel for {league} games")
-        self.pref_chip.clicked.connect(lambda: self.prefer.emit(None if self._preferred else self.feed))
-        self.pref_chip.setVisible(preferred)
-        row.addWidget(self.pref_chip)
         self.eye = _icon_utils.icon_button("hide", f"Hide this channel from {league} games", px=13)
         self.eye.clicked.connect(lambda: self._hide_menu(league))
         self.eye.setVisible(False)
@@ -222,17 +233,41 @@ def quality_chip(token: str, verified: bool = False) -> QWidget:
     return chip
 
 
+def language_chip(code: str) -> QWidget:
+    """The audio language playing this channel measured ("EN", with the mark). Never
+    guessed from the region or the name (owner, SV-Q78): feeds from other countries
+    often carry the English broadcast with only local ads."""
+    chip = measured_chip(CHIP_LANG, code, verified=True)
+    chip.setToolTip(f"Audio language measured while playing: {code}")
+    return chip
+
+
+def fps_chip(fps: str) -> QWidget:
+    """The frame rate playing this channel measured (SV-Q75), in the quality chip's style."""
+    chip = quality_badge(fps, verified=True)
+    chip.setToolTip(f"Frame rate measured while playing: {fps}")
+    return chip
+
+
 def chip_slots(feeds) -> dict:
-    """Slot widths for a channel list: the widest EPG and quality chip its rows
-    carry (0 when none does, so a list without EPG keeps no empty column)."""
-    def width(w: QWidget) -> int:
-        w.ensurePolished()
-        out = w.sizeHint().width()
-        w.deleteLater()
+    """Column widths for a channel list: its widest chip of each kind (0 when no row
+    has one, so a list keeps no empty column)."""
+    def width(make, values) -> int:
+        out = 0
+        for v in values:
+            w = make(v)
+            w.ensurePolished()
+            out = max(out, w.sizeHint().width())
+            w.deleteLater()
         return out
-    epg = width(guide_chip()) if any(f.from_guide for f in feeds) else 0
-    quality = max((width(quality_chip(f.quality, f.verified)) for f in feeds if f.quality), default=0)
-    return {"epg": epg, "quality": quality}
+    feeds = list(feeds)
+    return {
+        "language": width(language_chip, {f.language for f in feeds if f.language}),
+        "region": width(lambda r: make_region_chip(r), {f.region for f in feeds if f.region}),
+        "epg": width(lambda _v: guide_chip(), {True for f in feeds if f.from_guide}),
+        "tier": width(lambda tv: quality_chip(*tv), {(f.tier, f.verified) for f in feeds if f.tier}),
+        "fps": width(fps_chip, {f.fps for f in feeds if f.fps}),
+    }
 
 
 def _add_in_slot(row: QHBoxLayout, chip: Optional[QWidget], width: int) -> None:
@@ -580,7 +615,7 @@ class GameCard(QFrame):
         if self.top_feed is not None:
             if self.top_feed.region:
                 pl.addWidget(make_region_chip(self.top_feed.region))
-            self.station = QLabel(self.top_feed.station)
+            self.station = QLabel(self.top_feed.title)
             self.station.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             _theme.style(self.station, "CHANNEL_NAME_LIVE" if live else "TEXT_SM_MUTED")
             pl.addWidget(self.station, 1)

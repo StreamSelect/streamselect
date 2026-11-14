@@ -499,15 +499,19 @@ def chip_widget(kind: str, text: str) -> QWidget:
     return chip
 
 
-def quality_badge(token: str, *, verified: bool = False) -> QPushButton:
-    """The app's quality chip for *token*, with the measured mark when the app
-    played or probed the stream itself — shape, not colour, says "measured":
-    the tier hue stays the token's. The one builder the details pane's copy
-    chips and the Sports channel list share."""
-    badge = chip_widget(CHIP_QUALITY, token)
+def measured_chip(kind: str, text: str, *, verified: bool = False) -> QPushButton:
+    """A chip of *kind*, with the measured mark when the app played or probed the
+    stream itself — shape, not colour, says "measured": the chip's hue stays its own."""
+    chip = chip_widget(kind, text)
     if verified:
-        _icon_utils.set_button_icon(badge, "verified", trailing=True)
-    return badge
+        _icon_utils.set_button_icon(chip, "verified", trailing=True)
+    return chip
+
+
+def quality_badge(token: str, *, verified: bool = False) -> QPushButton:
+    """The app's quality chip for *token* (:func:`measured_chip`). The one builder
+    the details pane's copy chips and the Sports channel list share."""
+    return measured_chip(CHIP_QUALITY, token, verified=verified)
 
 
 def build_chip_row(

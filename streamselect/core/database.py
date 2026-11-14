@@ -231,15 +231,15 @@ class ChannelDB(Base):
     #     the channel's own detected_prefix — kept as its own "other language" chip
     #     value rather than silently dropped. NULL when the marker was adopted
     #     as/matches the prefix, or there was no plain marker.
-    #   detected_collection_subdub: a compound "CODE-SUB"/"CODE-DUB" marker's
-    #     chip-ready display text ("AR-SUB"). The same marker also feeds the
-    #     detected_audio sub/dub facet; this is only its chip's display text.
-    # NOT in _CATALOG_COLS / _CATALOG_UPDATE_COLS — the provider upsert never
-    # overwrites these. Backfilled for pre-existing rows by
-    # CategoryMarkerBackfillTask (streamselect/core/migrations/category_marker_backfill.py).
+    #   detected_collection_subdub: a compound "CODE-SUB"/"CODE-DUB" marker's chip
+    #     text ("AR-SUB"); the marker also feeds detected_audio's sub/dub facet.
+    #   detected_collection_quality: quality words peeled off the name's end ("HD HEVC").
+    # NOT in _CATALOG_COLS / _CATALOG_UPDATE_COLS — the provider upsert never overwrites
+    # these. Backfilled by CategoryMarkerBackfillTask / CollectionTokenCleanupBackfillTask.
     detected_collection          = Column(String, index=True, nullable=True)
     detected_collection_language = Column(String, nullable=True)
     detected_collection_subdub   = Column(String, nullable=True)
+    detected_collection_quality  = Column(String, nullable=True)
     detected_exclusion_code = Column(String, nullable=True)  # region_codes.exclusion_code(prefix)
     # Provider-appended trailing credits lifted from the channel name at
     # ingestion, e.g. "NICOLAS CAGE" from

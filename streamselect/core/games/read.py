@@ -8,6 +8,7 @@ vanish now, not at the next refresh.
 
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -21,7 +22,10 @@ from streamselect.core.event_datetime import DEFAULT_EVENT_DURATION, event_is_on
 from streamselect.core.games.finder import SportSettings
 from streamselect.core.games.models import GameDB, GameEndDB, GameFeedDB
 from streamselect.core.playback_models import PlaybackEventDB
-from streamselect.core.region_codes import leading_country
+from streamselect.core.quality_vocab import QUALITY_TIER_RANK
+from streamselect.core.region_codes import (
+    AUDIO_LANG_WORD_MAP, ISO_639_1_LANGUAGE_NAMES, PLATFORM_CODES, REGION_FULL_NAMES, leading_country,
+)
 from streamselect.core.repositories.stream_info import StreamInfoRepository
 from streamselect.core.stream_info import measured_quality, summarize
 
@@ -50,6 +54,17 @@ class GameFeedDTO:
     #: ``quality`` was measured by the app itself (played or probed), not read
     #: off the name: the chip carries the measured mark (PLAYED-3).
     verified: bool = False
+    #: The row as designed in The Sports Desk rev 8 (SV-Q68-Q80), all from stored
+    #: fields: the channel's own cleaned name (``detected_title``), its package
+    #: name cleaned at ingestion (``detected_collection``) and the quality words
+    #: peeled off it (``detected_collection_quality``), and what playing it measured.
+    own_name: str = ""
+    package: str = ""
+    package_quality: tuple = ()
+    language: str = ""          # measured audio language, two letters ("EN"); "" when not measured
+    fps: str = ""               # measured frame rate ("30fps"); "" when not measured
+    #: A muted note telling two otherwise identical rows apart (SV-Q79), set by load_games.
+    detail: str = ""
 
     @property
     def collection_key(self) -> str:
@@ -59,12 +74,37 @@ class GameFeedDTO:
 
     @property
     def station(self) -> str:
-        """The collection without its region head: "US| ESPN+ PPV VIP" -> "ESPN+ PPV VIP",
+        """The package without its region head: "US| ESPN+ PPV VIP" -> "ESPN+ PPV VIP",
         "SWEDEN TELIA PLAY" -> "TELIA PLAY" (category_headings / region_codes)."""
         # NFKC folds the superscript letters some collections use ("NORWAY ᴳᴼᴸᴰ ᴿᴬᵂ"),
         # which otherwise render tiny — the same folding the finder reads names with.
-        c = unicodedata.normalize("NFKC", self.channel_collection or self.collection)
+        c = unicodedata.normalize("NFKC", self.package or self.channel_collection or self.collection)
         return split_head(c)[1] or (leading_country(c) or ("", c))[1] or c
+
+    @property
+    def title(self) -> str:
+        """What the row is called (SV-Q77/Q80): a regular channel found through the
+        guide by its own name; an event channel by its package; a package that is
+        only a country or language name ("DE| GERMANY") by the country."""
+        if self.from_guide and self.own_name:
+            return self.own_name
+        if _only_place_or_language(self.station):
+            return REGION_FULL_NAMES.get(self.region, self.station)
+        return self.station
+
+    @property
+    def tier(self) -> str:
+        """One resolution tier: the measured one, else the best the name or package claims."""
+        if self.verified:
+            return self.quality
+        claims = [q for q in (self.quality, *self.package_quality) if q in QUALITY_TIER_RANK]
+        return max(claims, key=lambda q: QUALITY_TIER_RANK[q], default="")
+
+    @property
+    def codecs(self) -> tuple[str, ...]:
+        """The quality words that aren't a tier (HEVC, RAW…), each once (SV-Q69)."""
+        words = (self.quality, *self.package_quality) if not self.verified else self.package_quality
+        return tuple(dict.fromkeys(q for q in words if q and q not in QUALITY_TIER_RANK))
 
 
 #: Best feed first: a listing that states its own time with a zone is the most
@@ -291,6 +331,72 @@ def load_watch_history(session) -> WatchHistory:
     return history
 
 
+#: Two letters for a language name ("English" -> "EN"), from the shared ISO table.
+_LANGUAGE_CODE = {name: code.upper() for code, name in ISO_639_1_LANGUAGE_NAMES.items()}
+#: Country names (not the streaming platforms that share the table) and language names.
+_PLACE_OR_LANGUAGE = ({n.upper() for c, n in REGION_FULL_NAMES.items()
+                       if c not in PLATFORM_CODES and n.upper() != c.upper()}
+                      | {n.upper() for n in ISO_639_1_LANGUAGE_NAMES.values()})
+
+
+def _language_words(code: str) -> set[str]:
+    """Every way a name spells the row's language chip ("EN" -> EN, ENG, ENGLISH):
+    a note never repeats what the chip says (owner, 2026-11-14)."""
+    if not code:
+        return set()
+    name = ISO_639_1_LANGUAGE_NAMES.get(code.lower(), "")
+    return {code, *(w for w, n in AUDIO_LANG_WORD_MAP.items() if n == name)}
+
+
+def _only_place_or_language(name: str) -> bool:
+    return name.strip().upper() in _PLACE_OR_LANGUAGE
+
+
+def _measured_language(seen: dict) -> str:
+    """The first measured audio language as two letters ("EN"), else ""."""
+    for name in seen.get("audio") or ():
+        return _LANGUAGE_CODE.get(name, "")
+    return ""
+
+
+def _measured_fps(record: Optional[dict]) -> str:
+    fps = (((record or {}).get("info") or {}).get("video") or {}).get("fps")
+    return f"{round(fps)}fps" if isinstance(fps, (int, float)) and fps > 0 else ""
+
+
+#: Words never worth showing as a look-alike note: times, dates, and words that
+#: only say "live" or which sport.
+_NOTE_NOISE = frozenset({"LIVE", "VS", "AT", "MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN",
+                         "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT",
+                         "NOV", "DEC", "AM", "PM", "CET", "CEST", "ET", "PT", "GMT", "UTC"})
+
+
+def _note_words(name: str, said: set[str]) -> list[str]:
+    return [w for w in re.sub(r"[|:@()\-,]", " ", name).split()
+            if w.upper() not in _NOTE_NOISE and w.upper() not in said
+            and not re.fullmatch(r"[\d.:]+(PM|AM)?", w.upper())]
+
+
+def look_alike_details(feeds: list[GameFeedDTO]) -> list[GameFeedDTO]:
+    """Rows that read the same (title, region and language) get a short note from
+    the words of each channel's own name the others lack (SV-Q79): never a word a
+    chip already shows, never a time or date; "#1", "#2"… when nothing differs."""
+    groups: dict[tuple, list[int]] = {}
+    for i, f in enumerate(feeds):
+        groups.setdefault((f.title, f.region, f.language), []).append(i)
+    out = list(feeds)
+    for idx in groups.values():
+        if len(idx) < 2:
+            continue
+        said = [{*QUALITY_TIER_RANK, *feeds[i].codecs, *_language_words(feeds[i].language)} for i in idx]
+        words = [_note_words(feeds[i].own_name or feeds[i].name, said[k]) for k, i in enumerate(idx)]
+        for k, i in enumerate(idx):
+            others = {w.upper() for j, ws in enumerate(words) if j != k for w in ws}
+            own = [w for w in words[k] if w.upper() not in others]
+            out[i] = replace(feeds[i], detail=" ".join(own[:4]) or f"#{k + 1}")
+    return out
+
+
 def _league_logos(games, feed_rows, logos: dict[str, str]) -> dict[str, str]:
     """league -> its own logo URL: a channel logo whose file is named for the league
     ("…/NHL.png"). Most channel logos are a network's (ESPN, Viaplay), never used as
@@ -320,12 +426,15 @@ def load_games(session, sport: str, hidden_provider_ids: set[str],
         return []
     feed_rows = session.execute(select(GameFeedDB).where(GameFeedDB.game_id.in_([g.id for g in rows]))
                                 .order_by(GameFeedDB.id)).scalars().all()
-    chan, logos = {}, {}
-    for cid, pid, cat, region, quality, logo in session.execute(
+    chan, logos, stored = {}, {}, {}
+    for cid, pid, cat, region, quality, logo, title, package, pkg_quality in session.execute(
             select(ChannelDB.id, ChannelDB.provider_id, ChannelDB.category,
-                   ChannelDB.detected_region, ChannelDB.detected_quality, ChannelDB.logo_url)
+                   ChannelDB.detected_region, ChannelDB.detected_quality, ChannelDB.logo_url,
+                   ChannelDB.detected_title, ChannelDB.detected_collection,
+                   ChannelDB.detected_collection_quality)
             .where(ChannelDB.id.in_({f.channel_id for f in feed_rows if f.channel_id}))):
         chan[cid] = (pid, cat, region, quality)
+        stored[cid] = (title or "", package or "", tuple((pkg_quality or "").split()))
         if logo and pid not in hidden_provider_ids:
             logos[cid] = logo
     # What the stream itself measured outranks the name's claim, as in the details
@@ -336,19 +445,26 @@ def load_games(session, sport: str, hidden_provider_ids: set[str],
         pid, cat, region, quality = chan.get(f.channel_id, (f.source, f.collection, "", ""))
         if pid in hidden_provider_ids:
             continue
-        seen = summarize(measured.get(f.channel_id))
+        record = measured.get(f.channel_id)
+        seen = summarize(record)
+        ours = bool(seen) and seen["source"] in ("played", "probe")
         tier = measured_quality((seen or {}).get("height"))
+        own_name, package, package_quality = stored.get(f.channel_id, ("", "", ()))
         feeds.setdefault(f.game_id, []).append(
             GameFeedDTO(f.channel_id, f.name, f.collection, f.from_guide,
                         "guide" if f.from_guide else f.time_from,
                         pid or "", cat or "", region or "", tier or quality or "",
-                        verified=bool(tier) and seen["source"] in ("played", "probe")))
+                        verified=bool(tier) and ours, own_name=own_name, package=package,
+                        package_quality=package_quality,
+                        language=_measured_language(seen) if ours else "",
+                        fps=_measured_fps(record) if ours else ""))
     for gid, fs in feeds.items():
         fs.sort(key=lambda f: _FEED_RANK.get(f.time_from, 2))
         # One feed per channel: a guide programme on a channel already listed by
         # name adds no second place to watch (the named listing ranks first).
         seen: set = set()
-        feeds[gid] = [f for f in fs if not f.channel_id or not (f.channel_id in seen or seen.add(f.channel_id))]
+        feeds[gid] = look_alike_details(
+            [f for f in fs if not f.channel_id or not (f.channel_id in seen or seen.add(f.channel_id))])
     ends = {(e.league_key, e.team_a, e.team_b, e.start_utc): e.ended_at
             for e in session.execute(select(GameEndDB)).scalars()}
     league_logos = _league_logos(rows, feed_rows, logos)
