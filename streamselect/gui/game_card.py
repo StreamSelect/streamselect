@@ -51,6 +51,17 @@ def _keep_space(*widgets: QWidget) -> None:
         w.setSizePolicy(sp)
 
 
+def add_report_actions(menu: QMenu, report) -> None:
+    """The two channel reports, worded as what the user saw (owner, 2026-11-13).
+
+    "No picture" (``DIDNT_PLAY``): nothing came up — black, an empty window, or it
+    never loaded. "Not this game" (``WRONG_CONTENT``): a picture, but not the game
+    on the card. One wording for a card and a channel row; ``report(kind)`` emits.
+    """
+    menu.addAction("No picture").triggered.connect(lambda: report(DIDNT_PLAY))
+    menu.addAction("Not this game").triggered.connect(lambda: report(WRONG_CONTENT))
+
+
 class ChannelRow(QWidget):
     """One channel showing a game: [country] station · EPG · quality · PREFERRED · eye."""
 
@@ -138,19 +149,16 @@ class ChannelRow(QWidget):
         menu.exec(self.eye.mapToGlobal(QPoint(0, self.eye.height())))
 
     def build_context_menu(self, league: str) -> QMenu:
-        """Every channel action in one place: play, preferred, hide, then a
-        "Report this channel" section (owner, SV-Q39)."""
+        """Every channel action in one place: play, preferred, hide, then the two
+        reports (``add_report_actions``)."""
         menu = QMenu(self)
         menu.addAction("Play").triggered.connect(lambda: self.play.emit(self.feed.channel_id))
         menu.addAction(f"Clear PREFERRED for {league} games" if self._preferred
                        else f"Make PREFERRED for {league} games").triggered.connect(
             lambda: self.prefer.emit(None if self._preferred else self.feed))
         self._add_hide_actions(menu.addMenu(f"Hide from {league} games"), league)
-        menu.addSection("Report this channel")
-        menu.addAction("Didn't play").triggered.connect(
-            lambda: self.reportRequested.emit(self.feed, DIDNT_PLAY))
-        menu.addAction("Wrong content").triggered.connect(
-            lambda: self.reportRequested.emit(self.feed, WRONG_CONTENT))
+        menu.addSeparator()
+        add_report_actions(menu, lambda kind: self.reportRequested.emit(self.feed, kind))
         clear = menu.addAction("Clear bad reports")
         clear.setEnabled(bool(self.feed.report))
         clear.triggered.connect(lambda: self.clearReportsRequested.emit(self.feed))
@@ -217,7 +225,7 @@ class ChannelList(QWidget):
             self.hidden_button.setFlat(True)
             _theme.style(self.hidden_button, "LINK_BTN_SM")
             self.hidden_button.setToolTip("The channels you hid from these games, to bring one back"
-                                          if not show_hidden else "Fold the hidden channels away")
+                                          if not show_hidden else "Collapse the hidden channels")
             lay.addWidget(self.hidden_button, 0, Qt.AlignmentFlag.AlignLeft)
             if show_hidden:
                 for f in hidden:
@@ -319,6 +327,7 @@ class GameCard(QFrame):
     play = pyqtSignal(str)                    # channel id
     toggled = pyqtSignal(object)              # GameDTO: open / close the channel list
     finished = pyqtSignal(object)             # GameDTO: the user marked it over
+    reportRequested = pyqtSignal(object, object, str)  # GameDTO, its top GameFeedDTO, kind
 
     def __init__(self, game: GameDTO, state: str, now: datetime, usual_length, *,
                  expanded: bool = False, playing_id: Optional[str] = None,
@@ -431,9 +440,20 @@ class GameCard(QFrame):
         self._play_top()
         super().mouseDoubleClickEvent(event)
 
-    def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt API)
+    def build_context_menu(self) -> Optional[QMenu]:
+        """Mark as finished, then the two reports on the card's own channel (owner,
+        2026-11-13): a one-channel card has no channel list to report from."""
         if self.state not in (ON_NOW, ENDING):
-            return
+            return None
         menu = QMenu(self)
         menu.addAction("Mark as finished").triggered.connect(lambda: self.finished.emit(self.game))
-        menu.exec(event.globalPos())
+        feed = self.top_feed
+        if feed is not None and feed.channel_id:
+            menu.addSeparator()
+            add_report_actions(menu, lambda kind: self.reportRequested.emit(self.game, feed, kind))
+        return menu
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        menu = self.build_context_menu()
+        if menu is not None:
+            menu.exec(event.globalPos())

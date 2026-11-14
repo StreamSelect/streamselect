@@ -136,16 +136,17 @@ WATCHED_MIN_SECONDS = 60
 _PLAY_CAP_S = int(DEFAULT_EVENT_DURATION.total_seconds())
 
 
-#: Channel reports (SV-Q37-Q39): "didnt_play" or "wrong_content".
+#: Channel reports (SV-Q37-Q39), shown as "No picture" and "Not this game"
+#: (owner, 2026-11-13); the stored kinds keep their first names.
 DIDNT_PLAY, WRONG_CONTENT = "didnt_play", "wrong_content"
-_REPORT_WORDS = {DIDNT_PLAY: "didn't play", WRONG_CONTENT: "wrong content"}
+_REPORT_WORDS = {DIDNT_PLAY: "no picture", WRONG_CONTENT: "not this game"}
 #: A report counts this long after the latest one, times the number of reports
 #: (owner, SV-Q38: 30 days to start; more reports extend the tracking).
 REPORT_DAYS = 30
 
 
 def game_key(game: GameDTO) -> str:
-    """The game a "wrong content" report names: league, teams and start."""
+    """The game a "not this game" report names: league, teams and start."""
     return f"{game.league_key}|{game.team_a}|{game.team_b}|{game.start_utc.isoformat()}"
 
 
@@ -156,7 +157,7 @@ def report_text(reports: list[dict], game: GameDTO, last_watched: Optional[datet
     ``reports``: the stored list for the collection, each ``{"kind", "at", "game"?}``.
     A real watch (``last_watched``, plays of a minute or more) after the latest
     report cancels one report — a feed that came back earns its place back. A
-    "wrong content" report counts for its own game; "didn't play" for every game.
+    "not this game" report counts for its own game; "no picture" for every game.
     """
     relevant = [r for r in reports if r.get("kind") == DIDNT_PLAY
                 or (r.get("kind") == WRONG_CONTENT and r.get("game") == game_key(game))]

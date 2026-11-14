@@ -13,7 +13,7 @@ import pytest
 from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QLabel, QPushButton
+from PyQt6.QtWidgets import QLabel, QPushButton, QWidget
 
 from streamselect.core.games.read import (
     ENDING, ON_NOW, OVER, UPCOMING, GameDTO, GameFeedDTO, arrange_feeds, game_state, load_games,
@@ -558,22 +558,72 @@ def test_reporting_a_channel_puts_it_last_with_its_flag_and_clear_brings_it_back
     first = view.cards[0].findChildren(ChannelRow)[0]
     menu = first.build_context_menu("NHL")
     texts = [a.text() for a in menu.actions()]
-    assert "Report this channel" in texts and "Didn't play" in texts and "Wrong content" in texts
+    assert "No picture" in texts and "Not this game" in texts
+    assert "Report this channel" not in texts and "Didn't play" not in texts, "the old wording is back"
     clear = next(a for a in menu.actions() if a.text() == "Clear bad reports")
     assert not clear.isEnabled(), "nothing to clear yet"
-    next(a for a in menu.actions() if a.text() == "Didn't play").trigger()
+    next(a for a in menu.actions() if a.text() == "No picture").trigger()
     _settle(qapp)
     rows = view.cards[0].findChildren(ChannelRow)
     last = max(rows, key=lambda r: r.mapTo(view, QPoint(0, 0)).y())
     assert last.feed.channel_id == first.feed.channel_id, "a reported channel is listed last"
     assert last.report_icon is not None and last.report_icon.isVisibleTo(view)
-    assert "didn't play" in last.report_icon.toolTip()
+    assert "no picture" in last.report_icon.toolTip()
     assert all(r.report_icon is None for r in rows if r is not last), "no clutter on other rows"
     clear = next(a for a in last.build_context_menu("NHL").actions() if a.text() == "Clear bad reports")
     assert clear.isEnabled()
     clear.trigger()
     _settle(qapp)
     assert all(r.report_icon is None for r in view.cards[0].findChildren(ChannelRow))
+
+
+def test_a_live_card_reports_its_own_channel_so_a_one_channel_game_can_be_reported(
+        games_db, qapp, owned_widgets):
+    """Owner, 2026-11-13: two one-channel games that never played offered only "Mark
+    as finished" — a one-channel card has no channel list, so no report could be made."""
+    from streamselect.gui.game_card import ChannelRow
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    card = _card(view, "Sabres")
+    reported = card.top_feed
+    texts = [a.text() for a in card.build_context_menu().actions() if not a.isSeparator()]
+    assert texts == ["Mark as finished", "No picture", "Not this game"], texts
+    next(a for a in card.build_context_menu().actions() if a.text() == "No picture").trigger()
+    _settle(qapp)
+    _card(view, "Sabres").more_chip.click()
+    _settle(qapp)
+    rows = _card(view, "Sabres").findChildren(ChannelRow)
+    flagged = [r for r in rows if r.report_icon is not None and r.report_icon.isVisibleTo(view)]
+    assert [r.feed.collection_key for r in flagged] == [reported.collection_key]
+    assert "no picture" in flagged[0].report_icon.toolTip()
+    last = max(rows, key=lambda r: r.mapTo(view, QPoint(0, 0)).y())
+    assert last is flagged[0], "the card's reported channel drops to the bottom of its list"
+
+
+def test_only_a_card_that_is_on_has_a_menu(qapp, owned_widgets):
+    """Nothing to report, or to mark finished, before a game starts."""
+    from streamselect.gui.game_card import GameCard
+    g = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 1, (_feed("a", "ONE"),))
+    early = owned_widgets.own(GameCard(g, UPCOMING, START - timedelta(hours=1), HOCKEY.usual_length))
+    assert early.build_context_menu() is None
+    on = owned_widgets.own(GameCard(g, ON_NOW, START + timedelta(minutes=30), HOCKEY.usual_length))
+    assert [a.text() for a in on.build_context_menu().actions() if not a.isSeparator()] == [
+        "Mark as finished", "No picture", "Not this game"], "a one-channel card can report its channel"
+
+
+def test_a_header_tooltip_names_the_list_it_collapses(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-13: "Fold these games" is terrible language — name the list,
+    and say collapse (the app never says fold)."""
+    from streamselect.gui.sports_view import _games_list_name
+    assert _games_list_name("Tomorrow · Sat Nov 14") == "Tomorrow's games list"
+    assert _games_list_name("Sun Nov 15") == "the games list for Sun Nov 15"
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    assert view.headers["hockey:on_now"].toolTip() == "Collapse the list of games on now"
+    assert view.headers["sport:hockey"].toolTip() == "Collapse every Hockey list"
+    view.headers["hockey:on_now"].clicked.emit()
+    _settle(qapp)
+    assert view.headers["hockey:on_now"].toolTip() == "Expand the list of games on now"
+    tips = [w.toolTip() for w in view.findChildren(QWidget) if w.toolTip()]
+    assert not [t for t in tips if "fold" in t.lower()], "a tooltip still says fold"
 
 
 # ── event alerts: the bell (SV-Q24-Q26, Q42) ──────────────────────────────

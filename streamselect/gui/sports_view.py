@@ -58,6 +58,18 @@ def _game_key(g: GameDTO) -> tuple:
     return (g.league, g.team_a, g.team_b, g.start_utc)
 
 
+
+#: Day names that read as a possessive ("Tomorrow's games list"); a date reads
+#: "the games list for Sat Nov 15".
+_RELATIVE_DAYS = ("Tonight", "Today", "Tomorrow", "Yesterday")
+
+
+def _games_list_name(label: str) -> str:
+    """A section's day label as the list a fold tooltip names (owner, 2026-11-13:
+    "Fold these games" said nothing about which games)."""
+    name = label.split(" · ")[0]
+    return f"{name}'s games list" if name in _RELATIVE_DAYS else f"the games list for {name}"
+
 class SportsView(ContentView):
     """Games on now as cards, later and finished games as rows; see the module docstring."""
 
@@ -257,7 +269,8 @@ class SportsView(ContentView):
         on_now.sort(key=lambda gs: gs[0].start_utc, reverse=self.sort_order == SORT_LATEST)
 
         on_key = f"{sport}:on_now"
-        self._layout.addWidget(self._header(on_key, "On now", len(on_now), foldable=True))
+        self._layout.addWidget(self._header(on_key, "On now", len(on_now), foldable=True,
+                                         what="the list of games on now"))
         if on_key in self._folded():
             pass                             # folded like any other section (owner, 2026-11-13)
         elif on_now:
@@ -290,7 +303,8 @@ class SportsView(ContentView):
 
         if finished:
             key = f"{sport}:{FINISHED}"
-            self._layout.addWidget(self._header(key, "Finished", len(finished), foldable=True))
+            self._layout.addWidget(self._header(key, "Finished", len(finished), foldable=True,
+                                                what="the finished games list"))
             if key not in folded:
                 done = sorted((g for g, _ in finished), key=lambda g: g.start_utc, reverse=True)
                 by_day: dict = {}
@@ -323,7 +337,7 @@ class SportsView(ContentView):
             self._layout.addWidget(b)
 
     def _header(self, key: str, label: str, count: int, *, foldable: bool,
-                controls: Optional[QWidget] = None, sub: bool = False) -> QWidget:
+                controls: Optional[QWidget] = None, sub: bool = False, what: str = "") -> QWidget:
         """A section header on the sidebar's header band (SECTION_HEADER_TINT).
 
         A foldable one folds on a click ANYWHERE on the band — caret, label or empty
@@ -333,8 +347,12 @@ class SportsView(ContentView):
 
         ``sub`` is a heading INSIDE a section (Finished's days): indented, on no band
         of its own, so it reads as part of the section above it.
+
+        ``what`` names the list in the tooltip ("Collapse Tomorrow's games list");
+        by default it comes from a day label (``_games_list_name``).
         """
-        tip = ("Show these games" if key in self._folded() else "Fold these games") if foldable else ""
+        verb = "Expand" if key in self._folded() else "Collapse"
+        tip = f"{verb} {what or _games_list_name(label)}" if foldable else ""
         if foldable:
             band = _ClickableFrame() if sub else _ClickableHeader()
             if sub:
@@ -366,7 +384,7 @@ class SportsView(ContentView):
         # The whole band folds, not just the name (owner report: only the word worked).
         band = _ClickableFrame()
         cursor_affordance.set_clickable(band)
-        band.setToolTip(f"Show {sport}" if key in self._folded() else f"Fold {sport}")
+        band.setToolTip(f"{'Expand' if key in self._folded() else 'Collapse'} every {sport.title()} list")
         band.clicked.connect(lambda k=key: self._toggle_fold(k))
         h = QHBoxLayout(band)
         h.setContentsMargins(2, 10, 6, 2)
@@ -418,6 +436,7 @@ class SportsView(ContentView):
         card.play.connect(self.playRequested)
         card.toggled.connect(self._toggle_open)
         card.finished.connect(self._mark_finished)
+        card.reportRequested.connect(self._report)
         self.cards.append(card)
         return card
 
@@ -446,7 +465,7 @@ class SportsView(ContentView):
         if openable:
             row = QPushButton(text)
             _theme.style(row, "GAME_FEED_ROW")
-            row.setToolTip("Fold its channel list" if is_open else "List every channel that will show this game")
+            row.setToolTip("Collapse its channel list" if is_open else "List every channel that will show this game")
             row.clicked.connect(lambda _=False, game=g: self._toggle_open(game))
         else:
             row = QLabel(text)

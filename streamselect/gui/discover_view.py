@@ -195,7 +195,7 @@ class DiscoverView(QWidget):
         self._expanded_zone.setVisible(False)
         self._shelves_layout.addWidget(self._expanded_zone)
 
-        self._more_btn = QPushButton("More Categories", toolTip="Show the folded shelves")
+        self._more_btn = QPushButton("More Categories", toolTip="Show the collapsed shelves")
         _icon_utils.set_button_icon(self._more_btn, "expand")
         self._more_btn.setFixedHeight(36)
         _theme.style_fn(self._more_btn, lambda: "QPushButton {"
