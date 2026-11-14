@@ -241,8 +241,8 @@ def test_while_a_channel_plays_the_top_line_says_playing_in_green_and_rows_do_no
     card = view.cards[0]
     assert [r.feed.channel_id for r in card.findChildren(ChannelRow)] == before
     assert card.top_feed.channel_id == before[-1]
-    word = next(lbl for lbl in card.play_line.findChildren(QLabel) if lbl.text() == "PLAYING")
-    assert _near(_ink(word), QColor(theme.COLOR_OK)), "PLAYING in the playing green"
+    word = next(lbl for lbl in card.play_line.findChildren(QLabel) if lbl.text() == "WATCHING")
+    assert _near(_ink(word), QColor(theme.COLOR_OK)), "WATCHING in the playing green"
 
 
 def test_opening_a_later_game_and_redrawing_does_not_crash(games_db, qapp, owned_widgets):
@@ -1242,3 +1242,61 @@ def test_the_row_puts_language_first_and_region_epg_tier_fps_in_columns(qapp, ow
     assert x_of(guide, "HEVC") < x_of(guide, "DEN"), "a codec word sits by the title"
     assert x_of(measured, "FHD") == x_of(guide, "HD"), "tiers form a column"
     assert x_of(measured, "30fps") > x_of(measured, "FHD")
+
+
+
+# ── the card you're watching (SV-Q81-Q83) ────────────────────────────────
+
+def _watched_card(qapp, owned_widgets, *, expanded):
+    from streamselect.gui.game_card import GameCard
+    feed = _row_feed("w", quality="HD", verified=True, fps="60fps", bitrate_kbps=6649,
+                     channel_collection="US| NHL PACKAGE", region="US")
+    other = _row_feed("o", channel_collection="CA| SPORTSNET", region="CA")
+    g = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 2, (feed, other))
+    card = owned_widgets.own(GameCard(g, ON_NOW, LIVE_AT, HOCKEY.usual_length, expanded=expanded,
+                                      playing_id="w"))
+    plain = owned_widgets.own(GameCard(g, ON_NOW, LIVE_AT, HOCKEY.usual_length, expanded=expanded))
+    for c in (card, plain):
+        c.show()
+    qapp.processEvents()
+    return card, plain
+
+
+def _border(card):
+    image = card.grab().toImage()
+    y = card.height() // 2
+    return [QColor(image.pixel(x, y)) for x in range(6)]
+
+
+def test_a_closed_card_you_are_watching_says_watching_and_nothing_else(qapp, owned_widgets):
+    """Owner, 2026-11-14: "Maybe it should just say PLAYING … and the channel in the card
+    disappears completely"; WATCHING, so it can't read as the game (SV-Q83)."""
+    from streamselect.gui import theme
+    card, plain = _watched_card(qapp, owned_widgets, expanded=False)
+    words = [w.text() for w in card.play_line.findChildren((QLabel, QPushButton)) if w.isVisible()]
+    assert "WATCHING" in words and "NHL PACKAGE" not in words and "US" not in words, words
+    assert not card.measured_chips, "no room on a closed card for the measured chips"
+    green = QColor(theme.COLOR_OK)
+    assert sum(_near(c, green) for c in _border(card)) >= 2, "a green outline, thicker than one pixel"
+    assert not any(_near(c, green) for c in _border(plain))
+
+
+def test_the_open_card_you_are_watching_shows_bitrate_quality_and_fps(qapp, owned_widgets):
+    card, _plain = _watched_card(qapp, owned_widgets, expanded=True)
+    shown = [w.text() for w in card.play_line.findChildren(QPushButton) if w.isVisible()]
+    assert shown[:3] == ["6.6 Mb/s", "HD", "60fps"], shown
+    card.set_live_bitrate(5120)
+    assert card.bitrate_chip.text() == "5.1 Mb/s"
+
+
+def test_the_live_bitrate_is_averaged_across_polls(games_db, qapp, owned_widgets):
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    _card(view, "Sabres").more_chip.click()
+    _settle(qapp)
+    cid = _card(view, "Sabres").top_feed.channel_id
+    view.set_playing(cid)
+    _settle(qapp)
+    for bits in (4_000_000, 6_000_000, 8_000_000):
+        view.set_playing(cid, bits)
+    card = _card(view, "Sabres")
+    assert card.bitrate_chip is not None and card.bitrate_chip.text() == "6.0 Mb/s"

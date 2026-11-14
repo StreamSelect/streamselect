@@ -27,6 +27,10 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
             f"QFrame#gameCard[selected=\"true\"] {{ border: 2px solid {_('COLOR_ACCENT')}; }}"
             # Only one collection lists it (Level 2): dashed, the app's "guessed" mark.
             f"QFrame#gameCard[certain=\"false\"] {{ border-style: dashed; }}"
+            # The card you're watching: green and thicker, colour AND shape, so the
+            # word on its play line can be short (Sports Desk SV-Q81, owner 2026-11-14).
+            f"QFrame#gameCard[playing=\"true\"] {{ border: 2px solid {_('COLOR_OK')}; }}"
+            f"QFrame#gameCard[playing=\"true\"][selected=\"true\"] {{ border: 3px solid {_('COLOR_OK')}; }}"
         ),
         # The card's "▶ [US] STATION" line: one click plays, so it lights on hover.
         "GAME_PLAY_LINE": (

@@ -1129,7 +1129,7 @@ class _StreamingMixin(_WatchCaptureMixin):
         try:
             props = self.player_manager.get_properties(
                 ["path", "demuxer-cache-duration", "cache-speed", "frame-drop-count",
-                 "time-pos", "pause", "duration"],
+                 "time-pos", "pause", "duration", "video-bitrate"],
                 key=key,
             )
         except Exception as e:
@@ -1222,7 +1222,7 @@ class _StreamingMixin(_WatchCaptureMixin):
             # (Only clear the shown title when it plays in NO open window.)
             pass
         else:
-            self._notify_details_playing(ch_id, props.get("time-pos") or 0)
+            self._notify_details_playing(ch_id, props.get("time-pos") or 0, props.get("video-bitrate"))
 
         # Source glyph labels *which* stream the data refers to (shown whether one
         # or many windows are open). The [i/n] marker (multi only) adds count +
@@ -1252,7 +1252,8 @@ class _StreamingMixin(_WatchCaptureMixin):
             f"{_html.escape(prefix, quote=False)}{_icon_utils.role_html('play')}&nbsp;{text}")
         self._playback_health_label.show()
 
-    def _notify_details_playing(self, channel_id: str | None, position_seconds: float) -> None:
+    def _notify_details_playing(self, channel_id: str | None, position_seconds: float,
+                                video_bitrate=None) -> None:
         """Forward the live play-state to every "currently playing" mark (main thread).
 
         One poll feeds the details pane, the Watch Alerts sidebar and the Sports
@@ -1261,13 +1262,14 @@ class _StreamingMixin(_WatchCaptureMixin):
         Args:
             channel_id: The channel now playing, or None when nothing plays (clears).
             position_seconds: Current playback position in seconds.
+            video_bitrate: mpv's live ``video-bitrate`` (bits/s), for the Sports card.
         """
         pane = self.__dict__.get("details_pane")
         if pane is not None:
             pane.set_playing(channel_id, position_seconds)
         sports = self.__dict__.get("sports_view")
         if sports is not None:
-            sports.set_playing(channel_id)
+            sports.set_playing(channel_id, video_bitrate)
         # Reached through sidebar_sections, as every caller does (there is no attribute).
         sections = self.__dict__.get("sidebar_sections") or {}
         alerts = sections.get("alerts")

@@ -63,6 +63,7 @@ class GameFeedDTO:
     package_quality: tuple = ()
     language: str = ""          # measured audio language, two letters ("EN"); "" when not measured
     fps: str = ""               # measured frame rate ("30fps"); "" when not measured
+    bitrate_kbps: int = 0       # video bitrate when last measured; the card shows the live one while watching
     #: A muted note telling two otherwise identical rows apart (SV-Q79), set by load_games.
     detail: str = ""
 
@@ -359,6 +360,11 @@ def _measured_language(seen: dict) -> str:
     return ""
 
 
+def _measured_kbps(record: Optional[dict]) -> int:
+    kbps = (((record or {}).get("info") or {}).get("video") or {}).get("bitrate_kbps")
+    return int(kbps) if isinstance(kbps, (int, float)) and kbps > 0 else 0
+
+
 def _measured_fps(record: Optional[dict]) -> str:
     fps = (((record or {}).get("info") or {}).get("video") or {}).get("fps")
     return f"{round(fps)}fps" if isinstance(fps, (int, float)) and fps > 0 else ""
@@ -457,7 +463,8 @@ def load_games(session, sport: str, hidden_provider_ids: set[str],
                         verified=bool(tier) and ours, own_name=own_name, package=package,
                         package_quality=package_quality,
                         language=_measured_language(seen) if ours else "",
-                        fps=_measured_fps(record) if ours else ""))
+                        fps=_measured_fps(record) if ours else "",
+                        bitrate_kbps=_measured_kbps(record) if ours else 0))
     for gid, fs in feeds.items():
         fs.sort(key=lambda f: _FEED_RANK.get(f.time_from, 2))
         # One feed per channel: a guide programme on a channel already listed by

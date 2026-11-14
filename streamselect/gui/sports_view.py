@@ -17,6 +17,7 @@ Reads only what the game finder stored (``core/games``) through the host's
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -56,6 +57,8 @@ TICK_MS = 60_000
 SORT_EARLIEST, SORT_LATEST = "earliest", "latest"
 ORDER_SPORT, ORDER_TIME = "sport", "time"
 FINISHED = "finished"
+#: Live bitrate readings averaged for the WATCHING chip (one per player poll).
+BITRATE_SAMPLES = 5
 #: The section-key prefix for By time, where one list holds every sport.
 ALL = "all"
 
@@ -131,6 +134,8 @@ class SportsView(ContentView):
         self.rows: list[QWidget] = []          # a QPushButton, or a QLabel for an earlier day's finished game
         self.headers: dict[str, QWidget] = {}
         self._sub_text_x = 0            # set by each sub-heading; its rows line up under its words
+        #: The last few live bitrate readings (kb/s), averaged so the chip doesn't flicker.
+        self._bitrates: deque = deque(maxlen=BITRATE_SAMPLES)
         self._render()          # "Loading games…" until the first read comes back
 
     # ── remembered state ───────────────────────────────────────────────────
@@ -203,14 +208,21 @@ class SportsView(ContentView):
         if self.isVisible():
             self.reload()
 
-    def set_playing(self, channel_id: Optional[str]) -> None:
-        """The channel now playing (the host's player poll), or None."""
+    def set_playing(self, channel_id: Optional[str], video_bitrate=None) -> None:
+        """The channel now playing (the host's player poll), or None, and mpv's live
+        ``video-bitrate`` (bits/s) for it, shown averaged on the open card (SV-Q82)."""
         if channel_id != self._playing:
             self._playing = channel_id
+            self._bitrates.clear()
             if self._loaded:
                 # Re-read, not just re-draw: the play log just changed, and the order
                 # of each game's channels follows what was last watched.
                 self.reload()
+        if channel_id and isinstance(video_bitrate, (int, float)) and video_bitrate > 0:
+            self._bitrates.append(video_bitrate / 1000)
+            kbps = round(sum(self._bitrates) / len(self._bitrates))
+            for card in self.cards:
+                card.set_live_bitrate(kbps)
 
     def measurement_arrived(self, channel_id: str) -> None:
         """A channel's stream was just measured: re-read if one of the listed games

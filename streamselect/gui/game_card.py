@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
 
 from streamselect.core.epg_utils import fmt_time
 from streamselect.core.quality_vocab import quality_tooltip
+from streamselect.core.stream_info import _rate as rate_text
 from streamselect.core.games.read import (
     DIDNT_PLAY, ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, GameFeedDTO,
 )
@@ -239,6 +240,16 @@ def language_chip(code: str) -> QWidget:
     often carry the English broadcast with only local ads."""
     chip = measured_chip(CHIP_LANG, code, verified=True)
     chip.setToolTip(f"Audio language measured while playing: {code}")
+    return chip
+
+
+def bitrate_chip(kbps: int) -> QWidget:
+    """The video bitrate while watching, live from the player and averaged over a few
+    seconds (SV-Q82): a collapsing number is a stream that stopped showing anything.
+    Hidden until a reading exists."""
+    chip = quality_badge(rate_text(kbps) if kbps else "", verified=True)
+    chip.setToolTip("Video bitrate, live from the player, averaged over the last few seconds")
+    chip.setVisible(bool(kbps))
     return chip
 
 
@@ -537,6 +548,8 @@ class GameCard(QFrame):
         self.setObjectName("gameCard")
         self.setProperty("selected", "true" if expanded else "false")
         self.setProperty("certain", "true" if game.level == 1 else "false")
+        self.setProperty("playing", "true" if playing_id and any(
+            f.channel_id == playing_id for f in game.playable) else "false")
         _theme.style(self, "GAME_CARD")
         if expanded:
             self.setMinimumWidth(CARD_WIDTH)
@@ -600,7 +613,9 @@ class GameCard(QFrame):
             _icon_utils.set_label_icon(mark, "play", 12)
             pl.addWidget(mark)
             if playing:
-                word = QLabel("PLAYING")
+                # WATCHING, not PLAYING: under two teams and a LIVE marker "playing"
+                # reads as the game (owner, SV-Q83).
+                word = QLabel("WATCHING")
                 _theme.style(word, "GAME_PLAYING")
                 pl.addWidget(word)
             tip = "Click to play on this channel (double-clicking the card does the same)"
@@ -612,7 +627,21 @@ class GameCard(QFrame):
             f = self.top_feed
             tip += f"\n{f.name}\n{f.channel_collection or f.collection}"
         line.setToolTip(tip)
-        if self.top_feed is not None:
+        self.station, self.bitrate_chip, self.measured_chips = None, None, []
+        if playing:
+            # The card you're watching answers "this one" and leaves "which channel"
+            # to the open card's list, where that row is green (owner, SV-Q81). The
+            # open card adds what playing measured; a closed card has no room (owner).
+            if expanded:
+                self.bitrate_chip = bitrate_chip(playing.bitrate_kbps)
+                self.measured_chips = [c for c in (
+                    self.bitrate_chip,
+                    quality_chip(playing.tier, True) if playing.verified and playing.tier else None,
+                    fps_chip(playing.fps) if playing.fps else None) if c is not None]
+                for chip in self.measured_chips:
+                    pl.addWidget(chip)
+            pl.addStretch(1)
+        elif self.top_feed is not None:
             if self.top_feed.region:
                 pl.addWidget(make_region_chip(self.top_feed.region))
             self.station = QLabel(self.top_feed.title)
@@ -652,6 +681,13 @@ class GameCard(QFrame):
             sep.setMaximumHeight(1)
             lay.addWidget(sep)
             lay.addWidget(channels)
+
+    def set_live_bitrate(self, kbps: int) -> None:
+        """The averaged live bitrate while watching (SportsView.set_playing); only the
+        open card you're watching shows it."""
+        if self.bitrate_chip is not None:
+            self.bitrate_chip.setText(rate_text(kbps))
+            self.bitrate_chip.setVisible(True)
 
     def _play_top(self) -> None:
         if self.top_feed is not None and self.top_feed.channel_id and self.state != UPCOMING:
