@@ -24,7 +24,7 @@ import json
 import os
 import platform
 import re
-import shutil
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -38,7 +38,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from loguru import logger
 
 import streamselect
-from streamselect.core import app_paths
+from streamselect.core import app_paths, update_installer
 
 # GitHub REST v3 "latest release" endpoint (unauthenticated — ~60 req/hr/IP,
 # far more than a once-a-day check needs).
@@ -47,7 +47,6 @@ GITHUB_LATEST_RELEASE_URL = (
 )
 THROTTLE_HOURS = 24
 _NETWORK_TIMEOUT = 10
-_DOWNLOAD_TIMEOUT = 120
 
 _SEMVER_RE = re.compile(
     r"^v?(?P<major>\d+)\.(?P<minor>\d+)(?:\.(?P<patch>\d+))?"
@@ -66,6 +65,7 @@ class UpdateInfo:
         release_url: Human-facing GitHub release page (``html_url``).
         dmg_url: Direct download URL of the ``.dmg`` asset matching the running
             architecture, or ``""`` if the release has no ``.dmg`` at all.
+        zip_url: Direct download URL of the Windows ``.zip``, or ``""``.
     """
 
     current: str
@@ -73,6 +73,7 @@ class UpdateInfo:
     is_newer: bool
     release_url: str
     dmg_url: str
+    zip_url: str = ""
 
 
 # ── Pure version comparison ──────────────────────────────────────────────────
@@ -174,6 +175,33 @@ def select_dmg_url(assets) -> str:
     return dmg_assets[0][1]
 
 
+def select_windows_zip_url(assets) -> str:
+    """The Windows build's ``.zip`` download URL, or ``""`` when there is none."""
+    for asset in assets or []:
+        if not isinstance(asset, dict):
+            continue
+        name = str(asset.get("name") or "").lower()
+        if name.endswith(".zip") and "windows" in name:
+            return str(asset.get("browser_download_url") or "")
+    return ""
+
+
+def installer_url(info: "UpdateInfo", platform: Optional[str] = None) -> str:
+    """The asset this platform installs from: the ``.dmg`` or the Windows ``.zip``."""
+    platform = platform or sys.platform
+    if platform == "darwin":
+        return info.dmg_url
+    if platform == "win32":
+        return info.zip_url
+    return ""
+
+
+def _forced() -> bool:
+    """``STREAMSELECT_UPDATE_FORCE=1`` offers the latest release even when it is
+    not newer, so the install can be tried end to end from a rolling build."""
+    return os.environ.get("STREAMSELECT_UPDATE_FORCE") == "1"
+
+
 # ── Pure DTO construction / network fetch ────────────────────────────────────
 
 def build_update_info(data: dict, current_version: str) -> Optional[UpdateInfo]:
@@ -200,9 +228,10 @@ def build_update_info(data: dict, current_version: str) -> Optional[UpdateInfo]:
     return UpdateInfo(
         current=current_version,
         latest=latest_display,
-        is_newer=is_newer_version(tag, current_version),
+        is_newer=is_newer_version(tag, current_version) or _forced(),
         release_url=release_url,
         dmg_url=dmg_url,
+        zip_url=select_windows_zip_url(data.get("assets")),
     )
 
 
@@ -243,21 +272,14 @@ def download_dmg(dmg_url: str, dest_dir: Optional[Path] = None) -> Optional[str]
     if not dmg_url:
         return None
     dest_dir = dest_dir or app_paths.downloads_dir()
+    name = os.path.basename(urllib.parse.urlparse(dmg_url).path) or "StreamSelect.dmg"
     try:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        name = os.path.basename(urllib.parse.urlparse(dmg_url).path) or "StreamSelect.dmg"
-        dest = dest_dir / name
-        request = urllib.request.Request(
-            dmg_url, headers={"User-Agent": "StreamSelect-Updater"}
-        )
-        with urllib.request.urlopen(request, timeout=_DOWNLOAD_TIMEOUT) as response, \
-                open(dest, "wb") as handle:
-            shutil.copyfileobj(response, handle)
-        logger.info(f"Downloaded update to {dest}")
-        return str(dest)
-    except (urllib.error.URLError, OSError) as exc:
+        dest = update_installer.download_file(dmg_url, dest_dir / name)
+    except update_installer.UpdateInstallError as exc:
         logger.warning(f"Update download failed: {exc}")
         return None
+    logger.info(f"Downloaded update to {dest}")
+    return str(dest)
 
 
 # ── Qt-facing checker ────────────────────────────────────────────────────────
@@ -273,6 +295,10 @@ class UpdateChecker(QObject):
             (offline/error). Automatic checks stay silent here.
         download_completed(str): a ``.dmg`` download finished — the local path,
             or ``""`` on failure. The host reveals/opens it.
+        install_progress(int): download percent while installing an update.
+        install_ready(object): the new app is staged — payload is
+            ``(target, staged)`` paths; the host starts the helper and quits.
+        install_failed(str): installing failed; the message says why.
 
     Private signals marshal worker→main-thread results; never call them from UI.
     """
@@ -280,6 +306,9 @@ class UpdateChecker(QObject):
     update_available = pyqtSignal(object)   # UpdateInfo
     no_update = pyqtSignal(object)          # UpdateInfo | None (manual only)
     download_completed = pyqtSignal(str)    # local path, "" on failure
+    install_progress = pyqtSignal(int)      # percent
+    install_ready = pyqtSignal(object)      # (target Path, staged Path)
+    install_failed = pyqtSignal(str)        # message
 
     _result_ready = pyqtSignal(object)      # (UpdateInfo | None, manual: bool)
     _download_ready = pyqtSignal(str)       # local path, "" on failure
@@ -326,6 +355,18 @@ class UpdateChecker(QObject):
             return
         self._executor.submit(self._worker_download, info.dmg_url)
 
+    def install_async(self, info: UpdateInfo, target) -> None:
+        """Download and stage *info*'s package beside *target* in the background.
+
+        Emits ``install_progress`` while downloading, then ``install_ready``
+        or ``install_failed`` on the main thread.
+        """
+        url = installer_url(info)
+        if not url:
+            self.install_failed.emit("This release has no package for this system.")
+            return
+        self._executor.submit(self._worker_install, url, target)
+
     def shutdown(self) -> None:
         """Stop the executor (registered in the closeEvent cleanup registry)."""
         self._executor.shutdown(wait=False)
@@ -350,6 +391,20 @@ class UpdateChecker(QObject):
     def _worker_check(self, manual: bool) -> None:
         info = fetch_latest_release(self._current)
         self._result_ready.emit((info, manual))
+
+    def _worker_install(self, url: str, target) -> None:
+        try:
+            staged = update_installer.stage_update(
+                url, target, progress=self.install_progress.emit
+            )
+        except update_installer.UpdateInstallError as exc:
+            self.install_failed.emit(str(exc))
+            return
+        except Exception as exc:  # never let a worker die silently
+            logger.exception("Update install failed")
+            self.install_failed.emit(f"Something went wrong: {exc}")
+            return
+        self.install_ready.emit((target, staged))
 
     def _worker_download(self, dmg_url: str) -> None:
         path = download_dmg(dmg_url)

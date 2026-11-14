@@ -54,11 +54,20 @@ def is_frozen() -> bool:
     return bool(getattr(sys, "frozen", False))
 
 
+def is_installed_build() -> bool:
+    """True for a packaged install (macOS/Windows bundle or the Flatpak).
+
+    These check for updates on their own; a source checkout never does, so a
+    developer running ``./run.sh`` is never asked to update.
+    """
+    return is_frozen() or flatpak_app_id() is not None
+
+
 def flatpak_app_id() -> "str | None":
     """The Flatpak app id when running inside one, else ``None``.
 
     Flatpak sets ``FLATPAK_ID`` in every sandboxed process. Inside the sandbox
-    the app updates through Flatpak, not the in-app ``.dmg`` updater, and its
+    the app can't replace itself (an update's "Now" opens the download page), and its
     windows must name the exported desktop file so Wayland shows the right icon.
     """
     return os.environ.get("FLATPAK_ID") or None

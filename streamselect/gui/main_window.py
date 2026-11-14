@@ -20,7 +20,7 @@ from streamselect.core import feature_gates as _gates, watchlist
 from streamselect.core.build_info import window_title
 from streamselect.core.config import Config
 from streamselect.core.update_checker import UpdateChecker
-from streamselect.core.runtime_env import is_frozen
+from streamselect.core.runtime_env import is_installed_build
 from streamselect.core import profile_store
 from streamselect.gui.watchlist_write_notifier import install_watchlist_writes
 from streamselect.gui.time_display_settings import apply_time_display
@@ -491,9 +491,7 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
         # any download are surfaced through main-thread slots (_UpdatesMixin).
         self.update_checker = UpdateChecker(self.config, parent=self)
         self._register_cleanable("update_checker", self.update_checker.shutdown)
-        self.update_checker.update_available.connect(self._on_update_available)
-        self.update_checker.no_update.connect(self._on_update_none)
-        self.update_checker.download_completed.connect(self._on_update_downloaded)
+        self._wire_update_checker()
 
         self.setup_ui()
         self.setup_notifications()
@@ -613,11 +611,11 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
         # startup-kickoff gate above (it only affects the first, one-time poke).
         self.series_monitor.start_scheduler()
 
-        # Automatic update check — bundled (.app) builds only, so a source-run
-        # developer is never nagged. The manual "Check for updates now" button
+        # Automatic update check — packaged builds only (the Flatpak too), so a
+        # source-run developer is never nagged. The manual "Check for updates now" button
         # (Settings → Interface → Updates) always works regardless of this gate.
         # Deferred 3 s so startup work and the first paint finish first.
-        if is_frozen() and getattr(self.config, "update_check_enabled", True):
+        if is_installed_build() and getattr(self.config, "update_check_enabled", True):
             QTimer.singleShot(3000, self.update_checker.check_async)
 
         logger.info("Main window initialized")

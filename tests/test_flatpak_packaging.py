@@ -1,8 +1,7 @@
 """The Flatpak build: what the app does inside one, and what the manifest grants.
 
 The bundle is built and launched in CI (.github/workflows/flatpak.yml); these
-tests cover what that smoke run cannot see — the update button's behaviour in
-the sandbox, and that the manifest's folder grants still match the paths the
+tests cover what that smoke run cannot see — the update check in the sandbox, and that the manifest's folder grants still match the paths the
 app actually reads. Those paths come from ``Path.home()``, not ``$XDG_*``, so a
 missing grant makes the app start with an empty library rather than fail.
 """
@@ -40,15 +39,21 @@ def _updates_host() -> SimpleNamespace:
     return SimpleNamespace(notification_manager=MagicMock(), update_checker=MagicMock())
 
 
-def test_manual_update_check_inside_flatpak_points_at_the_bundle(monkeypatch) -> None:
-    """The checker only knows .dmg assets — inside the sandbox it must not run."""
+def test_manual_update_check_inside_flatpak_checks_too(monkeypatch) -> None:
+    """The Flatpak gets the update notice; its "Now" opens the download page."""
     monkeypatch.setenv("FLATPAK_ID", "io.github.streamselect.StreamSelect")
     host = _updates_host()
     _UpdatesMixin._manual_update_check(host)
-    host.update_checker.check_async.assert_not_called()
-    shown = host.notification_manager.show.call_args.kwargs
-    assert "Flatpak" in shown["title"]
-    assert "StreamSelect.flatpak" in shown["message"]
+    host.update_checker.check_async.assert_called_once_with(manual=True)
+
+
+def test_flatpak_counts_as_an_installed_build(monkeypatch) -> None:
+    """So it checks for updates at startup, like the macOS and Windows builds."""
+    monkeypatch.setattr(runtime_env, "is_frozen", lambda: False)
+    monkeypatch.setenv("FLATPAK_ID", "io.github.streamselect.StreamSelect")
+    assert runtime_env.is_installed_build()
+    monkeypatch.delenv("FLATPAK_ID")
+    assert not runtime_env.is_installed_build()
 
 
 def test_manual_update_check_outside_flatpak_still_checks(monkeypatch) -> None:

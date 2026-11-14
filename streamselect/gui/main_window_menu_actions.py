@@ -184,6 +184,7 @@ class _MenuActionsMixin:
         )
         tips_action.triggered.connect(self.reset_tips)
         tools_menu.addAction(tips_action)
+        self._add_update_menu_items(tools_menu)
         tools_menu.addSeparator()
         for keep, text, tip in (
             (False, "Fresh start…",

@@ -612,6 +612,8 @@ VECTOR_KEYS: dict[str, str] = {
     # Save a VOD to disk PERMANENTLY — the tray, not a cloud: nothing here
     # comes from a service, and the file lands on the local library dir.
     "download": "mdi6.tray-arrow-down",
+    # Tools ▸ Software Update… — a newer version of the app itself, not media.
+    "software_update": "mdi6.package-up",
     # The Downloads section's "reveal in file manager" action, and the same
     # action in a row's context menu. An OPEN folder: the button reveals a
     # location rather than describing one, which is the distinction
