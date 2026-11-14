@@ -60,6 +60,11 @@ FINISHED = "finished"
 ALL = "all"
 
 
+def sub_indent() -> int:
+    """How far a sub-heading, and the rows under it, sit in from a section heading."""
+    return _theme.space_px(_theme.SPACE_LG)
+
+
 def _game_key(g: GameDTO) -> tuple:
     return (g.league, g.team_a, g.team_b, g.start_utc)
 
@@ -366,7 +371,7 @@ class SportsView(ContentView):
             self._layout.addWidget(self._header(key, self._day_label(gs[0].start_utc, now),
                                                 len(gs), foldable=True, sub=sub))
             if key not in folded:
-                self._time_groups(gs, playable=False, label_of=label_of)
+                self._time_groups(gs, playable=False, label_of=label_of, sub=sub)
 
     def _finished_section(self, prefix: str, finished: list, now: datetime, folded: set, *,
                           label_of: Optional[Callable] = None) -> None:
@@ -393,12 +398,22 @@ class SportsView(ContentView):
             self._layout.addWidget(self._header(sub, past_day_label(gs[0].start_utc, now), len(gs),
                                                 foldable=True, sub=True))
             if sub not in folded:
-                self._time_groups(gs, playable=True, today=today, label_of=label_of)
+                self._time_groups(gs, playable=True, today=today, label_of=label_of, sub=True)
 
     def _time_groups(self, games: list, *, playable: bool, today=None,
-                     label_of: Optional[Callable] = None) -> None:
+                     label_of: Optional[Callable] = None, sub: bool = False) -> None:
         """Rows grouped by start time, the time shown once per group, every other
-        group on a very faint tint (SV-Q45-Q47). *games* arrive in display order."""
+        group on a very faint tint (SV-Q45-Q47). *games* arrive in display order.
+
+        ``sub``: the rows sit under a sub-heading (Finished's days, a league's days)
+        and are indented with it (owner report 2026-11-14), by :func:`sub_indent`."""
+        host = self._layout
+        if sub:
+            box = QWidget()
+            host = QVBoxLayout(box)
+            host.setContentsMargins(sub_indent(), 0, 0, 0)
+            host.setSpacing(0)
+            self._layout.addWidget(box)
         groups: dict = {}
         for g in sorted(games, key=lambda g: (g.sport, g.league, g.title)):
             groups.setdefault(g.start_utc, []).append(g)
@@ -415,7 +430,7 @@ class SportsView(ContentView):
                 openable = today is None or to_local(g.start_utc).date() == today
                 self._game_row(g, col, first=j == 0, playable=playable, openable=openable,
                                label=label_of(g) if label_of else "")
-            self._layout.addWidget(group)
+            host.addWidget(group)
 
     def _message(self, headline: str, body: str) -> None:
         h = QLabel(headline)
@@ -456,7 +471,7 @@ class SportsView(ContentView):
             band.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             _theme.style(band, "SECTION_HEADER_TINT")
         h = QHBoxLayout(band)
-        h.setContentsMargins(22 if sub else 6, 3, 6, 3)
+        h.setContentsMargins(6 + (sub_indent() if sub else 0), 3, 6, 3)
         h.setSpacing(6)
         if foldable:
             caret = QLabel()

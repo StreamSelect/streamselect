@@ -1133,3 +1133,20 @@ def test_later_rows_read_away_at_home(games_db, qapp, owned_widgets):
     view._render()
     _settle(qapp)
     assert all(" at " in r.text() for r in view.rows)
+
+
+def test_rows_under_a_finished_day_sit_indented_with_its_heading(games_db, qapp, owned_widgets):
+    """Owner report, 2026-11-14: yesterday's game sat flush left, under Finished
+    rather than under its own "Yesterday" heading."""
+    from streamselect.gui.sports_view import sub_indent
+    view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=23))
+    view._toggle_fold("hockey:finished")
+    _settle(qapp)
+    day = next(k for k in view.headers if k.startswith("hockey:finished:"))
+    section_x = view.headers["hockey:finished"].mapTo(view, QPoint(0, 0)).x()
+    lines = _lines(view)
+    assert lines
+    assert all(ln.mapTo(view, QPoint(0, 0)).x() == section_x + sub_indent() for ln in lines)
+    day_heading = view.headers[day].findChild(GroupHeading).mapTo(view, QPoint(0, 0)).x()
+    section_heading = view.headers["hockey:finished"].findChild(GroupHeading).mapTo(view, QPoint(0, 0)).x()
+    assert day_heading - section_heading >= sub_indent(), "the heading moves in by the same step"
