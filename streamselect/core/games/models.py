@@ -29,6 +29,8 @@ class GameDB(Base):
     replay      = Column(Boolean, nullable=False, default=False)
     collections = Column(Integer, nullable=False)   # independent collections that agree
     found_at    = Column(DateTime, nullable=False, default=datetime.utcnow)
+    #: The home side (team_a or team_b) when the listings say "away @ / at home"; else NULL.
+    home_team   = Column(String)
 
     feeds = relationship("GameFeedDB", cascade="all, delete-orphan")
 

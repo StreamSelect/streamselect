@@ -148,4 +148,5 @@ COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("metadata",     "release_date",                  "TEXT"),
     ("channels",     "channel_key",                   "INTEGER"),  # DB-9
     ("channels",     "detected_exclusion_code",       "TEXT"),
+    ("games",        "home_team",                     "TEXT"),
 ]

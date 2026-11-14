@@ -24,7 +24,8 @@ from typing import Optional
 
 from streamselect.core.event_datetime import zone_label_to_utc
 from streamselect.core.games.listing_text import (
-    StatedTime, candidate_days, find_date, find_time, league_matcher, matchups, norm,
+    HOME_SECOND, StatedTime, candidate_days, find_date, find_time, league_matcher, matchups,
+    matchups_with_separator, norm,
 )
 from streamselect.core.games.teams import Side, TeamBook, team_display
 
@@ -132,6 +133,9 @@ class Game:
     replay: bool
     collections: int
     feeds: tuple[GameFeed, ...]
+    #: The home side's display name when the listings say "away @ / at home" and
+    #: none contradicts it; "" when no listing says (owner, 2026-11-14: "at" then).
+    home: str = ""
 
     @property
     def title(self) -> str:
@@ -158,6 +162,18 @@ def _title(pair: frozenset) -> str:
     return " vs ".join(sorted(team_display(t) for t in pair))
 
 
+def _home(g: dict) -> str:
+    """The home side's display name, when the game's listings that say "@" / "at"
+    all name the same one; "" when none says or two disagree."""
+    homes = set()
+    for L in [*g["timed"], *g["extra"]]:
+        for p in L.pairs:
+            if (p.get("home_second") and len(p["ra"]) == 1 and len(p["rb"]) == 1
+                    and frozenset((p["ra"][0], p["rb"][0])) == g["pair"]):
+                homes.add(p["rb"][0])
+    return team_display(homes.pop()) if len(homes) == 1 else ""
+
+
 def _pair_key(L: _L) -> Optional[frozenset]:
     if not L.pairs:
         return None
@@ -179,16 +195,16 @@ def _read(listings: list[ListingIn], book: TeamBook, league, now: datetime) -> l
     out = []
     for li in listings:
         u = norm(li.name)
-        ms = matchups(u, league)
+        ms = matchups_with_separator(u, league)
         if ms:   # a restatement of the first matchup in shorter words is not a second game
-            a0, b0 = ms[0]
-            ms = [ms[0]] + [(a, b) for a, b in ms[1:]
+            a0, b0, _ = ms[0]
+            ms = [ms[0]] + [(a, b, sep) for a, b, sep in ms[1:]
                             if not ((_shares(a, a0) and _shares(b, b0)) or (_shares(a, b0) and _shares(b, a0)))]
         pairs = []
-        for a, b in ms:
+        for a, b, sep in ms:
             ra, ka = book.resolve(a, li.seeded)
             rb, kb = book.resolve(b, li.seeded)
-            pairs.append({"ra": ra, "rb": rb, "ka": ka, "kb": kb})
+            pairs.append({"ra": ra, "rb": rb, "ka": ka, "kb": kb, "home_second": sep in HOME_SECOND})
         L = _L(li, u, pairs, find_date(u, now), find_time(u))
         if li.guide_utc is not None:
             L.utc, L.time_from = li.guide_utc, "guide"
@@ -433,7 +449,8 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
                      L.utc, L in g["timed"])
             for L in [*g["timed"], *g["extra"]])
         a, b = sorted(team_display(t) for t in g["pair"])
-        games.append(Game(settings.sport, settings.league, a, b, g["utc"], g["level"], g["replay"], g["colls"], feeds))
+        games.append(Game(settings.sport, settings.league, a, b, g["utc"], g["level"], g["replay"], g["colls"],
+                          feeds, home=_home(g)))
 
     confirmed = {k: {u for u in v if now - u <= settings.replay_within} for k, v in memory.confirmed.items()}
     for g in games:

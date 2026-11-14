@@ -115,7 +115,7 @@ def refresh_games(db: Database, now: datetime | None = None) -> dict[str, int]:
             for g in games:
                 row = GameDB(sport=g.sport, league=g.league, team_a=g.team_a, team_b=g.team_b,
                              start_utc=g.start_utc, level=g.level, replay=g.replay,
-                             collections=g.collections, found_at=now)
+                             collections=g.collections, found_at=now, home_team=g.home or None)
                 row.feeds = [GameFeedDB(channel_id=f.channel_id, source=f.source, collection=f.collection,
                                         name=f.name, from_guide=f.from_guide, time_from=f.time_from,
                                         start_utc=f.start_utc, counts=f.counts) for f in g.feeds]

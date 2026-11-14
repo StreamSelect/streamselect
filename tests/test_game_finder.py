@@ -150,3 +150,21 @@ def test_refresh_games_stores_games_and_replaces_them_on_the_next_run(db):
         assert s.query(GameFeedDB).count() == 9           # replaced, not appended
         memory = s.get(GameFinderMemoryDB, "hockey/NHL").memory
         assert any(src == "p2" and coll == "COLL CLOCK" for src, coll, *_ in memory["clock_samples"])
+
+
+def test_a_listing_that_says_at_or_at_sign_names_the_home_team():
+    """Owner, 2026-11-14: "if we have an AT or @ we should use AT rather than VS"."""
+    games, _, _ = find_games(_two_games(), NHL, NOW)
+    assert _game(games, "Buffalo Sabres").home == "Chicago Blackhawks"      # "Sabres @ Blackhawks"
+    assert _game(games, "Dallas Stars").home == "Dallas Stars"               # "Jets @ Stars"
+    worded = [ListingIn(li.source, li.collection, li.name.replace("Jets @ Stars", "Jets at Stars"),
+                        li.channel_id, li.guide_utc) for li in _two_games()]
+    games, _, _ = find_games(worded, NHL, NOW)
+    assert _game(games, "Dallas Stars").home == "Dallas Stars", "the word works like the sign"
+
+
+def test_listings_that_disagree_about_home_name_no_home_team():
+    listings = _two_games() + [
+        ListingIn("p3", "COLL OTHER", "NHL | 07 - 8pm Blackhawks @ Sabres", "o1")]
+    games, _, _ = find_games(listings, NHL, NOW)
+    assert _game(games, "Buffalo Sabres").home == ""

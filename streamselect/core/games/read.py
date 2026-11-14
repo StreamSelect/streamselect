@@ -89,6 +89,10 @@ class GameDTO:
     hidden: tuple[GameFeedDTO, ...] = ()
     #: When the user marked it finished (UTC), else None.
     ended_at: Optional[datetime] = None
+    #: The home side when the listings say "away @ / at home", else "".
+    home: str = ""
+    #: The league's own logo URL, as one of its channels carries it (SV-Q67), else "".
+    league_logo: str = ""
 
     @property
     def league_key(self) -> str:
@@ -97,7 +101,22 @@ class GameDTO:
 
     @property
     def title(self) -> str:
+        """The game's identity: alphabetical, "vs" — what alerts and reports key on."""
         return f"{self.team_a} vs {self.team_b}"
+
+    @property
+    def sides(self) -> tuple[str, str, str]:
+        """(first, joiner, second) as shown: "away at home" when a listing says so
+        (owner, 2026-11-14), else the alphabetical pair joined by "vs"."""
+        if self.home in (self.team_a, self.team_b):
+            away = self.team_b if self.home == self.team_a else self.team_a
+            return away, "at", self.home
+        return self.team_a, "vs", self.team_b
+
+    @property
+    def matchup(self) -> str:
+        """The one-line display title: "Seattle Kraken at Carolina Hurricanes"."""
+        return " ".join(self.sides)
 
     @property
     def playable(self) -> tuple[GameFeedDTO, ...]:
@@ -272,6 +291,21 @@ def load_watch_history(session) -> WatchHistory:
     return history
 
 
+def _league_logos(games, feed_rows, logos: dict[str, str]) -> dict[str, str]:
+    """league -> its own logo URL: a channel logo whose file is named for the league
+    ("…/NHL.png"). Most channel logos are a network's (ESPN, Viaplay), never used as
+    the league's mark. Found on any of its games, it serves them all (owner, SV-Q67)."""
+    league_of = {g.id: g.league for g in games}
+    found: dict[str, str] = {}
+    for f in feed_rows:
+        url, league = logos.get(f.channel_id), league_of.get(f.game_id)
+        if url and league and league not in found:
+            stem = url.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            if stem.casefold() == league.casefold():
+                found[league] = url
+    return found
+
+
 def load_games(session, sport: str, hidden_provider_ids: set[str],
                min_level: int = 1, max_level: int = 2) -> list[GameDTO]:
     """Stored games of *sport* at levels min..max, feeds of hidden sources removed.
@@ -286,10 +320,14 @@ def load_games(session, sport: str, hidden_provider_ids: set[str],
         return []
     feed_rows = session.execute(select(GameFeedDB).where(GameFeedDB.game_id.in_([g.id for g in rows]))
                                 .order_by(GameFeedDB.id)).scalars().all()
-    chan = {cid: rest for cid, *rest in session.execute(
-        select(ChannelDB.id, ChannelDB.provider_id, ChannelDB.category,
-               ChannelDB.detected_region, ChannelDB.detected_quality)
-        .where(ChannelDB.id.in_({f.channel_id for f in feed_rows if f.channel_id})))}
+    chan, logos = {}, {}
+    for cid, pid, cat, region, quality, logo in session.execute(
+            select(ChannelDB.id, ChannelDB.provider_id, ChannelDB.category,
+                   ChannelDB.detected_region, ChannelDB.detected_quality, ChannelDB.logo_url)
+            .where(ChannelDB.id.in_({f.channel_id for f in feed_rows if f.channel_id}))):
+        chan[cid] = (pid, cat, region, quality)
+        if logo and pid not in hidden_provider_ids:
+            logos[cid] = logo
     # What the stream itself measured outranks the name's claim, as in the details
     # pane's Versions (PLAYED-3): a played 1080p channel reads FHD, with the mark.
     measured = StreamInfoRepository(session).get_many(list(chan))
@@ -313,11 +351,13 @@ def load_games(session, sport: str, hidden_provider_ids: set[str],
         feeds[gid] = [f for f in fs if not f.channel_id or not (f.channel_id in seen or seen.add(f.channel_id))]
     ends = {(e.league_key, e.team_a, e.team_b, e.start_utc): e.ended_at
             for e in session.execute(select(GameEndDB)).scalars()}
+    league_logos = _league_logos(rows, feed_rows, logos)
     out = []
     for g in rows:
         dto = GameDTO(g.id, g.sport, g.league, g.team_a, g.team_b, g.start_utc, g.level,
                       g.replay, g.collections, tuple(feeds.get(g.id, ())),
-                      ended_at=ends.get((f"{g.sport}/{g.league}", g.team_a, g.team_b, g.start_utc)))
+                      ended_at=ends.get((f"{g.sport}/{g.league}", g.team_a, g.team_b, g.start_utc)),
+                      home=g.home_team or "", league_logo=league_logos.get(g.league, ""))
         if dto.playable:
             out.append(dto)
     return out

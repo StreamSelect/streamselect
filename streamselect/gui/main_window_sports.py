@@ -18,7 +18,8 @@ class _SportsViewMixin:
     def _ensure_sports_view(self) -> SportsView:
         view = self.__dict__.get("sports_view")
         if view is None:
-            view = self.sports_view = SportsView(self.db, self.config, self._run_query, self)
+            view = self.sports_view = SportsView(self.db, self.config, self._run_query, self,
+                                                 image_cache=self.image_cache)
             view.playRequested.connect(self.play_channel_by_id)
             view.channelSelected.connect(self.show_channel_details_by_id)
             # The card's "Hide this channel everywhere…" is the app's own Hide.

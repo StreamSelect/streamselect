@@ -23,6 +23,7 @@ from datetime import datetime
 from typing import Optional
 
 from PyQt6.QtCore import QPoint, Qt, pyqtSignal
+from PyQt6.QtGui import QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMenu, QPushButton, QSizePolicy,
     QVBoxLayout, QWidget,
@@ -425,6 +426,58 @@ class GameLine(QWidget):
         super().leaveEvent(event)
 
 
+class MatchupTitle(QWidget):
+    """A card's title: one side, a small "—— vs ——" (or "at"), the other side, centred
+    (Sports Desk SV-Q61-Q65). Each side keeps its name whole on its own line, so
+    every card is the same height. An alerted game reads like a watch-list match
+    in the guide (SV-Q51); the ringing bell is the signal that isn't colour.
+    """
+
+    def __init__(self, game: GameDTO, *, alerted: bool, parent=None):
+        super().__init__(parent)
+        first, joiner, second = game.sides
+        col = QVBoxLayout(self)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+        self.sides = []
+        for text in (first, None, second):
+            if text is None:
+                col.addWidget(self._joiner(joiner))
+                continue
+            side = QLabel(text)
+            side.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+            side.setWordWrap(True)
+            side.setProperty("alerted", "true" if alerted else "false")
+            _theme.style(side, "GAME_CARD_TITLE")
+            col.addWidget(side)
+            self.sides.append(side)
+
+    @staticmethod
+    def _joiner(word: str) -> QWidget:
+        """"—— vs ——": the joining word between two short rules."""
+        mid = QWidget()
+        h = QHBoxLayout(mid)
+        h.setContentsMargins(0, 1, 0, 1)
+        h.setSpacing(6)
+        h.addStretch(1)
+        for part in ("rule", word, "rule"):
+            if part == "rule":
+                rule = QWidget()
+                rule.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+                rule.setFixedSize(22, 1)
+                _theme.style(rule, "FOOTER_DIVIDER")
+                h.addWidget(rule, 0, Qt.AlignmentFlag.AlignVCenter)
+            else:
+                label = QLabel(part)
+                _theme.style(label, "TEXT_SM_MUTED")
+                h.addWidget(label)
+        h.addStretch(1)
+        return mid
+
+    def text(self) -> str:
+        return " ".join(s.text() for s in self.sides)
+
+
 class GameCard(QFrame):
     """A game on now (or about to start): see the module docstring."""
 
@@ -437,9 +490,11 @@ class GameCard(QFrame):
     def __init__(self, game: GameDTO, state: str, now: datetime, usual_length, *,
                  expanded: bool = False, playing_id: Optional[str] = None,
                  channels: Optional[ChannelList] = None, alerts: Optional[list] = None,
-                 meta: str = "", parent=None):
+                 meta: str = "", league_logo: Optional[QPixmap] = None, parent=None):
         super().__init__(parent)
         self.game = game
+        #: The league's logo, drawn barely there behind the matchup (SV-Q66/Q67).
+        self.league_logo = league_logo
         self.state = state
         self.setObjectName("gameCard")
         self.setProperty("selected", "true" if expanded else "false")
@@ -476,12 +531,7 @@ class GameCard(QFrame):
         top.addWidget(self.bell)
         lay.addLayout(top)
 
-        self.title = QLabel(game.title)
-        self.title.setWordWrap(True)
-        # An alerted game reads like a watch-list match in the guide (SV-Q51);
-        # the ringing bell above is the signal that isn't colour.
-        self.title.setProperty("alerted", "true" if self.bell.covering else "false")
-        _theme.style(self.title, "GAME_CARD_TITLE")
+        self.title = MatchupTitle(game, alerted=self.bell.covering)
         lay.addWidget(self.title)
         if live:
             stop = game.start_utc + usual_length
@@ -568,6 +618,21 @@ class GameCard(QFrame):
     def _play_top(self) -> None:
         if self.top_feed is not None and self.top_feed.channel_id and self.state != UPCOMING:
             self.play.emit(self.top_feed.channel_id)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        """The card itself, then the league's logo, barely there, centred on the
+        matchup (SV-Q66); the children paint over it."""
+        super().paintEvent(event)
+        if self.league_logo is None or self.league_logo.isNull():
+            return
+        side = min(_theme.LEAGUE_MARK_PX, int(self.height() * 0.8))
+        logo = self.league_logo.scaled(side, side, Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation)
+        centre = self.title.geometry().center()
+        painter = QPainter(self)
+        painter.setOpacity(_theme.LEAGUE_MARK_OPACITY)
+        painter.drawPixmap(centre.x() - logo.width() // 2, centre.y() - logo.height() // 2, logo)
+        painter.end()
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 (Qt API)
         self._play_top()

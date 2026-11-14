@@ -85,9 +85,12 @@ class SportsView(ContentView):
     alertsChanged = pyqtSignal()              # a bell added or removed a rule: Watch Alerts re-reads
 
     def __init__(self, db, config, run_query: Callable, parent=None, *,
-                 clock: Callable[[], datetime] = now_utc):
+                 clock: Callable[[], datetime] = now_utc, image_cache=None):
         super().__init__(config, parent)
         self._clock = clock
+        #: The app's image cache, for the league logo behind a card (None in tests: no logo).
+        self._images = image_cache
+        self._logo_waits: set[str] = set()
         self._db = db
         self._run_query = run_query
         self._token: list[int] = [0]
@@ -346,7 +349,7 @@ class SportsView(ContentView):
                 self._layout.addWidget(grid_host)
         else:
             nxt = min(later, key=lambda g: g.start_utc) if later else None
-            self._message(empty, f"Next: {nxt.title}, {self._day_label(nxt.start_utc, now).split(' · ')[0]}"
+            self._message(empty, f"Next: {nxt.matchup}, {self._day_label(nxt.start_utc, now).split(' · ')[0]}"
                                  f" at {fmt_time(nxt.start_utc)}." if nxt else "No games are listed yet.")
 
     @staticmethod
@@ -529,7 +532,8 @@ class SportsView(ContentView):
         channels = self._channel_list(g) if expanded else None
         card = GameCard(g, state, now, self.sports[g.sport].usual_length, expanded=expanded,
                         playing_id=self._playing, channels=channels,
-                        alerts=alerts_for(g, self._alerts), meta=meta)
+                        alerts=alerts_for(g, self._alerts), meta=meta,
+                        league_logo=self._league_logo(g.league_logo))
         card.bell.toggled_rule.connect(self._set_alert)
         card.play.connect(self.playRequested)
         card.toggled.connect(self._toggle_open)
@@ -538,6 +542,22 @@ class SportsView(ContentView):
         card.unreportRequested.connect(self._unreport)
         self.cards.append(card)
         return card
+
+    def _league_logo(self, url: str):
+        """The league logo if the cache holds it; else ask once and redraw when it lands.
+        Never disk or network on this thread (``get_image_resident``)."""
+        if not url or self._images is None:
+            return None
+        pixmap = self._images.get_image_resident(url)
+        if pixmap is None and url not in self._logo_waits:
+            self._logo_waits.add(url)
+            self._images.subscribe(url, self._on_logo_loaded)
+            self._images.get_image_async(url)
+        return pixmap
+
+    def _on_logo_loaded(self, _url: str, _pixmap) -> None:
+        if self.isVisible():
+            self._render()
 
     def _channel_list(self, g: GameDTO) -> ChannelList:
         lst = ChannelList(g, preferred_key=self._prefs(g.league_key).get("preferred"),
@@ -570,14 +590,14 @@ class SportsView(ContentView):
         bell.toggled_rule.connect(self._set_alert)
         alerted = bell.covering and not playable
         if openable:
-            row = QPushButton(g.title)
+            row = QPushButton(g.matchup)
             row.setProperty("alerted", "true" if alerted else "false")
             _theme.style(row, "GAME_FEED_ROW")
             row.setToolTip(f"{when} · " + ("Collapse its channel list" if is_open
                                            else "List every channel that will show this game"))
             row.clicked.connect(lambda _=False, game=g: self._toggle_open(game))
         else:
-            row = QLabel(g.title)
+            row = QLabel(g.matchup)
             _theme.style(row, "GAME_ROW_PAST")
             row.setToolTip(f"{when} · Finished on an earlier day")
         row.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)

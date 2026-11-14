@@ -1,7 +1,7 @@
 """Reading one listing's text: matchup sides, a date, a time and its zone label.
 
 General formats only — what a date, a clock time or a zone label looks like,
-and the words that join two sides (vs, v, @, x, " - "). No source, collection
+and the words that join two sides (vs, v, @, at, x, " - "). No source, collection
 or channel name appears here; team names are learned elsewhere
 (:mod:`streamselect.core.games.teams`) from what this module reads.
 """
@@ -41,8 +41,10 @@ _WW = _alternation(WEEKDAY_WORD)
 _ZONE_RE = _alternation(ZONE_LABELS)
 _TIME_RE = re.compile(
     r"(?<![\d:.])(\d{1,2})(?::(\d{2}))?(?::\d{2})?\s*(AM|PM|A\.M\.|P\.M\.)?(?![\d])")
-_SEPARATORS = ("VS", "V", "@", "X", "-")   # tried in this order within a segment
-_SIDE_SPLIT_RE = re.compile(r"\s+(VS\.?|V|@|X|-)\s+")
+_SEPARATORS = ("VS", "V", "@", "X", "-", "AT")   # tried in this order within a segment
+#: "Away @ Home" / "Away at Home": the side after it is the home team.
+HOME_SECOND = ("@", "AT")
+_SIDE_SPLIT_RE = re.compile(r"\s+(VS\.?|V|@|X|-|AT)\s+")
 _CLOCK_IN_SIDE_RE = re.compile(r"\d{1,2}(:\d{2}){1,2}\s*(AM|PM)?|\d{1,2}\s*(AM|PM)(?![A-Z])")
 _STRIP_WORDS = set(MONTH_WORD) | set(WEEKDAY_WORD) | {"AM", "PM"} | set(ZONE_LABELS)
 
@@ -175,7 +177,13 @@ def clean_side(part: str, league: re.Pattern[str]) -> Optional[Side]:
 
 def matchups(u: str, league: re.Pattern[str]) -> list[tuple[Side, Side]]:
     """Every (side A, side B) a normalised name states, at most one per segment."""
-    out: list[tuple[Side, Side]] = []
+    return [(a, b) for a, b, _sep in matchups_with_separator(u, league)]
+
+
+def matchups_with_separator(u: str, league: re.Pattern[str]) -> list[tuple[Side, Side, str]]:
+    """:func:`matchups`, each with the word that joined it ("VS", "@", "AT"…): an
+    "@" or "AT" says the second side is at home (:data:`HOME_SECOND`)."""
+    out: list[tuple[Side, Side, str]] = []
     for seg in segments(u):
         parts = _SIDE_SPLIT_RE.split(" " + seg + " ")
         for sep in _SEPARATORS:
@@ -185,7 +193,7 @@ def matchups(u: str, league: re.Pattern[str]) -> list[tuple[Side, Side]]:
                     continue
                 a, b = clean_side(parts[i - 1], league), clean_side(parts[i + 1], league)
                 if a and b:
-                    hit = (a, b)
+                    hit = (a, b, sep)
                     break
             if hit:
                 out.append(hit)

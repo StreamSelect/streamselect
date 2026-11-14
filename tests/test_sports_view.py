@@ -1061,3 +1061,75 @@ def test_a_channel_measured_while_playing_shows_its_measured_quality(games_db, q
     chip = next(b for b in row.findChildren(QPushButton) if b.text() == "FHD")
     assert not chip.icon().isNull(), "the measured mark"
     assert chip.toolTip().startswith("Measured while playing")
+
+
+def test_a_game_reads_away_at_home_only_when_a_listing_says_so():
+    g = GameDTO(1, "hockey", "NHL", "Carolina Hurricanes", "Seattle Kraken", START, 1, False, 2, ())
+    assert g.sides == ("Carolina Hurricanes", "vs", "Seattle Kraken")
+    home = replace_game(g, home="Carolina Hurricanes")
+    assert home.sides == ("Seattle Kraken", "at", "Carolina Hurricanes")
+    assert home.matchup == "Seattle Kraken at Carolina Hurricanes"
+    assert home.title == g.title, "identity (alerts, reports) keeps the alphabetical pair"
+
+
+def replace_game(g, **kw):
+    from dataclasses import replace
+    return replace(g, **kw)
+
+
+def test_a_card_stacks_the_two_sides_centred_with_the_joiner_between(qapp, owned_widgets):
+    """Owner, 2026-11-14 (SV-Q61-Q65): one team per line, centred, "—— vs ——"."""
+    from streamselect.gui.game_card import GameCard
+    feed = GameFeedDTO("c1", "One", "C", False, "clock", "p", "C1", "US", "")
+    g = GameDTO(1, "hockey", "NHL", "Columbus Blue Jackets", "Philadelphia Flyers", START, 1, False, 2,
+                (feed,), home="Columbus Blue Jackets")
+    card = owned_widgets.own(GameCard(g, ON_NOW, LIVE_AT, HOCKEY.usual_length))
+    card.show()
+    qapp.processEvents()
+    first, second = card.title.sides
+    assert (first.text(), second.text()) == ("Philadelphia Flyers", "Columbus Blue Jackets")
+    words = [lb.text() for lb in card.title.findChildren(QLabel) if lb not in card.title.sides]
+    assert words == ["at"]
+
+    image = card.grab().toImage()
+    bg = QColor(image.pixel(card.width() // 2, 4))
+
+    def ink_span(label):      # leftmost and rightmost painted text column in the label's band
+        top = label.mapTo(card, QPoint(0, 0)).y()
+        xs = [x for y in range(top, top + label.height()) for x in range(4, image.width() - 4)
+              if abs(QColor(image.pixel(x, y)).lightness() - bg.lightness()) > 60]
+        return min(xs), max(xs)
+    (l1, r1), (l2, r2) = ink_span(first), ink_span(second)
+    assert l1 != l2, "different lengths, so a left-aligned pair would start together"
+    assert abs((l1 + r1) - (l2 + r2)) <= 4, "both lines share one centre"
+    assert abs((l1 + r1) // 2 - card.width() // 2) <= 8, "centred on the card"
+    assert first.mapTo(card, QPoint(0, 0)).y() < second.mapTo(card, QPoint(0, 0)).y()
+
+
+def test_the_league_logo_is_painted_barely_there_behind_the_card(qapp, owned_widgets):
+    from PyQt6.QtGui import QPixmap
+    from streamselect.gui import theme
+    from streamselect.gui.game_card import GameCard
+    feed = GameFeedDTO("c1", "One", "C", False, "clock", "p", "C1", "US", "")
+    g = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 2, (feed,))
+    logo = QPixmap(100, 100)
+    logo.fill(QColor("#ff0000"))
+    plain = owned_widgets.own(GameCard(g, ON_NOW, LIVE_AT, HOCKEY.usual_length))
+    marked = owned_widgets.own(GameCard(g, ON_NOW, LIVE_AT, HOCKEY.usual_length, league_logo=logo))
+    for c in (plain, marked):
+        c.show()
+    qapp.processEvents()
+    x = marked.title.geometry().center().x() - 45     # inside the logo, on bare card
+    y = marked.title.geometry().top() - 4
+    a, b = QColor(plain.grab().toImage().pixel(x, y)), QColor(marked.grab().toImage().pixel(x, y))
+    assert b.red() > a.red(), "the logo is drawn"
+    assert b.red() - a.red() <= 255 * theme.LEAGUE_MARK_OPACITY + 3, "barely: the theme's strength"
+
+
+def test_later_rows_read_away_at_home(games_db, qapp, owned_widgets):
+    from dataclasses import replace
+    view = _later_view(games_db, qapp, owned_widgets)
+    view._raw = [replace(g, home=g.team_a) for g in view._raw]
+    view._render()
+    _settle(qapp)
+    assert all(" at " in r.text() for r in view.rows)

@@ -128,3 +128,10 @@ def radius_px(token: str) -> int:
 # progress) it is a hairline that must not become the thing you look at.
 PROGRESS_H = "8px"
 PROGRESS_H_THIN = "4px"
+
+# The league's logo behind a Sports game card (Sports Desk SV-Q66): barely
+# there, a mark you notice only when you look for it. 6% was distracting and 2%
+# vanished on the dark palettes (owner, 2026-11-14, chose 4%). The size is the
+# closed card's, so a tall open card doesn't get a huge one.
+LEAGUE_MARK_OPACITY = 0.04
+LEAGUE_MARK_PX = 120

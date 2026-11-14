@@ -59,7 +59,7 @@ from streamselect.gui.token_color import to_qcolor
 # the type scale. See tokens/scales.py, in particular why a PILL cannot be
 # a radius step.
 from streamselect.gui.tokens.scales import (  # noqa: F401
-    PROGRESS_H, PROGRESS_H_THIN,
+    LEAGUE_MARK_OPACITY, LEAGUE_MARK_PX, PROGRESS_H, PROGRESS_H_THIN,
     RADIUS_LG, RADIUS_MD, RADIUS_NONE, RADIUS_SM,
     SPACE_LG, SPACE_MD, SPACE_NONE, SPACE_SM, SPACE_XS,
     radius_px, space_px, zoomed_font,
