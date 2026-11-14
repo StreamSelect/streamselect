@@ -388,12 +388,15 @@ class PlayLine(QFrame):
         super().mousePressEvent(event)
 
 
-def time_column_width(label: QLabel) -> int:
-    """The time column's width: the widest clock time of the day in *label*'s font,
-    so the column never moves with the games listed (SV-Q45)."""
+def time_column_width(label: QLabel, times: Optional[list] = None) -> int:
+    """The time column's width in *label*'s font: the widest clock time of the day,
+    so the column never moves with the games listed (SV-Q45) — or, given *times*,
+    the widest of those (a list under a sub-heading, whose times line up under the
+    heading's words)."""
     label.ensurePolished()
     fm = label.fontMetrics()
-    return max(fm.horizontalAdvance(fmt_time(datetime(2026, 1, 1, h, 55))) for h in range(24)) + 4
+    texts = times or [fmt_time(datetime(2026, 1, 1, h, 55)) for h in range(24)]
+    return max(fm.horizontalAdvance(t) for t in texts) + 4
 
 
 class GameLine(QWidget):
@@ -403,13 +406,13 @@ class GameLine(QWidget):
     own time, muted, in its empty cell (SV-Q46); its tooltip carries the time too.
     """
 
-    def __init__(self, when: str, *, first: bool, parent=None):
+    def __init__(self, when: str, *, first: bool, times: Optional[list] = None, parent=None):
         super().__init__(parent)
         self._when, self._first = when, first
         self.time = QLabel(when if first else "")
         self.time.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         _theme.style(self.time, "GAME_TIME" if first else "GAME_TIME_ECHO")
-        self.time.setFixedWidth(time_column_width(self.time))
+        self.time.setFixedWidth(time_column_width(self.time, times))
         self.row_layout = QHBoxLayout(self)
         self.row_layout.setContentsMargins(0, 0, 0, 0)
         self.row_layout.setSpacing(4)

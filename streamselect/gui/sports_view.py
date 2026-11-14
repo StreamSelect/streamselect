@@ -130,6 +130,7 @@ class SportsView(ContentView):
         self.cards: list[GameCard] = []
         self.rows: list[QWidget] = []          # a QPushButton, or a QLabel for an earlier day's finished game
         self.headers: dict[str, QWidget] = {}
+        self._sub_text_x = 0            # set by each sub-heading; its rows line up under its words
         self._render()          # "Loading games…" until the first read comes back
 
     # ── remembered state ───────────────────────────────────────────────────
@@ -406,12 +407,14 @@ class SportsView(ContentView):
         group on a very faint tint (SV-Q45-Q47). *games* arrive in display order.
 
         ``sub``: the rows sit under a sub-heading (Finished's days, a league's days)
-        and are indented with it (owner report 2026-11-14), by :func:`sub_indent`."""
+        and line up under its TEXT (owner report 2026-11-14), measured off the
+        heading just built rather than summed from its margins."""
         host = self._layout
+        times = sorted({fmt_time(g.start_utc) for g in games}) if sub else None
         if sub:
             box = QWidget()
             host = QVBoxLayout(box)
-            host.setContentsMargins(sub_indent(), 0, 0, 0)
+            host.setContentsMargins(self._sub_text_x, 0, 0, 0)
             host.setSpacing(0)
             self._layout.addWidget(box)
         groups: dict = {}
@@ -429,7 +432,7 @@ class SportsView(ContentView):
             for j, g in enumerate(groups[start]):
                 openable = today is None or to_local(g.start_utc).date() == today
                 self._game_row(g, col, first=j == 0, playable=playable, openable=openable,
-                               label=label_of(g) if label_of else "")
+                               label=label_of(g) if label_of else "", times=times)
             host.addWidget(group)
 
     def _message(self, headline: str, body: str) -> None:
@@ -479,6 +482,12 @@ class SportsView(ContentView):
             h.addWidget(caret)
         heading = GroupHeading(label, count, tooltip=tip)
         h.addWidget(heading, 1)
+        if sub:
+            # Where this heading's words start: the rows beneath line up there.
+            band.resize(max(band.sizeHint().width(), 400), band.sizeHint().height())
+            h.activate()
+            heading.layout().activate()
+            self._sub_text_x = heading.x() + heading.label.x()
         if controls is not None:
             h.addWidget(controls)
         self.headers[key] = band
@@ -589,7 +598,7 @@ class SportsView(ContentView):
         return lst
 
     def _game_row(self, g: GameDTO, into: QVBoxLayout, *, first: bool, playable: bool,
-                  openable: bool = True, label: str = "") -> None:
+                  openable: bool = True, label: str = "", times: Optional[list] = None) -> None:
         """A later or finished game: one line in its start-time group; click opens its
         channel list beneath it (SV-Q23).
 
@@ -616,7 +625,7 @@ class SportsView(ContentView):
             _theme.style(row, "GAME_ROW_PAST")
             row.setToolTip(f"{when} · Finished on an earlier day")
         row.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        line = GameLine(when, first=first)
+        line = GameLine(when, first=first, times=times)
         h = line.row_layout
         h.addWidget(row, 1)
         if label:

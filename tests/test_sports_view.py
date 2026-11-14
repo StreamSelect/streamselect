@@ -1135,18 +1135,31 @@ def test_later_rows_read_away_at_home(games_db, qapp, owned_widgets):
     assert all(" at " in r.text() for r in view.rows)
 
 
-def test_rows_under_a_finished_day_sit_indented_with_its_heading(games_db, qapp, owned_widgets):
-    """Owner report, 2026-11-14: yesterday's game sat flush left, under Finished
-    rather than under its own "Yesterday" heading."""
-    from streamselect.gui.sports_view import sub_indent
+def test_rows_under_a_finished_day_line_up_under_its_heading_text(games_db, qapp, owned_widgets):
+    """Owner reports, 2026-11-14: yesterday's game sat flush left under Finished, then
+    one step in but still not under the word "Yesterday"."""
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=23))
     view._toggle_fold("hockey:finished")
     _settle(qapp)
     day = next(k for k in view.headers if k.startswith("hockey:finished:"))
-    section_x = view.headers["hockey:finished"].mapTo(view, QPoint(0, 0)).x()
+    words = view.headers[day].findChild(GroupHeading).label
+    words_x = words.mapTo(view, QPoint(0, 0)).x()
     lines = _lines(view)
     assert lines
-    assert all(ln.mapTo(view, QPoint(0, 0)).x() == section_x + sub_indent() for ln in lines)
-    day_heading = view.headers[day].findChild(GroupHeading).mapTo(view, QPoint(0, 0)).x()
-    section_heading = view.headers["hockey:finished"].findChild(GroupHeading).mapTo(view, QPoint(0, 0)).x()
-    assert day_heading - section_heading >= sub_indent(), "the heading moves in by the same step"
+    first = next(ln for ln in lines if ln.time.text())
+    # The painted time itself starts under the heading's first letter (both measured as ink).
+    assert abs(_ink_x(first.time, view) - _ink_x(words, view)) <= 2, (
+        _ink_x(first.time, view), _ink_x(words, view))
+
+
+def _ink_x(label, view) -> int:
+    """Where a label's painted text starts, read off the VIEW's image (a lone
+    label's grab has no background to compare against)."""
+    image = view.grab().toImage()
+    top = label.mapTo(view, QPoint(0, 0))
+    bg = QColor(image.pixel(top.x() - 2, top.y() + label.height() // 2))
+    for x in range(top.x(), top.x() + label.width()):
+        if any(abs(QColor(image.pixel(x, y)).lightness() - bg.lightness()) > 30
+               for y in range(top.y(), top.y() + label.height())):
+            return x
+    raise AssertionError("no text drawn")
