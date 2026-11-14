@@ -6,13 +6,15 @@ icon button factory — so nothing here draws its own copy of something the app
 already draws.
 
 * A card: LIVE or the start time · title · progress bar (times in its tooltip)
-  · league · the play line "▶ [US] STATION" (one click plays) with a live-mark
+  · the league only where the header doesn't say it · the play line "▶ [US] STATION" (one click plays) with a live-mark
   "+N" chip that opens the card. Double-click anywhere plays the same channel.
 * An open card lists every channel: click a name to play it; a PREFERRED chip
   (solid on your pick, dashed on a hovered row) and an eye (hide, on hover)
   are the only controls. Hidden channels are counted, never silently gone.
 * While a channel plays, the top line reads PLAYING in green and the row is
   marked where it is; the list never reorders under the cursor.
+* A later or finished game is a ``GameLine`` in a start-time group: a fixed
+  time cell, then the row (The Sports Desk rev 5, SV-Q44-Q52).
 """
 
 from __future__ import annotations
@@ -334,6 +336,44 @@ class PlayLine(QFrame):
         super().mousePressEvent(event)
 
 
+def time_column_width(label: QLabel) -> int:
+    """The time column's width: the widest clock time of the day in *label*'s font,
+    so the column never moves with the games listed (SV-Q45)."""
+    label.ensurePolished()
+    fm = label.fontMetrics()
+    return max(fm.horizontalAdvance(fmt_time(datetime(2026, 1, 1, h, 55))) for h in range(24)) + 4
+
+
+class GameLine(QWidget):
+    """One later or finished game in a start-time group: a fixed time cell, then its row.
+
+    Only a group's first line shows the time. Hovering any other line shows its
+    own time, muted, in its empty cell (SV-Q46); its tooltip carries the time too.
+    """
+
+    def __init__(self, when: str, *, first: bool, parent=None):
+        super().__init__(parent)
+        self._when, self._first = when, first
+        self.time = QLabel(when if first else "")
+        self.time.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        _theme.style(self.time, "GAME_TIME" if first else "GAME_TIME_ECHO")
+        self.time.setFixedWidth(time_column_width(self.time))
+        self.row_layout = QHBoxLayout(self)
+        self.row_layout.setContentsMargins(0, 0, 0, 0)
+        self.row_layout.setSpacing(4)
+        self.row_layout.addWidget(self.time)
+
+    def enterEvent(self, event) -> None:
+        if not self._first:
+            self.time.setText(self._when)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if not self._first:
+            self.time.setText("")
+        super().leaveEvent(event)
+
+
 class GameCard(QFrame):
     """A game on now (or about to start): see the module docstring."""
 
@@ -345,7 +385,8 @@ class GameCard(QFrame):
 
     def __init__(self, game: GameDTO, state: str, now: datetime, usual_length, *,
                  expanded: bool = False, playing_id: Optional[str] = None,
-                 channels: Optional[ChannelList] = None, alerts: Optional[list] = None, parent=None):
+                 channels: Optional[ChannelList] = None, alerts: Optional[list] = None,
+                 meta: str = "", parent=None):
         super().__init__(parent)
         self.game = game
         self.state = state
@@ -386,7 +427,10 @@ class GameCard(QFrame):
 
         self.title = QLabel(game.title)
         self.title.setWordWrap(True)
-        _theme.style(self.title, "PANEL_HEADLINE")
+        # An alerted game reads like a watch-list match in the guide (SV-Q51);
+        # the ringing bell above is the signal that isn't colour.
+        self.title.setProperty("alerted", "true" if self.bell.covering else "false")
+        _theme.style(self.title, "GAME_CARD_TITLE")
         lay.addWidget(self.title)
         if live:
             stop = game.start_utc + usual_length
@@ -395,9 +439,13 @@ class GameCard(QFrame):
             lay.addWidget(self.bar)
         else:
             self.bar = None
-        league = QLabel(game.league)
-        _theme.style(league, "TEXT_SM_MUTED")
-        lay.addWidget(league)
+        # The sport header already names a lone league (SV-Q48): ``meta`` is the
+        # league only where a sport has several, or "Sport · League" in By time.
+        self.meta = None
+        if meta:
+            self.meta = QLabel(meta)
+            _theme.style(self.meta, "TEXT_SM_MUTED")
+            lay.addWidget(self.meta)
 
         # The play line: what a click (or a double-click on the card) plays.
         playing = next((f for f in game.playable if f.channel_id == playing_id), None)

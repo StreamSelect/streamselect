@@ -837,3 +837,137 @@ def test_the_notifier_shows_the_notice_with_play_on_the_cards_channel(games_db, 
     [(label, play)] = kw["actions"]
     play()
     assert label == "Play" and played == ["a1"]
+
+
+# ── the games list, rev 5 (SV-Q44-Q52) ────────────────────────────────────
+
+def _later_view(games_db, qapp, owned_widgets, *, shift=None, league=None):
+    """Both seeded games still to come; optionally move the second an hour later
+    (a second start-time group) or into another league."""
+    from dataclasses import replace
+    view = _view(games_db, qapp, owned_widgets, START - timedelta(minutes=30))
+    if shift or league:
+        a, b = sorted(view._raw, key=lambda g: g.title)
+        b = replace(b, start_utc=b.start_utc + (shift or timedelta()), league=league or b.league)
+        view._raw = [a, b]
+        view._render()
+        _settle(qapp)
+    return view
+
+
+def _lines(view):
+    from streamselect.gui.game_card import GameLine
+    return [r.parentWidget() for r in view.rows if isinstance(r.parentWidget(), GameLine)]
+
+
+def test_a_start_time_is_shown_once_and_every_title_starts_at_the_same_x(games_db, qapp, owned_widgets):
+    view = _later_view(games_db, qapp, owned_widgets)
+    lines = _lines(view)
+    assert len(lines) == 2
+    assert [ln.time.text() for ln in lines] == [lines[0]._when, ""], "one time for the group"
+    xs = {r.mapTo(view, QPoint(0, 0)).x() for r in view.rows}
+    assert len(xs) == 1, f"titles start together: {xs}"
+    assert all(ln.time.width() > 0 and ln.time.width() == lines[0].time.width() for ln in lines)
+    assert all(" · NHL" not in r.text() and r.text() == r.text().strip() for r in view.rows), (
+        "a row is the title alone: the sport header names the league")
+
+
+def test_hovering_a_row_shows_its_own_time_muted_in_its_empty_cell(games_db, qapp, owned_widgets):
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QEnterEvent
+    from streamselect.gui import theme
+    view = _later_view(games_db, qapp, owned_widgets)
+    second = _lines(view)[1]
+    QApplication = type(qapp)
+    QApplication.sendEvent(second, QEnterEvent(QPointF(5, 5), QPointF(5, 5), QPointF(5, 5)))
+    assert second.time.text() == second._when
+    assert _paints(second.time, QColor(theme.COLOR_MUTED_2), tol=12), "muted, not the group's time"
+    assert not _paints(second.time, QColor(theme.COLOR_TEXT), tol=6)
+    QApplication.sendEvent(second, QEvent(QEvent.Type.Leave))
+    assert second.time.text() == ""
+    assert second._when in view.rows[1].toolTip(), "the tooltip carries the time too"
+
+
+def test_every_other_start_time_group_is_faintly_tinted(games_db, qapp, owned_widgets):
+    view = _later_view(games_db, qapp, owned_widgets, shift=timedelta(hours=1))
+    lines = _lines(view)
+    assert [bool(ln.time.text()) for ln in lines] == [True, True], "two groups, a time each"
+    from collections import Counter
+
+    def fill(widget) -> QColor:          # the colour most of the widget is painted
+        image = view.grab(widget.geometry().translated(widget.parentWidget().mapTo(view, QPoint(0, 0))))
+        image = image.toImage()
+        return QColor(Counter(image.pixel(x, y) for x in range(0, image.width(), 3)
+                              for y in range(image.height())).most_common(1)[0][0])
+    groups = [ln.parentWidget() for ln in lines]
+    shade = [fill(g) for g in groups]
+    header = view.headers[next(k for k in view.headers if ":day:" in k)]
+    band = fill(header)
+    assert shade[0].rgb() != shade[1].rgb(), "the second group is tinted"
+    def apart(a: QColor, b: QColor) -> int:
+        return abs(a.red() - b.red()) + abs(a.green() - b.green()) + abs(a.blue() - b.blue())
+    assert 0 < apart(shade[1], shade[0]) < apart(band, shade[0]), (
+        f"fainter than a header band: {shade[0].name()} {shade[1].name()} {band.name()}")
+
+
+def test_the_day_header_says_today(games_db, qapp, owned_widgets):
+    view = _later_view(games_db, qapp, owned_widgets)
+    key = next(k for k in view.headers if ":day:" in k)
+    assert view.headers[key].findChild(GroupHeading).label.text().startswith("Today")
+
+
+def test_a_lone_leagues_card_has_no_league_line(games_db, qapp, owned_widgets):
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    assert view.cards and all(c.meta is None for c in view.cards)
+    assert not [lb for c in view.cards for lb in c.findChildren(QLabel) if lb.text() == "NHL"]
+
+
+def test_two_leagues_in_a_sport_each_get_a_heading_and_name_themselves_on_cards(
+        games_db, qapp, owned_widgets):
+    view = _later_view(games_db, qapp, owned_widgets, league="AHL")
+    assert "hockey:league:AHL" in view.headers and "hockey:league:NHL" in view.headers
+    nhl, ahl = (view.headers[f"hockey:league:{lg}"].mapTo(view, QPoint(0, 0)).y() for lg in ("NHL", "AHL"))
+    assert ahl < nhl, "leagues in name order"
+
+
+def test_by_time_lists_every_sport_together_and_rows_name_sport_and_league(games_db, qapp, owned_widgets):
+    view = _later_view(games_db, qapp, owned_widgets)
+    assert view.order_button.text() == "By sport"
+    view.order_button.click()
+    _settle(qapp)
+    assert view.config.sports_view_state["order"] == "time"
+    assert view.order_button.text() == "By time"
+    assert "sport:hockey" not in view.headers and "all:on_now" in view.headers
+    for line in _lines(view):
+        assert "Hockey · NHL" in [lb.text() for lb in line.findChildren(QLabel)]
+    view.order_button.click()
+    _settle(qapp)
+    assert "sport:hockey" in view.headers
+
+
+def _paints(widget, color: QColor, tol: int = 30) -> bool:
+    """Some text pixel of *widget* is *color* (anti-aliased edges aside)."""
+    image = widget.grab().toImage()
+    return any(_near(QColor(image.pixel(x, y)), color, tol)
+               for x in range(image.width()) for y in range(image.height()))
+
+
+def test_an_alerted_game_reads_like_a_watch_list_match(games_db, qapp, owned_widgets):
+    from streamselect.gui import theme
+    accent = QColor(theme.COLOR_ACCENT_HOVER)
+    view = _later_view(games_db, qapp, owned_widgets)
+    sabres = next(r for r in view.rows if "Sabres" in r.text())
+    assert not _paints(sabres, accent)
+    next(a for a in sabres.bell.build_menu().actions()
+         if a.text() == "Alert me for every Buffalo Sabres event").trigger()
+    _settle(qapp)
+    sabres = next(r for r in view.rows if "Sabres" in r.text())
+    dallas = next(r for r in view.rows if "Dallas" in r.text())
+    assert _paints(sabres, accent), "the guide's watch-list colour"
+    assert not _paints(dallas, accent)
+
+    live = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    card = _card(live, "Sabres")
+    other = next(c for c in live.cards if "Sabres" not in c.game.title)
+    assert _paints(card.title, accent)
+    assert not _paints(other.title, accent)

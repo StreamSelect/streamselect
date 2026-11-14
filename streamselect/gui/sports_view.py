@@ -1,8 +1,11 @@
 """The Sports view: the games on now, then later, then finished — from stored games.
 
-Design: The Sports Desk rev 3 (SV-Q17-Q36, all answered 2026-11-12). Every
-game on now is a card (``game_card.GameCard``); later and finished games are
-rows under day / Finished headings, and any game opens the same channel list.
+Design: The Sports Desk rev 3 (SV-Q17-Q36, all answered 2026-11-12) and rev 5
+(SV-Q44-Q52, 2026-11-14). Every game on now is a card (``game_card.GameCard``);
+later and finished games are rows under day / Finished headings, grouped by
+start time with the time shown once, and any game opens the same channel list.
+Two orderings: By sport (Sport ▸ League ▸ day) or By time (every sport in one
+list, each row naming its sport · league).
 Section headers sit on the sidebar's header band and fold (Finished starts
 folded); the sort order, the "Less certain games" toggle and the folds are
 remembered (``Config.sports_view_state``). The user's preferred channel and
@@ -41,7 +44,7 @@ from streamselect.gui.chips import ToggleChip
 from streamselect.gui.content_view import ContentView
 from streamselect.gui.flow_layout import FlowLayout
 from streamselect.gui.game_card import (
-    HIDE_CHANNEL, HIDE_COLLECTION, HIDE_EVERYWHERE, AlertBell, ChannelList, GameCard,
+    HIDE_CHANNEL, HIDE_COLLECTION, HIDE_EVERYWHERE, AlertBell, ChannelList, GameCard, GameLine,
 )
 from streamselect.gui.sidebar.base import GroupHeading, _ClickableHeader
 from streamselect.gui.similar_lightbox_card import _ClickableFrame
@@ -51,7 +54,10 @@ from streamselect.gui.similar_lightbox_card import _ClickableFrame
 #: Re-render this often while open: progress bars and on-now/finished move with the clock.
 TICK_MS = 60_000
 SORT_EARLIEST, SORT_LATEST = "earliest", "latest"
+ORDER_SPORT, ORDER_TIME = "sport", "time"
 FINISHED = "finished"
+#: The section-key prefix for By time, where one list holds every sport.
+ALL = "all"
 
 
 def _game_key(g: GameDTO) -> tuple:
@@ -134,6 +140,11 @@ class SportsView(ContentView):
         return self._state().get("sort", SORT_EARLIEST)
 
     @property
+    def ordering(self) -> str:
+        """By sport (the default) or By time (SV-Q50)."""
+        return self._state().get("order", ORDER_SPORT)
+
+    @property
     def less_certain(self) -> bool:
         return bool(self._state().get("less_certain", False))
 
@@ -141,7 +152,8 @@ class SportsView(ContentView):
         """Folded section keys, each ``"<sport>:<section>"`` or ``"sport:<sport>"``."""
         st = self._state()
         if "folded" not in st:
-            st["folded"] = [f"{sp}:{FINISHED}" for sp in self.sports]   # Finished starts folded (SV-Q21)
+            # Finished starts folded (SV-Q21), By time's too.
+            st["folded"] = [f"{sp}:{FINISHED}" for sp in [*self.sports, ALL]]
         elif FINISHED in st["folded"]:            # remembered before sports had sections: it was hockey's
             st["folded"] = [f"hockey:{FINISHED}" if k == FINISHED else k for k in st["folded"]]
         return set(st["folded"])
@@ -252,79 +264,148 @@ class SportsView(ContentView):
             _theme.style(looking, "TEXT_SM_MUTED")
             self._layout.addWidget(looking)
         folded = self._folded()
-        for sport, settings in self.sports.items():
-            mine = [g for g in games if g.sport == sport]
-            live = sum(1 for g in mine if event_live(g, now, settings))
-            self._layout.addWidget(self._sport_header(sport, mine, live))
-            if f"sport:{sport}" not in folded:
-                self._render_sport(sport, settings, mine, now, folded)
+        if self.ordering == ORDER_TIME:
+            self._render_by_time(games, now, folded)
+        else:
+            for sport, settings in self.sports.items():
+                mine = [g for g in games if g.sport == sport]
+                live = sum(1 for g in mine if event_live(g, now, settings))
+                self._layout.addWidget(self._sport_header(sport, mine, live))
+                if f"sport:{sport}" not in folded:
+                    self._render_sport(sport, mine, now, folded)
         self._layout.addStretch(1)
 
-    def _render_sport(self, sport: str, settings, games: list, now: datetime, folded: set) -> None:
-        """One sport's segment: On now, the days to come, Finished (keys prefixed by sport)."""
+    def _split(self, games: list, now: datetime) -> tuple[list, list, list]:
+        """(on now as (game, state), later, finished) — each game by its own sport's lengths."""
         on_now, later, finished = [], [], []
         for g in games:
-            state = game_state(g, now, settings)
-            (on_now if state in (ON_NOW, ENDING) else later if state == UPCOMING else finished).append((g, state))
+            state = game_state(g, now, self.sports[g.sport])
+            if state in (ON_NOW, ENDING):
+                on_now.append((g, state))
+            else:
+                (later if state == UPCOMING else finished).append(g)
         on_now.sort(key=lambda gs: gs[0].start_utc, reverse=self.sort_order == SORT_LATEST)
+        return on_now, later, finished
 
-        on_key = f"{sport}:on_now"
-        self._layout.addWidget(self._header(on_key, "On now", len(on_now), foldable=True,
-                                         what="the list of games on now"))
-        if on_key in self._folded():
-            pass                             # folded like any other section (owner, 2026-11-13)
-        elif on_now:
+    def _render_sport(self, sport: str, games: list, now: datetime, folded: set) -> None:
+        """One sport's segment: On now, the days to come, Finished (keys prefixed by sport).
+
+        The league is said once (SV-Q48/49): a sport with one league names it only in
+        its header; a sport with several gets a heading per league over its days.
+        """
+        on_now, later, finished = self._split(games, now)
+        leagues = sorted({g.league for g in games})
+        several = len(leagues) > 1
+        self._on_now_section(f"{sport}:on_now", on_now, later, now, f"No {sport} games on right now",
+                             meta=(lambda g: g.league) if several else (lambda g: ""))
+        if several:
+            for league in leagues:
+                mine = [g for g in later if g.league == league]
+                if not mine:
+                    continue
+                key = f"{sport}:league:{league}"
+                self._layout.addWidget(self._header(key, league, len(mine), foldable=True,
+                                                    what=f"the {league} games list"))
+                if key not in folded:
+                    self._day_sections(f"{sport}:{league}", mine, now, folded, sub=True)
+        else:
+            self._day_sections(sport, later, now, folded)
+        self._finished_section(sport, finished, now, folded)
+
+    def _render_by_time(self, games: list, now: datetime, folded: set) -> None:
+        """By time (SV-Q50): every sport in one list; rows and cards name sport · league."""
+        on_now, later, finished = self._split(games, now)
+        def label(g: GameDTO) -> str:
+            return f"{g.sport.title()} · {g.league}"
+        self._on_now_section(f"{ALL}:on_now", on_now, later, now, "No games on right now", meta=label)
+        self._day_sections(ALL, later, now, folded, label_of=label)
+        self._finished_section(ALL, finished, now, folded, label_of=label)
+
+    def _on_now_section(self, key: str, on_now: list, later: list, now: datetime, empty: str,
+                        meta: Callable) -> None:
+        self._layout.addWidget(self._header(key, "On now", len(on_now), foldable=True,
+                                            what="the list of games on now"))
+        if key in self._folded():
+            return                           # folded like any other section (owner, 2026-11-13)
+        if on_now:
             opened = [gs for gs in on_now if _game_key(gs[0]) == self._open]
             for g, state in opened:          # the open game spans the full width, first (SV-Q17)
-                self._layout.addWidget(self._card(g, state, now, expanded=True))
+                self._layout.addWidget(self._card(g, state, now, expanded=True, meta=meta(g)))
             rest = [gs for gs in on_now if gs not in opened]
             if rest:
                 grid_host = QWidget()
                 grid = FlowLayout(grid_host, spacing=10)
                 for g, state in rest:
-                    grid.addWidget(self._card(g, state, now))
+                    grid.addWidget(self._card(g, state, now, meta=meta(g)))
                 self._layout.addWidget(grid_host)
         else:
-            nxt = later[0][0] if later else None
-            self._message(f"No {sport} games on right now",
-                          f"Next: {nxt.title}, {browse_day_separator_label(nxt.start_utc, now).split(' · ')[0]}"
-                          f" at {fmt_time(nxt.start_utc)}." if nxt else "No games are listed yet.")
+            nxt = min(later, key=lambda g: g.start_utc) if later else None
+            self._message(empty, f"Next: {nxt.title}, {self._day_label(nxt.start_utc, now).split(' · ')[0]}"
+                                 f" at {fmt_time(nxt.start_utc)}." if nxt else "No games are listed yet.")
 
+    @staticmethod
+    def _day_label(start_utc: datetime, now: datetime) -> str:
+        return browse_day_separator_label(start_utc, now, today="Today")      # SV-Q44
+
+    def _day_sections(self, prefix: str, later: list, now: datetime, folded: set, *,
+                      sub: bool = False, label_of: Optional[Callable] = None) -> None:
         days: dict = {}
-        for g, _ in later:
+        for g in sorted(later, key=lambda g: g.start_utc):
             days.setdefault(to_local(g.start_utc).date(), []).append(g)
         for day, gs in days.items():
-            key = f"{sport}:day:{day.isoformat()}"
-            self._layout.addWidget(self._header(key, browse_day_separator_label(gs[0].start_utc, now),
-                                                len(gs), foldable=True))
+            key = f"{prefix}:day:{day.isoformat()}"
+            self._layout.addWidget(self._header(key, self._day_label(gs[0].start_utc, now),
+                                                len(gs), foldable=True, sub=sub))
             if key not in folded:
-                for g in gs:
-                    self._game_row(g, playable=False)
+                self._time_groups(gs, playable=False, label_of=label_of)
 
-        if finished:
-            key = f"{sport}:{FINISHED}"
-            self._layout.addWidget(self._header(key, "Finished", len(finished), foldable=True,
-                                                what="the finished games list"))
-            if key not in folded:
-                done = sorted((g for g, _ in finished), key=lambda g: g.start_utc, reverse=True)
-                by_day: dict = {}
-                for g in done:
-                    by_day.setdefault(to_local(g.start_utc).date(), []).append(g)
-                today = to_local(now).date()
-                if len(by_day) == 1:
-                    for g in done:
-                        self._game_row(g, playable=True, openable=to_local(g.start_utc).date() == today)
-                else:
-                    # Games that finished on different days: one sub-section per day,
-                    # most recent first (owner, 2026-11-13).
-                    for day, gs in by_day.items():
-                        sub = f"{sport}:{FINISHED}:{day.isoformat()}"
-                        self._layout.addWidget(self._header(
-                            sub, past_day_label(gs[0].start_utc, now), len(gs),
-                            foldable=True, sub=True))
-                        if sub not in folded:
-                            for g in gs:
-                                self._game_row(g, playable=True, openable=day == today)
+    def _finished_section(self, prefix: str, finished: list, now: datetime, folded: set, *,
+                          label_of: Optional[Callable] = None) -> None:
+        if not finished:
+            return
+        key = f"{prefix}:{FINISHED}"
+        self._layout.addWidget(self._header(key, "Finished", len(finished), foldable=True,
+                                            what="the finished games list"))
+        if key in folded:
+            return
+        done = sorted(finished, key=lambda g: g.start_utc, reverse=True)
+        by_day: dict = {}
+        for g in done:
+            by_day.setdefault(to_local(g.start_utc).date(), []).append(g)
+        today = to_local(now).date()
+        if len(by_day) == 1:
+            self._time_groups(done, playable=True, today=today, label_of=label_of)
+            return
+        # Games that finished on different days: one sub-section per day, most
+        # recent first (owner, 2026-11-13).
+        for day, gs in by_day.items():
+            sub = f"{key}:{day.isoformat()}"
+            self._layout.addWidget(self._header(sub, past_day_label(gs[0].start_utc, now), len(gs),
+                                                foldable=True, sub=True))
+            if sub not in folded:
+                self._time_groups(gs, playable=True, today=today, label_of=label_of)
+
+    def _time_groups(self, games: list, *, playable: bool, today=None,
+                     label_of: Optional[Callable] = None) -> None:
+        """Rows grouped by start time, the time shown once per group, every other
+        group on a very faint tint (SV-Q45-Q47). *games* arrive in display order."""
+        groups: dict = {}
+        for g in sorted(games, key=lambda g: (g.sport, g.league, g.title)):
+            groups.setdefault(g.start_utc, []).append(g)
+        for i, start in enumerate(dict.fromkeys(g.start_utc for g in games)):
+            group = QWidget()
+            group.setObjectName("gameTimeGroup")
+            if i % 2:
+                group.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+                _theme.style(group, "GAME_TIME_GROUP")
+            col = QVBoxLayout(group)
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(0)
+            for j, g in enumerate(groups[start]):
+                openable = today is None or to_local(g.start_utc).date() == today
+                self._game_row(g, col, first=j == 0, playable=playable, openable=openable,
+                               label=label_of(g) if label_of else "")
+            self._layout.addWidget(group)
 
     def _message(self, headline: str, body: str) -> None:
         h = QLabel(headline)
@@ -414,6 +495,15 @@ class SportsView(ContentView):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(6)
         h.addStretch(1)
+        by_time = self.ordering == ORDER_TIME
+        self.order_button = QPushButton("By time" if by_time else "By sport")
+        self.order_button.setFlat(True)
+        _theme.style(self.order_button, "LINK_BTN_SM")
+        self.order_button.setToolTip(
+            "Every sport in one list, by start time — click to group by sport instead" if by_time
+            else "Grouped by sport, then league — click to list every sport together by start time")
+        self.order_button.clicked.connect(self._toggle_order)
+        h.addWidget(self.order_button)
         self.sort_button = QPushButton("Earliest first" if self.sort_order == SORT_EARLIEST else "Latest first")
         self.sort_button.setFlat(True)
         _icon_utils.set_button_icon(self.sort_button, "sort")
@@ -427,11 +517,12 @@ class SportsView(ContentView):
         h.addWidget(self.less_certain_chip)
         return box
 
-    def _card(self, g: GameDTO, state: str, now: datetime, *, expanded: bool = False) -> GameCard:
+    def _card(self, g: GameDTO, state: str, now: datetime, *, expanded: bool = False,
+              meta: str = "") -> GameCard:
         channels = self._channel_list(g) if expanded else None
         card = GameCard(g, state, now, self.sports[g.sport].usual_length, expanded=expanded,
                         playing_id=self._playing, channels=channels,
-                        alerts=alerts_for(g, self._alerts))
+                        alerts=alerts_for(g, self._alerts), meta=meta)
         card.bell.toggled_rule.connect(self._set_alert)
         card.play.connect(self.playRequested)
         card.toggled.connect(self._toggle_open)
@@ -455,44 +546,51 @@ class SportsView(ContentView):
             lst.hidden_button.clicked.connect(lambda _=False, k=_game_key(g): self._toggle_show_hidden(k))
         return lst
 
-    def _game_row(self, g: GameDTO, *, playable: bool, openable: bool = True) -> None:
-        """A later or finished game: one row; click opens its channel list beneath it (SV-Q23).
+    def _game_row(self, g: GameDTO, into: QVBoxLayout, *, first: bool, playable: bool,
+                  openable: bool = True, label: str = "") -> None:
+        """A later or finished game: one line in its start-time group; click opens its
+        channel list beneath it (SV-Q23).
 
         ``openable=False`` is a game that finished on an earlier day: its channels have
         moved on, so the row is plain text with no list to open (owner, 2026-11-13).
+        ``label`` is By time's "Sport · League"; By sport says it in the headers.
         """
         when = fmt_time(g.start_utc)
-        text = f"{when}    {g.title}    ·  {g.league}"
         is_open = openable and _game_key(g) == self._open
-        if openable:
-            row = QPushButton(text)
-            _theme.style(row, "GAME_FEED_ROW")
-            row.setToolTip("Collapse its channel list" if is_open else "List every channel that will show this game")
-            row.clicked.connect(lambda _=False, game=g: self._toggle_open(game))
-        else:
-            row = QLabel(text)
-            _theme.style(row, "GAME_ROW_PAST")
-            row.setToolTip("Finished on an earlier day")
-        row.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
-        line = QWidget()
-        h = QHBoxLayout(line)
-        h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(4)
-        h.addWidget(row, 1)
         # A finished game's bell offers only team and matchup alerts: "this game"
         # means nothing once it is over (owner, 2026-11-13).
         bell = AlertBell(g, alerts_for(g, self._alerts), over=playable)
         bell.toggled_rule.connect(self._set_alert)
-        if bell.covering and not playable:
-            on = QLabel("ALERT ON")            # words with the colour (B2)
+        alerted = bell.covering and not playable
+        if openable:
+            row = QPushButton(g.title)
+            row.setProperty("alerted", "true" if alerted else "false")
+            _theme.style(row, "GAME_FEED_ROW")
+            row.setToolTip(f"{when} · " + ("Collapse its channel list" if is_open
+                                           else "List every channel that will show this game"))
+            row.clicked.connect(lambda _=False, game=g: self._toggle_open(game))
+        else:
+            row = QLabel(g.title)
+            _theme.style(row, "GAME_ROW_PAST")
+            row.setToolTip(f"{when} · Finished on an earlier day")
+        row.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        line = GameLine(when, first=first)
+        h = line.row_layout
+        h.addWidget(row, 1)
+        if label:
+            league = QLabel(label)
+            _theme.style(league, "TEXT_SM_MUTED")
+            h.addWidget(league)
+        if alerted:
+            on = QLabel("ALERT ON")            # words with the colour (B2, SV-Q51)
             _theme.style(on, "GAME_LIVE_TAG")
             h.addWidget(on)
         h.addWidget(bell)
         row.bell = bell
-        self._layout.addWidget(line)
+        into.addWidget(line)
         self.rows.append(row)
         if is_open:
-            self._layout.addWidget(self._channel_list(g))
+            into.addWidget(self._channel_list(g))
 
     # ── actions ────────────────────────────────────────────────────────────
 
@@ -516,6 +614,11 @@ class SportsView(ContentView):
         self._state()["sort"] = SORT_LATEST if self.sort_order == SORT_EARLIEST else SORT_EARLIEST
         self._save()
         QTimer.singleShot(0, self._render)
+
+    def _toggle_order(self) -> None:
+        self._state()["order"] = ORDER_SPORT if self.ordering == ORDER_TIME else ORDER_TIME
+        self._save()
+        self._render()
 
     def _toggle_less_certain(self, on: bool) -> None:
         self._state()["less_certain"] = bool(on)

@@ -52,6 +52,26 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
             f" color: {_('COLOR_TEXT')}; padding: 5px 8px; border-radius: {_('RADIUS_SM')};"
             f" font-size: {_('FONT_MD')}; }}"
             f"QPushButton:hover {{ background: {_('OVERLAY_ACCENT_35')}; color: {_('COLOR_TEXT_HI')}; }}"
+            # A game you have an alert on: the guide's watch-list look
+            # (epg_widgets.apply_watchlist_highlight), on rows and cards (SV-Q51).
+            f"QPushButton[alerted=\"true\"] {{ color: {_('COLOR_ACCENT_HOVER')}; font-weight: bold; }}"
+            f"QPushButton[alerted=\"true\"]:hover {{ color: {_('COLOR_TEXT_HI')}; }}"
+        ),
+        # A card's title: PANEL_HEADLINE's look, and the watch-list colour, bold,
+        # when you have an alert on the game (SV-Q51) — the same alerted state as
+        # GAME_FEED_ROW's, so a row and a card say it alike.
+        "GAME_CARD_TITLE": (
+            f"QLabel {{ color: {_('COLOR_TEXT_HI')}; font-size: {_('FONT_LG')}; font-weight: 600; }}"
+            f"QLabel[alerted=\"true\"] {{ color: {_('COLOR_ACCENT_HOVER')}; font-weight: bold; }}"
+        ),
+        # The games list's time column (SV-Q45/46): the group's time, and the muted
+        # echo a hovered row shows of its own time in its otherwise empty cell.
+        "GAME_TIME": f"color: {_('COLOR_TEXT')}; font-size: {_('FONT_MD')}; padding: 5px 0;",
+        "GAME_TIME_ECHO": f"color: {_('COLOR_MUTED_2')}; font-size: {_('FONT_MD')}; padding: 5px 0;",
+        # Every other start-time group: a very faint tint, below the header band's
+        # OVERLAY_10 and well apart from a hovered row's accent (SV-Q47).
+        "GAME_TIME_GROUP": (
+            f"QWidget#gameTimeGroup {{ background: {_('OVERLAY_04')}; border-radius: {_('RADIUS_SM')}; }}"
         ),
         # A finished game from an earlier day: the same line as GAME_FEED_ROW, but plain
         # text — its channels have moved on, so nothing to open (owner, 2026-11-13).

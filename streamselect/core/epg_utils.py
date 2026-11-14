@@ -408,7 +408,8 @@ def scrubber_label(dt: datetime, _now: datetime | None = None) -> str:
     return f"{prefix} {time_str}"
 
 
-def browse_day_separator_label(dt: datetime, _now: datetime | None = None) -> str:
+def browse_day_separator_label(dt: datetime, _now: datetime | None = None, *,
+                               today: str = "Tonight") -> str:
     """Format a UTC-naive datetime as a Browse day-separator row label.
 
     The forward-looking Browse list (sorted Time-ascending, the default) inserts a
@@ -424,6 +425,8 @@ def browse_day_separator_label(dt: datetime, _now: datetime | None = None) -> st
     Args:
         dt: The day boundary (UTC-naive) — typically ``local_day_window(day)[0]``.
         _now: Reference "now" (UTC-naive); defaults to :func:`now_utc`.
+        today: The word for today. The guide says "Tonight"; the Sports view's
+            games start at noon too, so it says "Today" (SV-Q44).
 
     Returns:
         The day-separator row label.
@@ -434,7 +437,7 @@ def browse_day_separator_label(dt: datetime, _now: datetime | None = None) -> st
     day_delta = (local.date() - local_now.date()).days
     date_str = weekday_date_text(local)
     if day_delta == 0:
-        return f"Tonight · {date_str}"
+        return f"{today} · {date_str}"
     if day_delta == 1:
         return f"Tomorrow · {date_str}"
     return date_str
