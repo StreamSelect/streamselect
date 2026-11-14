@@ -373,11 +373,12 @@ class SportsView(ContentView):
         for g in done:
             by_day.setdefault(to_local(g.start_utc).date(), []).append(g)
         today = to_local(now).date()
-        if len(by_day) == 1:
+        if list(by_day) == [today]:
             self._time_groups(done, playable=True, today=today, label_of=label_of)
             return
-        # Games that finished on different days: one sub-section per day, most
-        # recent first (owner, 2026-11-13).
+        # One sub-section per day, most recent first (owner, 2026-11-13) — also when
+        # every game is from one EARLIER day: a bare "9:05 PM" under Finished read as
+        # tonight's (owner, 2026-11-14).
         for day, gs in by_day.items():
             sub = f"{key}:{day.isoformat()}"
             self._layout.addWidget(self._header(sub, past_day_label(gs[0].start_utc, now), len(gs),

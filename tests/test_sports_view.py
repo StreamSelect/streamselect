@@ -971,3 +971,39 @@ def test_an_alerted_game_reads_like_a_watch_list_match(games_db, qapp, owned_wid
     other = next(c for c in live.cards if "Sabres" not in c.game.title)
     assert _paints(card.title, accent)
     assert not _paints(other.title, accent)
+
+
+def test_finished_games_all_from_an_earlier_day_still_say_which_day(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-14: last night's game sat under Finished as a bare "9:05 PM",
+    which read as tonight's."""
+    later = START + timedelta(hours=23)
+    assert to_local(later).date() > to_local(START).date(), "the clock is on the next local day"
+    view = _view(games_db, qapp, owned_widgets, later)
+    view._toggle_fold("hockey:finished")
+    _settle(qapp)
+    days = [k for k in view.headers if k.startswith("hockey:finished:")]
+    assert len(days) == 1 and view.rows
+    assert view.headers[days[0]].findChild(GroupHeading).label.text().startswith("Yesterday")
+
+
+def _text_x(widget, view) -> int:
+    """Where *widget*'s painted text starts, in the view's coordinates."""
+    image = widget.grab().toImage()
+    bg = QColor(image.pixel(image.width() - 1, 1))
+    for x in range(image.width()):
+        if any(abs(QColor(image.pixel(x, y)).lightness() - bg.lightness()) > 60
+               for y in range(image.height())):
+            return widget.mapTo(view, QPoint(x, 0)).x()
+    raise AssertionError("no text drawn")
+
+
+def test_finished_titles_start_where_todays_do(games_db, qapp, owned_widgets):
+    """Owner report, 2026-11-14: an earlier day's (plain text) title sat a few pixels
+    right of the clickable ones."""
+    _copy_game_a_day_earlier(games_db, "Buffalo Sabres")
+    view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=4))
+    view._toggle_fold("hockey:finished")
+    _settle(qapp)
+    past = next(r for r in view.rows if isinstance(r, QLabel))
+    today = next(r for r in view.rows if isinstance(r, QPushButton))
+    assert abs(_text_x(past, view) - _text_x(today, view)) <= 1

@@ -75,8 +75,11 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
         ),
         # A finished game from an earlier day: the same line as GAME_FEED_ROW, but plain
         # text — its channels have moved on, so nothing to open (owner, 2026-11-13).
+        # Left padding 5px, not GAME_FEED_ROW's 8px: a QLabel sets its text 3px further
+        # in than a QPushButton with the same padding, and the two sit in one column
+        # (owner report 2026-11-14; test_finished_titles_start_where_todays_do).
         "GAME_ROW_PAST": (
-            f"color: {_('COLOR_TEXT')}; padding: 5px 8px; font-size: {_('FONT_MD')};"
+            f"color: {_('COLOR_TEXT')}; padding: 5px 8px 5px 5px; font-size: {_('FONT_MD')};"
             f" background: transparent;"
         ),
         # "EPG": this listing came from the programme guide, which is less reliable.
