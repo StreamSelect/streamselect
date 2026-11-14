@@ -13,7 +13,7 @@ import pytest
 from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtGui import QColor
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QLabel, QPushButton, QWidget
+from PyQt6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 
 from streamselect.core.games.read import (
     ENDING, ON_NOW, OVER, UPCOMING, GameDTO, GameFeedDTO, arrange_feeds, game_state, load_games,
@@ -624,6 +624,65 @@ def test_a_header_tooltip_names_the_list_it_collapses(games_db, qapp, owned_widg
     assert view.headers["hockey:on_now"].toolTip() == "Expand the list of games on now"
     tips = [w.toolTip() for w in view.findChildren(QWidget) if w.toolTip()]
     assert not [t for t in tips if "fold" in t.lower()], "a tooltip still says fold"
+
+
+def _contrast(host, card) -> int:
+    """Lightness range inside the card as painted into its parent (where an opacity
+    effect applies): dimming blends the card into what is behind it, so its text
+    and its background draw closer whatever the theme."""
+    image = host.grab(card.geometry().adjusted(4, 4, -4, -4)).toImage()
+    light = [QColor(image.pixel(x, y)).lightness()
+             for x in range(0, image.width(), 2) for y in range(0, image.height(), 2)]
+    return max(light) - min(light)
+
+
+def test_a_card_whose_channel_is_reported_dims_and_flags_it_and_its_menu_is_ticked(qapp, owned_widgets):
+    """Owner, 2026-11-13: "I marked it No picture but there's no indication I did
+    anything" — the game doesn't hide, so it dims, flags the channel, ticks the menu."""
+    from dataclasses import replace
+
+    from streamselect.core.games.read import DIDNT_PLAY
+    from streamselect.gui.game_card import GameCard
+    plain = _feed("a", "ONE")
+    bad = replace(plain, report="Reported once in NHL games: no picture. Listed last.", reported=(DIDNT_PLAY,))
+    now = START + timedelta(minutes=30)
+
+    def shown(feed):
+        host = owned_widgets.own(QWidget())
+        lay = QVBoxLayout(host)
+        card = GameCard(GameDTO(1, "hockey", "NHL", "Colorado Avalanche", "Nashville Predators", START,
+                                2, False, 1, (feed,)), ON_NOW, now, HOCKEY.usual_length, parent=host)
+        lay.addWidget(card)
+        host.show()
+        qapp.processEvents()
+        return host, card
+
+    host_ok, ok = shown(plain)
+    host_bad, flagged = shown(bad)
+    assert ok.report_icon is None and ok.graphicsEffect() is None
+    assert flagged.report_icon is not None and flagged.report_icon.isVisibleTo(host_bad)
+    assert "no picture" in flagged.report_icon.toolTip()
+    assert _contrast(host_bad, flagged) < _contrast(host_ok, ok) * 0.7, "the reported card is drawn dimmer"
+    ticks = {a.text(): a.isChecked() for a in flagged.build_context_menu().actions() if a.isCheckable()}
+    assert ticks == {"No picture": True, "Not this game": False}, ticks
+    assert not any(a.isChecked() for a in ok.build_context_menu().actions())
+
+
+def test_a_ticked_report_is_taken_back_from_the_same_menu(games_db, qapp, owned_widgets):
+    from streamselect.gui.game_card import ChannelRow
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    next(a for a in _card(view, "Sabres").build_context_menu().actions() if a.text() == "No picture").trigger()
+    _settle(qapp)
+    assert _card(view, "Sabres").graphicsEffect() is None, (
+        "another channel still works, so the card plays that one and stays bright")
+    _card(view, "Sabres").more_chip.click()
+    _settle(qapp)
+    row = next(r for r in _card(view, "Sabres").findChildren(ChannelRow) if r.report_icon is not None)
+    item = next(a for a in row.build_context_menu("NHL").actions() if a.text() == "No picture")
+    assert item.isChecked()
+    item.trigger()
+    _settle(qapp)
+    assert all(r.report_icon is None for r in _card(view, "Sabres").findChildren(ChannelRow))
 
 
 # ── event alerts: the bell (SV-Q24-Q26, Q42) ──────────────────────────────

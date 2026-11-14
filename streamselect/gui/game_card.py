@@ -22,7 +22,8 @@ from typing import Optional
 
 from PyQt6.QtCore import QPoint, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
+    QFrame, QGraphicsOpacityEffect, QHBoxLayout, QLabel, QMenu, QPushButton, QSizePolicy,
+    QVBoxLayout, QWidget,
 )
 
 from streamselect.core.epg_utils import fmt_time
@@ -38,6 +39,8 @@ from streamselect.gui.progress_paint import ProgressBar, elapsed_pct
 
 #: Width of a closed card (SV-Q22: fixed for now, revisit after use).
 CARD_WIDTH = 280
+#: A card whose channel the user reported, as the sidebar dims an unavailable row.
+REPORTED_OPACITY = 0.45
 
 #: Hide scopes the eye's menu offers (SV-Q28).
 HIDE_CHANNEL, HIDE_COLLECTION, HIDE_EVERYWHERE = "channel", "collection", "everywhere"
@@ -51,15 +54,20 @@ def _keep_space(*widgets: QWidget) -> None:
         w.setSizePolicy(sp)
 
 
-def add_report_actions(menu: QMenu, report) -> None:
+def add_report_actions(menu: QMenu, feed: GameFeedDTO, report) -> None:
     """The two channel reports, worded as what the user saw (owner, 2026-11-13).
 
     "No picture" (``DIDNT_PLAY``): nothing came up — black, an empty window, or it
     never loaded. "Not this game" (``WRONG_CONTENT``): a picture, but not the game
-    on the card. One wording for a card and a channel row; ``report(kind)`` emits.
+    on the card. One wording for a card and a channel row. Each is ticked while it
+    counts on ``feed`` (owner: "there's no indication I did anything"); choosing a
+    ticked one takes it back. ``report(kind, on)`` emits.
     """
-    menu.addAction("No picture").triggered.connect(lambda: report(DIDNT_PLAY))
-    menu.addAction("Not this game").triggered.connect(lambda: report(WRONG_CONTENT))
+    for label, kind in (("No picture", DIDNT_PLAY), ("Not this game", WRONG_CONTENT)):
+        act = menu.addAction(label)
+        act.setCheckable(True)
+        act.setChecked(kind in feed.reported)
+        act.triggered.connect(lambda on, k=kind: report(k, on))
 
 
 class ChannelRow(QWidget):
@@ -70,6 +78,7 @@ class ChannelRow(QWidget):
     hideRequested = pyqtSignal(object, str)   # GameFeedDTO, scope (never `hide`: that shadows QWidget.hide)
     unhideRequested = pyqtSignal(object)      # GameFeedDTO
     reportRequested = pyqtSignal(object, str)  # GameFeedDTO, kind (DIDNT_PLAY / WRONG_CONTENT)
+    unreportRequested = pyqtSignal(object, str)  # GameFeedDTO, kind: take that report back
     clearReportsRequested = pyqtSignal(object)  # GameFeedDTO
 
     def __init__(self, feed: GameFeedDTO, league: str, *, preferred: bool, playing: bool,
@@ -158,7 +167,8 @@ class ChannelRow(QWidget):
             lambda: self.prefer.emit(None if self._preferred else self.feed))
         self._add_hide_actions(menu.addMenu(f"Hide from {league} games"), league)
         menu.addSeparator()
-        add_report_actions(menu, lambda kind: self.reportRequested.emit(self.feed, kind))
+        add_report_actions(menu, self.feed, lambda kind, on: (
+            self.reportRequested if on else self.unreportRequested).emit(self.feed, kind))
         clear = menu.addAction("Clear bad reports")
         clear.setEnabled(bool(self.feed.report))
         clear.triggered.connect(lambda: self.clearReportsRequested.emit(self.feed))
@@ -196,6 +206,7 @@ class ChannelList(QWidget):
     hideRequested = pyqtSignal(object, object, str)   # GameDTO, GameFeedDTO, scope
     unhideRequested = pyqtSignal(object, object)      # GameDTO, GameFeedDTO
     reportRequested = pyqtSignal(object, object, str)  # GameDTO, GameFeedDTO, kind
+    unreportRequested = pyqtSignal(object, object, str)  # GameDTO, GameFeedDTO, kind
     clearReportsRequested = pyqtSignal(object, object)  # GameDTO, GameFeedDTO
 
     def __init__(self, game: GameDTO, *, preferred_key: Optional[str], playing_id: Optional[str],
@@ -213,6 +224,7 @@ class ChannelList(QWidget):
             r.prefer.connect(lambda feed: self.prefer.emit(self.game, feed))
             r.hideRequested.connect(lambda feed, scope: self.hideRequested.emit(self.game, feed, scope))
             r.reportRequested.connect(lambda feed, kind: self.reportRequested.emit(self.game, feed, kind))
+            r.unreportRequested.connect(lambda feed, kind: self.unreportRequested.emit(self.game, feed, kind))
             r.clearReportsRequested.connect(lambda feed: self.clearReportsRequested.emit(self.game, feed))
             lay.addWidget(r)
             self.rows.append(r)
@@ -328,6 +340,7 @@ class GameCard(QFrame):
     toggled = pyqtSignal(object)              # GameDTO: open / close the channel list
     finished = pyqtSignal(object)             # GameDTO: the user marked it over
     reportRequested = pyqtSignal(object, object, str)  # GameDTO, its top GameFeedDTO, kind
+    unreportRequested = pyqtSignal(object, object, str)  # GameDTO, its top GameFeedDTO, kind
 
     def __init__(self, game: GameDTO, state: str, now: datetime, usual_length, *,
                  expanded: bool = False, playing_id: Optional[str] = None,
@@ -412,6 +425,18 @@ class GameCard(QFrame):
             self.station.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
             _theme.style(self.station, "CHANNEL_NAME_LIVE" if live else "TEXT_SM_MUTED")
             pl.addWidget(self.station, 1)
+        # The channel the card plays is reported, and every other one with it (reported
+        # channels sort last): the flag says so and the card dims (owner, 2026-11-13).
+        self.report_icon = None
+        if self.top_feed is not None and self.top_feed.report:
+            self.report_icon = QLabel()
+            _theme.style(self.report_icon, "TEXT_SM_MUTED")
+            _icon_utils.set_label_icon(self.report_icon, "reported", 12)
+            self.report_icon.setToolTip(self.top_feed.report)
+            pl.addWidget(self.report_icon)
+            dim = QGraphicsOpacityEffect(self)
+            dim.setOpacity(REPORTED_OPACITY)
+            self.setGraphicsEffect(dim)
         others = len(game.playable) - 1
         self.more_chip = None
         if others > 0:
@@ -450,7 +475,8 @@ class GameCard(QFrame):
         feed = self.top_feed
         if feed is not None and feed.channel_id:
             menu.addSeparator()
-            add_report_actions(menu, lambda kind: self.reportRequested.emit(self.game, feed, kind))
+            add_report_actions(menu, feed, lambda kind, on: (
+                self.reportRequested if on else self.unreportRequested).emit(self.game, feed, kind))
         return menu
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802 (Qt API)

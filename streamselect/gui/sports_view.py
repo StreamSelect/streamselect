@@ -437,6 +437,7 @@ class SportsView(ContentView):
         card.toggled.connect(self._toggle_open)
         card.finished.connect(self._mark_finished)
         card.reportRequested.connect(self._report)
+        card.unreportRequested.connect(self._unreport)
         self.cards.append(card)
         return card
 
@@ -448,6 +449,7 @@ class SportsView(ContentView):
         lst.hideRequested.connect(self._hide)
         lst.unhideRequested.connect(self._unhide)
         lst.reportRequested.connect(self._report)
+        lst.unreportRequested.connect(self._unreport)
         lst.clearReportsRequested.connect(self._clear_reports)
         if lst.hidden_button is not None:
             lst.hidden_button.clicked.connect(lambda _=False, k=_game_key(g): self._toggle_show_hidden(k))
@@ -576,6 +578,23 @@ class SportsView(ContentView):
         if kind == WRONG_CONTENT:
             entry["game"] = game_key(game)
         self._prefs(game.league_key).setdefault("reports", {}).setdefault(feed.collection_key, []).append(entry)
+        self._save()
+        QTimer.singleShot(0, self._render)
+
+    def _unreport(self, game: GameDTO, feed, kind: str) -> None:
+        """Take one report kind back for this collection: every "no picture", or this
+        game's "not this game" — what the ticked menu item stood for."""
+        reports = self._prefs(game.league_key).get("reports") or {}
+        mine = reports.get(feed.collection_key)
+        if not mine:
+            return
+        key = game_key(game)
+        keep = [r for r in mine if r.get("kind") != kind
+                or (kind == WRONG_CONTENT and r.get("game") != key)]
+        if keep:
+            reports[feed.collection_key] = keep
+        else:
+            reports.pop(feed.collection_key)
         self._save()
         QTimer.singleShot(0, self._render)
 
