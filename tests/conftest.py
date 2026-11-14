@@ -71,6 +71,13 @@ def _isolate_user_config(tmp_path_factory, monkeypatch):
     """
     fake_home = tmp_path_factory.mktemp("home")
     monkeypatch.setattr(Path, "home", staticmethod(lambda: fake_home))
+    # The runtime folder too (``app_paths.runtime_dir``: ``$XDG_RUNTIME_DIR``), where
+    # the running app's mpv IPC socket lives. A test that builds a player "removes
+    # the stale socket" before launching; without this it removed the LIVE app's
+    # socket, so the app lost its player, opened a second one and could not read
+    # the stream details (owner report, 2026-11-14, during a full-suite run).
+    fake_runtime = tmp_path_factory.mktemp("runtime")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(fake_runtime))
     yield
 
 

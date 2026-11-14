@@ -36,3 +36,14 @@ def test_saving_a_default_config_stays_in_tmp():
     assert "pytest" in str(written), (
         f"save() escaped isolation and wrote {written} — would clobber real config"
     )
+
+
+def test_the_runtime_folder_is_isolated_too(tmp_path_factory):
+    """A test that builds a player removes a "stale" socket at the mpv IPC address;
+    in the real runtime folder that is the RUNNING app's socket (owner report,
+    2026-11-14: a full-suite run cut the app off from its player)."""
+    from streamselect.core import app_paths
+    from streamselect.core.players import mpv_ipc
+    base = tmp_path_factory.getbasetemp()
+    assert app_paths.runtime_dir().is_relative_to(base), app_paths.runtime_dir()
+    assert mpv_ipc.address("socket").startswith(str(base))
