@@ -39,7 +39,7 @@ from PyQt6.QtWidgets import QGridLayout, QHBoxLayout, QLabel, QPushButton, QWidg
 from streamselect.core.quality_vocab import QUALITY_TOKENS
 from streamselect.core.region_codes import REGION_FULL_NAMES
 from streamselect.gui import chip_row, cursor_affordance
-from streamselect.gui import icon_utils, icons
+from streamselect.gui import icons
 from streamselect.gui import theme
 from streamselect.gui.flow_layout import FlowLayout
 from streamselect.gui.qt_text_utils import escape_mnemonic
@@ -253,11 +253,7 @@ def add_quality_badge(btn: QPushButton, colour_token: str, *, bold: bool = False
     ))
     layout.addWidget(label)
 
-    badge = chip_row.chip_widget(chip_row.CHIP_QUALITY, token)
-    if verified:
-        # Shape, not colour, says "measured": the tier hue stays the token's.
-        badge.setText(token)
-        icon_utils.set_button_icon(badge, "verified", trailing=True)
+    badge = chip_row.quality_badge(token, verified=verified)
     layout.addWidget(badge)
 
     if count:

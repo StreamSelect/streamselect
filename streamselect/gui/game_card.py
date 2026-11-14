@@ -37,7 +37,7 @@ from streamselect.gui import cursor_affordance, icons
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
 from streamselect.gui.badge_utils import make_region_chip
-from streamselect.gui.chip_row import CHIP_QUALITY, chip_widget
+from streamselect.gui.chip_row import quality_badge
 from streamselect.gui.detail_chips import make_chip
 from streamselect.gui.progress_paint import ProgressBar, elapsed_pct
 
@@ -127,7 +127,8 @@ class ChannelRow(QWidget):
         # 2026-11-14). Widths come from ChannelList (``chip_slots``).
         slots = slots or {}
         _add_in_slot(row, guide_chip() if feed.from_guide else None, slots.get("epg", 0))
-        _add_in_slot(row, quality_chip(feed.quality) if feed.quality else None, slots.get("quality", 0))
+        _add_in_slot(row, quality_chip(feed.quality, feed.verified) if feed.quality else None,
+                     slots.get("quality", 0))
         if hidden:
             self.eye = _icon_utils.icon_button("visibility_toggle", f"Show this channel again in {league} games", px=13)
             self.eye.clicked.connect(lambda: self.unhideRequested.emit(self.feed))
@@ -210,12 +211,13 @@ def guide_chip() -> QLabel:
     return epg
 
 
-def quality_chip(token: str) -> QWidget:
+def quality_chip(token: str, verified: bool = False) -> QWidget:
     """The app's one quality chip — tier-coloured text on a neutral hairline, no
     fill — as the details pane and the sidebar draw it (owner report 2026-11-14:
-    the solid-fill chip here broke the standard)."""
-    chip = chip_widget(CHIP_QUALITY, token.upper())
-    chip.setToolTip(quality_tooltip(token))
+    the solid-fill chip here broke the standard). ``verified``: the app measured
+    it while playing, so it carries the measured mark."""
+    chip = quality_badge(token.upper(), verified=verified)
+    chip.setToolTip(("Measured while playing: " if verified else "") + quality_tooltip(token))
     return chip
 
 
@@ -228,7 +230,7 @@ def chip_slots(feeds) -> dict:
         w.deleteLater()
         return out
     epg = width(guide_chip()) if any(f.from_guide for f in feeds) else 0
-    quality = max((width(quality_chip(f.quality)) for f in feeds if f.quality), default=0)
+    quality = max((width(quality_chip(f.quality, f.verified)) for f in feeds if f.quality), default=0)
     return {"epg": epg, "quality": quality}
 
 

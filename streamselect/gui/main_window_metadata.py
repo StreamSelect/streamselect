@@ -151,6 +151,9 @@ class _MetadataMixin:
 
     def _on_stream_info_loaded(self, channel_id: str, record) -> None:
         self.details_pane.apply_stream_info(channel_id, record)
+        sports = self.__dict__.get("sports_view")
+        if sports is not None and record is not None:
+            sports.measurement_arrived(channel_id)
         # Ask the provider once when there is nothing measured OR the title's
         # provider-only facts (original language, alternate titles) were never
         # fetched — a played movie still needs those.

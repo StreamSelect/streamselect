@@ -22,6 +22,8 @@ from streamselect.core.games.finder import SportSettings
 from streamselect.core.games.models import GameDB, GameEndDB, GameFeedDB
 from streamselect.core.playback_models import PlaybackEventDB
 from streamselect.core.region_codes import leading_country
+from streamselect.core.repositories.stream_info import StreamInfoRepository
+from streamselect.core.stream_info import measured_quality, summarize
 
 UPCOMING, ON_NOW, ENDING, OVER = "upcoming", "on_now", "ending", "over"
 
@@ -45,6 +47,9 @@ class GameFeedDTO:
     #: The report kinds active on it for this game (DIDNT_PLAY / WRONG_CONTENT): what
     #: the right-click menus tick.
     reported: tuple = ()
+    #: ``quality`` was measured by the app itself (played or probed), not read
+    #: off the name: the chip carries the measured mark (PLAYED-3).
+    verified: bool = False
 
     @property
     def collection_key(self) -> str:
@@ -285,15 +290,21 @@ def load_games(session, sport: str, hidden_provider_ids: set[str],
         select(ChannelDB.id, ChannelDB.provider_id, ChannelDB.category,
                ChannelDB.detected_region, ChannelDB.detected_quality)
         .where(ChannelDB.id.in_({f.channel_id for f in feed_rows if f.channel_id})))}
+    # What the stream itself measured outranks the name's claim, as in the details
+    # pane's Versions (PLAYED-3): a played 1080p channel reads FHD, with the mark.
+    measured = StreamInfoRepository(session).get_many(list(chan))
     feeds: dict[int, list[GameFeedDTO]] = {}
     for f in feed_rows:
         pid, cat, region, quality = chan.get(f.channel_id, (f.source, f.collection, "", ""))
         if pid in hidden_provider_ids:
             continue
+        seen = summarize(measured.get(f.channel_id))
+        tier = measured_quality((seen or {}).get("height"))
         feeds.setdefault(f.game_id, []).append(
             GameFeedDTO(f.channel_id, f.name, f.collection, f.from_guide,
                         "guide" if f.from_guide else f.time_from,
-                        pid or "", cat or "", region or "", quality or ""))
+                        pid or "", cat or "", region or "", tier or quality or "",
+                        verified=bool(tier) and seen["source"] in ("played", "probe")))
     for gid, fs in feeds.items():
         fs.sort(key=lambda f: _FEED_RANK.get(f.time_from, 2))
         # One feed per channel: a guide programme on a channel already listed by

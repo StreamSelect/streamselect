@@ -1036,3 +1036,28 @@ def test_a_channel_lists_epg_and_quality_chips_line_up_and_quality_is_unfilled(q
     inside = QColor(img.pixel(img.width() // 2, 2))
     assert inside.alpha() == 0 or not _near(inside, QColor(theme.COLOR_QUALITY_HD), 30), "no fill"
     assert _paints(hd, QColor(theme.COLOR_QUALITY_OUTLINE_HD)), "the tier colour is in the text"
+
+
+def test_a_channel_measured_while_playing_shows_its_measured_quality(games_db, qapp, owned_widgets):
+    """Owner report, 2026-11-14: after playing a channel (1080p, 30 fps) its row still
+    showed only what the name claimed. A measurement outranks the name, with the mark."""
+    from streamselect.core.repositories.stream_info import StreamInfoRepository
+    from streamselect.gui.game_card import ChannelList
+    with games_db.session_scope(commit=False) as s:
+        game = load_games(s, "hockey", set())[0]
+    measured_id = game.playable[0].channel_id
+    with games_db.session_scope() as s:
+        StreamInfoRepository(s).upsert(measured_id, {"video": {"width": 1920, "height": 1080, "fps": 30},
+                                                     "audio": [], "subs": []}, source="played")
+    with games_db.session_scope(commit=False) as s:
+        game = next(g for g in load_games(s, "hockey", set()) if g.title == game.title)
+    feed = next(f for f in game.feeds if f.channel_id == measured_id)
+    assert feed.quality == "FHD" and feed.verified
+    assert not any(f.verified for f in game.feeds if f.channel_id != measured_id)
+    lst = owned_widgets.own(ChannelList(game, preferred_key=None, playing_id=None, show_hidden=False))
+    lst.show()
+    qapp.processEvents()
+    row = next(r for r in lst.rows if r.feed.channel_id == measured_id)
+    chip = next(b for b in row.findChildren(QPushButton) if b.text() == "FHD")
+    assert not chip.icon().isNull(), "the measured mark"
+    assert chip.toolTip().startswith("Measured while playing")

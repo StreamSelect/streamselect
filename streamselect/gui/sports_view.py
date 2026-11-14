@@ -203,6 +203,12 @@ class SportsView(ContentView):
                 # of each game's channels follows what was last watched.
                 self.reload()
 
+    def measurement_arrived(self, channel_id: str) -> None:
+        """A channel's stream was just measured: re-read if one of the listed games
+        carries it, so its quality chip shows what playing it measured."""
+        if self._loaded and any(f.channel_id == channel_id for g in self._raw for f in g.feeds):
+            self.reload()
+
     def _on_games(self, result) -> None:
         games, history, alerts = result if result else ([], {}, [])
         self._raw, self._history, self._alerts = list(games or []), dict(history or {}), list(alerts or [])
