@@ -67,8 +67,12 @@ def test_metadata_from_raw_logs_nothing_per_row():
 
 # ── the sink level ──────────────────────────────────────────────────────────
 
+#: Where the app's (and its worker processes') file sink is configured.
+_LOGGING_SETUP = PKG / "core" / "app_logging.py"
+
+
 def _sink_call() -> ast.Call:
-    src = (PKG / "__main__.py").read_text()
+    src = _LOGGING_SETUP.read_text()
     for node in ast.walk(ast.parse(src)):
         if (isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
@@ -76,7 +80,7 @@ def _sink_call() -> ast.Call:
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "logger"):
             return node
-    raise AssertionError("no logger.add call found in __main__")
+    raise AssertionError("no logger.add call found in core/app_logging.py")
 
 
 def test_the_file_sink_is_not_hardcoded_to_debug():
@@ -92,7 +96,7 @@ def test_the_file_sink_is_not_hardcoded_to_debug():
 
 def test_the_level_can_still_be_raised_for_a_support_session():
     """Turning it up must not need a rebuild."""
-    src = (PKG / "__main__.py").read_text()
+    src = _LOGGING_SETUP.read_text()
     assert "STREAMSELECT_LOG_LEVEL" in src, (
         "there must be a documented way to get DEBUG back without editing code"
     )

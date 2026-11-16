@@ -157,7 +157,7 @@ class TestActiveNotificationBarUpdates:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             # Fire several distinct progress signals
@@ -183,7 +183,7 @@ class TestActiveNotificationBarUpdates:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             t1._fire_progress(10, 100, "Fetching…")
@@ -209,7 +209,7 @@ class TestActiveNotificationBarUpdates:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             overview_id = manager._overview_notif_id
@@ -256,7 +256,7 @@ class TestOverviewHasNoProgressBar:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
 

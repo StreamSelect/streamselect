@@ -58,10 +58,19 @@ _HOST_COOLDOWN_PROFILE_KEY_V1 = "image_host_cooldowns"
 
 # Bounded in-memory pixmap LRU (PERF-19): paint() may only ever consult this —
 # never disk. QPixmap construction and this dict are MAIN-THREAD-ONLY; see
-# ``_store_resident``. 512 pixmaps at a poster-thumbnail size is a few MB, well
-# inside the app's existing footprint, and comfortably covers a screen's worth
-# of rows plus recent scroll history.
+# ``_store_resident``. Pixmaps are kept at FULL size (the details pane rescales
+# its poster on every resize, and the preview overlay shows it large), and a
+# typical poster decodes to ~2 MB (600x900), so the count alone allowed ~1 GB.
+# The byte budget is what bounds memory; the count still covers a screen's rows
+# plus recent scroll history.
 _RESIDENT_CAP = 512
+#: Decoded bytes the resident LRU may hold before evicting its oldest entries.
+_RESIDENT_BUDGET_BYTES = 64 * 2**20
+
+
+def _decoded_bytes(pixmap: QPixmap) -> int:
+    """What *pixmap* occupies decoded: width x height x 4 bytes (32-bit)."""
+    return pixmap.width() * pixmap.height() * 4
 
 
 _YTIMG_MAXRES = re.compile(r"^(https?://i\.ytimg\.com/vi/[^/]+/)maxresdefault\.jpg$")
@@ -96,6 +105,7 @@ class ImageCache(QObject):
         # (get_image_resident). Written only from the main thread: QPixmap is
         # a GUI object, so never touch this from a worker.
         self._resident: "OrderedDict[str, QPixmap]" = OrderedDict()
+        self._resident_bytes = 0
 
         # Thread pool for async downloads
         self.executor = ThreadPoolExecutor(max_workers=4)
@@ -220,7 +230,7 @@ class ImageCache(QObject):
 
     def _store_resident(self, url: str, pixmap: QPixmap) -> None:
         """Insert/refresh *url* in the in-memory pixmap LRU, evicting the
-        oldest entry while over ``_RESIDENT_CAP``.
+        oldest entries while over ``_RESIDENT_CAP`` or ``_RESIDENT_BUDGET_BYTES``.
 
         MAIN-THREAD-ONLY: QPixmap is a GUI object and this dict backs
         ``get_image_resident`` (paint's only accessor) — never call this from
@@ -229,10 +239,16 @@ class ImageCache(QObject):
         """
         if pixmap is None or pixmap.isNull():
             return
+        previous = self._resident.pop(url, None)
+        if previous is not None:
+            self._resident_bytes -= _decoded_bytes(previous)
         self._resident[url] = pixmap
-        self._resident.move_to_end(url)
-        while len(self._resident) > _RESIDENT_CAP:
-            self._resident.popitem(last=False)
+        self._resident_bytes += _decoded_bytes(pixmap)
+        # The newest entry always stays, even alone over the budget.
+        while len(self._resident) > 1 and (len(self._resident) > _RESIDENT_CAP
+                                           or self._resident_bytes > _RESIDENT_BUDGET_BYTES):
+            _url, evicted = self._resident.popitem(last=False)
+            self._resident_bytes -= _decoded_bytes(evicted)
 
     def get_image_resident(self, url: str) -> Optional[QPixmap]:
         """Memory-only lookup — the ONLY image accessor paint code may call.

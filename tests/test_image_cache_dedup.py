@@ -21,7 +21,9 @@ import pytest
 import requests
 from PyQt6.QtGui import QPixmap
 
-from streamselect.core.image_cache import ImageCache, _HOST_COOLDOWN_S, _RESIDENT_CAP
+from streamselect.core.image_cache import (
+    _HOST_COOLDOWN_S, _RESIDENT_BUDGET_BYTES, _RESIDENT_CAP, ImageCache,
+)
 
 
 # A minimal, valid (per _verify_image's magic-byte + size check) PNG file:
@@ -238,6 +240,25 @@ def test_resident_lru_evicts_oldest_over_cap(cache) -> None:
         assert cache.get_image_resident(stale) is None, f"{stale} should have been evicted"
     for fresh in urls[-5:]:
         assert cache.get_image_resident(fresh) is not None, f"{fresh} should still be resident"
+
+
+def test_resident_lru_stays_inside_its_memory_budget(cache) -> None:
+    """Posters are kept at full size, ~2 MB decoded each, so the count cap
+    alone allowed ~1 GB. Full-size entries are evicted oldest-first to stay
+    within the byte budget; the newest always stays, and quality is untouched."""
+    poster = QPixmap(600, 900)                         # a typical poster, ~2 MB decoded
+    for i in range(_RESIDENT_CAP):
+        cache._store_resident(f"http://example.com/{i}.jpg", poster)
+    assert cache._resident_bytes <= _RESIDENT_BUDGET_BYTES
+    assert len(cache._resident) < _RESIDENT_CAP, "the budget, not the count, bounded it"
+    newest = f"http://example.com/{_RESIDENT_CAP - 1}.jpg"
+    assert cache.get_image_resident(newest).size() == poster.size(), "kept at full size"
+    assert cache.get_image_resident("http://example.com/0.jpg") is None
+    cache._store_resident(newest, poster)              # refreshing one does not double-count
+    assert cache._resident_bytes == len(cache._resident) * 600 * 900 * 4
+    huge = QPixmap(5000, 5000)                         # alone over budget: still kept
+    cache._store_resident("http://example.com/huge.png", huge)
+    assert list(cache._resident) == ["http://example.com/huge.png"]
 
 
 def test_ensure_resident_promotes_an_on_disk_hit(cache, qtbot) -> None:

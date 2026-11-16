@@ -23,9 +23,10 @@ The new contract:
 
 Thread safety: all mutating methods (``enqueue``, ``_start_next``,
 ``_on_thread_finished``) are called on the main thread — either directly by
-UI slots or via Qt signal delivery.  ``ProviderLoadThread`` is a ``QThread``
-whose ``finished`` / ``progress`` signals are connected to slots on *this*
-object (a ``QObject``), so Qt automatically delivers them on the main thread.
+UI slots or via Qt signal delivery.  Each refresh runs in a child process
+(``ProviderLoadProcess``, which runs ``ProviderLoadThread``'s code there); its
+``finished`` / ``progress`` signals are emitted from a main-thread poll of the
+child's pipe, so slots here always run on the main thread.
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from loguru import logger
 
 # Module-level imports so tests can patch them at `streamselect.gui.refresh_queue_manager.*`
 from streamselect.core.repositories import RepositoryFactory
-from streamselect.core.provider_loader import ProviderLoadThread
+from streamselect.gui.provider_load_process import ProviderLoadProcess
 from streamselect.core.database import ProviderDB
 
 if TYPE_CHECKING:
@@ -68,7 +69,7 @@ class _QueueEntry:
     provider_name: str
     status: ProviderRefreshStatus = ProviderRefreshStatus.QUEUED
     pct: int = 0
-    thread: "ProviderLoadThread | None" = field(default=None, repr=False)
+    thread: "ProviderLoadProcess | None" = field(default=None, repr=False)
     #: "full" or "live_only" (LIVE-1) — threaded into the ProviderLoadThread
     #: this entry starts. See RefreshQueueManager.enqueue for the supersede
     #: rule between the two.
@@ -230,8 +231,12 @@ class RefreshQueueManager(QObject):
                 return
 
     def _start_entry(self, entry: _QueueEntry) -> None:
-        """Build and start a ProviderLoadThread for *entry*."""
-        # Use module-level imports (RepositoryFactory, ProviderLoadThread, ProviderDB)
+        """Build and start a ProviderLoadProcess for *entry* (a child process).
+
+        In a process, not a thread: the memory one refresh's parse takes is
+        returned to the system when the child exits (``core.refresh_worker``).
+        """
+        # Use module-level imports (RepositoryFactory, ProviderLoadProcess, ProviderDB)
         # so tests can patch them at streamselect.gui.refresh_queue_manager.*
         from streamselect.gui.main_window_providers import (
             _make_steps, _advance_steps,
@@ -286,7 +291,7 @@ class RefreshQueueManager(QObject):
                 current_steps, epg_enabled,
             )
 
-        thread = ProviderLoadThread(
+        thread = ProviderLoadProcess(
             provider_model, self._db,
             separators=self._config.prefix_separators,
             language_groups=self._config.filter_language_groups,

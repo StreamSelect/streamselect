@@ -1,14 +1,13 @@
 """Main entry point for StreamSelect application"""
 
 import sys
-import os
 
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 from loguru import logger
 
 from streamselect.core.runtime_env import bundle_resource_path, flatpak_app_id, is_windows
-from streamselect.core.stream_diagnostics import _redact
+from streamselect.core.app_logging import configure_logging
 
 from streamselect.gui import cursor_affordance
 from streamselect.gui import theme as _theme
@@ -20,46 +19,8 @@ from streamselect.core.url_policy import UrlRankingPolicy, set_url_ranking_polic
 
 def setup_logging():
     """Configure application logging"""
-    from streamselect.core.log_paths import ACTIVE_LOG_NAME, log_directory
+    configure_logging()
 
-    log_dir = log_directory(create=True)
-
-    # Redact credentials on EVERY record, before any sink sees it.
-    #
-    # An Xtream stream URL embeds the subscription's username and password —
-    # `{base}/movie/{user}/{pass}/{id}.ext` — and `player_api.php` takes them
-    # as `?username=…&password=…`. Seventy-one call sites log a URL. A scan of
-    # one developer machine found many `username=` and many `password=`
-    # occurrences sitting in `~/.config/streamselect/logs/` under a seven-day
-    # retention, from ordinary use.
-    #
-    # Fixed HERE rather than at those 71 sites, and the distinction is the
-    # whole point: `_redact` already existed and was already imported by
-    # `main_window_streaming.py`, which called it at one of its five URL logs.
-    # Patching call sites is how you get four out of five — it is the same
-    # enumeration failure as the `refresh_theme()` sweep and the hand-listed
-    # test stubs. A patcher cannot be forgotten by the next person to write a
-    # `logger.info(f"... {url}")`, because they never have to know it exists.
-    def _scrub(record):
-        record["message"] = _redact(record["message"])
-
-    logger.configure(patcher=_scrub)
-
-    # DEBUG was hardcoded here, in the shipped app. Two logger.debug calls in
-    # the raw-metadata parser fired many times each and produced 1.30M of
-    # 1.44M lines — 330 MB across the retention window, which then held 8 days
-    # of noise where it would otherwise hold 76 days of signal. The level is
-    # now INFO by default and DEBUG on request, via STREAMSELECT_LOG_LEVEL, so a
-    # support session can turn it up without a rebuild.
-    level = os.environ.get("STREAMSELECT_LOG_LEVEL", "INFO").upper()
-    if level not in {"TRACE", "DEBUG", "INFO", "SUCCESS", "WARNING", "ERROR", "CRITICAL"}:
-        level = "INFO"
-    logger.add(
-        log_dir / ACTIVE_LOG_NAME,
-        rotation="10 MB",
-        retention="7 days",
-        level=level,
-    )
     # Name the build in the FIRST line, not just the About dialog. Under
     # rolling releases every push ships, so "0.56.0" no longer identifies a
     # build — a pasted log has to say which commit produced it or a report
@@ -81,6 +42,10 @@ def setup_logging():
 
 def main():
     """Main application entry point"""
+    # A packaged build's refresh worker is this same executable started by
+    # multiprocessing; freeze_support() runs it and exits before any UI is built.
+    import multiprocessing
+    multiprocessing.freeze_support()
     setup_logging()
 
     # A fresh start (Tools menu) recorded by the previous run: wipe BEFORE the

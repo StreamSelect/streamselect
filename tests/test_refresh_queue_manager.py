@@ -193,7 +193,7 @@ class TestSerialExecution:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             # After enqueueing p1, its thread should start immediately
@@ -225,7 +225,7 @@ class TestDeduplication:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             assert start_count[0] == 1
@@ -254,7 +254,7 @@ class TestLiveOnlyKind:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", thread_ctor),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", thread_ctor),
         ):
             manager.enqueue("p1", "Provider 1", kind="live_only")
 
@@ -271,7 +271,7 @@ class TestLiveOnlyKind:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", thread_ctor),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", thread_ctor),
         ):
             manager.enqueue("p1", "Provider 1")  # no kind passed
 
@@ -294,7 +294,7 @@ class TestLiveOnlyKind:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", thread_ctor),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", thread_ctor),
         ):
             manager.enqueue("p1", "Provider 1")                     # starts running (full)
             manager.enqueue("p2", "Provider 2", kind="live_only")   # queued behind p1
@@ -336,7 +336,7 @@ class TestLiveOnlyKind:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             manager.enqueue("p2", "Provider 2", kind="live_only")
@@ -366,7 +366,7 @@ class TestQueueChanged:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             qapp.processEvents()
@@ -384,7 +384,7 @@ class TestQueueChanged:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             t1._fire_finished(True)
@@ -411,7 +411,7 @@ class TestEnqueueWhileRunning:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             # Capture overview notif id before enqueueing p2
@@ -452,7 +452,7 @@ class TestRefreshFinishedSignal:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             t1._fire_finished(True, "Loaded 100 channels")
@@ -475,7 +475,7 @@ class TestRefreshFinishedSignal:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             t1._fire_finished(False, "Connection refused")
@@ -499,7 +499,7 @@ class TestOverviewDismissedWhenEmpty:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             overview_id = manager._overview_notif_id
@@ -530,7 +530,7 @@ class TestAllRefreshesFinished:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             assert not fired, "must NOT fire until the source actually finishes"
@@ -558,7 +558,7 @@ class TestAllRefreshesFinished:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             manager.enqueue("p2", "Provider 2")
@@ -584,7 +584,7 @@ class TestAllRefreshesFinished:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             t1._fire_finished(False, "Connection refused")
@@ -610,7 +610,7 @@ class TestShutdown:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             manager.enqueue("p2", "Provider 2")
@@ -649,7 +649,7 @@ class TestOverviewTitleNoDoubleIcon:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
 
@@ -715,7 +715,7 @@ class TestOverviewSteps:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
 
@@ -742,7 +742,7 @@ class TestOverviewSteps:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             manager.enqueue("p2", "Provider 2")
@@ -769,7 +769,7 @@ class TestOverviewSteps:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             qapp.processEvents()
@@ -796,7 +796,7 @@ class TestOverviewSteps:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             t1._fire_finished(True, "Loaded 100 channels")
@@ -826,7 +826,7 @@ class TestOverviewSteps:
 
         with (
             patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
-            patch("streamselect.gui.refresh_queue_manager.ProviderLoadThread", side_effect=thread_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
         ):
             manager.enqueue("p1", "Provider 1")
             qapp.processEvents()
