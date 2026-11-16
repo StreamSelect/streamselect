@@ -18,6 +18,7 @@ from streamselect.gui.dialog_chrome import dialog_buttons
 from streamselect.gui.middle_click_actions import DEFAULT_MIDDLE_CLICK_ACTION
 from streamselect.gui.settings_dialog_tabs import SettingsTabsMixin
 from streamselect.gui.settings_downloads_tab import SettingsDownloadsTabMixin
+from streamselect.gui.settings_tray_tab import SettingsTrayTabMixin
 from streamselect.gui.settings_recording_tab import SettingsRecordingTabMixin
 from streamselect.gui.three_panel_section_nav import ThreePanelSectionNav
 
@@ -220,6 +221,11 @@ SECTIONS: tuple[tuple[str, str, str, str], ...] = (
      "the source while it runs, so on an account limited to a single "
      "connection it competes with playback — which is why it defaults to "
      "once a day rather than hourly."),
+    ("tray", "System Tray", "_build_tray_tab",
+     "Whether closing the window leaves StreamSelect running in the system tray "
+     "(the menu bar on macOS), and which alerts it then shows as system "
+     "notifications. While it idles there it only reads what is already stored, "
+     "so it never uses a connection to your sources."),
     ("downloads", "Downloads", "_build_downloads_tab",
      "Where saved VOD downloads land, and how they are organized: a "
      "Movies/Series tree Plex, Jellyfin and Kodi read without configuration, "
@@ -255,7 +261,8 @@ def _dial_or_none(value: float, default: float):
     return None if abs(float(value) - float(default)) < 1e-9 else value
 
 
-class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecordingTabMixin, QDialog):
+class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecordingTabMixin,
+                     SettingsTrayTabMixin, QDialog):
     """Modal settings dialog: left-nav sections, center controls, right contextual help.
 
     Five sections — Playback, Interaction, Recommendations, Metadata & API Keys,
@@ -552,6 +559,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
             getattr(c, "update_check_enabled", True)
         )
         self._update_check_enabled_check.blockSignals(False)
+        self._load_tray_values(c)
 
         # EPG
         epg_idx = self._epg_interval_combo.findData(c.epg_default_refresh_interval)
@@ -738,6 +746,9 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
 
         # Updates
         c.update_check_enabled = self._update_check_enabled_check.isChecked()
+
+        # System Tray
+        self._save_tray_values(c)
 
         # EPG
         epg_val = self._epg_interval_combo.currentData()

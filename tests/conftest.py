@@ -1637,6 +1637,7 @@ _SETTINGS_APPLIED_HOOKS = (
     "_sync_split_toggle",
     "_apply_discover_reload_setting",
     "_apply_menu_bar_setting",
+    "_apply_tray_setting",
     "_refresh_vod_alerts_section",
     "_restart_series_monitor_scheduler",
     "_apply_player_settings",
@@ -2110,6 +2111,7 @@ def wire_player_manager_key_maps(mgr) -> None:
     """
     mgr._key_provider = {}
     mgr._key_url = {}
+    mgr._key_title = {}
 
 
 def wire_watch_queue_section(sec, rendered: list) -> None:
@@ -3286,6 +3288,34 @@ def wire_settings_downloads_widgets(dlg) -> None:
     dlg._download_policy_combo.addItem("Stop immediately", userData="stop_now")
 
 
+def wire_settings_tray_widgets(dlg) -> None:
+    """Attach the Settings → System Tray page's widgets to a skeleton dialog.
+
+    Same shape and same reason as its siblings: ``_load_values`` and
+    ``_save_values`` touch every page, so a skeleton missing one raises.
+
+    Args:
+        dlg: A ``SettingsDialog`` built via ``__new__`` (no ``__init__`` run).
+    """
+    from PyQt6.QtWidgets import QCheckBox
+
+    dlg._tray_close_check = QCheckBox()
+    dlg._tray_notify_watch_check = QCheckBox()
+    dlg._tray_notify_games_check = QCheckBox()
+    dlg._tray_notify_updates_check = QCheckBox()
+
+
+def mock_settings_tray_widgets(dlg) -> None:
+    """MagicMock flavor of :func:`wire_settings_tray_widgets` (Qt-free skeletons)."""
+    from unittest.mock import MagicMock
+
+    for name in ("_tray_close_check", "_tray_notify_watch_check",
+                 "_tray_notify_games_check", "_tray_notify_updates_check"):
+        check = MagicMock()
+        check.isChecked.return_value = name != "_tray_close_check"
+        setattr(dlg, name, check)
+
+
 def mock_settings_downloads_widgets(dlg) -> None:
     """MagicMock flavor of :func:`wire_settings_downloads_widgets`.
 
@@ -3375,6 +3405,7 @@ def wire_settings_widgets(dlg) -> None:
     wire_settings_signal_widgets(dlg)
     wire_settings_downloads_widgets(dlg)
     wire_settings_recording_widgets(dlg)
+    wire_settings_tray_widgets(dlg)
 
 
 def settings_config_double(**overrides):

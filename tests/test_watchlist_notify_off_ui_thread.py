@@ -84,7 +84,7 @@ def test_the_worker_raises_toasts_through_the_private_signal():
     """
     fn = _func("_watchlist_notification_worker")
     src = ast.get_source_segment(_SRC.read_text(encoding="utf-8"), fn) or ""
-    assert "_notify.emit" in src, "the worker must emit, not call the manager"
+    assert "_watch_alert.emit" in src, "the worker must emit, not call the manager"
     assert "self.notifications.show" not in src, (
         "the worker calls NotificationManager.show directly, which builds a "
         "QTimer off the main thread")

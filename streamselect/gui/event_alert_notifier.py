@@ -14,8 +14,10 @@ from loguru import logger
 
 from streamselect.core.epg_utils import now_utc
 from streamselect.core.games.alerts import due_notices, expired_event_rules, load_alerts, remove_alerts
-from streamselect.core.games.read import arrange_feeds, best_feed, load_games, load_watch_history
+from streamselect.core.games.read import (ON_NOW, ENDING, arrange_feeds, best_feed, game_state,
+                                          load_games, load_watch_history)
 from streamselect.core.games.store import sport_settings
+from streamselect.core.tray_state import TrayItem
 from streamselect.core.repositories.provider import ProviderRepository
 
 POLL_MS = 30_000
@@ -30,6 +32,8 @@ class EventAlertNotifier(QObject):
         self._play = play
         self._clock = clock
         self._sent: set[str] = set()
+        #: The alerted games from the latest poll, for the tray menu ("Tray Mode" TQ3).
+        self.upcoming: list[TrayItem] = []
         self._timer = QTimer(self)
         self._timer.setInterval(POLL_MS)
         self._timer.timeout.connect(self.check)
@@ -63,6 +67,7 @@ class EventAlertNotifier(QObject):
 
     def _on_data(self, result) -> None:
         games, alerts, history = result if result else ([], [], {})
+        self.upcoming = alerted_items(games, alerts, self._clock())
         if not alerts:
             return
         config = self._host.config
@@ -76,4 +81,20 @@ class EventAlertNotifier(QObject):
             actions = [("Play", lambda cid=feed.channel_id: self._play(cid))] if feed else []
             self._host.notification_manager.show(
                 title=title, message=f"{game.title} · {game.league}{where}",
-                type="info", auto_dismiss_ms=60_000, actions=actions)
+                type="info", auto_dismiss_ms=60_000, actions=actions,
+                alert="game", open_target="view:sports")
+
+
+def alerted_items(games, alerts, now) -> list[TrayItem]:
+    """The games an alert matches, as tray menu items; live ones marked LIVE."""
+    settings = sport_settings()
+    out = []
+    for game in games:
+        if not any(a.matches(game) for a in alerts):
+            continue
+        state = game_state(game, now, settings[game.sport]) if game.sport in settings else ""
+        if state not in (ON_NOW, ENDING) and game.start_utc < now:
+            continue                     # over, or past its usual length
+        out.append(TrayItem(game.start_utc, game.matchup, game.league, "view:sports",
+                            live=state in (ON_NOW, ENDING)))
+    return out

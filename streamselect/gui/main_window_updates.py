@@ -55,6 +55,7 @@ class _UpdatesMixin:
             message=f"You have {info.current}. Update?",
             type="info",
             dismissible=False,
+            alert="update",
             actions=[
                 ("Now", lambda i=info: self._update_now(i)),
                 ("Later", lambda: None),

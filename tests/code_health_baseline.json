@@ -9,7 +9,7 @@
     "streamselect/core/provider_loader.py": 1307,
     "streamselect/core/repositories/channel.py": 1711,
     "streamselect/core/repositories/channel_ingestion.py": 1318,
-    "streamselect/core/series_monitor.py": 1035,
+    "streamselect/core/series_monitor.py": 1034,
     "streamselect/gui/details_pane.py": 1000,
     "streamselect/gui/details_sections.py": 1012,
     "streamselect/gui/discover_view.py": 1014,

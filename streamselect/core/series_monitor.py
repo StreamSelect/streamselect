@@ -1020,8 +1020,7 @@ class SeriesMonitorManager(QObject):
                 self.notifications.show(
                     title=title,
                     message=f"{delta} new {ep_word} available{provider_suffix}",
-                    type="info",
-                    auto_dismiss_ms=6000,
+                    type="info", auto_dismiss_ms=6000, alert="watch",
                 )
 
             self.new_episodes_found.emit(series_channel_id, total_unseen)

@@ -88,6 +88,7 @@ from streamselect.gui.migration_progress_widget import MigrationProgressWidget
 from streamselect.gui.refresh_queue_manager import RefreshQueueManager
 from streamselect.gui.catalog_refresh_tick import _CatalogRefreshTickMixin
 from streamselect.gui.main_window_sports import _SportsViewMixin
+from streamselect.gui.main_window_tray import _TrayMixin
 
 import streamselect.whats_new as _whats_new
 
@@ -153,9 +154,8 @@ _SHUTDOWN_POOL_WAIT_S = 8.0
 
 
 class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixin, _ProviderConnectivityMixin, _SeriesMixin, _SeriesPlaybackMixin, _ChannelListMixin, _StreamingMixin, _QueueEndPromptMixin, _OverlaysMixin, _NavMixin, _MetadataMixin, _ExclusionActionsMixin, _FavoritesMixin, _DownloadsMixin, _UpdatesMixin, _StyleMenuMixin, _StatusMixin, _AsyncMixin, _AppHeaderMixin, _FilterChipHostMixin, _SearchPostersMixin, _MenuBarRevealMixin, _MenuActionsMixin, _AlertsMixin, _CatalogRefreshTickMixin, _SportsViewMixin,
-                 QMainWindow):
+                 _TrayMixin, QMainWindow):
     """Main application window"""
-    
     # Signal for thread-safe metadata updates (channel_id, metadata)
     metadata_loaded = pyqtSignal(object, object)
     # bool: True when the assignment changed which rows BELONG in the list (the
@@ -2318,6 +2318,8 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
 
     def closeEvent(self, event):
         """Handle window close"""
+        if self._close_to_tray(event):     # the tray keeps it running (Tray Mode TQ1, TQ13)
+            return
         # Ask FIRST, before any state changes — a due recording is the one
         # thing that makes "just close it" the wrong default (settled Q4).
         if not self._confirm_quit_with_due_recordings():

@@ -110,6 +110,12 @@ class Notification:
     # Grouping
     group_id: Optional[str] = None  # For grouping related notifications
 
+    # Alerts that may also go to the system while the window is in the tray
+    # ("Tray Mode" TQ5): the kind (core.tray_state.KINDS, "" = never) and the
+    # ``navigate_to`` target a click on the system notification opens.
+    alert: str = ""
+    open_target: str = ""
+
     # State
     created_at: datetime = field(default_factory=datetime.now)
     is_collapsed: bool = False
@@ -124,6 +130,10 @@ class NotificationManager:
         self.max_visible = max_visible
         self.listeners: list[Callable] = []
         self.auto_dismiss_timers: dict = {}  # notification_id -> QTimer
+        #: Called with every notification marked ``alert`` — the tray decides
+        #: whether it also goes to the system. The one place that happens, so
+        #: no sender knows the tray exists.
+        self.system_sink: Optional[Callable[[Notification], None]] = None
 
     def add_listener(self, callback: Callable):
         """Add notification change listener"""
@@ -195,9 +205,17 @@ class NotificationManager:
                 dismissible=kwargs.get('dismissible', True),
                 auto_dismiss_seconds=auto_dismiss_seconds,
                 actions=kwargs.get('actions', []),
+                alert=kwargs.get('alert', ''),
+                open_target=kwargs.get('open_target', ''),
             )
 
         self.notifications.append(notification)
+        if notification.alert and self.system_sink is not None:
+            try:
+                self.system_sink(notification)
+            except Exception:
+                from loguru import logger
+                logger.exception("system notification failed")
 
         # Set up auto-dismiss timer if specified
         if notification.auto_dismiss_seconds and notification.auto_dismiss_seconds > 0:

@@ -504,6 +504,8 @@ def test_settings_dialog_saves_partial_threshold(tmp_path):
     # Recording tab spins — mock flavor (same Qt-free reason as above).
     from tests.conftest import mock_settings_recording_widgets
     mock_settings_recording_widgets(dialog)
+    from tests.conftest import mock_settings_tray_widgets
+    mock_settings_tray_widgets(dialog)
 
     dialog._save_values()
 

@@ -57,6 +57,7 @@ class EpgManager(_EpgFetchMixin, QObject):
     refresh_error    = pyqtSignal(str, str)   # provider_id, error_message
     # Internal signals marshal notification calls from worker threads to main thread
     _notify          = pyqtSignal(str, str, str, int)  # title, message, type, auto_dismiss_ms
+    _watch_alert     = pyqtSignal(str, str, int)       # a Watch Alert match: title, message, ms
     _progress_update = pyqtSignal(str, int, int, str)   # notif_id, current, total (-1=indeterminate), message
     _progress_done   = pyqtSignal(str, str)             # notif_id, final_message
     _progress_error  = pyqtSignal(str)                  # notif_id — dismiss on error
@@ -88,6 +89,7 @@ class EpgManager(_EpgFetchMixin, QObject):
         self._notification_timer: QTimer | None = None
         self._scheduler_timer: QTimer | None = None
         self._notify.connect(self._do_notify)
+        self._watch_alert.connect(self._do_watch_alert)
         self._progress_update.connect(self._do_progress_update)
         self._progress_done.connect(self._do_progress_done)
         self._progress_error.connect(self._do_progress_error)
@@ -111,6 +113,14 @@ class EpgManager(_EpgFetchMixin, QObject):
             self.notifications.show(
                 title=title, message=message,
                 type=type_, auto_dismiss_ms=auto_dismiss_ms,
+            )
+
+    def _do_watch_alert(self, title: str, message: str, auto_dismiss_ms: int) -> None:
+        """A Watch Alert match: marked so it also reaches the system from the tray."""
+        if self.notifications:
+            self.notifications.show(
+                title=title, message=message, type="info", auto_dismiss_ms=auto_dismiss_ms,
+                alert="watch", open_target="view:epg",
             )
 
     def _do_progress_update(self, notif_id: str, current: int, total: int, message: str) -> None:
@@ -914,7 +924,7 @@ class EpgManager(_EpgFetchMixin, QObject):
 
             if not self._shutting_down and pending:
                 title, message, dismiss_ms = burst_banner(pending)
-                self._notify.emit(title, message, "info", dismiss_ms)
+                self._watch_alert.emit(title, message, dismiss_ms)
         except Exception as e:
             logger.error(f"EPG notification check error: {e}")
         finally:

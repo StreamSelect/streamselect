@@ -58,6 +58,8 @@ HANDLERS: tuple[str, ...] = (
     # Applies the menu-bar setting AND re-ticks the Tools entry, so the two
     # surfaces cannot disagree after an OK.
     "_apply_menu_bar_setting",
+    # Settings → System Tray: shows or removes the tray icon.
+    "_apply_tray_setting",
     "_sync_split_toggle",
     # THE Discover reload. Several settings change what its shelves contain —
     # the VE-1 dead-signal axis, the PLAT-1 platform-shelf threshold — and

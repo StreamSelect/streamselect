@@ -1,0 +1,223 @@
+"""The system-tray icon: its menu, its tooltip, and the system notifications.
+
+Settled in the "Tray Mode" design (owner, 2026-11-16, TQ1-TQ14). The menu is
+rebuilt from what is known at that moment: the player's windows (what plays),
+the event-alert notifier's latest poll (alerted games) and a read of the guide
+for Watch Alert matches, refreshed off-thread every few minutes. Nothing here
+talks to a source: idling adds no network use (TQ10).
+
+System notifications arrive through ``NotificationManager.system_sink`` — one
+seam, so no sender knows the tray exists — and go out only while the window is
+hidden or minimised (TQ5), only for the kinds switched on in Settings → System
+Tray, and never while paused (TQ7).
+"""
+
+from __future__ import annotations
+
+from loguru import logger
+from PyQt6.QtCore import QObject, QTimer
+from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
+
+from streamselect.core import runtime_env, tray_state, watchlist
+from streamselect.core.epg_utils import now_utc
+from streamselect.gui.icon_utils import role_icon
+
+#: How often the guide's Watch Alert matches and the tooltip are re-read.
+REFRESH_MS = 5 * 60_000
+#: How long a system notification stays up, where the system lets the app say.
+MESSAGE_MS = 10_000
+
+#: Settings switch per notification kind.
+_KIND_SWITCH = {
+    tray_state.KIND_WATCH: "tray_notify_watch",
+    tray_state.KIND_GAME: "tray_notify_games",
+    tray_state.KIND_UPDATE: "tray_notify_updates",
+}
+
+_PAUSES = (
+    (tray_state.PAUSE_HOUR, "For 1 hour"),
+    (tray_state.PAUSE_TOMORROW, "Until tomorrow"),
+    (tray_state.PAUSE_INDEFINITE, "Until I turn them back on"),
+)
+
+
+def tray_available() -> bool:
+    """Whether this desktop shows tray icons (stock GNOME does not, TQ12)."""
+    return QSystemTrayIcon.isSystemTrayAvailable()
+
+
+class TrayController(QObject):
+    """Owns the tray icon. *host* is the main window (``_TrayMixin``)."""
+
+    def __init__(self, host, parent=None, *, clock=now_utc):
+        super().__init__(parent)
+        self._host = host
+        self._clock = clock
+        self._watch_items: list[tray_state.TrayItem] = []
+        self._message_target: str | None = None
+        self._icon = QSystemTrayIcon(QApplication.windowIcon(), self)
+        self._menu = QMenu()
+        self._menu.aboutToShow.connect(self.rebuild)
+        self._icon.setContextMenu(self._menu)
+        self._icon.activated.connect(self._on_activated)
+        self._icon.messageClicked.connect(self._on_message_clicked)
+        self._timer = QTimer(self)
+        self._timer.setInterval(REFRESH_MS)
+        self._timer.timeout.connect(self.refresh)
+
+    # -- lifecycle ------------------------------------------------------------
+
+    def set_visible(self, visible: bool) -> None:
+        """Show or remove the icon; the refresh runs only while it is shown."""
+        self._icon.setVisible(visible)
+        if visible:
+            self._timer.start()
+            self.refresh()
+        else:
+            self._timer.stop()
+
+    def is_visible(self) -> bool:
+        return self._icon.isVisible()
+
+    def shutdown(self) -> None:
+        self._timer.stop()
+        self._icon.hide()
+
+    # -- what the menu knows -------------------------------------------------
+
+    def playing(self) -> dict[str, str]:
+        """``{player window: title}`` for every stream still playing."""
+        return self._host.player_manager.playing_titles()
+
+    def items(self) -> list[tray_state.TrayItem]:
+        """Alerted games plus Watch Alert matches, as the menu lists them."""
+        notifier = self._host.__dict__.get("event_alert_notifier")
+        games = list(notifier.upcoming) if notifier is not None else []
+        return tray_state.menu_items(games + self._watch_items, self._clock())
+
+    def refresh(self) -> None:
+        """Re-read the guide's Watch Alert matches off-thread, then redraw."""
+        rules = watchlist.rules(self._host.config)
+        if not rules:
+            self._watch_items = []
+            self.rebuild()
+            return
+        hours = int(tray_state.HORIZON.total_seconds() // 3600)
+
+        def query(repos):
+            from streamselect.core.repositories.epg import EpgRepository
+            from streamselect.core.database import ChannelDB
+
+            providers = repos.providers.get_epg_active_provider_ids()
+            if not providers:
+                return []
+            hidden = set(repos.providers.get_hidden_provider_ids())
+            repo = EpgRepository(repos.session)
+            found = []
+            for live, data in (
+                (True, repo.get_live_for_watchlist(
+                    rules, provider_ids=providers, excluded_channel_provider_ids=hidden)),
+                (False, repo.get_upcoming_for_watchlist(
+                    rules, hours_ahead=hours, provider_ids=providers,
+                    excluded_channel_provider_ids=hidden)),
+            ):
+                for progs in data.values():
+                    found.extend((live, p.title, p.start_time, p.channel_db_id) for p in progs)
+            ids = {cid for *_, cid in found if cid}
+            names = dict(repos.session.query(ChannelDB.id, ChannelDB.detected_title)
+                         .filter(ChannelDB.id.in_(ids)).all()) if ids else {}
+            return [tray_state.TrayItem(start, title, names.get(cid) or "", "view:epg", live=live)
+                    for live, title, start, cid in found]
+
+        self._host._run_query(query, self._on_watch_items,
+                              on_error=lambda exc: logger.warning("Tray: guide read failed: {}", exc))
+
+    def _on_watch_items(self, items) -> None:
+        self._watch_items = list(items or [])
+        self.rebuild()
+
+    # -- menu and tooltip -----------------------------------------------------
+
+    def rebuild(self) -> None:
+        """Rebuild the menu and tooltip from what is known now."""
+        now = self._clock()
+        playing = [t for t in self.playing().values() if t]
+        items = self.items()
+        pause = tray_state.pause_text(self._host.config.tray_notifications_paused, now)
+        self._icon.setToolTip(tray_state.tooltip(len(items), playing, pause))
+
+        m = self._menu
+        m.clear()
+        shown = self._host.isVisible() and not self._host.isMinimized()
+        m.addAction("Hide StreamSelect" if shown else "Show StreamSelect", self._host.toggle_from_tray)
+        if self.playing():
+            m.addSection("Playing")
+            for title in self.playing().values():
+                m.addAction(role_icon("play"), title or "A stream", self._host.show_from_tray)
+            m.addAction(role_icon("stop_playback"), "Stop playback", self.stop_playback)
+        m.addSection("Your alerts")
+        for item in items:
+            m.addAction(role_icon("monitor"), item.label(),
+                        lambda t=item.target: self._host.show_from_tray(t))
+        if not items:
+            m.addAction("Nothing alerted in the next 12 hours").setEnabled(False)
+        m.addSeparator()
+        sub = m.addMenu(role_icon("monitor_off"), "Pause notifications")
+        if pause:
+            sub.addAction(pause).setEnabled(False)
+            sub.addAction("Resume notifications", lambda: self.set_pause(""))
+            sub.addSeparator()
+        for choice, label in _PAUSES:
+            sub.addAction(label, lambda c=choice: self.set_pause(c))
+        m.addAction(role_icon("software_update"), "Check for Updates…",
+                    self._host._manual_update_check)
+        m.addSeparator()
+        m.addAction("Quit StreamSelect", self._host.quit_app)
+
+    def stop_playback(self) -> None:
+        """Stop every player window, each through ``PlayerManager`` (TQ9)."""
+        for key in list(self.playing()):
+            self._host.player_manager.stop(key=key)
+        QTimer.singleShot(500, self.rebuild)
+
+    def set_pause(self, choice: str) -> None:
+        """Pause for *choice* (``tray_state`` PAUSE_*), or resume with ""."""
+        value = tray_state.pause_value(choice, self._clock()) if choice else ""
+        self._host.config.tray_notifications_paused = value
+        self._host.config.save()
+        self.rebuild()
+
+    # -- clicks ---------------------------------------------------------------
+
+    def _on_activated(self, reason) -> None:
+        # macOS opens the menu on a click, as menu-bar items do (TQ4).
+        if runtime_env.is_macos():
+            return
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
+            self._host.toggle_from_tray()
+
+    def _on_message_clicked(self) -> None:
+        self._host.show_from_tray(self._message_target)
+
+    # -- system notifications -------------------------------------------------
+
+    def wants(self, kind: str) -> bool:
+        """Whether a *kind* notification goes to the system right now."""
+        config = self._host.config
+        if not self.is_visible() or kind not in _KIND_SWITCH or not getattr(config, _KIND_SWITCH[kind]):
+            return False
+        if tray_state.paused_until(config.tray_notifications_paused, self._clock()) is not None:
+            return False
+        return not self._host.isVisible() or self._host.isMinimized()
+
+    def notify(self, notification) -> None:
+        """``NotificationManager.system_sink``: send it on when :meth:`wants` says so."""
+        if not self.wants(notification.alert):
+            return
+        self.message(notification.title, notification.message, notification.open_target or None)
+
+    def message(self, title: str, body: str, target: str | None = None) -> None:
+        """Show a system notification; a click on it opens *target*."""
+        # Qt reports a click on the latest message only, so the latest target wins.
+        self._message_target = target
+        self._icon.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, MESSAGE_MS)

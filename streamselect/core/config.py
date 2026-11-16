@@ -828,6 +828,19 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     # suppressed while the latest release equals this value.
     update_skip_version: str = ""
 
+    # ── System tray ("Tray Mode" design, TQ1-TQ14) ───────────────────────────
+    # Closing the window keeps the app in the tray. None = never asked: the
+    # first close asks once and the answer becomes this (TQ1). Settings → System Tray.
+    tray_close_to_tray: Optional[bool] = None
+    # Which alerts become a system notification while the window is in the tray.
+    tray_notify_watch: bool = True     # EPG Watch Alerts and new episodes
+    tray_notify_games: bool = True     # Sports event alerts
+    tray_notify_updates: bool = True   # a new StreamSelect release
+    # "" = not paused; an ISO UTC end; or "indefinite" (core/tray_state.py).
+    tray_notifications_paused: str = ""
+    # The one-time "still running in the tray" notice has been shown.
+    tray_hide_notice_shown: bool = False
+
     # Stream diagnostics settings (headless engine; see core/stream_diagnostics.py)
     diagnostics_baseline_url: str = "https://speed.cloudflare.com/__down?bytes=25000000"  # Neutral-host speed sample
     diagnostics_sample_seconds: int = 8  # How long to sample provider throughput

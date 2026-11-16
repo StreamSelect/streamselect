@@ -49,6 +49,8 @@ class PlayerManager:
         # the provider_id when split is on, but "__shared__" when off — this map
         # resolves the shared window too).
         self._key_provider: dict[str, str] = {}
+        #: What each window was asked to play, for the tray's "Playing" row.
+        self._key_title: dict[str, str] = {}
         # Instance key → the exact URL last handed to mpv for it. Lets
         # same-provider stream switching (gui/stream_switch.py, PLAY-10) route
         # the next play onto the host that is CURRENTLY streaming — proven
@@ -319,6 +321,8 @@ class PlayerManager:
             deep_buffer=deep_buffer, channel_id=channel_id,
         )
 
+        if result:
+            self._key_title[key] = title
         if provider_id:
             if result:
                 # Remember which source is playing in this window (for the health readout).
@@ -376,6 +380,7 @@ class PlayerManager:
         self._key_url.pop(key, None)
         if old_provider:
             self.connection_accountant.release(old_provider, key)
+        self._key_title[key] = title
         return self.player.play(path, title, instance_key=key)
 
     def queue(
@@ -476,6 +481,10 @@ class PlayerManager:
             if self.get_properties(["path"], key=key).get("path"):
                 return True
         return False
+
+    def playing_titles(self) -> dict[str, str]:
+        """``{instance key: title}`` for every window still playing."""
+        return {k: self._key_title.get(k, "") for k in self.active_keys()}
 
     def active_keys(self) -> list[str]:
         """Return the instance keys whose player processes are currently alive.

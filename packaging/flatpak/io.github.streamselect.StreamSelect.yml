@@ -34,6 +34,12 @@ finish-args:
   - --filesystem=xdg-cache/streamselect:create
   - --filesystem=xdg-videos/StreamSelect:create
   - --env=LC_NUMERIC=C
+  # The system tray and its notifications (Settings > System Tray). Qt registers
+  # a StatusNotifierItem under its own name (sandbox pid 2, first icon) with the
+  # desktop's watcher, and shows notifications through the freedesktop service.
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --own-name=org.kde.StatusNotifierItem-2-1
+  - --talk-name=org.freedesktop.Notifications
 
 cleanup:
   - '*.la'
