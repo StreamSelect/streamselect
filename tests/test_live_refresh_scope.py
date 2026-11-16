@@ -88,6 +88,18 @@ def test_the_finished_refresh_stamps_its_own_kind(kind, due):
     host._maybe_refresh_provider_epg.assert_called_once_with(PID, due)
 
 
+@pytest.mark.parametrize("kind, checks", [("live_only", 0), ("full", 1)])
+def test_only_a_refresh_that_loaded_vod_checks_series_and_vod_alerts(kind, checks):
+    """A live-only refresh cannot change series or movies; checking every
+    monitored series cost one request each to the source per tick."""
+    host = _finished_host()
+    host.series_monitor, host.vod_watch_alert_manager = MagicMock(), MagicMock()
+    host._on_queue_refresh_finished(PID, True, "", SimpleNamespace(kind=kind, fetch_epg=False,
+                                                                   prefix_stats=None))
+    assert host.series_monitor.check_provider.call_count == checks
+    assert host.vod_watch_alert_manager.check_provider.call_count == checks
+
+
 def test_epg_not_due_is_not_fetched(db):
     with db.session_scope() as s:
         s.add(ProviderDB(id=PID, name="P", type="xtream", url="http://example.com",

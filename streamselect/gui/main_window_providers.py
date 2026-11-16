@@ -712,12 +712,17 @@ class _ProviderMixin:
             if getattr(self, "epg_manager", None):
                 self.epg_manager.relink_all()
 
+            # Series and VOD content: only a refresh that loaded it. A live-only
+            # refresh cannot change either, and checking every monitored series
+            # cost one request each to the source per tick (68 measured,
+            # 2026-11-16) — four times an hour at the 15-minute setting.
+            vod_loaded = provider_id and kind != "live_only"
             # Check monitored series for new episodes.
-            if provider_id and "series_monitor" in self.__dict__:
+            if vod_loaded and "series_monitor" in self.__dict__:
                 self.series_monitor.check_provider(provider_id)
 
             # Check VOD watch-for rules against this provider's freshly-loaded content.
-            if provider_id and "vod_watch_alert_manager" in self.__dict__:
+            if vod_loaded and "vod_watch_alert_manager" in self.__dict__:
                 self.vod_watch_alert_manager.check_provider(provider_id)
 
             # Post-refresh EPG pull: step 2 of a source refresh.
