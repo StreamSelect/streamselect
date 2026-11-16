@@ -2,6 +2,10 @@
   "_comment": "MENU-1 seed allowlist (tests/test_channel_menus_come_from_registry.py) - every entry is a QMenu( construction site outside streamselect/gui/channel_menu.py that is NOT channel-shaped (a section header, a config-only aggregate, a prefix/category axis, a filter dropdown, a picker for something other than a channel row) and so stays hand-rolled. Shrink-only: a site that migrates onto the channel_menu.py registry must be REMOVED here, never left (test_the_allowlist_only_shrinks fails the suite if it is). Format: file::qualified_function (Class.method inside a class, bare function name at module level).",
   "sites": [
     {
+      "entry": "streamselect/gui/tray.py::TrayController.__init__",
+      "reason": "the system-tray icon's menu (show/hide, playing, alerts, pause, quit) - not channel-shaped."
+    },
+    {
       "entry": "streamselect/gui/sidebar/queue.py::WatchQueueSection._on_context_menu",
       "reason": "section-level 'Clear Unavailable' menu on empty-space/header right-click - not channel-shaped."
     },

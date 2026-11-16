@@ -27,6 +27,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 import pytest
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
 from streamselect.core.repositories.queue import QueueEntry
@@ -200,14 +201,12 @@ class TestChunkedBuild:
         return sec
 
     def _built_row_count(self, sec) -> int:
-        """Row widgets only — a ``GroupHeading`` is a widget on an item too,
-        and counting it would make one batch of 40 rows read as 41."""
-        from streamselect.gui.sidebar.base import GroupHeading
-
+        """Content rows in the list — items carrying a row payload. Their WIDGETS
+        are built only near the viewport (``sidebar/lazy_rows.py``), so the
+        build is counted by items; a ``GroupHeading`` item carries no payload."""
         return sum(
             1 for i in range(sec._list.count())
-            if (w := sec._list.itemWidget(sec._list.item(i))) is not None
-            and not isinstance(w, GroupHeading)
+            if isinstance(sec._list.item(i).data(Qt.ItemDataRole.UserRole), dict)
         )
 
     def _pump_until_done(self, sec, max_iterations: int = 200) -> None:
@@ -256,7 +255,9 @@ class TestChunkedBuild:
         self._pump_until_done(sec)
 
         from streamselect.gui.sidebar.base import GroupHeading
+        from tests.conftest import build_lazy_rows
 
+        build_lazy_rows(sec)
         rows = [
             _real_row_title(sec, sec._list.item(i))
             for i in range(sec._list.count())

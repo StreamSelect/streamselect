@@ -102,6 +102,8 @@ class TestTheQueue:
             _entry("Keep Two", days=3),
         ])
         QApplication.processEvents()
+        from tests.conftest import build_lazy_rows
+        build_lazy_rows(queue)            # rows build when shown; this list never is
         survivors = {id(w) for w in _widgets(queue) if w is not None}
 
         assert queue.remove_row("ch-Delete Me") is True

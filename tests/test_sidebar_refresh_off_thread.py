@@ -390,7 +390,7 @@ def test_queue_on_data_ready_splits_and_maps_icons(qapp):
     from PyQt6.QtWidgets import QListWidget
     from streamselect.gui.sidebar.queue import WatchQueueSection
     from streamselect.core.repositories.queue import QueueEntry
-    from tests.conftest import wire_watch_queue_filter
+    from tests.conftest import build_lazy_rows, wire_watch_queue_filter
 
     obj = WatchQueueSection.__new__(WatchQueueSection)
     obj._list = QListWidget()
@@ -405,6 +405,7 @@ def test_queue_on_data_ready_splits_and_maps_icons(qapp):
                    media_type="series", last_played=datetime(2024, 1, 2), channel=None),
     ]
     obj._on_data_ready(entries)
+    build_lazy_rows(obj)
 
     texts = _texts(obj._list)
     assert _ids(obj._list) == ["q2", "q1"]   # continue-watching (q2) before never-watched (q1)

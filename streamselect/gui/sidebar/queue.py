@@ -22,6 +22,7 @@ from streamselect.gui.chunked_construction import ChunkHandle, build_chunked
 from streamselect.gui.scoped_filter_box import ScopedFilterBox
 from streamselect.gui.sidebar.background_refresh import BackgroundRefreshMixin
 from streamselect.gui.sidebar.base import SectionAction, CollapsibleSection, GroupHeading, make_seamless
+from streamselect.gui.sidebar.lazy_rows import LazyRowMixin
 from streamselect.gui import deferred_config_save as _cfgsave
 
 _ROLE_AVAILABLE   = Qt.ItemDataRole.UserRole + 1
@@ -112,7 +113,7 @@ def _matches_needle(needle: str, haystack: str) -> bool:
     return not needle or needle in haystack
 
 
-class WatchQueueSection(BackgroundRefreshMixin, CollapsibleSection):
+class WatchQueueSection(LazyRowMixin, BackgroundRefreshMixin, CollapsibleSection):
     """Sidebar section showing the user's ordered watch queue."""
 
     MIN_ROWS: int = 5
@@ -239,11 +240,11 @@ class WatchQueueSection(BackgroundRefreshMixin, CollapsibleSection):
         self._list_mc = install_list_middle_click(self._list)
         self._list_mc.middleClicked.connect(self.channelMiddleClicked)
         make_seamless(self._list)
+        self._install_lazy_rows(self._list)
         self.content_layout.addWidget(self._list)
 
-        # Both bulk actions live in the ⋯ overflow. "Clear Watched" used to be a
-        # full-width button, which cost ~29px — more than a compact row — in
-        # every session, whether or not there was anything to clear.
+        # Both bulk actions live in the ⋯ overflow: a full-width "Clear Watched"
+        # cost ~29px in every session, whether or not there was anything to clear.
 
         # Filter bookkeeping — rebuilt by every _populate_rows.
         self._groups: list[_FilterGroup] = []
@@ -508,6 +509,7 @@ class WatchQueueSection(BackgroundRefreshMixin, CollapsibleSection):
         if handle is not None:
             handle.cancel()
         self._build_handle = None
+        self._lazy_row_sizes = {}         # re-measured on every populate
         self._groups, self._no_match_item = [], None
 
     def _on_queue_build_done(self) -> None:
@@ -591,6 +593,7 @@ class WatchQueueSection(BackgroundRefreshMixin, CollapsibleSection):
                 group.header.setHidden(False)
                 group.heading.set_count(group.unfiltered_count())
         self._update_no_match_row(needle, visible)
+        self._schedule_materialize()      # rows the filter brought into view need widgets
 
     # --- In-place removal (InPlaceRowMixin) -----------------------------------
 
@@ -694,24 +697,30 @@ class WatchQueueSection(BackgroundRefreshMixin, CollapsibleSection):
         # to the year. The media TYPE is the icon, never a word.
         marker = episode_code(e.season_num, e.episode_num) or e.detected_year
         quality = quality_word(e.detected_quality)
-        row = build_chip_row(
-            title=title,
-            icon_role=media_icon_role(e.media_type),
-            chips=(
-                (CHIP_QUALITY, quality),
-                (CHIP_YEAR, marker),
-                (CHIP_LANG, e.detected_prefix),
-            ),
-            meta=sidebar_meta_line(marker, e.detected_prefix, quality),
-            density=self._row_density(),
-        )
+        meta = sidebar_meta_line(marker, e.detected_prefix, quality)
+        density = self._row_density()
+
+        def make_row():
+            row = build_chip_row(
+                title=title,
+                icon_role=media_icon_role(e.media_type),
+                chips=(
+                    (CHIP_QUALITY, quality),
+                    (CHIP_YEAR, marker),
+                    (CHIP_LANG, e.detected_prefix),
+                ),
+                meta=meta, density=density,
+            )
+            if not e.available:
+                # A custom item widget ignores the item's foreground role, so dim the
+                # whole row via a translucency effect (opacity, not a colour literal).
+                effect = QGraphicsOpacityEffect(row)
+                effect.setOpacity(0.45)
+                row.setGraphicsEffect(effect)
+            return row
+
         if not e.available:
-            # A custom item widget ignores the item's foreground role, so dim the whole
-            # row via a translucency effect (opacity, not a colour literal) and keep the
-            # recovery tooltip on the item (mouse-transparent row → item shows it).
-            effect = QGraphicsOpacityEffect(row)
-            effect.setOpacity(0.45)
-            row.setGraphicsEffect(effect)
+            # The recovery tooltip lives on the item (mouse-transparent row → item shows it).
             item.setToolTip(_UNAVAILABLE_TOOLTIP)
         elif e.media_type == "series" and not e.is_episode:
             # Series channel-grain row: double-click drills into the season/
@@ -721,11 +730,8 @@ class WatchQueueSection(BackgroundRefreshMixin, CollapsibleSection):
             item.setToolTip("Double-click to browse the series")
         else:
             item.setToolTip("Double-click to play")
-        # Width 0 → the item spans the viewport (no sideways scroll); the row's own
-        # height governs the row height.
-        item.setSizeHint(QSize(0, row.sizeHint().height()))
-        self._list.addItem(item)
-        self._list.setItemWidget(item, row)
+        # The widget is built when the row comes into view (lazy_rows).
+        self._add_lazy_row(item, ("entry", density, bool(meta)), make_row)
         return item
 
     # --- Alerts Matched (topmost group) ---------------------------------------
@@ -758,18 +764,20 @@ class WatchQueueSection(BackgroundRefreshMixin, CollapsibleSection):
             "channel_id": m.channel_id,
         })
         quality = quality_word(m.detected_quality)
-        row = build_chip_row(
-            title=m.title,
-            icon_role=media_icon_role(m.media_type),
-            chips=(
-                (CHIP_QUALITY, quality),
-                (CHIP_YEAR, m.detected_year),
-                (CHIP_LANG, m.detected_prefix),
-            ),
-            meta=sidebar_meta_line(m.detected_year, m.detected_prefix, quality),
-            density=self._row_density(),
-            new_badge=True,
-        )
+        meta = sidebar_meta_line(m.detected_year, m.detected_prefix, quality)
+        density = self._row_density()
+
+        def make_row():
+            return build_chip_row(
+                title=m.title,
+                icon_role=media_icon_role(m.media_type),
+                chips=(
+                    (CHIP_QUALITY, quality),
+                    (CHIP_YEAR, m.detected_year),
+                    (CHIP_LANG, m.detected_prefix),
+                ),
+                meta=meta, density=density, new_badge=True,
+            )
         hint = (
             "double-click to browse the series" if m.media_type == "series"
             else "double-click to play"
@@ -779,9 +787,7 @@ class WatchQueueSection(BackgroundRefreshMixin, CollapsibleSection):
             item.setToolTip(f"Matched your alert: {quoted} — {hint}")
         else:
             item.setToolTip(f"Matched your watch-for alert — {hint}")
-        item.setSizeHint(QSize(0, row.sizeHint().height()))
-        self._list.addItem(item)
-        self._list.setItemWidget(item, row)
+        self._add_lazy_row(item, ("matched_channel", density, bool(meta)), make_row)
         return item
 
     def _add_matched_series_item(self, entry: dict) -> QListWidgetItem:
@@ -804,16 +810,11 @@ class WatchQueueSection(BackgroundRefreshMixin, CollapsibleSection):
         item.setToolTip(
             f"{title}: +{unseen} new {ep_word} — double-click to browse the series"
         )
-        row = build_chip_row(
-            title=title,
-            icon_role=media_icon_role("series"),
-            news_text=f"+{unseen} {ep_word}",
-            new_badge=True,
-            density=self._row_density(),
-        )
-        item.setSizeHint(row.sizeHint())
-        self._list.addItem(item)
-        self._list.setItemWidget(item, row)
+        density = self._row_density()
+        self._add_lazy_row(item, ("matched_series", density), lambda: build_chip_row(
+            title=title, icon_role=media_icon_role("series"),
+            news_text=f"+{unseen} {ep_word}", new_badge=True, density=density,
+        ), size_of=lambda row: row.sizeHint())
         return item
 
     def _route_matched_click(self, item: QListWidgetItem) -> bool:

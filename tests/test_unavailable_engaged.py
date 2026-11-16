@@ -307,7 +307,7 @@ def test_queue_populate_rows_dims_unavailable_items(qapp):
     from PyQt6.QtWidgets import QListWidget
     from PyQt6.QtCore import Qt
     from streamselect.gui.sidebar.queue import WatchQueueSection, _ROLE_AVAILABLE, _ROLE_SEARCH_TITLE
-    from tests.conftest import wire_watch_queue_filter
+    from tests.conftest import build_lazy_rows, wire_watch_queue_filter
 
     obj = WatchQueueSection.__new__(WatchQueueSection)
     obj._list = QListWidget()
@@ -325,6 +325,7 @@ def test_queue_populate_rows_dims_unavailable_items(qapp):
                    available=False, search_title="Gone Title", provider_id="p2"),
     ]
     obj._populate_rows(entries)
+    build_lazy_rows(obj)
 
     # has_unavailable flag updated
     assert obj._has_unavailable is True

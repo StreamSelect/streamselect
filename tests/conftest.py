@@ -3514,6 +3514,26 @@ def sidebar_item_text(list_widget, item) -> str:
     return label.text() if label is not None else ""
 
 
+def build_lazy_rows(section) -> None:
+    """Build every row widget a lazy section is still holding back.
+
+    The Watch Queue builds a row's widget only when it comes into view
+    (``sidebar/lazy_rows.py``), so straight after ``_populate_rows`` most rows
+    are items with no widget yet. A test that inspects row WIDGETS (icons,
+    dimming, titles) calls this first, rather than each growing its own way to
+    force them — or reading ``None`` and failing for the wrong reason.
+    """
+    from streamselect.gui.sidebar.lazy_rows import ROLE_PENDING_ROW
+
+    lst = section._list
+    for i in range(lst.count()):
+        item = lst.item(i)
+        make_row = item.data(ROLE_PENDING_ROW)
+        if make_row is not None:
+            item.setData(ROLE_PENDING_ROW, None)
+            lst.setItemWidget(item, make_row())
+
+
 # ---------------------------------------------------------------------------
 # Discover "Manage shelves" dialog
 # ---------------------------------------------------------------------------
