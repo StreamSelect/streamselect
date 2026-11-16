@@ -66,6 +66,9 @@ _CONTENT_TYPE_ROLE = Qt.ItemDataRole.UserRole + 5  # On Now: classify_channel_co
 #: on +6 every Browse programme row read as a separator (CI on an earlier change).
 _PROG_START_ROLE   = Qt.ItemDataRole.UserRole + 8
 _PROG_STOP_ROLE    = Qt.ItemDataRole.UserRole + 9
+#: On the Rec column: the (state, tooltip) last applied, so a re-walk that finds
+#: nothing changed sets nothing (each setter re-signals the view).
+_REC_STATE_ROLE    = Qt.ItemDataRole.UserRole + 10
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +219,9 @@ def apply_rec_cell(item: QTreeWidgetItem, column: int, channel_id, start, stop,
     from streamselect.gui.recording_indicators import indicator_for, vector_key_for
 
     state, tooltip = indicator_for(channel_id, start, stop, progress_rows, now)
+    if item.data(column, _REC_STATE_ROLE) == [state, tooltip]:
+        return                   # unchanged since the last pass
+    item.setData(column, _REC_STATE_ROLE, [state, tooltip])
     item.setText(column, "")
     item.setIcon(column, _icon_utils.role_icon(
         vector_key_for(state), _theme.COLOR_ERR if state == "recording" else _theme.COLOR_TEXT))
@@ -234,9 +240,14 @@ def refresh_rec_column(tree: QTreeWidget, column: int, progress_rows, now, *,
     Shared by On Now (``grouped=True`` — programme rows sit one level under a
     prefix-group header) and Browse (flat top-level rows, some of which are Q3
     day separators skipped via ``separator_role``), called each poll tick from
-    ``EpgView.refresh_recording_indicators`` — cheap, since it only touches
-    rows already on screen and ``progress_rows`` is one shared read.
+    ``EpgView.refresh_recording_indicators``. It runs every 2 s, so it does
+    nothing for a list that is not on screen (switching to one reloads it) and
+    :func:`apply_rec_cell` sets nothing on a row whose state has not changed:
+    re-setting every row of a few-thousand-row On Now each tick held the UI
+    thread at ~35% with nothing recording (measured 2026-11-16).
     """
+    if not tree.isVisible():
+        return
     def _apply(row_item: QTreeWidgetItem) -> None:
         if separator_role is not None and row_item.data(0, separator_role):
             return

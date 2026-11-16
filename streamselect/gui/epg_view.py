@@ -586,7 +586,13 @@ class EpgView(_EpgWatchlistMixin, _EpgOnNowMixin, _EpgBrowseMixin, _EpgEventsMix
             self._reload_events()
 
     def _on_live_timer_tick(self) -> None:
-        """60-second timer: reload On Now data, and re-group Events from cache."""
+        """60-second timer: refresh the tab on screen — On Now, or Events from cache.
+
+        Only the tab on screen: refreshing On Now behind another tab ran its
+        10-15 s query and rebuilt every row on the UI thread once a minute for
+        nobody (measured 40-60% CPU bursts on the Watchlist tab, 2026-11-16).
+        Switching tabs reloads the tab it lands on (``_on_tab_changed``).
+        """
         tab = self.tab_bar.currentIndex()
         if tab == 3:
             self._reload_on_now()
@@ -594,10 +600,6 @@ class EpgView(_EpgWatchlistMixin, _EpgOnNowMixin, _EpgBrowseMixin, _EpgEventsMix
             # Re-group from cached DTOs — no DB round-trip needed; just recompute
             # "on now" boundary against the fresh now_utc().
             self._render_events(self._events_dto_cache)
-        else:
-            # If the user is on another tab, still refresh On Now in the background
-            # so the data is ready when they switch back.
-            self._reload_on_now()
 
     def _filtered_provider_ids(self) -> list[str]:
         return self._provider_ids
@@ -688,7 +690,7 @@ class EpgView(_EpgWatchlistMixin, _EpgOnNowMixin, _EpgBrowseMixin, _EpgEventsMix
         return manager.progress() if manager is not None else []
 
     def refresh_recording_indicators(self, progress_rows: list) -> None:
-        """Re-walk On Now + Browse's visible rows, refreshing the Rec column.
+        """Re-walk On Now or Browse, whichever is on screen, refreshing the Rec column.
 
         Pushed by ``MainWindow._refresh_transfer_sections`` with the SAME
         ``RecordingManager.progress()`` snapshot it reads for the Recordings

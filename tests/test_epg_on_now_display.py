@@ -860,3 +860,45 @@ def test_render_on_now_keeps_an_excluded_prefix_heard_in_another_language(qapp):
     destroy_widget(tree, host.on_now_search, host.on_now_stats,
                    host.on_now_prefix_dropdown, host.on_now_type_dropdown)
     assert shown == ["Channel heard"], f"On now showed {shown}"
+
+
+def test_the_rec_tick_skips_a_hidden_list_and_rows_that_did_not_change(qapp):
+    """Every 2 s the transfer tick re-walks the Rec column. A list not on screen
+    is left alone, and a row whose state is unchanged gets no setter (each one
+    re-signals the view): re-setting a few-thousand-row On Now each tick held
+    the UI thread at ~35% with nothing recording."""
+    from datetime import timedelta
+    from streamselect.core.epg_utils import now_utc
+    from streamselect.core.recording_manager import RecordingProgress
+    from streamselect.gui.epg_widgets import refresh_rec_column
+
+    now = now_utc()
+    recording = [RecordingProgress(
+        recording_id="r1", channel_id="ch1", channel_name="ch1",
+        programme_title="The Match", state="recording",
+        starts_at=now - timedelta(minutes=10), ends_at=now + timedelta(minutes=50),
+        recorded_bytes=0, dest_path="", error=None, waiting_for_slot=False,
+    )]
+    host = _make_render_host()
+    host._render_on_now([_rec_program()])
+    tree = host.on_now_list
+    item = tree.topLevelItem(0).child(0)
+
+    refresh_rec_column(tree, 6, recording, now, grouped=True)      # never shown
+    assert _rec_icon_is(item, 6, "record", _theme_mod.COLOR_TEXT), "a hidden list is skipped"
+
+    tree.show()
+    qapp.processEvents()
+    try:
+        refresh_rec_column(tree, 6, recording, now, grouped=True)
+        assert _rec_icon_is(item, 6, "recording_active", _theme_mod.COLOR_ERR)
+        changes = []
+        tree.model().dataChanged.connect(lambda *a: changes.append(a))
+        refresh_rec_column(tree, 6, recording, now, grouped=True)
+        assert changes == [], "an unchanged row is not touched"
+        refresh_rec_column(tree, 6, [], now, grouped=True)
+        assert _rec_icon_is(item, 6, "record", _theme_mod.COLOR_TEXT) and changes
+    finally:
+        from PyQt6.QtWidgets import QWidget
+        from tests.conftest import destroy_widget
+        destroy_widget(*[v for v in vars(host).values() if isinstance(v, QWidget)])

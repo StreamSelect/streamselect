@@ -16,6 +16,7 @@ from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from streamselect.gui import macos_dock
+from streamselect.gui.main_window_nav import CONTENT_VIEW_ATTRS
 from streamselect.gui.tray import TrayController, tray_available
 
 #: The automatic update check is re-asked this often while the app runs; its own
@@ -88,8 +89,25 @@ class _TrayMixin:
             return False
         return None
 
+    def _views_on_screen(self) -> list:
+        """The content views showing now that have a lifecycle (timers, loads)."""
+        views = [self.__dict__.get(attr) for attr in CONTENT_VIEW_ATTRS]
+        views += list(self.__dict__.get("explore_views", {}).values())
+        # getattr is polymorphism here, as in _hide_all_content_views: the list
+        # mixes ContentViews with plain item views that have no lifecycle.
+        return [v for v in views if v is not None and v.isVisible()
+                and getattr(v, "on_deactivate", None) and getattr(v, "on_activate", None)]
+
     def hide_to_tray(self) -> None:
-        """Hide the window; the first time, say where the app went."""
+        """Hide the window, pausing the view on screen; the first time, say where it went.
+
+        A hidden window's view would otherwise keep its timers: the guide went on
+        re-reading On Now every minute with nobody looking.
+        """
+        # Asked BEFORE hiding: once the window is hidden no view is "visible".
+        self._paused_views = self._views_on_screen()
+        for view in self._paused_views:
+            view.on_deactivate()
         self.hide()
         macos_dock.show_in_dock(False)
         if not self.config.tray_hide_notice_shown:
@@ -108,8 +126,11 @@ class _TrayMixin:
             self.show()
         self.raise_()
         self.activateWindow()
-        if target:
-            self.navigate_to(target)
+        paused, self._paused_views = self.__dict__.get("_paused_views", []), []
+        # Navigating activates the view it lands on; otherwise resume the paused one.
+        if not (target and self.navigate_to(target)):
+            for view in paused:
+                view.on_activate()
         tray = self.__dict__.get("tray")
         if tray is not None:
             tray.mark_seen()

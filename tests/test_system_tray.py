@@ -263,6 +263,21 @@ class _Window(main_window_tray._TrayMixin, QWidget):
 
     def navigate_to(self, target):
         self.navigated.append(target)
+        return True
+
+
+class _View(QWidget):
+    """A content view with a lifecycle: what timers a hidden window must pause."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.calls = []
+
+    def on_activate(self):
+        self.calls.append("activate")
+
+    def on_deactivate(self):
+        self.calls.append("deactivate")
 
 
 class _Close:
@@ -303,6 +318,33 @@ def test_the_users_close_hides_to_the_tray_and_says_so_once(qapp, config):
     w.show_from_tray("view:sports")
     assert w.isVisible() and w.navigated == ["view:sports"]
     destroy_widget(w)
+
+
+def test_hiding_to_the_tray_pauses_the_view_on_screen_and_showing_resumes_it(qapp, config):
+    w = _window(config)
+    w.epg_view = _View(w)
+    w.discover_view = _View(w)
+    w.discover_view.setVisible(False)              # not the view on screen
+    w.show()
+    w.hide_to_tray()
+    assert w.epg_view.calls == ["deactivate"] and w.discover_view.calls == []
+    w.show_from_tray()
+    assert w.epg_view.calls == ["deactivate", "activate"]
+    w.hide_to_tray()
+    w.show_from_tray("view:sports")
+    assert w.epg_view.calls[-1] == "deactivate", "navigating activates its own view instead"
+    destroy_widget(w)
+
+
+def test_the_guide_timer_refreshes_only_the_tab_on_screen():
+    from streamselect.gui.epg_view import EpgView
+    for tab, reloads in ((3, 1), (0, 0), (1, 0), (2, 0), (4, 0)):
+        seen = []
+        host = SimpleNamespace(tab_bar=SimpleNamespace(currentIndex=lambda t=tab: t),
+                               _reload_on_now=lambda: seen.append("on_now"),
+                               _render_events=lambda _c: None, _events_dto_cache=[])
+        EpgView._on_live_timer_tick(host)
+        assert len(seen) == reloads, f"tab {tab}: On Now is re-read only while it shows"
 
 
 @pytest.mark.parametrize("answer, hides, stored", [(True, True, True), (False, False, False),
