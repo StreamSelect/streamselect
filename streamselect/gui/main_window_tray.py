@@ -112,6 +112,7 @@ class _TrayMixin:
             self.navigate_to(target)
         tray = self.__dict__.get("tray")
         if tray is not None:
+            tray.mark_seen()
             tray.rebuild()
 
     def toggle_from_tray(self) -> None:

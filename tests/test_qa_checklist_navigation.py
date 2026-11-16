@@ -199,6 +199,9 @@ class _FakeHost(_NavMixin):
     def show_channel_details_by_id(self, channel_id):
         self.shown.append(channel_id)
 
+    def _on_vod_rule_show_matches(self, rule_created):
+        self.calls.append(("rule", rule_created))
+
     # Synchronous stand-in for the async read seam: run the query against the
     # real DB and deliver to the main-thread slot, mirroring _run_query's contract.
     def _run_query(self, query_fn, on_result, *, token_ref=None, on_error=None):
@@ -221,6 +224,14 @@ def test_navigate_to_settings_opens_tab():
     host = _FakeHost()
     assert host.navigate_to("settings:Interface") is True
     assert host.calls == [("settings", "Interface")]
+
+
+def test_navigate_to_a_channel_or_a_rule_opens_what_its_watch_alerts_row_opens():
+    """A tray notification's click: a series' details, or a movie rule's matches."""
+    host = _FakeHost()
+    assert host.navigate_to("channel:series-7") is True and host.shown == ["series-7"]
+    assert host.navigate_to("alert-rule:2026-11-16T10:00:00") is True
+    assert host.calls == [("rule", "2026-11-16T10:00:00")], "the rule id keeps its own colons"
 
 
 def test_navigate_to_unknown_is_noop():

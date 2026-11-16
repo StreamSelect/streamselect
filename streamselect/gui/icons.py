@@ -615,6 +615,8 @@ VECTOR_KEYS: dict[str, str] = {
     # Tools ▸ Software Update… — a newer version of the app itself, not media.
     "software_update": "mdi6.package-up",
     "stop_playback": "mdi6.stop-circle-outline",
+    # The red badge on the tray icon while an alert is unseen.
+    "tray_alert_badge": "mdi6.exclamation-thick",
     # The Downloads section's "reveal in file manager" action, and the same
     # action in a row's context menu. An OPEN folder: the button reveals a
     # location rather than describing one, which is the distinction

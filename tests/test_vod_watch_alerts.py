@@ -465,6 +465,9 @@ class TestVodWatchAlertManagerWorker:
         assert notif_mock.show.called, "NotificationManager.show() must be called"
         call_str = str(notif_mock.show.call_args)
         assert "Dune" in call_str
+        kw = notif_mock.show.call_args.kwargs
+        assert kw["alert"] == "watch", "a movie match reaches the system from the tray"
+        assert kw["open_target"] == f"alert-rule:{rule_created}", "a click opens the rule's matches"
 
         # Public signal must have been emitted
         assert found_signal_args, "new_matches_found must emit after a new match"

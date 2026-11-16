@@ -328,6 +328,7 @@ _MIDNIGHT_LEGACY: dict[str, TokenValue] = {
     # between them with theme.on_fill(); never hardcode "white", which is what
     # put 1.88:1 text on the mint fills.
     'COLOR_ON_FILL_LIGHT': '#ffffff',
+    'COLOR_TRAY_BADGE': '#e53935',  # sits on the desktop's panel, not the app
     'COLOR_ON_FILL_DARK': '#10131a',
 }
 
@@ -526,6 +527,7 @@ _GRAPHITE_LEGACY: dict[str, TokenValue] = {
     # between them with theme.on_fill(); never hardcode "white", which is what
     # put 1.88:1 text on the mint fills.
     'COLOR_ON_FILL_LIGHT': '#ffffff',
+    'COLOR_TRAY_BADGE': '#e53935',  # sits on the desktop's panel, not the app
     'COLOR_ON_FILL_DARK': '#10131a',
 }
 
@@ -557,6 +559,8 @@ def is_theme_invariant(key: str, value: TokenValue) -> bool:
     - ``OVERLAY_BLACK_*`` — image scrims darken a poster so text can sit on it.
     - ``COLOR_ON_FILL_*`` — text on a solid fill, where the FILL carries the
       palette (``theme.on_fill()`` picks between them).
+    - ``COLOR_TRAY_*`` — painted into the tray icon, which sits on the
+      desktop's panel, never on the app's surface.
 
     One definition, used by :func:`_derive` to carry them across from the legacy
     dicts AND by the palette-distinctness test to exclude them from its measure
@@ -564,7 +568,8 @@ def is_theme_invariant(key: str, value: TokenValue) -> bool:
     insufficiently different.
     """
     return (
-        key.startswith(("FONT_", "COLOR_LIGHTBOX_", "OVERLAY_BLACK_", "COLOR_ON_FILL_")) or not isinstance(value, str)
+        key.startswith(("FONT_", "COLOR_LIGHTBOX_", "OVERLAY_BLACK_", "COLOR_ON_FILL_",
+                        "COLOR_TRAY_")) or not isinstance(value, str)
     )
 
 
@@ -797,6 +802,7 @@ _DAYLIGHT_LEGACY: dict[str, TokenValue] = {
     # between them with theme.on_fill(); never hardcode "white", which is what
     # put 1.88:1 text on the mint fills.
     'COLOR_ON_FILL_LIGHT': '#ffffff',
+    'COLOR_TRAY_BADGE': '#e53935',  # sits on the desktop's panel, not the app
     'COLOR_ON_FILL_DARK': '#10131a',
 }
 

@@ -433,6 +433,8 @@ class TestSeriesMonitorWorker:
         call_kwargs = notif_mock.show.call_args
         assert "new episode" in str(call_kwargs).lower()
         assert "Test Provider" in str(call_kwargs)
+        assert call_kwargs.kwargs["open_target"] == "channel:ch1", \
+            "from the tray, a click opens the series as its Watch Alerts row does"
 
         # Signal was emitted
         assert len(found_signal_args) == 1

@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from PyQt6.QtGui import QColor, QIcon, QPixmap
 from PyQt6.QtWidgets import QApplication, QWidget
 
 from streamselect.core import tray_state
@@ -88,6 +89,22 @@ def test_alerted_items_keep_only_matching_games_that_are_not_over():
     assert [(i.title, i.target) for i in got] == [("Kraken vs Jets", "view:sports")]
 
 
+def test_a_live_alerted_game_carries_its_preferred_feed_and_an_upcoming_one_none():
+    from dataclasses import replace
+    from streamselect.core.games.read import GameDTO, GameFeedDTO
+
+    feeds = (GameFeedDTO("ch-first", "One", "Pack A", False), GameFeedDTO("ch-pref", "Two", "Pack B", False))
+
+    def game(gid, a, minutes):
+        return GameDTO(gid, "hockey", "NHL", a, "Jets", NOW + timedelta(minutes=minutes), 1, False, 2, feeds)
+    alert = SimpleNamespace(matches=lambda g: True)
+    preferred_first = lambda g: replace(g, feeds=tuple(reversed(g.feeds)))  # noqa: E731
+    got = alerted_items([game(1, "Kraken", -20), game(2, "Oilers", 90)], [alert], NOW, preferred_first)
+    by = {i.title.split()[0]: i for i in got}
+    assert by["Kraken"].live and by["Kraken"].plays == "ch-pref", "the card's first feed: the preferred one"
+    assert not by["Oilers"].live and by["Oilers"].plays is None, "a future game only opens the app"
+
+
 # ── the controller ──────────────────────────────────────────────────────────
 
 class _Host(QWidget):
@@ -99,6 +116,10 @@ class _Host(QWidget):
                                               stop=lambda key: self.stopped.append(key))
         self.event_alert_notifier = SimpleNamespace(upcoming=list(games))
         self.shown_on = []
+        self.played = []
+
+    def play_channel_by_id(self, channel_id):
+        self.played.append(channel_id)
 
     def _run_query(self, *a, **k):
         pass
@@ -145,6 +166,22 @@ def test_menu_shows_what_plays_stop_and_the_alerts(qapp, config):
     destroy_widget(ctl._menu, host)
 
 
+def test_a_live_item_opens_the_app_and_plays_an_upcoming_one_only_opens(qapp, config):
+    live = TrayItem(NOW - timedelta(minutes=20), "Kraken vs Jets", "NHL", "view:sports",
+                    live=True, channel_id="ch-pref")
+    later = TrayItem(NOW + timedelta(minutes=90), "News at Six", "", "view:epg", channel_id="ch-news")
+    host = _Host(config, games=[live, later])
+    ctl = tray_mod.TrayController(host, clock=lambda: NOW)
+    ctl.rebuild()
+    by = {a.text(): a for a in ctl._menu.actions()}
+    next(a for t, a in by.items() if "Kraken" in t).trigger()
+    assert host.shown_on == ["view:sports"] and host.played == ["ch-pref"]
+    next(a for t, a in by.items() if "News at Six" in t).trigger()
+    assert host.shown_on[-1] == "view:epg" and host.played == ["ch-pref"], "nothing new plays"
+    ctl.shutdown()
+    destroy_widget(ctl._menu, host)
+
+
 def test_menu_says_when_nothing_is_alerted(qapp, config):
     host = _Host(config)
     ctl = tray_mod.TrayController(host, clock=lambda: NOW)
@@ -177,6 +214,44 @@ def test_notifications_go_out_only_hidden_switched_on_and_unpaused(qapp, config)
     destroy_widget(ctl._menu, host)
 
 
+def _blue_icon():
+    pm = QPixmap(64, 64)
+    pm.fill(QColor(0, 0, 255))
+    return QIcon(pm)
+
+
+def test_the_badge_keeps_the_app_icon_and_adds_a_red_mark_lower_right(qapp):
+    from streamselect.gui import theme
+    img = tray_mod.badged_icon(_blue_icon()).pixmap(64, 64).toImage()
+    assert img.pixelColor(8, 8) == QColor(0, 0, 255), "the app icon still shows"
+    edge = img.pixelColor(64 - 3, 64 - 18)          # on the disc, clear of the "!"
+    err = QColor(theme.COLOR_TRAY_BADGE)
+    assert abs(edge.red() - err.red()) < 30 and edge.blue() < 120, "a red disc, bottom-right"
+    centre = img.pixelColor(64 - 18, 64 - 18)
+    assert centre != edge, "the disc carries a mark, not a plain dot"
+
+
+def test_an_alert_badges_the_icon_until_the_menu_or_window_is_opened(qapp, config):
+    old = qapp.windowIcon()
+    qapp.setWindowIcon(_blue_icon())
+    host = _Host(config)
+    ctl = tray_mod.TrayController(host, clock=lambda: NOW)
+    try:
+        def corner():
+            return ctl._icon.icon().pixmap(64, 64).toImage().pixelColor(61, 46)
+        plain = corner()
+        ctl.message("Still running", "…")
+        assert not ctl.unseen and corner() == plain, "the hide notice is not an alert"
+        ctl.message("Starting now", "A vs B", "view:sports", alert=True)
+        assert ctl.unseen and corner() != plain
+        ctl._menu.aboutToShow.emit()
+        assert not ctl.unseen and corner() == plain
+    finally:
+        ctl.shutdown()
+        qapp.setWindowIcon(old)
+        destroy_widget(ctl._menu, host)
+
+
 # ── close, hide, quit ───────────────────────────────────────────────────────
 
 class _Window(main_window_tray._TrayMixin, QWidget):
@@ -203,7 +278,8 @@ class _Close:
 
 
 def _window(config):
-    tray = SimpleNamespace(messages=[], rebuild=lambda: None, set_visible=lambda v: None)
+    tray = SimpleNamespace(messages=[], rebuild=lambda: None, set_visible=lambda v: None,
+                           mark_seen=lambda: None)
     tray.message = lambda *a: tray.messages.append(a)
     return _Window(config, tray)
 

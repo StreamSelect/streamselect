@@ -1018,7 +1018,7 @@ class SeriesMonitorManager(QObject):
                 ep_word = "episode" if delta == 1 else "episodes"
                 provider_suffix = f" on {', '.join(grown_names)}" if grown_names else ""
                 self.notifications.show(
-                    title=title,
+                    title=title, open_target=f"channel:{series_channel_id}",
                     message=f"{delta} new {ep_word} available{provider_suffix}",
                     type="info", auto_dismiss_ms=6000, alert="watch",
                 )

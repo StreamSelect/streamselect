@@ -41,6 +41,14 @@ class TrayItem:
     detail: str            # league, or channel name
     target: str            # a ``navigate_to`` target, e.g. "view:sports"
     live: bool = False
+    #: What a click on a LIVE item also plays: the game's preferred feed, or the
+    #: programme's channel. None for upcoming items, which only open the app.
+    channel_id: str | None = None
+
+    @property
+    def plays(self) -> str | None:
+        """The channel a click starts, or None (owner, 2026-11-16: live only)."""
+        return self.channel_id if self.live else None
 
     def label(self) -> str:
         when = "LIVE" if self.live else clock_text(to_local(self.start_utc))

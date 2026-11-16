@@ -67,15 +67,18 @@ class EventAlertNotifier(QObject):
 
     def _on_data(self, result) -> None:
         games, alerts, history = result if result else ([], [], {})
-        self.upcoming = alerted_items(games, alerts, self._clock())
+        config = self._host.config
+        now = self._clock()
+
+        def arranged(game):
+            return arrange_feeds(game, config.game_channel_prefs.get(game.league_key, {}), history, now)
+        self.upcoming = alerted_items(games, alerts, now, arranged)
         if not alerts:
             return
-        config = self._host.config
         for key, game, title in due_notices(games, alerts, self._clock(),
                                             int(config.event_alert_lead_minutes), self._sent):
             self._sent.add(key)
-            game = arrange_feeds(game, config.game_channel_prefs.get(game.league_key, {}), history,
-                                 self._clock())
+            game = arranged(game)
             feed = best_feed(game)
             where = f" · plays on {feed.region + ' ' if feed.region else ''}{feed.station}" if feed else ""
             actions = [("Play", lambda cid=feed.channel_id: self._play(cid))] if feed else []
@@ -85,8 +88,12 @@ class EventAlertNotifier(QObject):
                 alert="game", open_target="view:sports")
 
 
-def alerted_items(games, alerts, now) -> list[TrayItem]:
-    """The games an alert matches, as tray menu items; live ones marked LIVE."""
+def alerted_items(games, alerts, now, arranged=lambda g: g) -> list[TrayItem]:
+    """The games an alert matches, as tray menu items; live ones marked LIVE.
+
+    A live game carries the feed a click plays: the first of *arranged* (the
+    user's preferred collection first, as on its card).
+    """
     settings = sport_settings()
     out = []
     for game in games:
@@ -95,6 +102,8 @@ def alerted_items(games, alerts, now) -> list[TrayItem]:
         state = game_state(game, now, settings[game.sport]) if game.sport in settings else ""
         if state not in (ON_NOW, ENDING) and game.start_utc < now:
             continue                     # over, or past its usual length
+        live = state in (ON_NOW, ENDING)
+        feed = best_feed(arranged(game)) if live else None
         out.append(TrayItem(game.start_utc, game.matchup, game.league, "view:sports",
-                            live=state in (ON_NOW, ENDING)))
+                            live=live, channel_id=feed.channel_id if feed else None))
     return out

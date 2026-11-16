@@ -266,6 +266,9 @@ class VodWatchAlertManager(QObject):
                 message=channel_name,
                 type="info",
                 auto_dismiss_ms=7000,
+                # From the tray, a click opens what the rule's Watch Alerts row opens.
+                alert="watch",
+                open_target=f"alert-rule:{rule_created}",
             )
 
         self.new_matches_found.emit()

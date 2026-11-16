@@ -15,12 +15,14 @@ Tray, and never while paused (TQ7).
 from __future__ import annotations
 
 from loguru import logger
-from PyQt6.QtCore import QObject, QTimer
+from PyQt6.QtCore import QObject, QRect, Qt, QTimer
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from streamselect.core import runtime_env, tray_state, watchlist
 from streamselect.core.epg_utils import now_utc
-from streamselect.gui.icon_utils import role_icon
+from streamselect.gui import theme
+from streamselect.gui.icon_utils import role_icon, role_pixmap
 
 #: How often the guide's Watch Alert matches and the tooltip are re-read.
 REFRESH_MS = 5 * 60_000
@@ -41,6 +43,38 @@ _PAUSES = (
 )
 
 
+#: Sizes the badged icon is drawn at; trays pick the nearest.
+_BADGE_SIZES = (16, 22, 24, 32, 48, 64)
+
+
+def badged_icon(base: QIcon) -> QIcon:
+    """*base* with a red "!" disc in its lower-right corner: an alert not yet seen.
+
+    The app's own icon stays recognisable, so the tray is still easy to find
+    (owner, 2026-11-16: a generic notification icon made it hard to spot).
+    """
+    out = QIcon()
+    fill = theme.COLOR_TRAY_BADGE
+    for size in _BADGE_SIZES:
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        base.paint(p, QRect(0, 0, size, size))
+        d = max(8, round(size * 0.55))
+        disc = QRect(size - d, size - d, d, d)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(fill))
+        p.drawEllipse(disc)
+        glyph = max(6, round(d * 0.8))
+        mark = QRect(0, 0, glyph, glyph)
+        mark.moveCenter(disc.center())
+        p.drawPixmap(mark, role_pixmap("tray_alert_badge", theme.on_fill(fill), glyph))
+        p.end()
+        out.addPixmap(pm)
+    return out
+
+
 def tray_available() -> bool:
     """Whether this desktop shows tray icons (stock GNOME does not, TQ12)."""
     return QSystemTrayIcon.isSystemTrayAvailable()
@@ -55,8 +89,12 @@ class TrayController(QObject):
         self._clock = clock
         self._watch_items: list[tray_state.TrayItem] = []
         self._message_target: str | None = None
-        self._icon = QSystemTrayIcon(QApplication.windowIcon(), self)
+        self._plain_icon = QApplication.windowIcon()
+        self._badged_icon = badged_icon(self._plain_icon)
+        self.unseen = False
+        self._icon = QSystemTrayIcon(self._plain_icon, self)
         self._menu = QMenu()
+        self._menu.aboutToShow.connect(self.mark_seen)
         self._menu.aboutToShow.connect(self.rebuild)
         self._icon.setContextMenu(self._menu)
         self._icon.activated.connect(self._on_activated)
@@ -126,7 +164,8 @@ class TrayController(QObject):
             ids = {cid for *_, cid in found if cid}
             names = dict(repos.session.query(ChannelDB.id, ChannelDB.detected_title)
                          .filter(ChannelDB.id.in_(ids)).all()) if ids else {}
-            return [tray_state.TrayItem(start, title, names.get(cid) or "", "view:epg", live=live)
+            return [tray_state.TrayItem(start, title, names.get(cid) or "", "view:epg",
+                                        live=live, channel_id=cid or None)
                     for live, title, start, cid in found]
 
         self._host._run_query(query, self._on_watch_items,
@@ -157,8 +196,8 @@ class TrayController(QObject):
             m.addAction(role_icon("stop_playback"), "Stop playback", self.stop_playback)
         m.addSection("Your alerts")
         for item in items:
-            m.addAction(role_icon("monitor"), item.label(),
-                        lambda t=item.target: self._host.show_from_tray(t))
+            m.addAction(role_icon("play" if item.plays else "monitor"), item.label(),
+                        lambda i=item: self.open_item(i))
         if not items:
             m.addAction("Nothing alerted in the next 12 hours").setEnabled(False)
         m.addSeparator()
@@ -173,6 +212,13 @@ class TrayController(QObject):
                     self._host._manual_update_check)
         m.addSeparator()
         m.addAction("Quit StreamSelect", self._host.quit_app)
+
+    def open_item(self, item: tray_state.TrayItem) -> None:
+        """Open the app on *item*; a LIVE one also starts playing (owner, 2026-11-16)."""
+        self._host.show_from_tray(item.target)
+        if item.plays:
+            self._host.play_channel_by_id(item.plays)
+        QTimer.singleShot(500, self.rebuild)
 
     def stop_playback(self) -> None:
         """Stop every player window, each through ``PlayerManager`` (TQ9)."""
@@ -199,6 +245,12 @@ class TrayController(QObject):
     def _on_message_clicked(self) -> None:
         self._host.show_from_tray(self._message_target)
 
+    def mark_seen(self) -> None:
+        """The menu or the window was opened: back to the plain icon."""
+        if self.unseen:
+            self.unseen = False
+            self._icon.setIcon(self._plain_icon)
+
     # -- system notifications -------------------------------------------------
 
     def wants(self, kind: str) -> bool:
@@ -214,10 +266,22 @@ class TrayController(QObject):
         """``NotificationManager.system_sink``: send it on when :meth:`wants` says so."""
         if not self.wants(notification.alert):
             return
-        self.message(notification.title, notification.message, notification.open_target or None)
+        self.message(notification.title, notification.message, notification.open_target or None,
+                     alert=True)
 
-    def message(self, title: str, body: str, target: str | None = None) -> None:
-        """Show a system notification; a click on it opens *target*."""
+    def message(self, title: str, body: str, target: str | None = None, *,
+                alert: bool = False) -> None:
+        """Show a system notification; a click on it opens *target*.
+
+        An *alert* badges the tray icon until the menu or the window is opened.
+        The icon is passed as a QIcon, never a ``MessageIcon`` type: on KDE Qt
+        shows the type's theme icon ("dialog-information") in place of the
+        app's while the notification is up, which made the tray hard to find.
+        """
         # Qt reports a click on the latest message only, so the latest target wins.
         self._message_target = target
-        self._icon.showMessage(title, body, QSystemTrayIcon.MessageIcon.Information, MESSAGE_MS)
+        if alert:
+            self.unseen = True
+            self._icon.setIcon(self._badged_icon)
+        shown = self._badged_icon if alert else self._plain_icon
+        self._icon.showMessage(title, body, shown, MESSAGE_MS)

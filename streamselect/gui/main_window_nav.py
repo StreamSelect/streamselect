@@ -421,6 +421,10 @@ class _NavMixin:
           whose label contains ``<tab>`` (case-insensitive).
         - ``"sample:<kind>"``  — find a representative channel (vod | live |
           partial | series) and open Browse + its details.
+        - ``"channel:<id>"``   — that channel's details, as a click on its
+          Watch Alerts row opens them (a monitored series).
+        - ``"alert-rule:<created>"`` — a Watch Alert rule's matches, as a click
+          on the rule's row shows them.
 
         Args:
             target: The ``"<kind>:<arg>"`` deep-link string.
@@ -443,6 +447,12 @@ class _NavMixin:
             return True
         if kind == "sample":
             return self._navigate_to_sample(arg)
+        if kind == "channel" and arg:
+            self.show_channel_details_by_id(arg)
+            return True
+        if kind == "alert-rule" and arg:
+            self._on_vod_rule_show_matches(arg)
+            return True
         logger.warning("navigate_to: unknown target kind '{}'", kind)
         return False
 
