@@ -855,6 +855,22 @@ def _later_view(games_db, qapp, owned_widgets, *, shift=None, league=None):
     return view
 
 
+def test_with_nothing_on_there_is_no_on_now_band_and_the_days_follow_the_sport(
+        games_db, qapp, owned_widgets):
+    """Owner, 2026-11-17: "On now 0" with a "Next:" line was wasted space, and the
+    next game is the first row of the day listed right below."""
+    view = _later_view(games_db, qapp, owned_widgets)
+    assert "hockey:on_now" not in view.headers
+    shown = [w.text() for w in view.findChildren(QLabel) if w.isVisible()]
+    assert not [t for t in shown if t.startswith("Next:") or "on right now" in t], shown
+    days = [k for k in view.headers if k.startswith("hockey:day:")]
+    assert days, "the coming games are still listed"
+    sport = view.headers["sport:hockey"]
+    first_day = min((view.headers[k] for k in days), key=lambda h: h.mapTo(view, QPoint(0, 0)).y())
+    gap = first_day.mapTo(view, QPoint(0, 0)).y() - (sport.mapTo(view, QPoint(0, 0)).y() + sport.height())
+    assert 0 <= gap < first_day.height(), f"the first day sits right under the sport ({gap} px)"
+
+
 def _lines(view):
     from streamselect.gui.game_card import GameLine
     return [r.parentWidget() for r in view.rows if isinstance(r.parentWidget(), GameLine)]
@@ -937,7 +953,8 @@ def test_by_time_lists_every_sport_together_and_rows_name_sport_and_league(games
     _settle(qapp)
     assert view.config.sports_view_state["order"] == "time"
     assert view.order_button.text() == "By time"
-    assert "sport:hockey" not in view.headers and "all:on_now" in view.headers
+    assert "sport:hockey" not in view.headers and "all:on_now" not in view.headers, \
+        "nothing on: no On now band"
     for line in _lines(view):
         assert "Hockey · NHL" in [lb.text() for lb in line.findChildren(QLabel)]
     view.order_button.click()

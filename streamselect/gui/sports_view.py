@@ -323,7 +323,7 @@ class SportsView(ContentView):
         on_now, later, finished = self._split(games, now)
         leagues = sorted({g.league for g in games})
         several = len(leagues) > 1
-        self._on_now_section(f"{sport}:on_now", on_now, later, now, f"No {sport} games on right now",
+        self._on_now_section(f"{sport}:on_now", on_now, now,
                              meta=(lambda g: g.league) if several else (lambda g: ""))
         if several:
             for league in leagues:
@@ -344,31 +344,29 @@ class SportsView(ContentView):
         on_now, later, finished = self._split(games, now)
         def label(g: GameDTO) -> str:
             return f"{g.sport.title()} · {g.league}"
-        self._on_now_section(f"{ALL}:on_now", on_now, later, now, "No games on right now", meta=label)
+        self._on_now_section(f"{ALL}:on_now", on_now, now, meta=label)
         self._day_sections(ALL, later, now, folded, label_of=label)
         self._finished_section(ALL, finished, now, folded, label_of=label)
 
-    def _on_now_section(self, key: str, on_now: list, later: list, now: datetime, empty: str,
-                        meta: Callable) -> None:
+    def _on_now_section(self, key: str, on_now: list, now: datetime, meta: Callable) -> None:
+        """Absent when nothing is on (owner, 2026-11-17): an "On now 0" band and a
+        "Next:" line only repeated the first day's games listed right below."""
+        if not on_now:
+            return
         self._layout.addWidget(self._header(key, "On now", len(on_now), foldable=True,
                                             what="the list of games on now"))
         if key in self._folded():
             return                           # folded like any other section (owner, 2026-11-13)
-        if on_now:
-            opened = [gs for gs in on_now if _game_key(gs[0]) == self._open]
-            for g, state in opened:          # the open game spans the full width, first (SV-Q17)
-                self._layout.addWidget(self._card(g, state, now, expanded=True, meta=meta(g)))
-            rest = [gs for gs in on_now if gs not in opened]
-            if rest:
-                grid_host = QWidget()
-                grid = FlowLayout(grid_host, spacing=10)
-                for g, state in rest:
-                    grid.addWidget(self._card(g, state, now, meta=meta(g)))
-                self._layout.addWidget(grid_host)
-        else:
-            nxt = min(later, key=lambda g: g.start_utc) if later else None
-            self._message(empty, f"Next: {nxt.matchup}, {self._day_label(nxt.start_utc, now).split(' · ')[0]}"
-                                 f" at {fmt_time(nxt.start_utc)}." if nxt else "No games are listed yet.")
+        opened = [gs for gs in on_now if _game_key(gs[0]) == self._open]
+        for g, state in opened:              # the open game spans the full width, first (SV-Q17)
+            self._layout.addWidget(self._card(g, state, now, expanded=True, meta=meta(g)))
+        rest = [gs for gs in on_now if gs not in opened]
+        if rest:
+            grid_host = QWidget()
+            grid = FlowLayout(grid_host, spacing=10)
+            for g, state in rest:
+                grid.addWidget(self._card(g, state, now, meta=meta(g)))
+            self._layout.addWidget(grid_host)
 
     @staticmethod
     def _day_label(start_utc: datetime, now: datetime) -> str:
