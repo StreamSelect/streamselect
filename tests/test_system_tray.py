@@ -43,6 +43,29 @@ def test_menu_shows_a_repeated_programme_once():
     assert len(got) == 1
 
 
+def _show(title, minutes, live=False):
+    return TrayItem(NOW + timedelta(minutes=minutes), title, "Comedy Ch", "view:epg", live=live)
+
+
+def _game(title, minutes, live=False):
+    return TrayItem(NOW + timedelta(minutes=minutes), title, "NHL", "view:sports", live=live,
+                    kind=tray_state.KIND_GAME)
+
+
+def test_games_get_their_own_section_first_and_live_shows_cannot_push_them_out():
+    shows = [_show(f"Show {n}", -10, live=True) for n in range(6)]
+    sections = tray_state.menu_sections(shows + [_game("Kraken vs Jets", 35)], NOW)
+    assert [h for h, _ in sections] == ["Sports alerts", "Watch Alerts"]
+    assert [i.title for i in sections[0][1]] == ["Kraken vs Jets"]
+    assert len(sections[1][1]) == tray_state.MENU_LIMIT
+
+
+def test_a_show_rerun_all_evening_is_listed_once_at_its_live_airing():
+    reruns = [_show("Sitcom", m) for m in (30, 60, 90)] + [_show("Sitcom", -10, live=True)]
+    [(_heading, items)] = tray_state.menu_sections(reruns, NOW)
+    assert len(items) == 1 and items[0].live
+
+
 def test_live_items_read_live_and_upcoming_items_read_their_time():
     assert _item("X", -5, live=True).label().startswith("LIVE")
     assert not _item("X", 30).label().startswith("LIVE")
@@ -86,7 +109,8 @@ def test_alerted_items_keep_only_matching_games_that_are_not_over():
     alert = SimpleNamespace(matches=lambda g: "Kraken" in (g.team_a, g.team_b))
     got = alerted_items([game("Kraken", "Jets", 60), game("Oilers", "Jets", 60),
                          game("Kraken", "Stars", -600)], [alert], NOW)
-    assert [(i.title, i.target) for i in got] == [("Kraken vs Jets", "view:sports")]
+    assert [(i.title, i.target, i.kind) for i in got] == [
+        ("Kraken vs Jets", "view:sports", tray_state.KIND_GAME)]
 
 
 def test_a_live_alerted_game_carries_its_preferred_feed_and_an_upcoming_one_none():
@@ -178,6 +202,29 @@ def test_a_live_item_opens_the_app_and_plays_an_upcoming_one_only_opens(qapp, co
     assert host.shown_on == ["view:sports"] and host.played == ["ch-pref"]
     next(a for t, a in by.items() if "News at Six" in t).trigger()
     assert host.shown_on[-1] == "view:epg" and host.played == ["ch-pref"], "nothing new plays"
+    ctl.shutdown()
+    destroy_widget(ctl._menu, host)
+
+
+def _icon_image(action):
+    return action.icon().pixmap(16, 16).toImage()
+
+
+def test_the_menu_heads_sports_alerts_above_watch_alerts_and_marks_games_apart(qapp, config):
+    host = _Host(config, games=[_show("Sitcom", -10, live=True), _show("News", 60),
+                                _game("Kraken vs Jets", 35)])
+    ctl = tray_mod.TrayController(host, clock=lambda: NOW)
+    ctl.rebuild()
+    acts = ctl._menu.actions()
+    texts = [a.text() for a in acts]
+    sports, watch = texts.index("Sports alerts"), texts.index("Watch Alerts")
+    game = next(i for i, t in enumerate(texts) if "Kraken" in t)
+    shows = [i for i, t in enumerate(texts) if "Sitcom" in t or "News" in t]
+    assert acts[sports].isSeparator() and acts[watch].isSeparator()
+    assert sports < game < watch < min(shows)
+    upcoming_show = next(acts[i] for i in shows if "News" in texts[i])
+    assert _icon_image(acts[game]) != _icon_image(upcoming_show), "a game looks unlike a guide match"
+    assert "3 alerts" in ctl._icon.toolTip()
     ctl.shutdown()
     destroy_widget(ctl._menu, host)
 

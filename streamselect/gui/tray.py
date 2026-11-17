@@ -75,6 +75,13 @@ def badged_icon(base: QIcon) -> QIcon:
     return out
 
 
+def _item_icon(item: tray_state.TrayItem) -> str:
+    """A game wears the Sports whistle, so it never reads as one more guide match."""
+    if item.kind == tray_state.KIND_GAME:
+        return "sports"
+    return "play" if item.plays else "monitor"
+
+
 def tray_available() -> bool:
     """Whether this desktop shows tray icons (stock GNOME does not, TQ12)."""
     return QSystemTrayIcon.isSystemTrayAvailable()
@@ -127,11 +134,11 @@ class TrayController(QObject):
         """``{player window: title}`` for every stream still playing."""
         return self._host.player_manager.playing_titles()
 
-    def items(self) -> list[tray_state.TrayItem]:
-        """Alerted games plus Watch Alert matches, as the menu lists them."""
+    def sections(self) -> list[tuple[str, list[tray_state.TrayItem]]]:
+        """Alerted games, then Watch Alert matches, as the menu lists them."""
         notifier = self._host.__dict__.get("event_alert_notifier")
         games = list(notifier.upcoming) if notifier is not None else []
-        return tray_state.menu_items(games + self._watch_items, self._clock())
+        return tray_state.menu_sections(games + self._watch_items, self._clock())
 
     def refresh(self) -> None:
         """Re-read the guide's Watch Alert matches off-thread, then redraw."""
@@ -181,9 +188,10 @@ class TrayController(QObject):
         """Rebuild the menu and tooltip from what is known now."""
         now = self._clock()
         playing = [t for t in self.playing().values() if t]
-        items = self.items()
+        sections = self.sections()
+        count = sum(len(items) for _heading, items in sections)
         pause = tray_state.pause_text(self._host.config.tray_notifications_paused, now)
-        self._icon.setToolTip(tray_state.tooltip(len(items), playing, pause))
+        self._icon.setToolTip(tray_state.tooltip(count, playing, pause))
 
         m = self._menu
         m.clear()
@@ -194,11 +202,12 @@ class TrayController(QObject):
             for title in self.playing().values():
                 m.addAction(role_icon("play"), title or "A stream", self._host.show_from_tray)
             m.addAction(role_icon("stop_playback"), "Stop playback", self.stop_playback)
-        m.addSection("Your alerts")
-        for item in items:
-            m.addAction(role_icon("play" if item.plays else "monitor"), item.label(),
-                        lambda i=item: self.open_item(i))
-        if not items:
+        for heading, items in sections:
+            m.addSection(heading)
+            for item in items:
+                m.addAction(role_icon(_item_icon(item)), item.label(), lambda i=item: self.open_item(i))
+        if not sections:
+            m.addSection("Your alerts")
             m.addAction("Nothing alerted in the next 12 hours").setEnabled(False)
         m.addSeparator()
         sub = m.addMenu(role_icon("monitor_off"), "Pause notifications")
@@ -265,7 +274,11 @@ class TrayController(QObject):
     def notify(self, notification) -> None:
         """``NotificationManager.system_sink``: send it on when :meth:`wants` says so."""
         if not self.wants(notification.alert):
+            if notification.alert:
+                logger.info("Tray: {} alert stays in the app (window open, paused or switched off): {}",
+                            notification.alert, notification.title)
             return
+        logger.info("Tray: {} alert sent to the system: {}", notification.alert, notification.title)
         self.message(notification.title, notification.message, notification.open_target or None,
                      alert=True)
 

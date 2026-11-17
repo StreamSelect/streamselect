@@ -31,6 +31,11 @@ KIND_GAME = "game"        # Sports event alerts
 KIND_UPDATE = "update"    # a new StreamSelect release
 KINDS = (KIND_WATCH, KIND_GAME, KIND_UPDATE)
 
+#: The menu's alert sections, in order: sports alerts are few and time-critical,
+#: so they lead and never share a limit with guide matches (owner, 2026-11-16: a
+#: game "blended in" among reruns of a sitcom).
+SECTIONS = ((KIND_GAME, "Sports alerts"), (KIND_WATCH, "Watch Alerts"))
+
 
 @dataclass(frozen=True)
 class TrayItem:
@@ -44,6 +49,8 @@ class TrayItem:
     #: What a click on a LIVE item also plays: the game's preferred feed, or the
     #: programme's channel. None for upcoming items, which only open the app.
     channel_id: str | None = None
+    #: :data:`KIND_GAME` for an alerted sports event, :data:`KIND_WATCH` for a guide match.
+    kind: str = KIND_WATCH
 
     @property
     def plays(self) -> str | None:
@@ -55,18 +62,34 @@ class TrayItem:
         return f"{when}   {self.title}  ·  {self.detail}" if self.detail else f"{when}   {self.title}"
 
 
+def menu_sections(items: list[TrayItem], now: datetime) -> list[tuple[str, list[TrayItem]]]:
+    """``(heading, items)`` per kind in :data:`SECTIONS` order, empty ones left out.
+
+    Each section has its own :data:`MENU_LIMIT`, so live guide matches can never
+    push an alerted game off the menu.
+    """
+    out = []
+    for kind, heading in SECTIONS:
+        shown = menu_items([i for i in items if i.kind == kind], now)
+        if shown:
+            out.append((heading, shown))
+    return out
+
+
 def menu_items(items: list[TrayItem], now: datetime) -> list[TrayItem]:
     """Live items first, then upcoming within :data:`HORIZON`, at most :data:`MENU_LIMIT`.
 
     The same programme can reach the list twice (two rules, two sources of the
-    same game); a repeated title at the same start is shown once.
+    same game); a repeated title at the same start is shown once. A guide match
+    is listed once per title, at its live or soonest airing: a show rerun all
+    evening would otherwise fill the menu with one title.
     """
     keep = [i for i in items if i.live or now <= i.start_utc <= now + HORIZON]
     keep.sort(key=lambda i: (not i.live, i.start_utc))
-    seen: set[tuple[str, datetime]] = set()
+    seen: set[tuple[str, datetime | None]] = set()
     out: list[TrayItem] = []
     for item in keep:
-        key = (item.title.casefold(), item.start_utc)
+        key = (item.title.casefold(), None if item.kind == KIND_WATCH else item.start_utc)
         if key in seen:
             continue
         seen.add(key)

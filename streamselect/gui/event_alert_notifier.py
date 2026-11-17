@@ -17,7 +17,7 @@ from streamselect.core.games.alerts import due_notices, expired_event_rules, loa
 from streamselect.core.games.read import (ON_NOW, ENDING, arrange_feeds, best_feed, game_state,
                                           load_games, load_watch_history)
 from streamselect.core.games.store import sport_settings
-from streamselect.core.tray_state import TrayItem
+from streamselect.core.tray_state import KIND_GAME, TrayItem
 from streamselect.core.repositories.provider import ProviderRepository
 
 POLL_MS = 30_000
@@ -80,6 +80,7 @@ class EventAlertNotifier(QObject):
             self._sent.add(key)
             game = arranged(game)
             feed = best_feed(game)
+            logger.info("Event alert: {} — {} ({})", title, game.title, game.league)
             where = f" · plays on {feed.region + ' ' if feed.region else ''}{feed.station}" if feed else ""
             actions = [("Play", lambda cid=feed.channel_id: self._play(cid))] if feed else []
             self._host.notification_manager.show(
@@ -105,5 +106,6 @@ def alerted_items(games, alerts, now, arranged=lambda g: g) -> list[TrayItem]:
         live = state in (ON_NOW, ENDING)
         feed = best_feed(arranged(game)) if live else None
         out.append(TrayItem(game.start_utc, game.matchup, game.league, "view:sports",
-                            live=live, channel_id=feed.channel_id if feed else None))
+                            live=live, channel_id=feed.channel_id if feed else None,
+                            kind=KIND_GAME))
     return out
