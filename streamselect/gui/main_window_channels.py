@@ -29,6 +29,7 @@ from loguru import logger
 
 from streamselect.core.repositories.channel_list_rows import rows_to_dtos
 from streamselect.core.quality_vocab import quality_display
+from streamselect.gui.channel_load_scope import with_provider_scope
 from streamselect.gui.empty_state import EmptyState
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui import icon_utils as _icon_utils
@@ -360,37 +361,9 @@ class _ChannelListMixin:
         platform_prefixes: list = []
         quality_prefixes:  list = []
 
-        # Resolve provider filter on main thread (tiny queries)
-        session = self.db.get_session()
-        try:
-            repos = RepositoryFactory(session)
-            active_providers = repos.providers.get_all(active_only=True)
-            all_providers   = repos.providers.get_all()
-        finally:
-            session.close()
-
-        active_provider_ids = [p.id for p in active_providers]
-        inactive_provider_ids = [p.id for p in all_providers if p.id not in active_provider_ids]
-        force_adult_ids     = [p.id for p in all_providers if getattr(p, 'force_adult', False)]
-        excluded_ids        = set(filter_state.get('excluded_provider_ids', []))
-
-        if provider_id:
-            target_provider_id = provider_id
-        else:
-            visible_ids = [pid for pid in active_provider_ids if pid not in excluded_ids]
-            if len(visible_ids) == len(active_provider_ids) and len(visible_ids) == 1:
-                target_provider_id = visible_ids[0]
-            elif len(visible_ids) < len(active_provider_ids):
-                target_provider_id = visible_ids if visible_ids else None
-            else:
-                target_provider_id = None
-
-        # Build provider icon map (used later for display)
-        show_provider_icon = (target_provider_id is None)
-        provider_icon_map: dict = {}
-        if show_provider_icon:
-            for p in all_providers:
-                provider_icon_map[p.id] = (getattr(p, "icon", "") or self.config.provider_icon)
+        # Which sources this covers is read in the worker (channel_load_scope):
+        # on the UI thread it waited on a database connection at launch.
+        excluded_ids = set(filter_state.get('excluded_provider_ids', []))
 
         from streamselect.core.filter_utils import global_exclusion_set, keyword_exclusion_list
         from streamselect.core.tag_exclusions import excluded_tag_content_types
@@ -413,7 +386,6 @@ class _ChannelListMixin:
         _bypassing = self._bypass_tier1_filters
         _genre_filters = filter_state.get('_genre_filters')
         params = {
-            'provider_id': target_provider_id,
             'media_types': filter_state.get('media_types', ['live', 'movie', 'series']),
             # Legacy prefix lists — now always empty (tag_includes is the active path).
             # Kept in params so _query_channels_page (pagination) still has these keys.
@@ -426,7 +398,6 @@ class _ChannelListMixin:
             'include_untagged': filter_state.get('include_untagged', True),
             'include_untagged_quality': filter_state.get('include_untagged_quality', True),
             'adult_mode': filter_state.get('adult_mode', 'hide'),
-            'force_adult_ids': force_adult_ids,
             # Tag facet filter — the active filter path (Slice B).
             # None when bypassing or no facet is constrained.
             'tag_includes': None if _bypassing else tag_includes,
@@ -462,8 +433,6 @@ class _ChannelListMixin:
             # visibility filters (provider-scoping/media-type/exclusions/hide-watched).
             'id_filter_show_all': self._id_filter_show_all,
             'page_size': self._search_page_size,
-            'show_provider_icon': show_provider_icon,
-            'provider_icon_map': provider_icon_map,
             'given_provider_id': provider_id,
             'hidden_only': self._hidden_mode,
             'downloaded_only': _dl_scope.scope_from_host(self) == 'downloaded',
@@ -478,18 +447,17 @@ class _ChannelListMixin:
             # verbatim for fetchMore()), so every page of a search uses one
             # consistent collapse setting.
             'collapse_variants': getattr(self.config, "collapse_variants_in_list", False),
-            # Zero-sources empty state (main thread, already read above — no extra
-            # query): distinguishes "no source configured at all" from "sources
-            # exist but filters/search/exclusions hide everything", which
-            # _on_channels_loaded needs to pick the honest empty-state message.
-            'has_any_provider': bool(all_providers),
+            # provider_id, force_adult_ids, show_provider_icon, provider_icon_map and
+            # has_any_provider are added in the worker by with_provider_scope.
         }
 
+        _default_icon = self.config.provider_icon
         # Run the heavy query off the UI thread via the async seam; stale results
         # are dropped by the seam's token_ref. _on_channels_loaded receives the
         # (dtos, params) tuple the query_fn returns and renders on the main thread.
         self._run_query(
-            lambda repos: self._query_channels(repos, params),
+            lambda repos: self._query_channels(repos, with_provider_scope(
+                repos, params, excluded_ids=excluded_ids, default_icon=_default_icon)),
             self._on_channels_loaded,
             token_ref=self._load_channels_token,
             on_error=self._on_channels_load_error,
