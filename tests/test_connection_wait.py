@@ -164,3 +164,92 @@ def test_connections_summary_and_provider_delete(db):
         RepositoryFactory(s).playback_events.delete_for_provider("delta")
     with db.session_scope(commit=False) as s:
         assert s.query(ConnectionHoldDB).count() == 0
+
+
+# ── a hold is measured from our stream's end, across Play pressed again ──────
+
+def _hold_row(db):
+    with db.session_scope(commit=False) as s:
+        [hold] = s.query(ConnectionHoldDB).all()
+        return SimpleNamespace(**{c: getattr(hold, c) for c in
+                                  ("refused_at", "seconds", "ended_at", "freed_at", "checks", "plays")})
+
+
+def test_pressing_play_again_mid_hold_continues_it_from_our_streams_end(qapp, db, fake_account):
+    host = _host(db)
+    connection_wait.note_stream_ended(host, "delta")
+    host._source_stream_ended["delta"] -= timedelta(minutes=16)
+    _refuse(host)
+    first = host._connection_wait
+    first.refused_at -= timedelta(minutes=15)
+    fake_account[:] = [{"active_cons": 1, "max_connections": 1}]
+    first.poll()
+    _refuse(host)                                  # the user presses Play again: refused again
+    second = host._connection_wait
+    assert second is not first and second.ledger is first.ledger, "one hold, not a new one"
+    fake_account[:] = [{"active_cons": 0, "max_connections": 1}]
+    second.poll()
+    hold = _hold_row(db)
+    assert hold.plays == 2 and hold.checks == 2
+    assert 15 * 60 <= hold.seconds < 16 * 60, "from the FIRST refusal, not the last"
+    assert 16 * 60 <= (hold.freed_at - hold.ended_at).total_seconds() < 17 * 60
+
+
+def test_a_play_that_starts_on_its_own_closes_the_hold(qapp, db):
+    host = _host(db)
+    connection_wait.note_stream_ended(host, "delta")
+    _refuse(host)
+    connection_wait.cancel(host)                   # what arm() does for the next play
+    connection_wait.note_started(host, "delta")
+    hold = _hold_row(db)
+    assert hold.plays == 1 and hold.checks == 0 and hold.ended_at is not None
+    connection_wait.note_started(host, "delta")    # recorded once
+    with db.session_scope(commit=False) as s:
+        assert s.query(ConnectionHoldDB).count() == 1
+
+
+def test_an_old_cancelled_hold_is_not_continued(qapp, db):
+    host = _host(db)
+    _refuse(host)
+    first = host._connection_wait.ledger
+    connection_wait.cancel(host)
+    first.cancelled_at -= connection_wait.CARRY_S + 1
+    _refuse(host)
+    assert host._connection_wait.ledger is not first
+    connection_wait.cancel(host)
+
+
+def test_with_past_holds_the_first_check_waits_for_the_usual_free_up(qapp, db):
+    with db.session_scope() as s:
+        repo = RepositoryFactory(s).playback_events
+        t = datetime(2026, 11, 1, 20, 0)
+        for secs in (500, 600, 700):
+            repo.record_hold("delta", t, 30, ended_at=t, freed_at=t + timedelta(seconds=secs))
+    host = _host(db)
+    connection_wait.note_stream_ended(host, "delta")
+    host._source_stream_ended["delta"] -= timedelta(seconds=40)
+    _refuse(host)
+    wait = host._connection_wait
+    assert 495_000 <= wait.timer.interval() <= 500_000, "600 s usual − 60 s early − 40 s already gone"
+    assert "usually frees one 10 min after a stream ends" in \
+        host.notification_manager.show.call_args.kwargs["message"]
+    connection_wait.cancel(host)
+
+
+def test_first_check_timing():
+    now = datetime(2026, 11, 16, 21, 0)
+    assert connection_wait.first_check_ms(None, None, now) == connection_wait.POLL_MS
+    assert connection_wait.first_check_ms(600, now - timedelta(minutes=20), now) == connection_wait.POLL_MS
+    assert connection_wait.first_check_ms(600, None, now) == 540_000
+
+
+def test_a_streams_end_is_noted_once_not_moved_by_the_next_play(qapp, db):
+    host = _host(db)
+    host._run_query = lambda *a, **k: None
+    watch.arm(host, ATTEMPT)
+    host._health_ever_progressed = True
+    watch.on_player_gone(host, "Quit")
+    ended = host._source_stream_ended["delta"]
+    host._source_stream_ended["delta"] = ended - timedelta(minutes=3)
+    watch.arm(host, ATTEMPT)                       # Play pressed three minutes later
+    assert host._source_stream_ended["delta"] == ended - timedelta(minutes=3)

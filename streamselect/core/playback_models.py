@@ -87,4 +87,14 @@ class ConnectionHoldDB(Base):
     id          = Column(Integer, primary_key=True, autoincrement=True)
     provider_id = Column(String, nullable=False, index=True)
     refused_at  = Column(DateTime, nullable=False)   # UTC-naive
-    seconds     = Column(Integer, nullable=False)
+    seconds     = Column(Integer, nullable=False)    # refused → freed
+    #: When our last stream from this source closed — where the hold really
+    #: began — and when a connection was free again. UTC-naive; ended_at is None
+    #: when no stream of ours from this source ended this session.
+    ended_at    = Column(DateTime)
+    freed_at    = Column(DateTime)
+    #: What we sent the source meanwhile: account checks, and plays it refused.
+    #: Holds with few checks against holds with many show whether contact
+    #: stretches the hold.
+    checks      = Column(Integer)
+    plays       = Column(Integer)

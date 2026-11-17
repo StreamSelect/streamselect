@@ -198,10 +198,15 @@ def arm(host: Any, attempt: "Optional[PlayAttempt]" = None) -> None:
             the counters reset — they simply report nothing if it fails.
     """
     connection_wait.cancel(host)   # any new play supersedes a wait for a free connection
+    prev = host.__dict__.get("_health_attempt")
+    if (prev is not None and host.__dict__.get("_health_ever_progressed")
+            and not host.__dict__.get("_health_end_noted")):
+        # Switching titles in the same window closes the previous stream too.
+        connection_wait.note_stream_ended(host, prev.provider_id)
+    host._health_end_noted = False
     # Q6: the previous play's outcome row gets how long it ran — before the
     # resets below erase what it played. This play's row is written at its verdict.
     _finish_recorded_play(host)
-    prev = host.__dict__.get("_health_attempt")
     if (prev is not None and not host.__dict__.get("_health_ever_progressed")
             and not host.__dict__.get("_health_reported")):
         # Not a toast — switching titles mid-open is normal — but the log must
@@ -334,6 +339,8 @@ def on_loaded_tick(host: Any, time_pos: Any, paused: bool, cache_duration: Any =
             host._health_progress_at = time.monotonic()
             _record_outcome(host, "started", time_to_picture_ms=int(
                 (time.monotonic() - host.__dict__.get("_health_armed_at", time.monotonic())) * 1000))
+            started = host.__dict__.get("_health_attempt")
+            connection_wait.note_started(host, started.provider_id if started else None)
             host._health_last_time_pos = float(time_pos)
             host._health_last_duration = (
                 float(duration) if isinstance(duration, (int, float)) else None)
@@ -445,6 +452,10 @@ def on_player_gone(host: Any, exit_reason: "str | None" = None) -> bool:
     module does not touch.
     """
     if host.__dict__.get("_health_ever_progressed"):
+        attempt = host.__dict__.get("_health_attempt")
+        if not host.__dict__.get("_health_end_noted"):
+            connection_wait.note_stream_ended(host, attempt.provider_id if attempt else None)
+            host._health_end_noted = True
         if exit_reason in STREAM_EXIT_REASONS:
             last_pos = host.__dict__.get("_health_last_time_pos")
             if dropped_mid_stream(last_pos, host.__dict__.get("_health_last_duration")):

@@ -112,10 +112,24 @@ class PlaybackEventRepository:
             by_hour=tuple((a, f) for a, f in by_hour) if since else (),
         )
 
-    def record_hold(self, provider_id: str, refused_at: datetime, seconds: int) -> None:
+    def record_hold(self, provider_id: str, refused_at: datetime, seconds: int, *,
+                    ended_at: datetime | None = None, freed_at: datetime | None = None,
+                    checks: int | None = None, plays: int | None = None) -> None:
         """A connection wait resolved: the source held its connections *seconds* (Q7)."""
         self.session.add(ConnectionHoldDB(provider_id=provider_id, refused_at=refused_at,
-                                          seconds=max(0, int(seconds))))
+                                          seconds=max(0, int(seconds)), ended_at=ended_at,
+                                          freed_at=freed_at, checks=checks, plays=plays))
+
+    def typical_hold_after_end(self, provider_id: str) -> int | None:
+        """Median seconds from our last stream closing to a connection being free.
+
+        Only holds where both ends are known; None until there is one.
+        """
+        spans = sorted(int((freed - ended).total_seconds()) for ended, freed in self.session.query(
+            ConnectionHoldDB.ended_at, ConnectionHoldDB.freed_at).filter(
+            ConnectionHoldDB.provider_id == provider_id, ConnectionHoldDB.ended_at.isnot(None),
+            ConnectionHoldDB.freed_at.isnot(None)))
+        return int(median(spans)) if spans else None
 
     def connections(self, provider_id: str) -> ConnectionsDTO:
         """The account's limit and use at its last check, plus the recorded waits."""
