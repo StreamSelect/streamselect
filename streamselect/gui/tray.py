@@ -47,14 +47,25 @@ _PAUSES = (
 _BADGE_SIZES = (16, 22, 24, 32, 48, 64)
 
 
-def badged_icon(base: QIcon) -> QIcon:
-    """*base* with a red "!" disc in its lower-right corner: an alert not yet seen.
+#: Each badge's glyph and disc colour (``tray_state.BADGE_*``).
+_BADGES = {
+    tray_state.BADGE_LIVE: ("sports", "COLOR_TRAY_LIVE"),
+    # The Watch Alerts bell on a soft disc: a red "!" was too aggressive for
+    # "something you follow is on" (owner, 2026-11-16).
+    tray_state.BADGE_ALERT: ("tray_alert_badge", "COLOR_TRAY_ALERT"),
+    tray_state.BADGE_UPDATE: ("tray_update_badge", "COLOR_TRAY_UPDATE"),
+}
+
+
+def badged_icon(base: QIcon, glyph: str = "tray_alert_badge",
+                fill_token: str = "COLOR_TRAY_ALERT") -> QIcon:
+    """*base* with a *glyph* on a disc in its lower-right corner.
 
     The app's own icon stays recognisable, so the tray is still easy to find
     (owner, 2026-11-16: a generic notification icon made it hard to spot).
     """
     out = QIcon()
-    fill = theme.COLOR_TRAY_BADGE
+    fill = getattr(theme, fill_token)
     for size in _BADGE_SIZES:
         pm = QPixmap(size, size)
         pm.fill(Qt.GlobalColor.transparent)
@@ -66,10 +77,10 @@ def badged_icon(base: QIcon) -> QIcon:
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(fill))
         p.drawEllipse(disc)
-        glyph = max(6, round(d * 0.8))
-        mark = QRect(0, 0, glyph, glyph)
+        glyph_px = max(6, round(d * 0.8))
+        mark = QRect(0, 0, glyph_px, glyph_px)
         mark.moveCenter(disc.center())
-        p.drawPixmap(mark, role_pixmap("tray_alert_badge", theme.on_fill(fill), glyph))
+        p.drawPixmap(mark, role_pixmap(glyph, theme.on_fill(fill), glyph_px))
         p.end()
         out.addPixmap(pm)
     return out
@@ -97,8 +108,11 @@ class TrayController(QObject):
         self._watch_items: list[tray_state.TrayItem] = []
         self._message_target: str | None = None
         self._plain_icon = QApplication.windowIcon()
-        self._badged_icon = badged_icon(self._plain_icon)
-        self.unseen = False
+        self._badge_icons = {badge: badged_icon(self._plain_icon, glyph, token)
+                             for badge, (glyph, token) in _BADGES.items()}
+        #: Notification kinds sent since the menu or window was last opened.
+        self._unseen: set[str] = set()
+        self._badge: str | None = None
         self._icon = QSystemTrayIcon(self._plain_icon, self)
         self._menu = QMenu()
         self._menu.aboutToShow.connect(self.mark_seen)
@@ -109,6 +123,11 @@ class TrayController(QObject):
         self._timer = QTimer(self)
         self._timer.setInterval(REFRESH_MS)
         self._timer.timeout.connect(self.refresh)
+        # A game going live changes the badge between menu opens; the notifier
+        # is built first (``catalog_refresh_tick``) and says when it re-reads.
+        notifier = host.__dict__.get("event_alert_notifier")
+        if notifier is not None:
+            notifier.updated.connect(self.refresh_icon)
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -193,6 +212,7 @@ class TrayController(QObject):
         pause = tray_state.pause_text(self._host.config.tray_notifications_paused, now)
         self._icon.setToolTip(tray_state.tooltip(count, playing, pause))
 
+        self.refresh_icon()
         m = self._menu
         m.clear()
         shown = self._host.isVisible() and not self._host.isMinimized()
@@ -254,11 +274,24 @@ class TrayController(QObject):
     def _on_message_clicked(self) -> None:
         self._host.show_from_tray(self._message_target)
 
+    @property
+    def unseen(self) -> bool:
+        """Whether a notification was sent since the menu or window was opened."""
+        return bool(self._unseen)
+
     def mark_seen(self) -> None:
-        """The menu or the window was opened: back to the plain icon."""
-        if self.unseen:
-            self.unseen = False
-            self._icon.setIcon(self._plain_icon)
+        """The menu or the window was opened: the notices are seen."""
+        self._unseen.clear()
+        self.refresh_icon()
+
+    def refresh_icon(self) -> None:
+        """Wear the badge ``tray_state.badge_for`` picks, or the plain icon."""
+        notifier = self._host.__dict__.get("event_alert_notifier")
+        live = notifier is not None and any(i.live for i in notifier.upcoming)
+        badge = tray_state.badge_for(live, self._unseen)
+        if badge != self._badge:
+            self._badge = badge
+            self._icon.setIcon(self._badge_icons.get(badge, self._plain_icon))
 
     # -- system notifications -------------------------------------------------
 
@@ -280,13 +313,14 @@ class TrayController(QObject):
             return
         logger.info("Tray: {} alert sent to the system: {}", notification.alert, notification.title)
         self.message(notification.title, notification.message, notification.open_target or None,
-                     alert=True)
+                     alert=notification.alert)
 
     def message(self, title: str, body: str, target: str | None = None, *,
-                alert: bool = False) -> None:
+                alert: str | None = None) -> None:
         """Show a system notification; a click on it opens *target*.
 
-        An *alert* badges the tray icon until the menu or the window is opened.
+        An *alert* (its ``tray_state.KIND_*``) badges the tray icon until the menu
+        or the window is opened.
         The icon is passed as a QIcon, never a ``MessageIcon`` type: on KDE Qt
         shows the type's theme icon ("dialog-information") in place of the
         app's while the notification is up, which made the tray hard to find.
@@ -294,7 +328,6 @@ class TrayController(QObject):
         # Qt reports a click on the latest message only, so the latest target wins.
         self._message_target = target
         if alert:
-            self.unseen = True
-            self._icon.setIcon(self._badged_icon)
-        shown = self._badged_icon if alert else self._plain_icon
-        self._icon.showMessage(title, body, shown, MESSAGE_MS)
+            self._unseen.add(alert)
+            self.refresh_icon()
+        self._icon.showMessage(title, body, self._icon.icon(), MESSAGE_MS)

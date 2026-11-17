@@ -99,6 +99,30 @@ def menu_items(items: list[TrayItem], now: datetime) -> list[TrayItem]:
     return out
 
 
+#: The tray icon's badges, strongest first (owner, 2026-11-16): an alerted game
+#: on now, an alert not yet seen, then an app update not yet seen.
+BADGE_LIVE = "live"
+BADGE_ALERT = "alert"
+BADGE_UPDATE = "update"
+
+
+def badge_for(game_live: bool, unseen: set[str]) -> str | None:
+    """Which badge the tray icon wears, or None for the plain app icon.
+
+    *unseen* holds the notification kinds sent since the menu or window was last
+    opened. A live game is a state, not a notice: its badge stays while the game
+    is on, opened or not. An update alone gets its own mark, so a waiting
+    release never reads as an alert.
+    """
+    if game_live:
+        return BADGE_LIVE
+    if unseen - {KIND_UPDATE}:
+        return BADGE_ALERT
+    if unseen:
+        return BADGE_UPDATE
+    return None
+
+
 def pause_value(choice: str, now: datetime) -> str:
     """The stored pause for a menu *choice*: an ISO UTC end, or :data:`PAUSE_INDEFINITE`.
 

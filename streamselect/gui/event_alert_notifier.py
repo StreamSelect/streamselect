@@ -9,7 +9,7 @@ Play, which plays the channel the event's card would play.
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QObject, QTimer
+from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from loguru import logger
 
 from streamselect.core.epg_utils import now_utc
@@ -25,6 +25,9 @@ POLL_MS = 30_000
 
 class EventAlertNotifier(QObject):
     """Owns the poll; ``play`` is the host's play-by-channel-id slot."""
+
+    #: Each poll's ``upcoming`` is in: the tray re-reads whether a game is live.
+    updated = pyqtSignal()
 
     def __init__(self, host, play, parent=None, *, clock=now_utc):
         super().__init__(parent)
@@ -73,6 +76,7 @@ class EventAlertNotifier(QObject):
         def arranged(game):
             return arrange_feeds(game, config.game_channel_prefs.get(game.league_key, {}), history, now)
         self.upcoming = alerted_items(games, alerts, now, arranged)
+        self.updated.emit()
         if not alerts:
             return
         for key, game, title in due_notices(games, alerts, self._clock(),

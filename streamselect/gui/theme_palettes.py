@@ -328,7 +328,9 @@ _MIDNIGHT_LEGACY: dict[str, TokenValue] = {
     # between them with theme.on_fill(); never hardcode "white", which is what
     # put 1.88:1 text on the mint fills.
     'COLOR_ON_FILL_LIGHT': '#ffffff',
-    'COLOR_TRAY_BADGE': '#e53935',  # sits on the desktop's panel, not the app
+    'COLOR_TRAY_ALERT': '#9575cd',  # the tray's "new alert" badge: on the desktop's panel, not the app
+    'COLOR_TRAY_UPDATE': '#1e88e5',  # the tray's "update waiting" badge
+    'COLOR_TRAY_LIVE': '#2e7d32',  # the tray's "alerted game is live" badge
     'COLOR_ON_FILL_DARK': '#10131a',
 }
 
@@ -527,7 +529,9 @@ _GRAPHITE_LEGACY: dict[str, TokenValue] = {
     # between them with theme.on_fill(); never hardcode "white", which is what
     # put 1.88:1 text on the mint fills.
     'COLOR_ON_FILL_LIGHT': '#ffffff',
-    'COLOR_TRAY_BADGE': '#e53935',  # sits on the desktop's panel, not the app
+    'COLOR_TRAY_ALERT': '#9575cd',  # the tray's "new alert" badge: on the desktop's panel, not the app
+    'COLOR_TRAY_UPDATE': '#1e88e5',  # the tray's "update waiting" badge
+    'COLOR_TRAY_LIVE': '#2e7d32',  # the tray's "alerted game is live" badge
     'COLOR_ON_FILL_DARK': '#10131a',
 }
 
@@ -802,7 +806,9 @@ _DAYLIGHT_LEGACY: dict[str, TokenValue] = {
     # between them with theme.on_fill(); never hardcode "white", which is what
     # put 1.88:1 text on the mint fills.
     'COLOR_ON_FILL_LIGHT': '#ffffff',
-    'COLOR_TRAY_BADGE': '#e53935',  # sits on the desktop's panel, not the app
+    'COLOR_TRAY_ALERT': '#9575cd',  # the tray's "new alert" badge: on the desktop's panel, not the app
+    'COLOR_TRAY_UPDATE': '#1e88e5',  # the tray's "update waiting" badge
+    'COLOR_TRAY_LIVE': '#2e7d32',  # the tray's "alerted game is live" badge
     'COLOR_ON_FILL_DARK': '#10131a',
 }
 

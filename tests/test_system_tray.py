@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
+from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QColor, QIcon, QPixmap
 from PyQt6.QtWidgets import QApplication, QWidget
 
@@ -138,7 +139,7 @@ class _Host(QWidget):
         self.stopped = []
         self.player_manager = SimpleNamespace(playing_titles=lambda: dict(playing or {}),
                                               stop=lambda key: self.stopped.append(key))
-        self.event_alert_notifier = SimpleNamespace(upcoming=list(games))
+        self.event_alert_notifier = _Notifier(games)
         self.shown_on = []
         self.played = []
 
@@ -159,6 +160,16 @@ class _Host(QWidget):
 
     def _manual_update_check(self):
         pass
+
+
+class _Notifier(QObject):
+    """The event-alert notifier's face to the tray: its games and its poll signal."""
+
+    updated = pyqtSignal()
+
+    def __init__(self, games):
+        super().__init__()
+        self.upcoming = list(games)
 
 
 @pytest.fixture
@@ -267,32 +278,69 @@ def _blue_icon():
     return QIcon(pm)
 
 
-def test_the_badge_keeps_the_app_icon_and_adds_a_red_mark_lower_right(qapp):
+def _near(a: QColor, b: QColor, tol=30) -> bool:
+    return all(abs(x - y) < tol for x, y in ((a.red(), b.red()), (a.green(), b.green()),
+                                               (a.blue(), b.blue())))
+
+
+@pytest.mark.parametrize("badge", list(tray_mod._BADGES))
+def test_each_badge_keeps_the_app_icon_and_adds_its_disc_lower_right(qapp, badge):
     from streamselect.gui import theme
-    img = tray_mod.badged_icon(_blue_icon()).pixmap(64, 64).toImage()
+    glyph, token = tray_mod._BADGES[badge]
+    img = tray_mod.badged_icon(_blue_icon(), glyph, token).pixmap(64, 64).toImage()
     assert img.pixelColor(8, 8) == QColor(0, 0, 255), "the app icon still shows"
-    edge = img.pixelColor(64 - 3, 64 - 18)          # on the disc, clear of the "!"
-    err = QColor(theme.COLOR_TRAY_BADGE)
-    assert abs(edge.red() - err.red()) < 30 and edge.blue() < 120, "a red disc, bottom-right"
+    edge = img.pixelColor(64 - 3, 64 - 18)          # on the disc, clear of the glyph
+    assert _near(edge, QColor(getattr(theme, token))), f"a {token} disc, bottom-right"
     centre = img.pixelColor(64 - 18, 64 - 18)
     assert centre != edge, "the disc carries a mark, not a plain dot"
 
 
-def test_an_alert_badges_the_icon_until_the_menu_or_window_is_opened(qapp, config):
+def test_the_three_badges_look_different_and_none_is_red(qapp):
+    imgs = [tray_mod.badged_icon(_blue_icon(), g, t).pixmap(64, 64).toImage()
+            for g, t in tray_mod._BADGES.values()]
+    assert len({i.pixelColor(61, 46).name() for i in imgs}) == 3
+    assert all(not _near(i.pixelColor(61, 46), QColor(229, 57, 53), tol=60) for i in imgs), \
+        "the red alarm disc is retired (owner, 2026-11-16)"
+
+
+def test_badge_order_live_game_then_alert_then_update_alone():
+    K = tray_state
+    assert K.badge_for(False, set()) is None
+    assert K.badge_for(False, {K.KIND_UPDATE}) == K.BADGE_UPDATE
+    assert K.badge_for(False, {K.KIND_UPDATE, K.KIND_WATCH}) == K.BADGE_ALERT
+    assert K.badge_for(False, {K.KIND_GAME}) == K.BADGE_ALERT
+    assert K.badge_for(True, {K.KIND_WATCH}) == K.BADGE_LIVE
+    assert K.badge_for(True, set()) == K.BADGE_LIVE
+
+
+def test_the_icon_follows_alerts_updates_and_a_live_game(qapp, config):
     old = qapp.windowIcon()
     qapp.setWindowIcon(_blue_icon())
     host = _Host(config)
     ctl = tray_mod.TrayController(host, clock=lambda: NOW)
     try:
-        def corner():
-            return ctl._icon.icon().pixmap(64, 64).toImage().pixelColor(61, 46)
-        plain = corner()
+        def badge():
+            return ctl._icon.icon().pixmap(64, 64).toImage().pixelColor(61, 46).name()
+        disc = {b: tray_mod.badged_icon(_blue_icon(), g, t).pixmap(64, 64).toImage()
+                .pixelColor(61, 46).name() for b, (g, t) in tray_mod._BADGES.items()}
+        plain = badge()
         ctl.message("Still running", "…")
-        assert not ctl.unseen and corner() == plain, "the hide notice is not an alert"
-        ctl.message("Starting now", "A vs B", "view:sports", alert=True)
-        assert ctl.unseen and corner() != plain
+        assert not ctl.unseen and badge() == plain, "the hide notice is not an alert"
+        ctl.message("Update", "1.0.6 is out", alert=tray_state.KIND_UPDATE)
+        assert badge() == disc[tray_state.BADGE_UPDATE]
+        ctl.message("Starting soon", "A show", "view:epg", alert=tray_state.KIND_WATCH)
+        assert badge() == disc[tray_state.BADGE_ALERT], "an alert outranks the update"
         ctl._menu.aboutToShow.emit()
-        assert not ctl.unseen and corner() == plain
+        assert not ctl.unseen and badge() == plain
+
+        host.event_alert_notifier.upcoming = [_game("Kraken vs Jets", -10, live=True)]
+        host.event_alert_notifier.updated.emit()
+        assert badge() == disc[tray_state.BADGE_LIVE], "a poll finding the game on badges at once"
+        ctl._menu.aboutToShow.emit()
+        assert badge() == disc[tray_state.BADGE_LIVE], "seen or not, it stays while the game is on"
+        host.event_alert_notifier.upcoming = []
+        host.event_alert_notifier.updated.emit()
+        assert badge() == plain
     finally:
         ctl.shutdown()
         qapp.setWindowIcon(old)
