@@ -61,8 +61,16 @@ Side = tuple[str, ...]
 
 
 def norm(text: Optional[str]) -> str:
-    """Upper case with accents folded, so "Montréal" and "MONTREAL" are one word."""
-    folded = "".join(c for c in unicodedata.normalize("NFKD", text or "")
+    """Upper case with accents folded, so "Montréal" and "MONTREAL" are one word.
+
+    Plain ASCII has nothing to fold or recompose, so it skips the per-character
+    pass: the finder normalises every live channel name, 160,000 calls a run,
+    and that pass was half of the run's time (measured 2026-11-17).
+    """
+    text = text or ""
+    if text.isascii():
+        return text.upper()
+    folded = "".join(c for c in unicodedata.normalize("NFKD", text)
                      if not unicodedata.combining(c))
     return unicodedata.normalize("NFKC", folded).upper()
 
