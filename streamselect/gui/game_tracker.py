@@ -54,6 +54,19 @@ class GameTracker(QObject):
         self.finding_started.emit()
         self._pool.submit(self._run)
 
+    def request_first(self) -> None:
+        """The launch run, unless one already ran or is running.
+
+        The Sports view, open at launch, starts a run before the launch timer
+        fires; a plain ``request()`` from the timer then queued a second run of
+        the same listings straight after it (two back-to-back runs at every such
+        launch, 2026-11-17).
+        """
+        with self._lock:
+            if self.has_run or self._running:
+                return
+        self.request()
+
     def _run(self) -> None:
         while True:
             try:

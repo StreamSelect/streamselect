@@ -48,8 +48,7 @@ class _SportsViewMixin:
         self._hide_all_content_views()
         view = self._ensure_sports_view()
         tracker = self.game_tracker
-        if not tracker.has_run and not tracker.busy:
-            tracker.request()          # opened before the first run after launch: run it now
+        tracker.request_first()        # opened before the first run after launch: run it now
         view.set_finding(tracker.busy)
         view.setVisible(True)
         self.stats_label.setText("Sports")

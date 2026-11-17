@@ -19,6 +19,9 @@ from sqlalchemy import delete, or_, select
 from streamselect.core.database import Database, ChannelDB, EpgProgramDB
 from streamselect.core.epg_utils import now_utc
 from streamselect.core.games.finder import GUIDE, ListingIn, Memory, SportSettings, find_games
+from streamselect.core.games.listing_text import (
+    MATCHUP_LIKE_PATTERNS, NOT_PLAIN_GLOB, league_matcher, norm,
+)
 from streamselect.core.games.models import GameDB, GameFeedDB, GameFinderMemoryDB
 from streamselect.core.repositories.provider import ProviderRepository
 from streamselect.core.special_content import _BUNDLED_DEFINITIONS
@@ -72,11 +75,46 @@ def _memory_from_json(d: dict | None) -> Memory:
     return m
 
 
+def _could_name_a_game(session, settings: SportSettings):
+    """SQL for the live channels the finder can use: one in a category naming the
+    league, or one whose name names the league or states a matchup. Every other
+    channel is dropped by the finder unread, so leaving it in the database
+    changes no game; it was 60% of 54,000 rows read and normalised on every run,
+    under a UI thread building widgets (2026-11-17).
+
+    Categories are few (hundreds), so the finder's own whole-word rule runs on
+    each distinct one here. Names are not, so for them this is only a necessary
+    condition: LIKE is a substring test the finder narrows again, and a name LIKE
+    cannot judge (anything beyond printable ASCII) is kept. Returns None (read
+    every live channel) when a league word is itself beyond plain ASCII.
+    """
+    words = list(settings.words)
+    if not all(w.isascii() and w.isprintable() for w in words):
+        return None
+    league = league_matcher(words)
+    categories = [c for (c,) in session.execute(
+        select(ChannelDB.category).where(ChannelDB.media_type == "live").distinct())
+        if c and league.search(norm(c))]
+
+    def like(word):
+        escaped = word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return ChannelDB.name.like(f"%{escaped}%", escape="\\")
+
+    return or_(
+        ChannelDB.category.in_(categories),
+        ChannelDB.name.op("GLOB")(NOT_PLAIN_GLOB),
+        *(ChannelDB.name.like(p) for p in MATCHUP_LIKE_PATTERNS),
+        *(like(w) for w in words),
+    )
+
+
 def _read_listings(session, settings: SportSettings, now: datetime, hidden: set[str]) -> list[ListingIn]:
-    """Every live channel of the visible sources, plus the guide programmes naming the league."""
-    rows = session.execute(
-        select(ChannelDB.id, ChannelDB.provider_id, ChannelDB.category, ChannelDB.name)
-        .where(ChannelDB.media_type == "live")).all()
+    """The live channels of the visible sources that could name a game, plus the
+    guide programmes naming the league."""
+    query = (select(ChannelDB.id, ChannelDB.provider_id, ChannelDB.category, ChannelDB.name)
+             .where(ChannelDB.media_type == "live"))
+    narrow = _could_name_a_game(session, settings)
+    rows = session.execute(query if narrow is None else query.where(narrow)).all()
     listings = [ListingIn(pid, cat or "", name or "", cid)
                 for cid, pid, cat, name in rows if pid not in hidden]
     # SQL narrows by substring; the finder applies the whole-word rule itself.

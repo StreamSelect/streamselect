@@ -100,7 +100,7 @@ class _CatalogRefreshTickMixin:
         self._register_cleanable("game_tracker", self.game_tracker.shutdown)
         self.refresh_queue_manager.all_refreshes_finished.connect(self.game_tracker.request)
         self.epg_manager.refresh_finished.connect(self.game_tracker.request)
-        QTimer.singleShot(GAME_TRACKER_LAUNCH_DELAY_MS, self.game_tracker.request)
+        QTimer.singleShot(GAME_TRACKER_LAUNCH_DELAY_MS, self.game_tracker.request_first)
         # Newly found games can match an event alert: the Watch Alerts Sports group re-reads.
         self.game_tracker.games_updated.connect(lambda _counts: self._refresh_sports_alerts())
         # Event alerts set with the Sports bell: notify before and at the start (SV-Q43).

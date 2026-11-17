@@ -45,6 +45,16 @@ _SEPARATORS = ("VS", "V", "@", "X", "-", "AT")   # tried in this order within a 
 #: "Away @ Home" / "Away at Home": the side after it is the home team.
 HOME_SECOND = ("@", "AT")
 _SIDE_SPLIT_RE = re.compile(r"\s+(VS\.?|V|@|X|-|AT)\s+")
+#: SQL LIKE patterns one of which every plain-ASCII name stating a matchup
+#: contains: a separator from :data:`_SEPARATORS` with a space each side
+#: (``_SIDE_SPLIT_RE`` needs whitespace there, and a side on each). "VS." is
+#: the one spelling the regex adds. LIKE ignores ASCII case, so these match the
+#: raw name the same as the upper-cased :func:`norm` text. A name with any other
+#: character (a tab, an accent, full-width letters) cannot be judged by LIKE;
+#: :data:`NOT_PLAIN_GLOB` keeps it.
+MATCHUP_LIKE_PATTERNS = tuple(f"% {sep} %" for sep in _SEPARATORS) + ("% VS. %",)
+#: A GLOB that matches any text holding a character outside printable ASCII.
+NOT_PLAIN_GLOB = "*[^ -~]*"
 _CLOCK_IN_SIDE_RE = re.compile(r"\d{1,2}(:\d{2}){1,2}\s*(AM|PM)?|\d{1,2}\s*(AM|PM)(?![A-Z])")
 _STRIP_WORDS = set(MONTH_WORD) | set(WEEKDAY_WORD) | {"AM", "PM"} | set(ZONE_LABELS)
 

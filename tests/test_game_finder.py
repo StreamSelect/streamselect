@@ -178,3 +178,35 @@ def test_names_fold_to_one_spelling_with_or_without_accents():
     assert norm("ＮＨＬ ｖｓ") == "NHL VS", "full-width letters still recompose"
     assert norm("Boston Bruins vs") == "BOSTON BRUINS VS"
     assert norm(None) == norm("") == ""
+
+
+def test_the_read_leaves_out_only_channels_that_cannot_name_a_game(db):
+    """The finder's read is narrowed in SQL (2026-11-17): a channel with no league
+    word and no matchup stays in the database, and the games found are the same
+    as reading every live channel."""
+    from unittest import mock
+
+    from streamselect.core.games import store
+    _seed_db(db)
+    with db.session_scope() as s:
+        for cid, name, coll in [
+            ("n1", "US: ESPN News", "SPORTS"),                          # nothing to read
+            ("n2", "Bruins vs Canadiens 7PM", "ZONE"),                  # a matchup: kept
+            ("n3", "ＮＨＬ Network", "ZONE"),                            # full-width: kept
+            ("n4", "Hockey Night", "CA| ᴿᴬᵂ SPORTS"),                    # decorated, no league word
+            ("n5", "Hockey Night", "CA| ᴺᴴᴸ ᴾᴬᶜᴷ"),                      # superscript NHL folds to NHL
+        ]:
+            s.add(ChannelDB(id=cid, source_id=cid, provider_id="p1", name=name, category=coll,
+                            media_type="live"))
+    with db.session_scope(commit=False) as s:
+        narrowed = {li.channel_id for li in store._read_listings(s, NHL, NOW, set())}
+        with mock.patch.object(store, "_could_name_a_game", lambda *_: None):
+            everything = {li.channel_id for li in store._read_listings(s, NHL, NOW, set())}
+    assert "n1" in everything and "n1" not in narrowed
+    assert "n4" not in narrowed, "a category that does not name the league after folding"
+    assert {"n2", "n3", "n5"} <= narrowed
+    dropped = everything - narrowed
+    assert dropped == {"n1", "n4"}, dropped
+    first = refresh_games(db, NOW)
+    with mock.patch.object(store, "_could_name_a_game", lambda *_: None):
+        assert refresh_games(db, NOW) == first
