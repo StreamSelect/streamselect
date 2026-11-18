@@ -235,3 +235,24 @@ def test_a_movie_gets_its_tmdb_id_from_the_real_key(db):
         assert meta.tmdb_id == "27205"
         # No source for a movie runtime in the LIST payload — stays None.
         assert meta.runtime is None
+
+
+def test_each_transaction_is_short_enough_for_other_writers(db, monkeypatch):
+    """Each batch holds SQLite's write lock until it commits. 1,000 titles took
+    25-30 s a batch on a real library, past other writers' 30 s busy timeout
+    (the game finder failed "database is locked", 2026-11-17). 250 titles must
+    commit in several short transactions, every one of them stored."""
+    for i in range(250):
+        _add(db, f"c{i:03d}", {"plot": f"Plot {i}", "name": f"Show {i}"})
+    commits = []
+    real = db.session_scope
+
+    def counting(*a, **kw):
+        commits.append(1)
+        return real(*a, **kw)
+    monkeypatch.setattr(db, "session_scope", counting)
+    _run(db)
+    assert len(commits) >= 3, f"{len(commits)} transaction(s) for 250 titles"
+    from streamselect.core.database import ChannelDB
+    with real(commit=False) as s:
+        assert s.query(ChannelDB).filter(ChannelDB.metadata_id.isnot(None)).count() == 250

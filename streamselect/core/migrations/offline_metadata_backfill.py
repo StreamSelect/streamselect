@@ -45,7 +45,11 @@ if TYPE_CHECKING:
     from streamselect.core.config import Config
     from streamselect.core.database import Database
 
-_BATCH = 1_000
+#: Titles per transaction. Each batch holds SQLite's write lock from its first
+#: flush to its commit; at 1,000 that was 25-30 s a batch on a real library
+#: (2,551 titles in 70 s, 2026-11-17), past other writers' 30 s busy_timeout:
+#: the game finder's write failed "database is locked". 100 holds it ~3 s.
+_BATCH = 100
 
 # Value-aware, not key-aware: raw_data very often carries a key with an empty
 # value, and counting those as pending leaves needs_run permanently True (the
