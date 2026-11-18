@@ -36,7 +36,7 @@ from streamselect.core.games.read import (
     mark_not_finished,
 )
 from streamselect.core.games.alerts import add_alert, alerts_for, load_alerts, remove_alerts, rule_for
-from streamselect.core.games.store import sport_settings
+from streamselect.core.games.store import load_league_watch, sport_settings
 from streamselect.core.repositories.provider import ProviderRepository
 from streamselect.gui import cursor_affordance
 from streamselect.gui import deferred_config_save as _cfgsave
@@ -57,6 +57,9 @@ from streamselect.gui.similar_lightbox_card import _ClickableFrame
 #: Re-render this often while open: progress bars and on-now/finished move with the clock.
 TICK_MS = 60_000
 ORDER_SPORT, ORDER_TIME = "sport", "time"
+#: The order of sports and leagues (owner, 2026-11-18): the ones you watch on the most
+#: days come first, or A–Z. Never-watched ones always follow, A–Z.
+RANK_WATCHED, RANK_AZ = "watched", "az"
 FINISHED = "finished"
 #: Live bitrate readings averaged for the WATCHING chip (one per player poll).
 BITRATE_SAMPLES = 5
@@ -106,6 +109,8 @@ class SportsView(ContentView):
         self._raw: list[GameDTO] = []
         self._history: dict = {}
         self._alerts: list = []
+        #: league key -> (local days watched, seconds), for the "Most watched" order.
+        self._watch: dict = {}
         self._open: Optional[tuple] = None
         self._show_hidden: set[tuple] = set()
         self._playing: Optional[str] = None
@@ -152,6 +157,28 @@ class SportsView(ContentView):
         return self.config.game_channel_prefs.setdefault(league_key, {})
 
     @property
+    def rank(self) -> str:
+        return self._state().get("rank", RANK_WATCHED)
+
+    def _league_watch(self, sport: str, league: str) -> tuple:
+        return self._watch.get(f"{sport}/{league}", (frozenset(), 0))
+
+    def _sport_watch(self, sport: str) -> tuple:
+        mine = [v for k, v in self._watch.items() if k.split("/", 1)[0] == sport]
+        return frozenset().union(*(d for d, _ in mine)), sum(s for _, s in mine)
+
+    def _ranked(self, names: list, watch: Callable) -> list:
+        """*names* most-watched first (days watched, then time), never-watched after,
+        A–Z; or all A–Z when the user picked that (owner, 2026-11-18)."""
+        if self.rank == RANK_AZ:
+            return sorted(names, key=str.lower)
+
+        def key(name):
+            days, secs = watch(name)
+            return (-len(days), -secs, name.lower())
+        return sorted(names, key=key)
+
+    @property
     def ordering(self) -> str:
         """By sport (the default) or By time (SV-Q50)."""
         return self._state().get("order", ORDER_SPORT)
@@ -186,7 +213,8 @@ class SportsView(ContentView):
         def query(repos):
             hidden = set(ProviderRepository(repos.session).get_hidden_provider_ids())
             games = [g for sp in self.sports for g in load_games(repos.session, sp, hidden, 1, top)]
-            return games, load_watch_history(repos.session), load_alerts(repos.session)
+            return (games, load_watch_history(repos.session), load_alerts(repos.session),
+                    load_league_watch(repos.session))
         self._run_query(query, self._on_games, token_ref=self._token, on_error=self._on_error)
 
     def set_finding(self, on: bool) -> None:
@@ -229,8 +257,9 @@ class SportsView(ContentView):
             self.reload()
 
     def _on_games(self, result) -> None:
-        games, history, alerts = result if result else ([], {}, [])
+        games, history, alerts, watch = (tuple(result) + ({},))[:4] if result else ([], {}, [], {})
         self._raw, self._history, self._alerts = list(games or []), dict(history or {}), list(alerts or [])
+        self._watch = dict(watch or {})
         self._loaded = True
         self._render()
 
@@ -292,7 +321,7 @@ class SportsView(ContentView):
         if self.ordering == ORDER_TIME:
             self._render_by_time(games, now, folded)
         else:
-            for sport in self.sports:
+            for sport in self._ranked(list(self.sports), self._sport_watch):
                 mine = [g for g in games if g.sport == sport]
                 self._layout.addWidget(self._sport_header(sport, mine))
                 if f"sport:{sport}" not in folded:
@@ -321,7 +350,7 @@ class SportsView(ContentView):
         league's own On now, days and Finished in a frame under its centred banner
         (Sports Desk rev 13, C4; SV-Q84/Q98). Cards then carry no league line.
         """
-        leagues = sorted({g.league for g in games})
+        leagues = self._ranked(sorted({g.league for g in games}), lambda lg: self._league_watch(sport, lg))
         if len(leagues) < 2:
             self._sections(sport, games, now, folded)
             return
@@ -608,7 +637,7 @@ class SportsView(ContentView):
         # they get the logo and #").
         settings = self.sports.get(sport)
         now = self._clock()
-        for league in sorted({g.league for g in games}):
+        for league in self._ranked(sorted({g.league for g in games}), lambda lg: self._league_watch(sport, lg)):
             on = sum(1 for g in games if g.league == league and settings is not None
                      and event_live(g, now, settings))
             chip = labeled_chip(league, on, "live")
@@ -636,6 +665,17 @@ class SportsView(ContentView):
             else "Grouped by sport, then league — click to list every sport together by start time")
         self.order_button.clicked.connect(self._toggle_order)
         h.addWidget(self.order_button)
+        watched = self.rank == RANK_WATCHED
+        self.rank_button = QPushButton("Most watched" if watched else "A–Z")
+        self.rank_button.setFlat(True)
+        _icon_utils.set_button_icon(self.rank_button, "sort")
+        _theme.style(self.rank_button, "LINK_BTN_SM")
+        self.rank_button.setToolTip(
+            "Sports and leagues you watched on the most days in the last 30 come first, then the "
+            "rest A–Z — click to order them A–Z" if watched
+            else "Sports and leagues in A–Z order — click to put the ones you watch most first")
+        self.rank_button.clicked.connect(self._toggle_rank)
+        h.addWidget(self.rank_button)
         self.less_certain_chip = ToggleChip("Less certain games", enabled=self.less_certain)
         self.less_certain_chip.setToolTip("Also show games only one collection lists (dashed outline)")
         self.less_certain_chip.toggled_changed.connect(self._toggle_less_certain)
@@ -756,6 +796,11 @@ class SportsView(ContentView):
         self._state()["folded"] = sorted(folded)
         self._save()
         QTimer.singleShot(0, self._render)
+
+    def _toggle_rank(self) -> None:
+        self._state()["rank"] = RANK_AZ if self.rank == RANK_WATCHED else RANK_WATCHED
+        self._save()
+        self._render()
 
     def _toggle_order(self) -> None:
         self._state()["order"] = ORDER_SPORT if self.ordering == ORDER_TIME else ORDER_TIME

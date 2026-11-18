@@ -1504,3 +1504,23 @@ def test_counts_leave_out_finished_games(games_db, qapp, owned_widgets):
     band = view.headers["sport:hockey"]
     assert _rect(view, sport).left() > _rect(view, band.findChildren(QLabel)[2]).left(), (
         "the count follows the sport's name")
+
+
+def test_the_league_you_watch_most_comes_first_and_az_is_a_click_away(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-18: NHL, watched most, sat at the bottom under A–Z order."""
+    view = _two_league_view(games_db, qapp, owned_widgets, START - timedelta(minutes=30))
+
+    def tops():
+        return {lg: _rect(view, view.headers[f"hockey:league:{lg}"]).top() for lg in ("AHL", "NHL")}
+    assert tops()["AHL"] < tops()["NHL"], "nothing watched yet: A–Z"
+    view._watch = {"hockey/NHL": (frozenset({"2026-11-10", "2026-11-11"}), 9000)}
+    view._render()
+    _settle(qapp)
+    assert tops()["NHL"] < tops()["AHL"], "the league watched on the most days first"
+    chips = {lg: _rect(view, view.league_chips[("hockey", lg)]).left() for lg in ("AHL", "NHL")}
+    assert chips["NHL"] < chips["AHL"], "the sport header's chips follow the same order"
+    assert view.rank_button.text() == "Most watched"
+    view.rank_button.click()
+    _settle(qapp)
+    assert view.config.sports_view_state["rank"] == "az" and view.rank_button.text() == "A–Z"
+    assert tops()["AHL"] < tops()["NHL"], "A–Z on request"

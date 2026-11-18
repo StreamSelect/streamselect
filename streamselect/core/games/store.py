@@ -9,7 +9,7 @@ thread (the caller's executor); the finder itself never touches the database.
 from __future__ import annotations
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 
 import yaml
@@ -17,12 +17,16 @@ from loguru import logger
 from sqlalchemy import delete, or_, select
 
 from streamselect.core.database import Database, ChannelDB, EpgProgramDB
-from streamselect.core.epg_utils import now_utc
-from streamselect.core.games.finder import GUIDE, ListingIn, Memory, SportSettings, _learn_clocks, find_games
+from streamselect.core.epg_utils import now_utc, to_local
+from streamselect.core.event_datetime import DEFAULT_EVENT_DURATION
+from streamselect.core.games.finder import (
+    GUIDE, WATCH_WINDOW_DAYS, ListingIn, Memory, PlayIn, SportSettings, _learn_clocks, find_games,
+)
 from streamselect.core.games.listing_text import (
     MATCHUP_LIKE_PATTERNS, NOT_PLAIN_GLOB, league_matcher, norm,
 )
 from streamselect.core.games.models import GameDB, GameFeedDB, GameFinderMemoryDB
+from streamselect.core.playback_models import PlaybackEventDB
 from streamselect.core.repositories.provider import ProviderRepository
 from streamselect.core.special_content import _BUNDLED_DEFINITIONS
 
@@ -61,6 +65,7 @@ def _memory_to_json(m: Memory) -> dict:
                           for game, (diff, seen) in games.items()],
         "first_seen": [[cid, name, seen.isoformat()] for (cid, name), seen in m.first_seen.items()],
         "confirmed": {title: sorted(u.isoformat() for u in starts) for title, starts in m.confirmed.items()},
+        "watched": [[pid, day, secs] for pid, (day, secs) in m.watched.items()],
     }
 
 
@@ -72,7 +77,33 @@ def _memory_from_json(d: dict | None) -> Memory:
         m.first_seen[(cid, name)] = datetime.fromisoformat(seen)
     for title, starts in (d or {}).get("confirmed", {}).items():
         m.confirmed[title] = {datetime.fromisoformat(u) for u in starts}
+    for pid, day, secs in (d or {}).get("watched", []):
+        m.watched[int(pid)] = (str(day), int(secs))
     return m
+
+
+def _recent_plays(session, now: datetime) -> list[PlayIn]:
+    """Plays that showed a picture in the last :data:`WATCH_WINDOW_DAYS`, each under
+    the channel name it had then, on the viewer's local day."""
+    since = now - timedelta(days=WATCH_WINDOW_DAYS)
+    rows = session.execute(
+        select(PlaybackEventDB.id, PlaybackEventDB.title, PlaybackEventDB.started_at,
+               PlaybackEventDB.seconds_watched)
+        .where(PlaybackEventDB.started_at >= since,
+               PlaybackEventDB.outcome.in_(("started", "dropped")))).all()
+    cap = int(DEFAULT_EVENT_DURATION.total_seconds())      # one play counts at most one event
+    return [PlayIn(pid, title or "", to_local(at).date().isoformat(), min(int(secs or 0), cap))
+            for pid, title, at, secs in rows]
+
+
+def load_league_watch(session) -> dict[str, tuple[frozenset[str], int]]:
+    """league key ("hockey/NHL") -> (the local days it was watched, seconds watched),
+    from each league's stored memory: the "Most watched" order's input."""
+    out = {}
+    for row in session.query(GameFinderMemoryDB).all():
+        watched = _memory_from_json(row.memory).watched.values()
+        out[row.finder] = (frozenset(day for day, _ in watched), sum(secs for _, secs in watched))
+    return out
 
 
 def _could_name_a_game(session, settings: SportSettings):
@@ -142,6 +173,7 @@ def refresh_games(db: Database, now: datetime | None = None) -> dict[str, int]:
     with db.session_scope(commit=False) as session:
         known = tuple(c for row in session.query(GameFinderMemoryDB).all()
                       for c in _learn_clocks(_memory_from_json(row.memory).clock_samples).values())
+        plays = _recent_plays(session, now)
     for settings in enabled_leagues():
         t0 = time.monotonic()
         key = _finder_key(settings)
@@ -150,7 +182,7 @@ def refresh_games(db: Database, now: datetime | None = None) -> dict[str, int]:
             listings = _read_listings(session, settings, now, hidden)
             row = session.get(GameFinderMemoryDB, key)
             memory = _memory_from_json(row.memory if row else None)
-        games, memory, clocks = find_games(listings, settings, now, memory, known)
+        games, memory, clocks = find_games(listings, settings, now, memory, known, plays)
         with db.session_scope(background=True) as session:
             old = select(GameDB.id).where(GameDB.sport == settings.sport, GameDB.league == settings.league)
             session.execute(delete(GameFeedDB).where(GameFeedDB.game_id.in_(old)))

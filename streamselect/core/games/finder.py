@@ -18,6 +18,7 @@ The confidence ladder:
 from __future__ import annotations
 
 import collections
+import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Optional
@@ -89,6 +90,38 @@ class Memory:
     first_seen: dict[tuple[str, str], datetime] = field(default_factory=dict)
     #: game title -> starts of earlier Level 1 games with those teams
     confirmed: dict[str, set[datetime]] = field(default_factory=dict)
+    #: play id -> (local day "YYYY-MM-DD", seconds) for plays credited to this league
+    #: (:func:`credit_plays`), kept :data:`WATCH_WINDOW_DAYS`: the league's "most watched"
+    #: rank. Kept rather than recomputed so a play stays credited after the teams it
+    #: named leave the listings.
+    watched: dict[int, tuple[str, int]] = field(default_factory=dict)
+
+
+#: How far back viewing counts toward a league's rank (owner, 2026-11-18: days watched).
+WATCH_WINDOW_DAYS = 30
+
+
+@dataclass(frozen=True)
+class PlayIn:
+    """One play from the playback log: what the channel was called when it played."""
+
+    id: int
+    title: str
+    day: str        # the viewer's local day, "YYYY-MM-DD"
+    seconds: int
+
+
+def credit_plays(plays, book: "TeamBook", league: re.Pattern[str]) -> dict[int, tuple[str, int]]:
+    """The plays that were this league: the name says the league's word, or a
+    matchup in it names two of the league's teams exactly (an NHL game on a channel
+    that never says "NHL"). A side the book only half-knows credits nothing."""
+    out = {}
+    for p in plays:
+        u = norm(p.title)
+        if league.search(u) or any(book.resolve(a, False)[1] == "exact" and book.resolve(b, False)[1] == "exact"
+                                   for a, b in matchups(u, league)):
+            out[p.id] = (p.day, p.seconds)
+    return out
 
 
 @dataclass(frozen=True)
@@ -372,7 +405,7 @@ def _mark_stale(work: list[_L], memory: Memory, now: datetime, stale_after: time
 
 def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime,
                memory: Optional[Memory] = None,
-               known: tuple[Clock, ...] = ()) -> tuple[list[Game], Memory, list[Clock]]:
+               known: tuple[Clock, ...] = (), plays=()) -> tuple[list[Game], Memory, list[Clock]]:
     """Find one sport's games among *listings*.
 
     Args:
@@ -383,6 +416,9 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
         memory: what the previous run returned (empty on the first run).
         known: clocks other leagues' runs learned; a collection without its own
             borrows from them (:func:`_with_borrowed`).
+        plays: recent plays (:class:`PlayIn`); those that were this league join
+            ``memory.watched`` (:func:`credit_plays`), which drops days past
+            :data:`WATCH_WINDOW_DAYS`.
 
     Returns:
         (games in the window and outside it, the memory for the next run, learned clocks)
@@ -513,4 +549,7 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
             confirmed.setdefault(g.title, set()).add(g.start_utc)
     current = {(L.src.channel_id, L.src.name) for L in work}
     first_seen = {k: v for k, v in first_seen.items() if k in current}
-    return games, Memory(samples, first_seen, confirmed), list(clocks.values())
+    oldest = (now - timedelta(days=WATCH_WINDOW_DAYS)).date().isoformat()
+    watched = {pid: v for pid, v in {**memory.watched, **credit_plays(plays, book, league)}.items()
+               if v[0] >= oldest}
+    return games, Memory(samples, first_seen, confirmed, watched), list(clocks.values())

@@ -344,3 +344,42 @@ def test_a_word_with_other_letters_is_still_another_team():
     from streamselect.core.games.teams import match
     assert match(("LOS", "ANGELES", "WINGS"), ("LOS", "ANGELES", "KINGS")) is None
     assert match(("DETROIT", "KINGS"), ("DETROIT", "RED", "WINGS")) is None
+
+
+# ── Most watched: plays credited to a league (owner, 2026-11-18) ──
+
+def test_plays_are_credited_by_the_league_word_or_two_known_teams():
+    from streamselect.core.games.finder import PlayIn
+    plays = [
+        PlayIn(1, "NHL | 09 - 8pm Jets @ Stars", "2026-11-12", 3000),
+        PlayIn(2, "LIVE | CHICAGO BLACKHAWKS VS. BUFFALO SABRES | Thu 12 Nov 19:30 EST", "2026-11-12", 1200),
+        PlayIn(3, "Florida State vs Boston College 8:00 PM ET", "2026-11-12", 5000),
+        PlayIn(4, "Some film", "2026-11-12", 7000),
+    ]
+    _, memory, _ = find_games(_two_games(), NHL, NOW, plays=plays)
+    assert set(memory.watched) == {1, 2}, "the league word, or both sides exactly known teams"
+    assert memory.watched[2] == ("2026-11-12", 1200)
+
+
+def test_credited_plays_are_kept_for_thirty_days_then_dropped():
+    from streamselect.core.games.finder import PlayIn
+    old = Memory(watched={7: ("2026-10-01", 60), 8: ("2026-11-01", 60)})
+    _, memory, _ = find_games(_two_games(), NHL, NOW, old, plays=[PlayIn(9, "NHL: Jets vs Stars", "2026-11-13", 60)])
+    assert set(memory.watched) == {8, 9}, "kept from the last run, the 30-day-old one dropped"
+
+
+def test_a_refresh_stores_the_leagues_watched_days(db):
+    from streamselect.core.games.store import load_league_watch
+    from streamselect.core.playback_models import PlaybackEventDB
+    _seed_db(db)
+    with db.session_scope() as s:
+        for i, (title, at) in enumerate([("NHL: Jets vs Stars", NOW - timedelta(days=2)),
+                                         ("NHL: Jets vs Stars", NOW - timedelta(days=2, hours=1)),
+                                         ("BUFFALO SABRES VS. CHICAGO BLACKHAWKS", NOW - timedelta(days=5)),
+                                         ("NHL: Jets vs Stars", NOW - timedelta(days=40))]):
+            s.add(PlaybackEventDB(provider_id="p1", channel_id=f"x{i}", title=title, started_at=at,
+                                  outcome="started", seconds_watched=600))
+    refresh_games(db, NOW)
+    with db.session_scope(commit=False) as s:
+        days, secs = load_league_watch(s)["hockey/NHL"]
+    assert len(days) == 2 and secs == 1800, (days, secs)
