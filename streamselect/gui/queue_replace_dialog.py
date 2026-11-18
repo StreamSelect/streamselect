@@ -17,8 +17,9 @@ group's own tick box selecting or clearing all of it —
   (owner's "Alien: Earth"), so this copy is a duplicate. Greyed, never swapped.
 - **Nothing to replace them**: greyed, with the reason, and left in the queue.
 
-A trash button at the far right of every row and group header strikes rows
-through: struck rows are not migrated but removed from the queue on Replace,
+A trash button at the far right of every row and group header — shown only
+on the row under the mouse, which is lightly highlighted, or on a struck row —
+strikes rows through: struck rows are not migrated but removed from the queue on Replace,
 and clicking it again keeps them (owner, 2026-11-17).
 
 A row with several copies has a drop-down. Nothing changes until Replace,
@@ -30,11 +31,11 @@ left can be revisited from the same menu any time.
 from __future__ import annotations
 
 from loguru import logger
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QBrush, QColor
+from PyQt6.QtCore import QEvent, Qt
+from PyQt6.QtGui import QBrush, QColor, QCursor
 from PyQt6.QtWidgets import (
     QAbstractItemView, QButtonGroup, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView, QLabel,
-    QPushButton, QRadioButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout,
+    QPushButton, QRadioButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from streamselect.core.queue_replacement import (
@@ -81,6 +82,9 @@ class QueueReplaceDialog(QDialog):
         self._row_of: dict[int, tuple[Stranded, QTreeWidgetItem, QComboBox | None]] = {}
         self._remove_btn: dict[int, QPushButton] = {}
         self._notes: dict[int, str] = {}
+        self._trash_of: dict[int, QPushButton] = {}   # id(item) -> its trash button
+        self._items: dict[int, QTreeWidgetItem] = {}  # id(item) -> item (rows and headers)
+        self._hover: QTreeWidgetItem | None = None
 
         layout = QVBoxLayout(self)
         intro = QLabel("These Watch Queue items are on sources that can't play. Ticked items are "
@@ -123,6 +127,10 @@ class QueueReplaceDialog(QDialog):
         self.tree.setColumnWidth(COL_ARROW, 28)
         self.tree.setColumnWidth(COL_REMOVE, 30)
         self.tree.itemChanged.connect(lambda *_: self._update_count())
+        # Trash buttons show only on the row under the mouse (owner: "otherwise
+        # it's just a messy row of trash"), which is also lightly highlighted.
+        self.tree.setMouseTracking(True)
+        self.tree.viewport().installEventFilter(self)
         layout.addWidget(self.tree, 1)
 
         self.buttons = dialog_buttons(self, ok="Replace", on_ok=self._replace)
@@ -156,8 +164,51 @@ class QueueReplaceDialog(QDialog):
         btn = self._trash(f"Remove every item under {title} from your queue, or keep them all",
                           lambda: self._strike_all(ids))
         btn.setCheckable(False)
-        self.tree.setItemWidget(group, COL_REMOVE, btn)
+        self._attach_trash(group, btn)
         return group
+
+    def _attach_trash(self, item: QTreeWidgetItem, btn: QPushButton) -> None:
+        # In a holder: the view re-shows its cell widgets on every layout, so a
+        # hidden button set as the cell widget would come straight back.
+        holder = QWidget()
+        box = QHBoxLayout(holder)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.addWidget(btn)
+        holder.installEventFilter(self)
+        self.tree.setItemWidget(item, COL_REMOVE, holder)
+        self._trash_of[id(item)] = btn
+        self._items[id(item)] = item
+        btn.installEventFilter(self)
+        btn.setVisible(False)
+
+    def eventFilter(self, obj, event):  # noqa: N802 — Qt override
+        """Follow the mouse: over the list, over a row's own widgets, or out."""
+        kind = event.type()
+        if obj is self.tree.viewport() and kind == QEvent.Type.MouseMove:
+            self._set_hover(self.tree.itemAt(event.position().toPoint()))
+        elif kind in (QEvent.Type.Enter, QEvent.Type.Leave):
+            pos = self.tree.viewport().mapFromGlobal(QCursor.pos())
+            inside = self.tree.viewport().rect().contains(pos)
+            self._set_hover(self.tree.itemAt(pos) if inside else None)
+        return False
+
+    def _set_hover(self, item: QTreeWidgetItem | None) -> None:
+        if item is not None and id(item) not in self._trash_of:
+            item = None
+        if item is self._hover:
+            return
+        previous, self._hover = self._hover, item
+        for it in (previous, item):
+            if it is not None:
+                self._paint_hover(it)
+
+    def _paint_hover(self, item: QTreeWidgetItem) -> None:
+        on = item is self._hover
+        brush = QBrush(QColor(_theme.COLOR_LINE_DARK)) if on else QBrush()
+        for col in range(self.tree.columnCount()):
+            item.setBackground(col, brush)
+        btn = self._trash_of[id(item)]
+        btn.setVisible(on or btn.isChecked())     # a struck row keeps its button, to undo it
 
     def _trash(self, tip: str, on_click) -> QPushButton:
         btn = QPushButton()
@@ -174,6 +225,7 @@ class QueueReplaceDialog(QDialog):
         self.tree.blockSignals(True)
         self.tree.clear()
         self._rows, self.groups, self._row_of, self._remove_btn, self._notes = [], {}, {}, {}, {}
+        self._trash_of, self._items, self._hover = {}, {}, None
         shown = self.shown()
         self.removing &= {s.queue_id for s in shown}
         sure = [s for s in shown if s.best is not None and not s.doubts]
@@ -210,6 +262,7 @@ class QueueReplaceDialog(QDialog):
                         for c in s.candidates:
                             combo.addItem(describe_new(c), c.channel_id)
                         self.tree.setItemWidget(item, COL_NEW, combo)
+                        combo.installEventFilter(self)    # the mouse over a row's drop-down
                     else:
                         item.setText(COL_NEW, describe_new(s.best))
                         item.setToolTip(COL_NEW, item.text(COL_NEW))
@@ -220,7 +273,7 @@ class QueueReplaceDialog(QDialog):
                                   "(click again to keep it)",
                                   lambda q=s.queue_id: self._strike(q, q not in self.removing))
                 self._remove_btn[s.queue_id] = btn
-                self.tree.setItemWidget(item, COL_REMOVE, btn)
+                self._attach_trash(item, btn)
                 if s.queue_id in self.removing:
                     self._strike(s.queue_id, True, update=False)
             if group is not None:
@@ -250,6 +303,7 @@ class QueueReplaceDialog(QDialog):
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
         item.setText(COL_NOTE, REMOVING_NOTE if on else self._notes[queue_id])
         self._remove_btn[queue_id].setChecked(on)
+        self._paint_hover(item)
         self.tree.blockSignals(False)
         if update:
             self._update_count()

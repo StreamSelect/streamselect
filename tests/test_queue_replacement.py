@@ -301,10 +301,10 @@ def test_the_trash_button_strikes_a_row_through_and_turns_it_into_a_removal(
     dlg, rows = _dialog(db, qapp, owned_widgets)
     ids = {s.old.channel_id: s.queue_id for s, _i, _c in dlg._rows}
     one, dupe = rows["old_1"], rows["old_7"]
-    trash = dlg.tree.itemWidget(one, COL_REMOVE)
+    trash, cell = dlg._trash_of[id(one)], dlg.tree.itemWidget(one, COL_REMOVE)
     combo = dlg.tree.itemWidget(one, COL_NEW)
-    assert trash.geometry().x() > combo.geometry().right(), "the trash button is at the far right"
-    assert abs(trash.geometry().center().y() - dlg.tree.visualItemRect(one).center().y()) <= 2
+    assert cell.geometry().x() > combo.geometry().right(), "the trash button is at the far right"
+    assert abs(cell.geometry().center().y() - dlg.tree.visualItemRect(one).center().y()) <= 2
 
     trash.click()
     assert one.font(COL_OLD).strikeOut() and combo.font().strikeOut() and not combo.isEnabled()
@@ -313,7 +313,7 @@ def test_the_trash_button_strikes_a_row_through_and_turns_it_into_a_removal(
     assert dlg.removals() == [ids["old_1"]] and dlg.choices() == []
     assert dlg._ok.text() == "Remove 1" and dlg._ok.isEnabled()
 
-    dlg.tree.itemWidget(dlg.groups[GROUP_DUPLICATE], COL_REMOVE).click()   # the whole group
+    dlg._trash_of[id(dlg.groups[GROUP_DUPLICATE])].click()          # the whole group
     assert dupe.font(COL_OLD).strikeOut()
     assert sorted(dlg.removals()) == sorted([ids["old_1"], ids["old_5"], ids["old_7"]])
 
@@ -322,3 +322,38 @@ def test_the_trash_button_strikes_a_row_through_and_turns_it_into_a_removal(
     assert one.text(COL_NOTE) == ""
     one.setCheckState(COL_OLD, Qt.CheckState.Checked)
     assert dlg._ok.text() == "Replace 1 · Remove 2"
+
+
+def test_only_the_row_under_the_mouse_shows_its_trash_and_a_highlight(db, qapp, owned_widgets):
+    """Owner: a trash button on every row is "a messy row of trash"; show it on
+    the hovered row, lightly highlighted. A struck row keeps its button to undo."""
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QMouseEvent
+
+    from streamselect.gui.queue_replace_dialog import COL_NOTE, COL_OLD
+    _seed(db)
+    dlg, rows = _dialog(db, qapp, owned_widgets)
+    a, b = rows["old_1"], rows["old_2"]
+    trash_a, trash_b = (dlg._trash_of[id(r)] for r in (a, b))
+    assert not trash_a.isVisible() and not trash_b.isVisible(), "no trash until hovered"
+
+    def hover(item):
+        at = QPointF(dlg.tree.visualItemRect(item).center()) + QPointF(0, 0)
+        at.setX(5)
+        ev = QMouseEvent(QEvent.Type.MouseMove, at, at, Qt.MouseButton.NoButton,
+                         Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier)
+        qapp.sendEvent(dlg.tree.viewport(), ev)
+        qapp.processEvents()
+
+    hover(a)
+    assert trash_a.isVisible() and not trash_b.isVisible()
+    assert a.background(COL_OLD).style() != Qt.BrushStyle.NoBrush
+    assert a.background(COL_NOTE).color() == a.background(COL_OLD).color(), "the whole row"
+    assert b.background(COL_OLD).style() == Qt.BrushStyle.NoBrush
+    hover(b)
+    assert trash_b.isVisible() and not trash_a.isVisible(), "it goes when the mouse moves on"
+    hover(a)
+    trash_a.click()                                  # strike it
+    hover(b)
+    assert trash_b.isVisible() and trash_a.isVisible(), "a struck row keeps its button"
+    assert a.background(COL_OLD).style() == Qt.BrushStyle.NoBrush, "highlight followed the mouse"
