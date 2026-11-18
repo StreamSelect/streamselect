@@ -18,7 +18,7 @@ The confidence ladder:
 from __future__ import annotations
 
 import collections
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -100,6 +100,9 @@ class Clock:
     offset_min: int
     agree: int
     total: int
+    #: Set when this collection never showed its own clock and took one learned
+    #: elsewhere (:func:`_with_borrowed`): the collection it came from.
+    borrowed_from: str = ""
 
     @property
     def learned(self) -> bool:
@@ -288,6 +291,47 @@ def _learn_clocks(samples) -> dict[tuple[str, str], Clock]:
     return clocks
 
 
+def region_tag(collection: str) -> str:
+    """The region a collection name opens with — "CA" for "CA| AHL PPV" — or ""
+    when it has none (no "|"), in which case nothing is borrowed for it."""
+    return collection.split("|", 1)[0].strip().upper() if "|" in collection else ""
+
+
+def _with_borrowed(clocks: dict, known, work: list[_L]) -> dict:
+    """*clocks* plus a borrowed clock for each collection that states clock times
+    but never showed its own clock — nothing typed in, only what was learned.
+
+    A clock belongs to a collection, not a league, so first the same collection's
+    clock learned by another league's run (*known*). Failing that, the clock its
+    source's sibling collections share: same source, same :func:`region_tag`, and
+    every learned sibling on ONE offset ("CA| AHL PPV" takes "CA| SPORTS PPV"'s,
+    learned from NHL games; owner, 2026-11-17: "it should have to have a way to
+    figure it out internally"). Siblings that disagree, or none, lend nothing,
+    and such a listing still gets no time.
+    """
+    pool = {(c.source, c.collection): c for c in known if c.learned}
+    pool.update({k: c for k, c in clocks.items() if c.learned})
+    out = dict(clocks)
+    wanted = {(L.src.source, L.src.collection) for L in work
+              if L.src.source != GUIDE and L.time and not L.time.zone and L.utc is None}
+    for src, coll in wanted:
+        if (src, coll) in out and out[(src, coll)].learned:
+            continue
+        same = pool.get((src, coll))
+        if same is not None:
+            out[(src, coll)] = replace(same, borrowed_from=coll)
+            continue
+        tag = region_tag(coll)
+        siblings = [c for (s, cn), c in pool.items() if s == src and cn != coll and tag
+                    and region_tag(cn) == tag]
+        if siblings and len({c.offset_min for c in siblings}) == 1:
+            first = siblings[0]
+            out[(src, coll)] = Clock(src, coll, first.offset_min,
+                                     sum(c.agree for c in siblings), sum(c.total for c in siblings),
+                                     borrowed_from=", ".join(sorted(c.collection for c in siblings)))
+    return out
+
+
 def _place_times(work: list[_L], anchors, clocks, now: datetime) -> None:
     for L in work:
         if L.utc is not None or not L.time:
@@ -303,7 +347,7 @@ def _place_times(work: list[_L], anchors, clocks, now: datetime) -> None:
                 cands = [L.date.replace(hour=h, minute=m) - off]
             else:
                 cands = [d - off for d in candidate_days(now, h, m)]
-            how = "clock"
+            how = "borrowed" if clock.borrowed_from else "clock"
         else:
             continue
         if not cands:
@@ -327,7 +371,8 @@ def _mark_stale(work: list[_L], memory: Memory, now: datetime, stale_after: time
 
 
 def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime,
-               memory: Optional[Memory] = None) -> tuple[list[Game], Memory, list[Clock]]:
+               memory: Optional[Memory] = None,
+               known: tuple[Clock, ...] = ()) -> tuple[list[Game], Memory, list[Clock]]:
     """Find one sport's games among *listings*.
 
     Args:
@@ -336,6 +381,8 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
         settings: the sport's league words and measured constants.
         now: UTC-naive; never read from the clock here.
         memory: what the previous run returned (empty on the first run).
+        known: clocks other leagues' runs learned; a collection without its own
+            borrows from them (:func:`_with_borrowed`).
 
     Returns:
         (games in the window and outside it, the memory for the next run, learned clocks)
@@ -361,7 +408,7 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
 
     anchors = _anchor_times(work)
     samples = _clock_samples(work, anchors, memory, now, settings.same_game)
-    clocks = _learn_clocks(samples)
+    clocks = _with_borrowed(_learn_clocks(samples), known, work)
     _place_times(work, anchors, clocks, now)
     first_seen = _mark_stale(work, memory, now, settings.stale_after)
 
@@ -415,6 +462,14 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
     for g in G:
         g["colls"] = len({_coll_key(L) for L in g["timed"]})
         g["level"] = 4 if not g["inwin"] else (1 if g["colls"] >= 2 else 2)
+        # Borrowed clocks are an inference (_with_borrowed): two collections that
+        # agree only because each borrowed a clock confirm the GAME, not its time,
+        # when their times disagree — Cleveland at Hamilton, "8pm" in one and
+        # 19:00 in another, an hour apart (2026-11-17). Unconfirmed: less certain.
+        borrowed = [L.utc for L in g["timed"] if L.time_from == "borrowed"]
+        if (g["level"] == 1 and borrowed and len(borrowed) == len(g["timed"])
+                and (max(borrowed) - min(borrowed)).total_seconds() / 60 > CLOCK_AGREE_MIN):
+            g["level"] = 2
         g["replay"] = False
     airings: dict[tuple, set[datetime]] = collections.defaultdict(set)
     for g in G:

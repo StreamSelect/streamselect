@@ -18,7 +18,7 @@ from sqlalchemy import delete, or_, select
 
 from streamselect.core.database import Database, ChannelDB, EpgProgramDB
 from streamselect.core.epg_utils import now_utc
-from streamselect.core.games.finder import GUIDE, ListingIn, Memory, SportSettings, find_games
+from streamselect.core.games.finder import GUIDE, ListingIn, Memory, SportSettings, _learn_clocks, find_games
 from streamselect.core.games.listing_text import (
     MATCHUP_LIKE_PATTERNS, NOT_PLAIN_GLOB, league_matcher, norm,
 )
@@ -136,6 +136,12 @@ def refresh_games(db: Database, now: datetime | None = None) -> dict[str, int]:
     """
     now = now or now_utc()
     counts: dict[str, int] = {}
+    # Every league's learned clocks, so a collection one league never learned can
+    # borrow what another's run did (finder._with_borrowed). Re-learned from the
+    # stored samples: a clock is a property of the collection, not the league.
+    with db.session_scope(commit=False) as session:
+        known = tuple(c for row in session.query(GameFinderMemoryDB).all()
+                      for c in _learn_clocks(_memory_from_json(row.memory).clock_samples).values())
     for settings in enabled_leagues():
         t0 = time.monotonic()
         key = _finder_key(settings)
@@ -144,7 +150,7 @@ def refresh_games(db: Database, now: datetime | None = None) -> dict[str, int]:
             listings = _read_listings(session, settings, now, hidden)
             row = session.get(GameFinderMemoryDB, key)
             memory = _memory_from_json(row.memory if row else None)
-        games, memory, clocks = find_games(listings, settings, now, memory)
+        games, memory, clocks = find_games(listings, settings, now, memory, known)
         with db.session_scope(background=True) as session:
             old = select(GameDB.id).where(GameDB.sport == settings.sport, GameDB.league == settings.league)
             session.execute(delete(GameFeedDB).where(GameFeedDB.game_id.in_(old)))
@@ -162,5 +168,10 @@ def refresh_games(db: Database, now: datetime | None = None) -> dict[str, int]:
         counts[key] = sum(g.level == 1 for g in games)
         logger.info("Games {}: {} found ({} at level 1) from {:,} listings, {} clocks learned, {:.1f}s",
                     key, len(games), counts[key], len(listings),
-                    sum(c.learned for c in clocks), time.monotonic() - t0)
+                    sum(c.learned and not c.borrowed_from for c in clocks), time.monotonic() - t0)
+        for c in clocks:
+            if c.borrowed_from and any(g.feeds and any(f.collection == c.collection and f.time_from == "borrowed"
+                                                          for f in g.feeds) for g in games):
+                logger.info("Games {}: {} has no clock of its own; borrowed {:+d} min from {}",
+                            key, c.collection, c.offset_min, c.borrowed_from)
     return counts

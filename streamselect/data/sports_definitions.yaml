@@ -232,3 +232,15 @@ game_finder_leagues:
   hockey:
     NHL:
       - NHL
+    # TRIAL (owner, 2026-11-17): not yet through the test above. One source
+    # lists AHL games with clock times and no zone; their collections borrow a
+    # clock their sibling collections learned from NHL games (finder
+    # _with_borrowed), never a typed one, and a game whose borrowed times
+    # disagree stays less certain.
+    AHL:
+      - AHL
+      - American Hockey League
+    # TRIAL (owner, 2026-11-17): listings state date and zone; each game is in
+    # one collection, so its games are less certain until a second lists them.
+    Hockeyallsvenskan:
+      - Hockeyallsvenskan

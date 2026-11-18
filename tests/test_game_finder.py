@@ -138,7 +138,9 @@ def _seed_db(db) -> None:
 
 def test_refresh_games_stores_games_and_replaces_them_on_the_next_run(db):
     _seed_db(db)
-    assert refresh_games(db, NOW) == {"hockey/NHL": 2}
+    counts = refresh_games(db, NOW)
+    assert counts["hockey/NHL"] == 2
+    assert all(n == 0 for k, n in counts.items() if k != "hockey/NHL"), "no other league's games here"
     refresh_games(db, NOW + timedelta(minutes=5))
     with db.session_scope(commit=False) as s:
         games = s.query(GameDB).order_by(GameDB.team_a).all()
@@ -210,3 +212,86 @@ def test_the_read_leaves_out_only_channels_that_cannot_name_a_game(db):
     first = refresh_games(db, NOW)
     with mock.patch.object(store, "_could_name_a_game", lambda *_: None):
         assert refresh_games(db, NOW) == first
+
+
+# ── Borrowed clocks (owner, 2026-11-17: no timing typed in; figure it out) ──
+
+def _ahl():
+    from streamselect.core.games.finder import SportSettings
+    return SportSettings("hockey", "AHL", ("AHL",))
+
+
+def _clock(coll, off, src="p2"):
+    from streamselect.core.games.finder import Clock
+    return Clock(src, coll, off, 10, 10)
+
+
+_SIBLINGS = (_clock("CA| SPORTS PPV", -300), _clock("US| NHL GAMES", -300))
+
+
+def _calgary(flo_time="20:00:00", ppv_coll="CA| AHL PPV", flo_coll="US| STREAM NETWORK"):
+    return [ListingIn("p2", ppv_coll, "AHL 03 : 8pm Calgary Wranglers vs Coachella Valley Firebirds", "x1"),
+            ListingIn("p2", flo_coll, "streamhockey: 2026 Calgary Wranglers vs Coachella Valley Firebirds "
+                                      f"(2026-11-12 {flo_time})", "x2")]
+
+
+def test_a_collection_with_no_clock_borrows_its_siblings_and_the_game_is_placed():
+    games, _, clocks = find_games(_calgary(), _ahl(), NOW, None, _SIBLINGS)
+    g = _game(games, "Calgary Wranglers")
+    assert g.start_utc == datetime(2026, 11, 13, 1, 0), "8pm on the siblings' -5 h clock"
+    assert g.level == 1, "two collections, and their borrowed times agree"
+    assert {f.time_from for f in g.feeds} == {"borrowed"}
+    lent = {c.collection: c.borrowed_from for c in clocks if c.borrowed_from}
+    assert lent == {"CA| AHL PPV": "CA| SPORTS PPV", "US| STREAM NETWORK": "US| NHL GAMES"}
+
+
+def test_borrowed_times_that_disagree_leave_the_game_less_certain():
+    """Cleveland at Hamilton on 2026-11-17: "8pm" in one, 19:00 in the other."""
+    games, _, _ = find_games(_calgary(flo_time="19:00:00"), _ahl(), NOW, None, _SIBLINGS)
+    assert _game(games, "Calgary Wranglers").level == 2
+
+
+def test_siblings_that_disagree_lend_nothing_and_nothing_is_guessed():
+    split = (_clock("CA| SPORTS PPV", -300), _clock("CA| OTHER PPV", -360), _clock("US| NHL GAMES", -300))
+    games, _, clocks = find_games(_calgary(), _ahl(), NOW, None, split)
+    assert "CA| AHL PPV" not in {c.collection for c in clocks if c.borrowed_from}
+    # The AHL listing has no time, and the FLO listing alone (no league word) is
+    # not a seed: no game is made from a guess.
+    assert games == []
+
+
+def test_a_collection_without_a_region_borrows_nothing():
+    games, _, clocks = find_games(_calgary(ppv_coll="AHL PPV", flo_coll="STREAM NETWORK"),
+                                  _ahl(), NOW, None, _SIBLINGS)
+    assert not [c for c in clocks if c.borrowed_from] and games == []
+
+
+def test_the_same_collections_own_clock_from_another_league_beats_its_siblings():
+    known = _SIBLINGS + (_clock("CA| AHL PPV", -360),)
+    _games, _, clocks = find_games(_calgary(), _ahl(), NOW, None, known)
+    mine = next(c for c in clocks if c.collection == "CA| AHL PPV")
+    assert mine.offset_min == -360 and mine.borrowed_from == "CA| AHL PPV"
+
+
+def test_a_refresh_lends_one_leagues_learned_clocks_to_another(db):
+    """The NHL run learned "CA| SPORTS PPV"'s clock; the AHL run, whose collection
+    never showed one, places its games with it — through the stored memory."""
+    from streamselect.core.games.models import GameFinderMemoryDB
+    with db.session_scope() as s:
+        s.add(ProviderDB(id="p2", name="Two", type="xtream", url="http://example.com", username="u",
+                         password="p", is_active=True))
+        seen = NOW.isoformat()
+        s.add(GameFinderMemoryDB(finder="hockey/NHL", updated_at=NOW, memory={
+            "clock_samples": [["p2", "CA| SPORTS PPV", "A vs B@1", -300, seen],
+                              ["p2", "CA| SPORTS PPV", "C vs D@2", -300, seen],
+                              ["p2", "US| NHL GAMES", "A vs B@1", -300, seen],
+                              ["p2", "US| NHL GAMES", "C vs D@2", -300, seen]],
+            "first_seen": [], "confirmed": {}}))
+        for li in _calgary():
+            s.add(ChannelDB(id=li.channel_id, source_id=li.channel_id, provider_id=li.source,
+                            name=li.name, category=li.collection, media_type="live"))
+    counts = refresh_games(db, NOW)
+    assert counts["hockey/AHL"] == 1
+    with db.session_scope(commit=False) as s:
+        g = s.query(GameDB).filter(GameDB.league == "AHL").one()
+        assert g.start_utc == datetime(2026, 11, 13, 1, 0)

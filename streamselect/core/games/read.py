@@ -111,7 +111,7 @@ class GameFeedDTO:
 #: Best feed first: a listing that states its own time with a zone is the most
 #: explicit about being this game, then a learned clock, then one with no time,
 #: and a guide link last (the guide is the least reliable input).
-_FEED_RANK = {"zone": 0, "clock": 1, "": 2, "guide": 3}
+_FEED_RANK = {"zone": 0, "clock": 1, "borrowed": 2, "": 2, "guide": 3}
 
 
 @dataclass(frozen=True)
