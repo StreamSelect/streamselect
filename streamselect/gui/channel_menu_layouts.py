@@ -105,7 +105,11 @@ SURFACE_LAYOUTS: dict[str, list[str]] = {
         "play", "play_new_window", "play_open_ended_buffer", "play_deep_cache",
         "play_from_beginning", "resume_from",
         "sep",
-        "favorite", "queue",
+        # Owner, 2026-11-17: "Remove from Watch Later" got lost among the other
+        # actions in the queue's own menu, so it has a separator above and below.
+        "queue",
+        "sep",
+        "favorite",
         "sep",
         "like", "dislike",
         "sep",

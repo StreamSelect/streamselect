@@ -262,3 +262,21 @@ def test_versions_offers_download_for_vod(qapp):
         header="US", version_prefix="US", media_type="live",
     )
     assert "Download to library" not in _texts(build_channel_menu(live, handlers, parent=None))
+
+
+def test_remove_from_watch_later_stands_alone_in_the_queue_menu(qapp):
+    """Owner, 2026-11-17: in the Watch Queue's own menu the remove action "gets
+    lost in all the options" — a separator above and below it, on screen."""
+    ctx = ChannelMenuContext(
+        channel_ids=["ch1"], surface="queue", media_type="movie",
+        channel_found=True, in_queue=True,
+    )
+    handlers = {k: (lambda: None) for k in ("play", "favorite", "queue", "like", "dislike",
+                                             "mark_watched", "copy_title")}
+    menu = build_channel_menu(ctx, handlers, parent=None)
+    acts = menu.actions()
+    i = next(n for n, a in enumerate(acts) if a.text() == "Remove from Watch Later")
+    assert acts[i - 1].isSeparator() and acts[i + 1].isSeparator()
+    menu.adjustSize()
+    above, me, below = (menu.actionGeometry(acts[n]) for n in (i - 1, i, i + 1))
+    assert above.bottom() < me.top() and me.bottom() < below.top(), "drawn as bars around it"
