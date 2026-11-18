@@ -17,7 +17,7 @@
     "streamselect/gui/filter_panel.py": 1000,
     "streamselect/gui/global_filter_dialog.py": 1394,
     "streamselect/gui/main_window.py": 2387,
-    "streamselect/gui/main_window_channels.py": 2184,
+    "streamselect/gui/main_window_channels.py": 2152,
     "streamselect/gui/main_window_favorites.py": 1093,
     "streamselect/gui/main_window_streaming.py": 1314,
     "streamselect/gui/qa_checklist_window.py": 2450,
