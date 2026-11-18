@@ -164,9 +164,11 @@ def test_the_patcher_is_installed_before_the_sink():
     """
     import inspect
 
-    from streamselect import __main__ as app_main
+    # The setup lives in core/app_logging.py since the refresh moved into its
+    # own process (both processes call it); __main__ only calls it.
+    from streamselect.core import app_logging
 
-    source = inspect.getsource(app_main)
+    source = inspect.getsource(app_logging)
     assert source.index("logger.configure(patcher=") < source.index("logger.add("), (
         "the patcher is installed AFTER the file sink, so early records leak"
     )

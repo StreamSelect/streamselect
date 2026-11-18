@@ -30,10 +30,12 @@ REFRESH_MS = 5 * 60_000
 MESSAGE_MS = 10_000
 
 #: Settings switch per notification kind.
+#: Plain attribute reads, not names for getattr, so the stored-field reader
+#: check (tests/test_stored_fields_have_readers.py) can see them.
 _KIND_SWITCH = {
-    tray_state.KIND_WATCH: "tray_notify_watch",
-    tray_state.KIND_GAME: "tray_notify_games",
-    tray_state.KIND_UPDATE: "tray_notify_updates",
+    tray_state.KIND_WATCH: lambda config: config.tray_notify_watch,
+    tray_state.KIND_GAME: lambda config: config.tray_notify_games,
+    tray_state.KIND_UPDATE: lambda config: config.tray_notify_updates,
 }
 
 _PAUSES = (
@@ -372,7 +374,7 @@ class TrayController(QObject):
     def wants(self, kind: str) -> bool:
         """Whether a *kind* notification goes to the system right now."""
         config = self._host.config
-        if not self.is_visible() or kind not in _KIND_SWITCH or not getattr(config, _KIND_SWITCH[kind]):
+        if not self.is_visible() or kind not in _KIND_SWITCH or not _KIND_SWITCH[kind](config):
             return False
         if tray_state.paused_until(config.tray_notifications_paused, self._clock()) is not None:
             return False
