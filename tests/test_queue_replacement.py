@@ -29,7 +29,10 @@ def _seed(db):
         s.add(ProviderDB(id="live", name="Live Source", type="xtream", url="http://example.com",
                          is_active=True))
 
+        names = {}
+
         def ch(cid, pid, name, key, prefix="EN", **kw):
+            names[cid] = name
             s.add(ChannelDB(id=cid, source_id=cid, provider_id=pid, name=name, media_type="movie",
                             content_key=key, detected_prefix=prefix, detected_title=name, **kw))
         ch("old_1", "old", "Dark Matter", "tmdb:1|movie", last_played=T0, play_count=2,
@@ -50,7 +53,7 @@ def _seed(db):
         ch("live_6", "live", "Kiss TV", "kiss tv|live")
         for pos, cid in enumerate(["old_1", "old_2", "old_3", "off_4", "old_5", "live_5", "old_6",
                                    "old_7", "live_7a"]):
-            s.add(WatchQueueDB(channel_id=cid, channel_name=cid, media_type="movie",
+            s.add(WatchQueueDB(channel_id=cid, channel_name=names[cid], media_type="movie",
                                source_id=cid, position=pos, added_at=T0 + timedelta(minutes=pos)))
 
 
@@ -386,3 +389,32 @@ def test_rows_fit_their_drop_downs_before_and_after_switching_the_sources(db, qa
     for _ in range(3):
         qapp.processEvents()
     assert drop_downs_fit()
+
+
+def test_a_queue_entry_whose_number_now_lists_another_title_is_unavailable(db):
+    """STREAM-ID REUSE: the queued series' number now lists a live channel. It
+    must not play the stranger: unavailable, cleared by Clear Unavailable, and
+    offered in the replace window by its queued title (owner, 2026-11-17)."""
+    from streamselect.core.queue_replacement import SCOPE_EXPIRED
+    _seed(db)
+    with db.session_scope() as s:
+        s.add(ChannelDB(id="live_9", source_id="9", provider_id="live", name="LAT| TNT HD",
+                        media_type="live"))
+        s.add(ChannelDB(id="live_9b", source_id="9b", provider_id="live",
+                        name="EN - Jeeves And Wooster (1990)", media_type="series",
+                        detected_title="Jeeves And Wooster", detected_year="1990",
+                        detected_prefix="EN"))
+        s.add(WatchQueueDB(channel_id="live_9", channel_name="EN - Jeeves And Wooster (1990)",
+                           media_type="series", source_id="9", position=50))
+    with db.session_scope(commit=False) as s:
+        entry = next(e for e in RepositoryFactory(s).queue.get_all() if e.channel_id == "live_9")
+        assert entry.reused and not entry.available
+        assert entry.search_title == "EN - Jeeves And Wooster (1990)"
+    found = _scan(db, SCOPE_EXPIRED)["live_9"]
+    assert found.state == "reused" and not found.by_tmdb
+    assert found.best.channel_id == "live_9b" and "matched by name only" in found.doubts
+    with db.session_scope() as s:
+        repos = RepositoryFactory(s)
+        repos.queue.clear_unavailable(set(repos.providers.get_hidden_provider_ids()))
+    with db.session_scope(commit=False) as s:
+        assert not s.query(WatchQueueDB).filter_by(channel_id="live_9").count()

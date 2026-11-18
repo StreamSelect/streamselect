@@ -10,6 +10,8 @@ swaps the ticked ones (owner, 2026-11-17):
 - the old copy's watch history moves to the new copy;
 - items with no copy are listed and left alone, unless the user strikes them
   out, which removes them from the queue instead;
+- an item whose stream id the source now uses for another title ("reused") is
+  listed in either scope and matched by its queued name;
 - an item whose title is already queued from an active source is a duplicate,
   offered for removal, never swapped (that would queue the title twice);
 - :func:`undo` puts everything back, from the snapshot :func:`replace` returns.
@@ -25,8 +27,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sqlalchemy import func
+
 from streamselect.core.database import ChannelDB, ProviderDB, WatchQueueDB
 from streamselect.core.repositories.channel_live_copy import live_siblings
+from streamselect.core.repositories.queue import is_reused
 
 #: Which unusable sources a scan covers.
 SCOPE_EXPIRED = "expired"
@@ -62,7 +67,7 @@ class Stranded:
 
     queue_id: int
     old: Copy
-    state: str                       # "expired" | "disabled" | "removed"
+    state: str                       # "expired" | "disabled" | "removed" | "reused"
     candidates: tuple[Copy, ...]     # best first; empty when nothing matches
     reason: str = ""                 # why there is nothing to offer
     by_tmdb: bool = True             # matched on a TMDb id, not on the name alone
@@ -119,6 +124,9 @@ def find_stranded(repos, scope: str = SCOPE_ALL, config=None) -> list[Stranded]:
             .filter(WatchQueueDB.episode_id.is_(None))
             .order_by(WatchQueueDB.position).all())
     for row, ch in rows:
+        if is_reused(row, ch):
+            out.append(_reused_item(repos, row, ch, hidden, queued, sources, config))
+            continue
         if ch.provider_id not in covered:
             continue
         state = ("expired" if ch.provider_id in expired else
@@ -140,6 +148,47 @@ def find_stranded(repos, scope: str = SCOPE_ALL, config=None) -> list[Stranded]:
                             by_tmdb=(ch.content_key or "").startswith("tmdb:"),
                             duplicate=twin is not None))
     return out
+
+
+def _reused_item(repos, row, ch, hidden, queued, sources, config) -> Stranded:
+    """A queue item whose stream id the source now uses for another title.
+
+    The channel row describes the stranger, so its ``content_key`` cannot find
+    copies; the queued name is all that is left of what was queued. Copies are
+    the same title (and year, when the name has one) and media type on usable
+    sources, matched by name only — so they are never pre-ticked.
+    """
+    from streamselect.core.channel_name_utils import parse_channel_name
+    from streamselect.core.content_identity import normalize_title_for_key
+
+    parsed = parse_channel_name(row.channel_name)
+    title, year, lang = parsed.bare_name or row.channel_name, parsed.year or "", parsed.region or ""
+    old = Copy(row.channel_id, title, lang, "", year,
+               sources.get(ch.provider_id) or REMOVED_SOURCE)
+    key = normalize_title_for_key(title)
+    found = []
+    if key:
+        rows = (repos.session.query(ChannelDB)
+                .filter(ChannelDB.media_type == row.media_type, ChannelDB.id != row.channel_id,
+                        ChannelDB.provider_id.notin_(list(hidden)),
+                        ChannelDB.is_hidden.isnot(True),
+                        func.lower(ChannelDB.detected_title) == title.lower())
+                .all())
+        found = [c for c in rows
+                 if normalize_title_for_key(c.detected_title or "") == key
+                 and (not year or not c.detected_year or str(c.detected_year) == year)]
+    if config is not None and found:
+        from streamselect.core.preference_engine import version_score
+        found.sort(key=lambda c: -version_score(c, config))
+    mine = [c for c in found if (c.detected_prefix or "") == lang]
+    other = [c for c in found if (c.detected_prefix or "") != lang]
+    candidates = tuple([_copy(c, sources) for c in mine]
+                       + [_copy(c, sources, same_language=False) for c in other])
+    twin = next((c for c in candidates if c.channel_id in queued), None)
+    reason = (f"Already in your queue from {twin.source}" if twin else
+              "" if candidates else "No copy on your active sources")
+    return Stranded(row.id, old, "reused", () if twin else candidates, reason,
+                    by_tmdb=False, duplicate=twin is not None)
 
 
 @dataclass(frozen=True)

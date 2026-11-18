@@ -49,7 +49,8 @@ COL_OLD, COL_ARROW, COL_NEW, COL_NOTE, COL_REMOVE = 0, 1, 2, 3, 4
 GROUP_SURE, GROUP_CHECK = "Ready to replace", "Check these first"
 GROUP_DUPLICATE, GROUP_NONE = "Already in your queue", "Nothing to replace them"
 REMOVING_NOTE = "Will be removed from your queue"
-_STATE_WORDS = {"expired": "expired", "disabled": "switched off", "removed": "removed"}
+_STATE_WORDS = {"expired": "expired", "disabled": "switched off", "removed": "removed",
+                "reused": "its source now uses this for another channel"}
 
 
 def describe(copy: Copy) -> str:
@@ -149,7 +150,8 @@ class QueueReplaceDialog(QDialog):
         return SCOPE_EXPIRED if self.expired_only.isChecked() else SCOPE_ALL
 
     def shown(self) -> list[Stranded]:
-        return [s for s in self._all if self.scope == SCOPE_ALL or s.state == "expired"]
+        # A reused stream id cannot play under either scope, so it shows in both.
+        return [s for s in self._all if self.scope == SCOPE_ALL or s.state in ("expired", "reused")]
 
     def _group(self, title: str, rows: list[Stranded], checkable: bool) -> QTreeWidgetItem | None:
         if not rows:

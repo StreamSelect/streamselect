@@ -38,15 +38,24 @@ def is_rename(stored: str, live: str) -> bool:
 def provider_id_of(channel_id: str) -> str:
     """Return the provider id embedded in a composite ``ChannelDB.id``.
 
-    ``ChannelDB.id`` is built as ``f"{provider_id}_{stream_id}"``
-    (``providers/xtream.py``'s ``convert_to_channel``) — the provider id is
-    everything before the final ``_``. Used to scope an orphan-recovery
+    ``ChannelDB.id`` was built as ``f"{provider_id}_{stream_id}"``
+    (``providers/xtream.py``'s ``convert_to_channel``), and new rows get
+    ``f"{provider_id}_{media_type}-{stream_id}"`` (``channel_identity``): in
+    both, the provider id is everything before the final ``_``. Used to scope an orphan-recovery
     ``source_id`` lookup to the SAME provider: ``source_id`` is the
     provider's native stream id, which every provider reuses (small
     integers), so matching on it alone can bind to a different source's
     channel that happens to reuse the same native id.
     """
     return channel_id.rsplit("_", 1)[0]
+
+
+def is_reused(row: WatchQueueDB, ch: ChannelDB | None) -> bool:
+    """The source now lists a different title under *row*'s stream id: the live
+    name differs from the queued one and is not just the same title re-listed
+    with more detail (:func:`is_rename`)."""
+    return bool(ch and row.channel_name and ch.name != row.channel_name
+                and not is_rename(row.channel_name, ch.name))
 
 
 @dataclass
@@ -86,6 +95,11 @@ class QueueEntry:
     # in that order buries everything you queue today under months of older
     # entries (measured: 611 queued, oldest dating to May).
     added_at:      datetime | None = None
+    # The source now lists a different title under this entry's stream id
+    # (STREAM-ID REUSE): what was queued is not there, so the entry is
+    # unavailable rather than a play of a stranger's channel (2026-11-17: a
+    # queued series pointed at a live sports channel, warned every launch).
+    reused:        bool = False
 
     @property
     def is_episode(self) -> bool:
@@ -110,14 +124,14 @@ class WatchQueueRepository:
         """
         if not row.source_id:
             return None
-        return (
-            self.session.query(ChannelDB)
-            .filter_by(
-                source_id=row.source_id,
-                provider_id=provider_id_of(row.channel_id),
-            )
-            .first()
-        )
+        query = self.session.query(ChannelDB).filter_by(
+            source_id=row.source_id, provider_id=provider_id_of(row.channel_id))
+        if row.media_type:
+            # Same type too: a source numbers series apart from live channels and
+            # movies, so the number alone can name a different channel
+            # (core/repositories/channel_identity.py).
+            query = query.filter_by(media_type=row.media_type)
+        return query.first()
 
     def get_all(
         self,
@@ -188,7 +202,9 @@ class WatchQueueRepository:
             # search (sidebar/queue.py) show what was actually queued, not a
             # stranger's title.
             drifted = bool(ch and row.channel_name and ch.name != row.channel_name)
-            if drifted and not is_rename(row.channel_name, ch.name):
+            reused = is_reused(row, ch)
+            available = available and not reused
+            if reused:
                 if (row.channel_id, ch.name) not in _drift_reported:
                     _drift_reported.add((row.channel_id, ch.name))
                     logger.warning(
@@ -231,6 +247,7 @@ class WatchQueueRepository:
                 episode_num=row.episode_num,
                 episode_title=row.episode_title,
                 added_at=row.added_at,
+                reused=reused,
             ))
         return entries
 
@@ -254,8 +271,9 @@ class WatchQueueRepository:
             ch = self.session.get(ChannelDB, row.channel_id)
             if not ch and row.source_id:
                 ch = self._relocate_orphan(row)
-            # Remove orphaned entries or entries on a hidden provider.
-            if ch is None or ch.provider_id in hidden_provider_ids:
+            # Remove orphaned entries, entries on a hidden provider, and entries whose
+            # stream id now lists another title — exactly what get_all marks unavailable.
+            if ch is None or ch.provider_id in hidden_provider_ids or is_reused(row, ch):
                 self.session.delete(row)
                 removed += 1
         return removed
