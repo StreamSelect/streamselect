@@ -42,7 +42,7 @@ from streamselect.gui import cursor_affordance
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
-from streamselect.gui.chip_row import labeled_chip
+from streamselect.gui.chip_row import CHIP_COUNT, chip_widget, labeled_chip
 from streamselect.gui.chips import ToggleChip
 from streamselect.gui.content_view import ContentView
 from streamselect.gui.flow_layout import FlowLayout
@@ -379,13 +379,14 @@ class SportsView(ContentView):
         title = QLabel(league)
         _theme.style(title, "LEAGUE_TITLE")
         h.addWidget(title)
-        settings = self.sports.get(games[0].sport) if games else None
-        on = sum(1 for g in games if settings is not None and event_live(g, now, settings))
-        upcoming = sorted(g.start_utc for g in games if g.start_utc > now)
-        chip = labeled_chip(str(len(games)), on or (fmt_time(upcoming[0]) if upcoming else 0), "live")
-        chip.setToolTip(f"{league}: {len(games)} game{'s' if len(games) != 1 else ''}, "
-                        + (f"{on} on now" if on else f"next at {fmt_time(upcoming[0])}" if upcoming
-                           else "nothing still to come"))
+        # Finished games don't count: nobody cares (owner, 2026-11-18).
+        on_now, later, _ = self._split(games, now)
+        ahead = len(on_now) + len(later)
+        nxt = fmt_time(min(g.start_utc for g in later)) if later else ""
+        chip = labeled_chip(str(ahead), len(on_now) or nxt, "live")
+        chip.setToolTip(f"{league}: {ahead} game{'s' if ahead != 1 else ''} on now or still to come"
+                        + (f", {len(on_now)} on now" if on_now else f", next at {nxt}" if nxt else ""))
+        chip.setVisible(ahead > 0)
         h.addWidget(chip)
         h.addWidget(rule(), 1, Qt.AlignmentFlag.AlignVCenter)
         band.title, band.chip = title, chip
@@ -595,6 +596,15 @@ class SportsView(ContentView):
         name = QLabel(sport.title())
         _theme.style(name, "PANEL_HEADLINE")
         h.addWidget(name)
+        # Every game on now or still to come, all leagues (owner, 2026-11-18): the
+        # headings' outlined count chip, not clickable, so a click still folds.
+        on_now, later, _ = self._split(games, self._clock()) if sport in self.sports else ([], [], [])
+        count = chip_widget(CHIP_COUNT, str(len(on_now) + len(later)))
+        count.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        count.setToolTip(f"{len(on_now) + len(later)} {sport} games on now or still to come")
+        count.setVisible(bool(on_now or later))
+        h.addWidget(count)
+        band.count = count
         # One outlined chip per league with games here — none when nothing is
         # listed — and a league with games on now carries the live mark and how
         # many (owner, 2026-11-17: "when there are live games within a league

@@ -1478,3 +1478,25 @@ def test_finished_has_no_count(games_db, qapp, owned_widgets):
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=5))
     key = next(k for k in view.headers if k.endswith(":finished"))
     assert view.headers[key].findChild(GroupHeading).count_label.isHidden()
+
+
+def test_counts_leave_out_finished_games(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-18: a league's chip counts only games on now or still to
+    come ("nobody cares" about finished ones), and the sport's heading counts
+    every such game across its leagues."""
+    from dataclasses import replace
+    view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=4))
+    a, b = sorted(view._raw, key=lambda g: g.title)
+    later = replace(b, start_utc=START + timedelta(hours=6))             # NHL, still to come
+    ahl = replace(a, league="AHL", start_utc=START + timedelta(hours=7))  # AHL, still to come
+    view._raw = [a, later, ahl]                                           # a: NHL, finished
+    view._render()
+    _settle(qapp)
+    nhl = view.headers["hockey:league:NHL"].chip
+    assert nhl.name_label.text() == "1", "the finished NHL game is not counted"
+    assert nhl.count_label.text() == fmt_time(later.start_utc)
+    sport = view.headers["sport:hockey"].count
+    assert sport.isVisibleTo(view) and sport.text() == "2", "the sport counts the two games to come"
+    band = view.headers["sport:hockey"]
+    assert _rect(view, sport).left() > _rect(view, band.findChildren(QLabel)[2]).left(), (
+        "the count follows the sport's name")
