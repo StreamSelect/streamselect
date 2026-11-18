@@ -15,8 +15,8 @@ Tray, and never while paused (TQ7).
 from __future__ import annotations
 
 from loguru import logger
-from PyQt6.QtCore import QObject, QRect, Qt, QTimer
-from PyQt6.QtGui import QColor, QIcon, QPainter, QPixmap
+from PyQt6.QtCore import QObject, QPointF, QRect, QRectF, Qt, QTimer
+from PyQt6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap
 from PyQt6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
 from streamselect.core import runtime_env, tray_state, watchlist
@@ -49,6 +49,7 @@ _BADGE_SIZES = (16, 22, 24, 32, 48, 64)
 
 #: Each badge's glyph and disc colour (``tray_state.BADGE_*``).
 _BADGES = {
+    # Live draws the logo itself on this colour (live_icon); the glyph is unused.
     tray_state.BADGE_LIVE: ("sports", "COLOR_TRAY_LIVE"),
     # The Watch Alerts bell on a soft disc: a red "!" was too aggressive for
     # "something you follow is on" (owner, 2026-11-16).
@@ -105,22 +106,54 @@ def badged_icon(base: QIcon, glyph: str = "tray_alert_badge",
     return out
 
 
-def live_icon(glyph: str = "sports", fill_token: str = "COLOR_TRAY_LIVE") -> QIcon:
-    """The whole tray icon while an alerted game is live: *glyph* on a full disc.
+def _logo_paths() -> tuple[QPainterPath, QPainterPath]:
+    """The app logo's S-arrow in its own 64-unit box, transcribed from
+    ``packaging/icon/streamselect.svg``: the S (stroked 8 wide) and the arrowhead."""
+    s = QPainterPath(QPointF(12, 48))
+    s.lineTo(40, 48)
+    s.arcTo(QRectF(32, 32, 16, 16), 270, 180)       # round the right, up to (40, 32)
+    s.lineTo(24, 32)
+    s.arcTo(QRectF(16, 16, 16, 16), 270, -180)      # round the left, up to (24, 16)
+    s.lineTo(36, 16)
+    head = QPainterPath(QPointF(36, 5.5))
+    head.lineTo(53, 16)
+    head.lineTo(36, 26.5)
+    head.closeSubpath()
+    return s, head
 
-    A corner badge is too small to notice at tray size for something that is
-    on NOW (owner, 2026-11-17), so the icon itself changes; the plain logo
-    returns when the game ends, and the tooltip and menu still name the game.
+
+def live_icon(fill_token: str = "COLOR_TRAY_LIVE") -> QIcon:
+    """The tray icon while an alerted game is live: the app logo on *fill*.
+
+    A corner badge is too small to notice at tray size for something on NOW
+    (owner, 2026-11-17), and a whistle in place of the logo "shifts away from
+    the logo" — so the logo itself turns green: its S-arrow, in the on-fill
+    colour, on a *fill* square with the logo's own corners. The plain logo
+    returns when the game ends; the tooltip and menu still name the game.
     """
     out = QIcon()
-    fill = getattr(theme, fill_token)
+    fill = QColor(getattr(theme, fill_token))
+    ink = QColor(theme.on_fill(getattr(theme, fill_token)))
+    s_path, head = _logo_paths()
     for size in _BADGE_SIZES:
         pm = QPixmap(size, size)
         pm.fill(Qt.GlobalColor.transparent)
         p = QPainter(pm)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        inset = max(0, round(size / 32))
-        _glyph_disc(p, QRect(inset, inset, size - 2 * inset, size - 2 * inset), glyph, fill, 0.7)
+        p.scale(size / 64, size / 64)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(fill)
+        p.drawRoundedRect(QRectF(0, 0, 64, 64), 14, 14)
+        pen = QPen(ink, 8)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawPath(s_path)
+        pen = QPen(ink, 2)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen)
+        p.setBrush(ink)
+        p.drawPath(head)
         p.end()
         out.addPixmap(pm)
     return out
@@ -148,7 +181,7 @@ class TrayController(QObject):
         self._watch_items: list[tray_state.TrayItem] = []
         self._message_target: str | None = None
         self._plain_icon = QApplication.windowIcon()
-        self._badge_icons = {badge: (live_icon(glyph, token) if badge == tray_state.BADGE_LIVE
+        self._badge_icons = {badge: (live_icon(token) if badge == tray_state.BADGE_LIVE
                                      else badged_icon(self._plain_icon, glyph, token))
                              for badge, (glyph, token) in _BADGES.items()}
         #: Notification kinds sent since the menu or window was last opened.

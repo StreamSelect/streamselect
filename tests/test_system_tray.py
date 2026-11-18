@@ -293,7 +293,7 @@ def _disc_colour(badge, img):
 
 def _icon_for(badge):
     glyph, token = tray_mod._BADGES[badge]
-    icon = (tray_mod.live_icon(glyph, token) if badge == tray_state.BADGE_LIVE
+    icon = (tray_mod.live_icon(token) if badge == tray_state.BADGE_LIVE
             else tray_mod.badged_icon(_blue_icon(), glyph, token))
     return icon.pixmap(64, 64).toImage()
 
@@ -327,16 +327,22 @@ def test_the_corner_badge_is_big_enough_to_read_at_tray_size(qapp):
     assert widest >= 14, f"disc {widest} px wide at 22 px (was 12)"
 
 
-def test_a_live_game_replaces_the_whole_icon_with_a_full_disc(qapp):
+def test_a_live_game_turns_the_logo_itself_green(qapp):
+    """Owner, 2026-11-17: a corner badge was too small, and a whistle in place
+    of the logo "shifts away from the logo": the logo's S-arrow on green."""
     from streamselect.gui import theme
     img = _icon_for(tray_state.BADGE_LIVE)
     fill = QColor(theme.COLOR_TRAY_LIVE)
+    ink = QColor(theme.on_fill(theme.COLOR_TRAY_LIVE))
     assert _near(img.pixelColor(32, 5), fill) and _near(img.pixelColor(5, 32), fill), \
-        "the disc spans the icon"
-    assert img.pixelColor(32, 32) != img.pixelColor(32, 5), "with its glyph in the middle"
+        "a green square fills the icon"
+    assert img.pixelColor(0, 0).alpha() == 0, "with the logo's rounded corners"
+    for x, y in ((30, 48), (48, 40), (32, 32), (16, 24), (30, 16), (42, 16)):   # along the S
+        assert _near(img.pixelColor(x, y), ink, tol=60), f"the S-arrow at {(x, y)}"
+    assert _near(img.pixelColor(30, 40), fill), "between the S's strokes is the background"
     blue = QColor(0, 0, 255)
     assert not any(_near(img.pixelColor(x, y), blue, tol=40)
-                   for x in range(0, 64, 4) for y in range(0, 64, 4)), "no small logo to squint at"
+                   for x in range(0, 64, 4) for y in range(0, 64, 4)), "not the badge on the old icon"
 
 
 def test_the_three_states_look_different_and_none_is_red(qapp):
