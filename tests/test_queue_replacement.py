@@ -43,9 +43,13 @@ def _seed(db):
         ch("live_4", "live", "Arrival", "tmdb:4|movie")
         ch("old_5", "old", "Ronin", "tmdb:5|movie")
         ch("live_5", "live", "Ronin", "tmdb:5|movie")                           # already queued itself
+        ch("old_7", "old", "Alien: Earth", "tmdb:7|movie")          # queued from live already...
+        ch("live_7a", "live", "Alien: Earth", "tmdb:7|movie")
+        ch("live_7b", "live", "Alien: Earth", "tmdb:7|movie")       # ...though this copy is free
         ch("old_6", "old", "Kiss TV", "kiss tv|live")                # matched by name only
         ch("live_6", "live", "Kiss TV", "kiss tv|live")
-        for pos, cid in enumerate(["old_1", "old_2", "old_3", "off_4", "old_5", "live_5", "old_6"]):
+        for pos, cid in enumerate(["old_1", "old_2", "old_3", "off_4", "old_5", "live_5", "old_6",
+                                   "old_7", "live_7a"]):
             s.add(WatchQueueDB(channel_id=cid, channel_name=cid, media_type="movie",
                                source_id=cid, position=pos, added_at=T0 + timedelta(minutes=pos)))
 
@@ -58,7 +62,8 @@ def _scan(db, scope=SCOPE_ALL):
 def test_items_on_unusable_sources_are_found_with_their_copies_language_first(db):
     _seed(db)
     found = _scan(db)
-    assert set(found) == {"old_1", "old_2", "old_3", "off_4", "old_5", "old_6"}, "active untouched"
+    assert set(found) == {"old_1", "old_2", "old_3", "off_4", "old_5", "old_6", "old_7"}, \
+        "active untouched"
     assert found["old_1"].doubts == ()
     assert found["old_3"].doubts == ("different language: SW → D+",)
     assert found["old_6"].doubts == ("matched by name only",)
@@ -66,9 +71,25 @@ def test_items_on_unusable_sources_are_found_with_their_copies_language_first(db
     assert found["old_1"].best.same_language
     assert found["old_2"].best is None and "No copy" in found["old_2"].reason
     assert not found["old_3"].best.same_language, "only another language is on offer"
-    assert found["old_5"].best is None and "Already in your queue" in found["old_5"].reason
+    assert found["old_5"].best is None and found["old_5"].duplicate
+    assert found["old_5"].reason == "Already in your queue from Live Source"
+    assert found["old_7"].duplicate and found["old_7"].best is None, \
+        "another free copy would still queue the title twice"
     assert found["off_4"].state == "disabled" and found["old_1"].state == "expired"
-    assert set(_scan(db, SCOPE_EXPIRED)) == {"old_1", "old_2", "old_3", "old_5", "old_6"}
+
+
+def test_an_item_on_a_deleted_source_names_it_in_words_not_by_its_id(db):
+    from streamselect.core.queue_replacement import REMOVED_SOURCE
+    _seed(db)
+    with db.session_scope() as s:
+        s.add(ChannelDB(id="gone_8", source_id="gone_8", provider_id="deleted-source-id",
+                        name="Heat", media_type="movie", content_key="tmdb:3|movie",
+                        detected_prefix="SW", detected_title="Heat"))
+        s.add(WatchQueueDB(channel_id="gone_8", channel_name="Heat", media_type="movie",
+                           source_id="gone_8", position=99))
+    found = _scan(db)["gone_8"]
+    assert found.state == "removed" and found.old.source == REMOVED_SOURCE
+    assert set(_scan(db, SCOPE_EXPIRED)) == {"old_1", "old_2", "old_3", "old_5", "old_6", "old_7"}
 
 
 def test_a_swap_keeps_the_place_moves_the_history_and_undo_puts_it_back(db):
@@ -77,8 +98,9 @@ def test_a_swap_keeps_the_place_moves_the_history_and_undo_puts_it_back(db):
         before = {r.id: (r.position, r.added_at) for r in s.query(WatchQueueDB)}
         qid = s.query(WatchQueueDB.id).filter_by(channel_id="old_1").scalar()
     with db.session_scope() as s:
-        done, skipped, snap = replace(s, [(qid, "live_1")])
-    assert (done, skipped) == (1, 0)
+        out = replace(s, [(qid, "live_1")])
+    assert (out.replaced, out.skipped) == (1, 0)
+    snap = out.snapshot
     with db.session_scope(commit=False) as s:
         row = s.get(WatchQueueDB, qid)
         assert row.channel_id == "live_1" and (row.position, row.added_at) == before[qid]
@@ -100,8 +122,8 @@ def test_a_copy_already_queued_is_never_made_a_duplicate(db):
     with db.session_scope(commit=False) as s:
         ids = dict(s.query(WatchQueueDB.channel_id, WatchQueueDB.id))
     with db.session_scope() as s:
-        done, skipped, _ = replace(s, [(ids["old_1"], "live_1"), (ids["old_5"], "live_5")])
-    assert (done, skipped) == (1, 1)
+        out = replace(s, [(ids["old_1"], "live_1"), (ids["old_5"], "live_5")])
+    assert (out.replaced, out.skipped) == (1, 1)
     with db.session_scope(commit=False) as s:
         assert s.query(WatchQueueDB).filter_by(channel_id="live_5").count() == 1
 
@@ -120,11 +142,12 @@ def _dialog(db, qapp, owned_widgets):
 def test_the_window_shows_queued_copy_then_its_replacement_grouped_by_confidence(
         db, qapp, owned_widgets):
     from streamselect.gui.queue_replace_dialog import (
-        COL_NEW, COL_NOTE, COL_OLD, GROUP_CHECK, GROUP_NONE, GROUP_SURE,
+        COL_NEW, COL_NOTE, COL_OLD, GROUP_CHECK, GROUP_DUPLICATE, GROUP_NONE, GROUP_SURE,
     )
     _seed(db)
     dlg, rows = _dialog(db, qapp, owned_widgets)
-    assert set(rows) == {"old_1", "old_2", "old_3", "old_5", "old_6"}, "expired only, by default"
+    assert set(rows) == {"old_1", "old_2", "old_3", "old_5", "old_6", "old_7"}, "expired only"
+    assert rows["old_7"].parent() is dlg.groups[GROUP_DUPLICATE]
     assert rows["old_6"].parent() is dlg.groups[GROUP_CHECK]
     assert rows["old_6"].text(COL_NOTE) == "Matched by name only"
 
@@ -250,3 +273,52 @@ def test_replace_keeps_the_window_open_and_the_doubtful_rows_move_up(
     undo_fn()
     qapp.processEvents()
     assert dlg.tree.topLevelItem(0) is dlg.groups[GROUP_SURE], "Undo brings them back"
+
+
+def test_a_struck_item_is_removed_not_migrated_and_undo_puts_it_back_in_place(db):
+    _seed(db)
+    with db.session_scope(commit=False) as s:
+        row = s.query(WatchQueueDB).filter_by(channel_id="old_2").one()
+        before = (row.id, row.position, row.added_at)
+    with db.session_scope() as s:
+        out = replace(s, [], [before[0]])
+    assert (out.replaced, out.removed) == (0, 1)
+    with db.session_scope(commit=False) as s:
+        assert s.get(WatchQueueDB, before[0]) is None
+    with db.session_scope() as s:
+        assert undo(s, out.snapshot) == 1
+    with db.session_scope(commit=False) as s:
+        row = s.get(WatchQueueDB, before[0])
+        assert (row.id, row.position, row.added_at, row.channel_id) == (*before, "old_2")
+
+
+def test_the_trash_button_strikes_a_row_through_and_turns_it_into_a_removal(
+        db, qapp, owned_widgets):
+    from streamselect.gui.queue_replace_dialog import (
+        COL_NEW, COL_NOTE, COL_OLD, COL_REMOVE, GROUP_DUPLICATE, REMOVING_NOTE,
+    )
+    _seed(db)
+    dlg, rows = _dialog(db, qapp, owned_widgets)
+    ids = {s.old.channel_id: s.queue_id for s, _i, _c in dlg._rows}
+    one, dupe = rows["old_1"], rows["old_7"]
+    trash = dlg.tree.itemWidget(one, COL_REMOVE)
+    combo = dlg.tree.itemWidget(one, COL_NEW)
+    assert trash.geometry().x() > combo.geometry().right(), "the trash button is at the far right"
+    assert abs(trash.geometry().center().y() - dlg.tree.visualItemRect(one).center().y()) <= 2
+
+    trash.click()
+    assert one.font(COL_OLD).strikeOut() and combo.font().strikeOut() and not combo.isEnabled()
+    assert one.text(COL_NOTE) == REMOVING_NOTE
+    assert one.checkState(COL_OLD) == Qt.CheckState.Unchecked
+    assert dlg.removals() == [ids["old_1"]] and dlg.choices() == []
+    assert dlg._ok.text() == "Remove 1" and dlg._ok.isEnabled()
+
+    dlg.tree.itemWidget(dlg.groups[GROUP_DUPLICATE], COL_REMOVE).click()   # the whole group
+    assert dupe.font(COL_OLD).strikeOut()
+    assert sorted(dlg.removals()) == sorted([ids["old_1"], ids["old_5"], ids["old_7"]])
+
+    trash.click()                                                   # keep it after all
+    assert not one.font(COL_OLD).strikeOut() and combo.isEnabled()
+    assert one.text(COL_NOTE) == ""
+    one.setCheckState(COL_OLD, Qt.CheckState.Checked)
+    assert dlg._ok.text() == "Replace 1 · Remove 2"

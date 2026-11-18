@@ -8,7 +8,10 @@ swaps the ticked ones (owner, 2026-11-17):
 
 - the item keeps its place in the queue and its date added;
 - the old copy's watch history moves to the new copy;
-- items with no copy are listed and left alone;
+- items with no copy are listed and left alone, unless the user strikes them
+  out, which removes them from the queue instead;
+- an item whose title is already queued from an active source is a duplicate,
+  offered for removal, never swapped (that would queue the title twice);
 - :func:`undo` puts everything back, from the snapshot :func:`replace` returns.
 
 Copies come from ``channel_live_copy.live_siblings`` — the one rule the details
@@ -29,6 +32,9 @@ from streamselect.core.repositories.channel_live_copy import live_siblings
 SCOPE_EXPIRED = "expired"
 SCOPE_ALL = "all"            # expired, switched off, or removed
 
+#: How a copy on a deleted source names it: its provider row, and name, are gone,
+#: and the bare id is a meaningless code (seen on a real queue, 2026-11-17).
+REMOVED_SOURCE = "a removed source"
 #: The watch-history columns that move with an item (``ChannelDB``).
 HISTORY_FIELDS = ("last_played", "play_count", "watch_progress", "watch_percent",
                   "watch_completed", "last_played_via")
@@ -60,6 +66,7 @@ class Stranded:
     candidates: tuple[Copy, ...]     # best first; empty when nothing matches
     reason: str = ""                 # why there is nothing to offer
     by_tmdb: bool = True             # matched on a TMDb id, not on the name alone
+    duplicate: bool = False          # the title is already queued from an active source
 
     @property
     def best(self) -> Copy | None:
@@ -87,7 +94,7 @@ class Stranded:
 def _copy(ch: ChannelDB, sources: dict, same_language: bool = True) -> Copy:
     return Copy(ch.id, ch.detected_title or ch.name or "", ch.detected_prefix or "",
                 ch.detected_quality or "", str(ch.detected_year or ""),
-                sources.get(ch.provider_id, ch.provider_id), same_language)
+                sources.get(ch.provider_id) or REMOVED_SOURCE, same_language)
 
 
 def find_stranded(repos, scope: str = SCOPE_ALL, config=None) -> list[Stranded]:
@@ -123,13 +130,15 @@ def find_stranded(repos, scope: str = SCOPE_ALL, config=None) -> list[Stranded]:
         other = [c for c in found if (c.detected_prefix or "") != lang]
         candidates = tuple([_copy(c, sources) for c in mine]
                            + [_copy(c, sources, same_language=False) for c in other])
-        free = tuple(c for c in candidates if c.channel_id not in queued)
-        reason = ("" if free else
-                  "Already in your queue from an active source" if candidates else
-                  "No copy on your active sources")
-        candidates = free
-        out.append(Stranded(row.id, old, state, candidates, reason,
-                            by_tmdb=(ch.content_key or "").startswith("tmdb:")))
+        # A copy of the title already queued from an active source makes this
+        # item a duplicate (owner's "Alien: Earth"): swapping in another copy
+        # would queue the title twice, so it is offered for removal instead.
+        twin = next((c for c in candidates if c.channel_id in queued), None)
+        reason = (f"Already in your queue from {twin.source}" if twin else
+                  "" if candidates else "No copy on your active sources")
+        out.append(Stranded(row.id, old, state, () if twin else candidates, reason,
+                            by_tmdb=(ch.content_key or "").startswith("tmdb:"),
+                            duplicate=twin is not None))
     return out
 
 
@@ -139,6 +148,11 @@ class Snapshot:
 
     queue_rows: tuple[tuple[int, dict], ...]       # (queue_id, its fields before)
     channels: tuple[tuple[str, dict], ...]         # (channel_id, its history before)
+    removed: tuple[dict, ...] = ()                 # whole queue rows taken out
+
+
+def _row_fields(row: WatchQueueDB) -> dict:
+    return {c.key: getattr(row, c.key) for c in WatchQueueDB.__table__.columns}
 
 
 def _history(ch: ChannelDB) -> dict:
@@ -164,18 +178,33 @@ def _merge_history(old: dict, new: dict) -> dict:
     }
 
 
-def replace(session, choices: list[tuple[int, str]]) -> tuple[int, int, Snapshot]:
-    """Point each chosen queue item at its new copy, moving its watch history.
+@dataclass(frozen=True)
+class Outcome:
+    """What one Replace did."""
+
+    replaced: int
+    removed: int
+    skipped: int          # new copy already queued: left as it was, never duplicated
+    snapshot: Snapshot
+
+
+def replace(session, choices: list[tuple[int, str]], removals: list[int] = ()) -> Outcome:
+    """Point each chosen queue item at its new copy, moving its watch history,
+    and take the items marked for removal out of the queue.
 
     Args:
         session: An open, committing session.
         choices: ``(queue_id, new channel_id)`` pairs the user ticked.
-
-    Returns:
-        ``(replaced, skipped, snapshot)``: skipped counts items whose new copy
-        is already queued (by another item, or earlier in this batch) — they
-        are left as they were, never made a duplicate.
+        removals: queue ids the user struck through (owner, 2026-11-17: an item
+            they no longer want is removed, not migrated).
     """
+    removed = []
+    for queue_id in removals:
+        row = session.get(WatchQueueDB, queue_id)
+        if row is not None:
+            removed.append(_row_fields(row))
+            session.delete(row)
+    session.flush()
     queued = {cid for (cid,) in session.query(WatchQueueDB.channel_id)
               .filter(WatchQueueDB.episode_id.is_(None)).all()}
     rows, channels = [], {}
@@ -204,16 +233,22 @@ def replace(session, choices: list[tuple[int, str]]) -> tuple[int, int, Snapshot
         row.channel_id, row.channel_name = new.id, new.name or ""
         row.media_type, row.source_id = new.media_type or "", new.source_id or ""
         replaced += 1
-    return replaced, skipped, Snapshot(tuple(rows), tuple(channels.items()))
+    return Outcome(replaced, len(removed), skipped,
+                   Snapshot(tuple(rows), tuple(channels.items()), tuple(removed)))
 
 
 def undo(session, snapshot: Snapshot) -> int:
-    """Put back every queue item and watch history :func:`replace` changed.
+    """Put back every queue item and watch history :func:`replace` changed,
+    and every item it removed, in its old place.
 
     Returns:
         How many queue items were restored.
     """
     restored = 0
+    for fields in snapshot.removed:
+        if session.get(WatchQueueDB, fields["id"]) is None:
+            session.add(WatchQueueDB(**fields))
+            restored += 1
     for queue_id, fields in snapshot.queue_rows:
         row = session.get(WatchQueueDB, queue_id)
         if row is None:
