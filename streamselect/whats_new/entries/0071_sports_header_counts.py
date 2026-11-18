@@ -6,15 +6,16 @@ ENTRY = WhatsNewEntry(
     date="2026-11-17",
     title="Sports: counts that stand out, and the live mark",
     items=(
-        "The counts on the Sports headings (On now, each day, Finished) sit in the same small "
-        "outlined chip the sidebar uses, so the number stands out from its label.",
-        "A sport's heading shows how many games are on with the live mark and the number, "
-        "instead of the words \"3 live\".",
+        "The counts on the Sports headings (On now, each day, Finished) sit in a small "
+        "outlined chip in bold, like the chips in the sidebar, so the number stands out "
+        "from its label.",
+        "A sport's heading shows how many games are on as the live mark and the number in "
+        "the same chip, instead of the words \"3 live\".",
     ),
     test_steps=(
         "Open Sports: On now, each day and Finished show their count in an outlined chip; "
         "clicking the chip collapses the list like the rest of the heading.",
-        "With a game on, the sport's heading reads its leagues then the live mark and a "
-        "number, in the same quiet grey; hovering it says how many games are on now.",
+        "With a game on, the sport's heading reads its leagues then an outlined chip with the "
+        "live mark and a bold number; hovering it says how many games are on now.",
     ),
 )

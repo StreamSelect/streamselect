@@ -1373,7 +1373,6 @@ def test_header_counts_are_outlined_chips_and_live_is_the_live_mark(games_db, qa
     """Owner, 2026-11-17: the bands' counts take the rows' outlined chip (not
     clickable, it only stands out), and "3 live" is the app's live glyph and the
     number, quiet like the leagues beside it."""
-    from streamselect.gui.icon_utils import label_role
     view = _view(games_db, qapp, owned_widgets, LIVE_AT)
     band = view.headers["hockey:on_now"]
     heading = band.findChild(GroupHeading)
@@ -1383,9 +1382,14 @@ def test_header_counts_are_outlined_chips_and_live_is_the_live_mark(games_db, qa
     assert "border" in chip.styleSheet(), "outlined"
     assert chip.mapTo(view, QPoint(0, 0)).x() > heading.label.mapTo(view, QPoint(0, 0)).x() \
         + heading.label.width() - 1, "after its label"
-    mark, count = view.live_marks["sport:hockey"]
-    assert label_role(mark) == "live" and count.text() == "2"
+    assert chip.font().bold(), "the count is bold"
+    live = view.live_marks["sport:hockey"]
+    from streamselect.gui.icon_utils import button_role
+    assert button_role(live) == "live" and live.text() == "2", "the live glyph and the number"
+    assert isinstance(live, QPushButton) and "border" in live.styleSheet(), "outlined, like the counts"
+    assert live.font().bold()
+    assert live.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
     sport_band = view.headers["sport:hockey"]
     texts = [w.text() for w in sport_band.findChildren(QLabel)]
     assert not any("live" in t.lower() for t in texts), texts
-    assert mark.toolTip() == "2 hockey games on now"
+    assert live.toolTip() == "2 hockey games on now"

@@ -101,6 +101,12 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
             for role, fill in (
                 ("SIDEBAR_CHIP_YEAR",
                  f"color: {text}; border: 1px solid {border}; background: transparent;"),
+                # The year chip's outline, bold: a heading's COUNT, which is what
+                # the eye looks for (Sports bands and sport headers, owner
+                # 2026-11-17: "the numbers in the chips should be bolder").
+                ("SIDEBAR_CHIP_COUNT",
+                 f"color: {text}; border: 1px solid {border}; background: transparent;"
+                 f" font-weight: bold;"),
                 # A TRANSPARENT border, not `none`: the border is part of the
                 # box, so a chip without one is 2px shorter than its neighbours
                 # and the row's chips stop lining up. Keeps the fill-only look

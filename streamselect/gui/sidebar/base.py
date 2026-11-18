@@ -74,7 +74,7 @@ class GroupHeading(QWidget):
                 caller, the same way ``chip_row``'s row indent is, because the
                 widget cannot know how deep it has been put.
             tooltip: Hover text; a sensible default is supplied when interactive.
-            count_chip: Draw the count in the outlined chip the rows use (CHIP_YEAR,
+            count_chip: Draw the count in the rows' outlined chip, bold (CHIP_COUNT,
                 not clickable) — the Sports bands (owner, 2026-11-17).
             trailing_button: An action belonging to the GROUP rather than a row
                 — History's per-group "forget these". Pinned past the stretch so
@@ -112,10 +112,10 @@ class GroupHeading(QWidget):
         _theme.style(self.label, "SIDEBAR_GROUP_HEADING")
         row.addWidget(self.label)
 
-        from streamselect.gui.chip_row import CHIP_NEWS, CHIP_YEAR, chip_widget
+        from streamselect.gui.chip_row import CHIP_COUNT, CHIP_NEWS, CHIP_YEAR, chip_widget
         self._count_chip = count_chip
         if count_chip:
-            self.count_label = chip_widget(CHIP_YEAR, "")
+            self.count_label = chip_widget(CHIP_COUNT, "")
             row.addSpacing(8)
         else:
             self.count_label = QLabel()

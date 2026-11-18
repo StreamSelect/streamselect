@@ -21,7 +21,7 @@ from collections import deque
 from datetime import datetime
 from typing import Callable, Optional
 
-from PyQt6.QtCore import QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QSize, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
@@ -42,6 +42,7 @@ from streamselect.gui import cursor_affordance
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
+from streamselect.gui.chip_row import CHIP_COUNT, chip_widget
 from streamselect.gui.chips import ToggleChip
 from streamselect.gui.content_view import ContentView
 from streamselect.gui.flow_layout import FlowLayout
@@ -134,7 +135,7 @@ class SportsView(ContentView):
         self.cards: list[GameCard] = []
         self.rows: list[QWidget] = []          # a QPushButton, or a QLabel for an earlier day's finished game
         self.headers: dict[str, QWidget] = {}
-        self.live_marks: dict[str, tuple[QLabel, QLabel]] = {}   # sport header key -> (glyph, count)
+        self.live_marks: dict[str, QWidget] = {}   # sport header key -> its live chip
         self._sub_text_x = 0            # set by each sub-heading; its rows line up under its words
         #: The last few live bitrate readings (kb/s), averaged so the chip doesn't flicker.
         self._bitrates: deque = deque(maxlen=BITRATE_SAMPLES)
@@ -537,18 +538,15 @@ class SportsView(ContentView):
         h.addWidget(meta)
         if live:
             # The app's live mark, the broadcast glyph and the number, instead of
-            # the words "3 live"; quiet like the leagues beside it (owner, 2026-11-17:
-            # "a basic non-distracting look").
-            tip = f"{live} {sport} game{'s' if live != 1 else ''} on now"
-            mark, count = QLabel(), QLabel(str(live))
-            for w in (mark, count):
-                _theme.style(w, "TEXT_SM_MUTED")
-                w.setToolTip(tip)
-            _icon_utils.set_label_icon(mark, "live", 14)
+            # the words "3 live", in the bold outlined count chip the bands use
+            # (owner, 2026-11-17); the glyph in the chip's own text colour.
+            chip = chip_widget(CHIP_COUNT, str(live))
+            _icon_utils.set_button_icon(chip, "live", color=_theme.COLOR_TEXT)
+            chip.setIconSize(QSize(12, 12))
+            chip.setToolTip(f"{live} {sport} game{'s' if live != 1 else ''} on now")
             h.addSpacing(4)
-            h.addWidget(mark)
-            h.addWidget(count)
-            self.live_marks[key] = (mark, count)
+            h.addWidget(chip)
+            self.live_marks[key] = chip
         h.addStretch(1)
         self.headers[key] = band
         return band

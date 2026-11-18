@@ -160,12 +160,14 @@ CHIP_YEAR = "year"
 CHIP_LANG = "lang"
 CHIP_NEWS = "news"
 CHIP_ACTION = "action"
+CHIP_COUNT = "count"           # a heading's count: the year chip's outline, bold
 #: Quality and news are absent on purpose: both sheets are COMPOSED at build
 #: time — quality per tier (see :func:`quality_chip_style`), news from
 #: ``theme.on_fill`` (:func:`_news_chip_style`) — so neither has a single
 #: static role.
 _CHIP_ROLES = {
     CHIP_YEAR: "SIDEBAR_CHIP_YEAR",
+    CHIP_COUNT: "SIDEBAR_CHIP_COUNT",
     CHIP_LANG: "SIDEBAR_CHIP_LANG",
     CHIP_ACTION: "SIDEBAR_CHIP_ACTION",
 }
