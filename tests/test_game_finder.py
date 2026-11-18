@@ -295,3 +295,29 @@ def test_a_refresh_lends_one_leagues_learned_clocks_to_another(db):
     with db.session_scope(commit=False) as s:
         g = s.query(GameDB).filter(GameDB.league == "AHL").one()
         assert g.start_utc == datetime(2026, 11, 13, 1, 0)
+
+
+# ── A guide's short form with a word dropped (owner, 2026-11-18) ──
+
+def test_a_guides_name_with_a_word_dropped_joins_the_longer_team():
+    """One guide writes "Vegas Knights": it is the Vegas Golden Knights, so its
+    programme is a feed of that game, not a second Dallas–Vegas game."""
+    vegas = [
+        ListingIn("p1", "COLL ZONE A", "LIVE | NHL: VEGAS GOLDEN KNIGHTS - LOS ANGELES KINGS | Fri 13 Nov 02:05 CET", "v1"),
+        ListingIn("p1", "COLL ZONE B", "LOS ANGELES KINGS VS. VEGAS GOLDEN KNIGHTS | Thu 12 Nov 8:05 PM ET", "v2"),
+        ListingIn(GUIDE, "Guide channel 3", "Hokej na ledu (M): Vegas Knights - Kings, NHL 2026/2027", "v3", START),
+    ]
+    games, _, _ = find_games(_two_games() + vegas, NHL, NOW)
+    assert not any("Vegas Knights" in (g.team_a, g.team_b) for g in games), [g.title for g in games]
+    g = _game(games, "Vegas Golden Knights")
+    assert {f.channel_id for f in g.feeds} == {"v1", "v2", "v3"}
+
+
+def test_a_listed_team_with_an_extra_word_stays_a_different_team():
+    """A seed listing's own "BUFFALO JR SABRES" is another team: only a guide's
+    short form joins a longer name."""
+    junior = [ListingIn("p1", "COLL ZONE A", "LIVE | NHL: BUFFALO JR SABRES - CHICAGO JR BLACKHAWKS | Fri 13 Nov 02:05 CET", "j1"),
+              ListingIn("p1", "COLL ZONE B", "CHICAGO JR BLACKHAWKS VS. BUFFALO JR SABRES | Thu 12 Nov 8:05 PM ET", "j2")]
+    games, _, _ = find_games(_two_games() + junior, NHL, NOW)
+    g = _game(games, "Buffalo Sabres")
+    assert not {"j1", "j2"} & {f.channel_id for f in g.feeds}

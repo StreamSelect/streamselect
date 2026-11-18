@@ -49,6 +49,14 @@ def match(side: Side, team: Side, allow_abbrev: bool = True) -> Optional[Match]:
     return None
 
 
+def _gapped(side: Side, team: Side) -> bool:
+    """Every side word is a team word, in order, with a team word left out between."""
+    if not set(side) <= set(team):
+        return False
+    pos = [team.index(w) for w in side]
+    return pos == sorted(pos) and pos[-1] - pos[0] > len(pos) - 1
+
+
 class TeamBook:
     """The teams of one sport, learned from its seed names and guide titles."""
 
@@ -57,10 +65,13 @@ class TeamBook:
         """Learn from normalised names (see :func:`listing_text.norm`)."""
         seed_names = list(seed_names)
         side_count: collections.Counter[Side] = collections.Counter()
-        for u in [*seed_names, *guide_titles]:
+        seed_sides: set[Side] = set()
+        for i, u in enumerate([*seed_names, *guide_titles]):
             for a, b in matchups(u, league):
                 side_count[a] += 1
                 side_count[b] += 1
+                if i < len(seed_names):
+                    seed_sides.update((a, b))
         # A 2-4-word name segment that contains a known side is a longer form of
         # that team ("CALGARY" -> "CALGARY FLAMES").
         longer: collections.Counter[Side] = collections.Counter()
@@ -84,9 +95,18 @@ class TeamBook:
             merged[self._unlabel(sd)] += n
         ordered = sorted(merged, key=lambda s: (-len(s), -sum(map(len, s)), -merged[s]))
         self.teams: list[Side] = []
+        #: A guide's short form with a word dropped from the middle ("VEGAS
+        #: KNIGHTS" for "VEGAS GOLDEN KNIGHTS"). Only a side no seed listing uses:
+        #: a seed side with an extra word is a different team (BUFFALO JR SABRES).
+        self._short: dict[Side, Side] = {}
         for s in ordered:
-            if not any(match(s, t) for t in self.teams):
-                self.teams.append(s)
+            if any(match(s, t) for t in self.teams):
+                continue
+            gapped = [t for t in self.teams if len(s) >= 2 and _gapped(s, t)]
+            if s not in seed_sides and len(gapped) == 1:
+                self._short[s] = gapped[0]
+                continue
+            self.teams.append(s)
 
     def _unlabel(self, side: Side) -> Side:
         return side[2:] if len(side) > 2 and side[:2] in self._labels else side
@@ -94,6 +114,8 @@ class TeamBook:
     def resolve(self, side: Side, allow_abbrev: bool = True) -> tuple[list[Side], Resolution]:
         """The team(s) a side can mean, and how sure that is."""
         side = self._unlabel(side)
+        if side in self._short:
+            return [self._short[side]], "exact"
         hits = [(t, k) for t in self.teams if (k := match(side, t, allow_abbrev))]
         exact = [t for t, k in hits if k == "exact"]
         if len(exact) == 1:
