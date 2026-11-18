@@ -172,6 +172,11 @@ def game_state(game: GameDTO, now: datetime, settings: SportSettings) -> str:
         return OVER                      # the user said so (Mark as finished)
     if now < start:
         return UPCOMING
+    if game.ended_at is not None:
+        # An end the user pushed into the future (Not finished): on until then,
+        # whatever the sport's lengths say — overtime runs past them.
+        on = event_is_on_now(start, start + settings.usual_length, now)
+        return ON_NOW if on else ENDING
     # The one "is it on" rule (event_datetime), given the sport's lengths as the stop.
     if event_is_on_now(start, start + settings.usual_length, now):
         return ON_NOW
@@ -288,6 +293,25 @@ def arrange_feeds(game: GameDTO, prefs: dict, history: WatchHistory,
         return (bool(f.report), f.collection_key != preferred, f.collection_key != last, -secs, -plays,
                 _FEED_RANK.get(f.time_from, 2))
     return replace(game, feeds=tuple(sorted(keep, key=key)), hidden=tuple(gone))
+
+
+#: "Not finished" keeps a game on this much longer: enough for overtime or a
+#: shootout; the user can say it again, or Mark as finished when it really ends.
+NOT_FINISHED_FOR = timedelta(minutes=30)
+#: Only a game that started this recently can be brought back: last week's game
+#: cannot still be on.
+NOT_FINISHED_WINDOW = timedelta(hours=12)
+
+
+def can_mark_not_finished(game: GameDTO, now: datetime) -> bool:
+    """Whether "Not finished" makes sense for a finished *game* (owner, 2026-11-17:
+    a game that went into extra time drops out of On now and needs bringing back)."""
+    return game.start_utc <= now < game.start_utc + NOT_FINISHED_WINDOW
+
+
+def mark_not_finished(session, game: GameDTO, now: datetime) -> None:
+    """Put *game* back on, until :data:`NOT_FINISHED_FOR` from *now*."""
+    mark_finished(session, game, now + NOT_FINISHED_FOR)
 
 
 def mark_finished(session, game: GameDTO, ended_at: datetime) -> None:

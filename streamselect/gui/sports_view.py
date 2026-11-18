@@ -23,7 +23,7 @@ from typing import Callable, Optional
 
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
+    QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from loguru import logger
@@ -32,7 +32,8 @@ from streamselect.core.epg_utils import browse_day_separator_label, fmt_time, no
 from streamselect.core.games.read import (
     event_is_live as event_live,
     CHANNEL_REPORTS, ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, arrange_feeds, best_feed, game_key, game_state,
-    load_games, load_watch_history, mark_finished,
+    NOT_FINISHED_FOR, can_mark_not_finished, load_games, load_watch_history, mark_finished,
+    mark_not_finished,
 )
 from streamselect.core.games.alerts import add_alert, alerts_for, load_alerts, remove_alerts, rule_for
 from streamselect.core.games.store import enabled_leagues, sport_settings
@@ -399,7 +400,7 @@ class SportsView(ContentView):
             by_day.setdefault(to_local(g.start_utc).date(), []).append(g)
         today = to_local(now).date()
         if list(by_day) == [today]:
-            self._time_groups(done, playable=True, today=today, label_of=label_of)
+            self._time_groups(done, playable=True, label_of=label_of)
             return
         # One sub-section per day, most recent first (owner, 2026-11-13) — also when
         # every game is from one EARLIER day: a bare "9:05 PM" under Finished read as
@@ -409,9 +410,9 @@ class SportsView(ContentView):
             self._layout.addWidget(self._header(sub, past_day_label(gs[0].start_utc, now), len(gs),
                                                 foldable=True, sub=True))
             if sub not in folded:
-                self._time_groups(gs, playable=True, today=today, label_of=label_of, sub=True)
+                self._time_groups(gs, playable=True, label_of=label_of, sub=True)
 
-    def _time_groups(self, games: list, *, playable: bool, today=None,
+    def _time_groups(self, games: list, *, playable: bool,
                      label_of: Optional[Callable] = None, sub: bool = False) -> None:
         """Rows grouped by start time, the time shown once per group, every other
         group on a very faint tint (SV-Q45-Q47). *games* arrive in display order.
@@ -440,7 +441,10 @@ class SportsView(ContentView):
             col.setContentsMargins(0, 0, 0, 0)
             col.setSpacing(0)
             for j, g in enumerate(groups[start]):
-                openable = today is None or to_local(g.start_utc).date() == today
+                # A finished game is never openable: its channels have moved on to
+                # whatever is on now (owner, 2026-11-13 for earlier days, 2026-11-17
+                # for today's). Right-click brings one back if it is still on.
+                openable = not playable
                 self._game_row(g, col, first=j == 0, playable=playable, openable=openable,
                                label=label_of(g) if label_of else "", times=times)
             host.addWidget(group)
@@ -633,9 +637,14 @@ class SportsView(ContentView):
         else:
             row = QLabel(g.matchup)
             _theme.style(row, "GAME_ROW_PAST")
-            row.setToolTip(f"{when} · Finished on an earlier day")
+            back = can_mark_not_finished(g, self._clock())
+            row.setToolTip(f"{when} · Finished" + (" · right-click if it is still on" if back else ""))
         row.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         line = GameLine(when, first=first, times=times)
+        if not openable and can_mark_not_finished(g, self._clock()):
+            line.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            line.customContextMenuRequested.connect(
+                lambda pos, game=g, w=line: self._finished_menu(game, w.mapToGlobal(pos)))
         h = line.row_layout
         h.addWidget(row, 1)
         if label:
@@ -771,6 +780,22 @@ class SportsView(ContentView):
         if reports.pop(feed.channel_id, None) is not None:
             self._save()
         QTimer.singleShot(0, self._render)
+
+    def _finished_menu(self, game: GameDTO, at) -> None:
+        """Right-click on a finished game: bring it back if it went into extra time."""
+        menu = QMenu(self)
+        act = menu.addAction("Not finished — still on")
+        act.setToolTip("Put this game back in On now for another "
+                       f"{int(NOT_FINISHED_FOR.total_seconds() // 60)} minutes")
+        menu.setToolTipsVisible(True)
+        act.triggered.connect(lambda: self._mark_not_finished(game))
+        menu.exec(at)
+
+    def _mark_not_finished(self, game: GameDTO) -> None:
+        now = self._clock()
+        self._run_query(lambda repos: mark_not_finished(repos.session, game, now),
+                        lambda _r: self.reload(), commit=True,
+                        on_error=lambda exc: self._write_failed("Not finished", exc))
 
     def _mark_finished(self, game: GameDTO) -> None:
         ended = self._clock()

@@ -374,26 +374,44 @@ def test_finished_games_from_different_days_get_a_sub_section_per_day(games_db, 
     assert days[1] in view._folded() and days[1] in view.headers
 
 
-def test_only_todays_finished_games_open_a_channel_list(games_db, qapp, owned_widgets):
-    """Owner, 2026-11-13: a game that finished on an earlier day has no channels worth
-    opening; one that finished today might still be on (it ran late)."""
+def test_no_finished_game_opens_a_channel_list(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-13 (earlier days) and 2026-11-17 (today's too): a finished
+    game's channels have moved on to whatever is on now, so its row is plain text.
+    Today's can be brought back on right-click; an earlier day's cannot."""
     _copy_game_a_day_earlier(games_db, "Buffalo Sabres")
     later = START + timedelta(hours=4)          # every game over; still START's local day
-    assert to_local(later).date() == to_local(START).date()
     view = _view(games_db, qapp, owned_widgets, later)
     view._toggle_fold("hockey:finished")
     _settle(qapp)
-    today = to_local(later).date()
-    past = [r for r in view.rows if "Ottawa Senators" in r.text()]
-    same_day = [r for r in view.rows if "Ottawa Senators" not in r.text()]
-    assert past and same_day
-    earlier_day_rows_are_today = to_local(START - timedelta(days=1)).date() == today
-    assert not earlier_day_rows_are_today
-    assert all(isinstance(r, QLabel) for r in past), "an earlier day's game is plain text"
-    assert all(isinstance(r, QPushButton) for r in same_day), "today's still open their channels"
-    same_day[0].click()
+    rows = [r for r in view.rows if r.text()]
+    assert rows and all(isinstance(r, QLabel) for r in rows), "no finished game is clickable"
+    lines = {r.text(): r.parentWidget() for r in rows}
+    past = next(w for t, w in lines.items() if "Ottawa Senators" in t)
+    today = next(w for t, w in lines.items() if "Ottawa Senators" not in t)
+    assert today.contextMenuPolicy() == Qt.ContextMenuPolicy.CustomContextMenu
+    assert past.contextMenuPolicy() != Qt.ContextMenuPolicy.CustomContextMenu, \
+        "an earlier day's game cannot still be on"
+
+
+def test_not_finished_puts_a_game_back_on_now_for_a_while(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-17: a game that went into extra time drops into Finished;
+    right-click, Not finished, and it is back in On now with its channels."""
+    from streamselect.core.games.read import NOT_FINISHED_FOR
+    later = START + timedelta(hours=4)
+    clock = {"now": later}
+    view = _view(games_db, qapp, owned_widgets, later)
+    view._clock = lambda: clock["now"]
+    view._toggle_fold("hockey:finished")
     _settle(qapp)
-    assert view._open is not None, "today's finished game opens its channel list"
+    sabres = next(g for g in view._raw if g.team_a == "Buffalo Sabres")
+    assert game_state(sabres, later, view.sports["hockey"]) == OVER
+    view._mark_not_finished(sabres)
+    _settle(qapp)
+    back = next(g for g in view._raw if g.team_a == "Buffalo Sabres")
+    assert game_state(back, later, view.sports["hockey"]) == ENDING, "likely ending: past its usual length"
+    assert any(c.game.team_a == "Buffalo Sabres" for c in view.cards), "a card in On now again"
+    after = later + NOT_FINISHED_FOR
+    assert game_state(back, after, view.sports["hockey"]) == OVER, "it finishes again by itself"
 
 
 def test_a_finished_games_bell_offers_only_team_and_matchup_alerts(games_db, qapp, owned_widgets):
@@ -1053,8 +1071,8 @@ def test_finished_titles_start_where_todays_do(games_db, qapp, owned_widgets):
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=4))
     view._toggle_fold("hockey:finished")
     _settle(qapp)
-    past = next(r for r in view.rows if isinstance(r, QLabel))
-    today = next(r for r in view.rows if isinstance(r, QPushButton))
+    past = next(r for r in view.rows if "Ottawa Senators" in r.text())
+    today = next(r for r in view.rows if r.text() and "Ottawa Senators" not in r.text())
     assert abs(_text_x(past, view) - _text_x(today, view)) <= 1
 
 
