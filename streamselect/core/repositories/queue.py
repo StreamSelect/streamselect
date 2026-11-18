@@ -11,10 +11,12 @@ from loguru import logger
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from streamselect.core.content_labels import EVENT_STATUS_PREFIXES
 from streamselect.core.database import WatchQueueDB, ChannelDB, EpisodeDB
 
 
 _WORD_RE = re.compile(r"[a-z0-9]+")
+_STATUS_WORDS = {w.lower() for w in EVENT_STATUS_PREFIXES}
 
 #: (channel_id, live name) pairs already reported this process — the queue is
 #: re-read on every sidebar refresh, and eight warnings per read for the same
@@ -30,9 +32,17 @@ def is_rename(stored: str, live: str) -> bool:
     is not a recycled stream id and must not be reported as one. Rule: every
     word of the queued name survives in the live name. A true reuse
     (``|EN| Silicon Valley`` → ``|RO| FILMBOX``) replaces the words.
+
+    Event status words (``EVENT_STATUS_PREFIXES``: LIVE, NEXT, END, ENDED) are
+    left out on both sides: an event going ``LIVE | NHL FLORIDA - EDMONTON`` →
+    ``ENDED | NHL FLORIDA - EDMONTON`` is the same channel changing status, and
+    was reported as a recycled id every evening (2026-11-17).
     """
-    queued = set(_WORD_RE.findall(stored.lower()))
-    return bool(queued) and queued <= set(_WORD_RE.findall(live.lower()))
+    def words(name: str) -> set[str]:
+        return set(_WORD_RE.findall(name.lower())) - _STATUS_WORDS
+
+    queued = words(stored)
+    return bool(queued) and queued <= words(live)
 
 
 def provider_id_of(channel_id: str) -> str:

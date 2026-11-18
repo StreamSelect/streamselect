@@ -16,6 +16,7 @@ from streamselect.core.episode_metadata_extract import extract_episode_metadata_
 from streamselect.core.repositories.stream_info import StreamInfoRepository
 from streamselect.core.repositories.provider import persist_url_stats
 from streamselect.core.repositories.channel_identity import repoint_queue_entries, resolve_channel_ids
+from streamselect.core.repositories.queue import is_rename
 from streamselect.core.repositories.channel_change_detection import (
     diff_batch_for_upsert, force_recompute_for_changed_ids)
 from streamselect.core.repositories.channel_upsert import flush_channel_batch
@@ -478,10 +479,10 @@ class ProviderLoadThread(QThread):
     def _report_recycled_ids(self, session, before: dict[str, str]) -> None:
         """Warn for every engaged channel whose title changed during this refresh.
 
-        A changed name on a preserved id means the provider recycled that
-        ``stream_id`` for different content, so the user's favorite / queue entry
-        / rating now points at something they never chose. This only reports —
-        deciding what to DO about it is a separate, deliberate change.
+        A different title on a preserved id (by ``queue.is_rename``: not a re-listing
+        with more detail, not an event's LIVE → ENDED) means the provider recycled
+        the ``stream_id``, so the user's favorite / queue entry / rating now points
+        at something they never chose. This only reports.
 
         Args:
             session: An active database session.
@@ -502,11 +503,8 @@ class ProviderLoadThread(QThread):
         )
         after: dict[str, str] = dict(after_rows)
 
-        changed: list[tuple[str, str, str]] = []
-        for cid, old in before.items():
-            new = after.get(cid)
-            if new is not None and new != old:
-                changed.append((cid, old, new))
+        changed = [(cid, old, after[cid]) for cid, old in before.items()
+                   if after.get(cid) not in (None, old) and not is_rename(old, after[cid])]
 
         for cid, old, new in changed:
             logger.warning(

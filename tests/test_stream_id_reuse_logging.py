@@ -352,3 +352,35 @@ def test_recycled_id_lookup_routes_through_sql_batching(tmp_db, captured_warning
         "a title change past the first 500-id chunk must still be detected — "
         "proves the chunker's results are concatenated across all chunks"
     )
+
+
+# ---------------------------------------------------------------------------
+# An event changing status (LIVE -> ENDED) is the same channel, not a reuse
+# ---------------------------------------------------------------------------
+
+def test_an_event_going_from_live_to_ended_is_not_reported(tmp_db, captured_warnings):
+    """Owner's log, 2026-11-17: four played NHL event channels reported as
+    recycled every evening because "LIVE | …" became "ENDED | …"."""
+    thread = _make_thread(tmp_db)
+    live = "LIVE | NHL FLORIDA - EDMONTON | Wed 18 Nov 01:05 CET (SE) | SE: VIAPLAY PPV 20"
+    _seed_channel(tmp_db, id="p1_2016259", source_id="2016259", name=live, is_favorite=True,
+                  media_type="live")
+    session = tmp_db.get_session()
+    try:
+        before = thread._snapshot_engaged_names(session)
+        row = session.query(ChannelDB).filter_by(id="p1_2016259").one()
+        row.name = live.replace("LIVE |", "ENDED |")
+        session.commit()
+        thread._report_recycled_ids(session, before)
+    finally:
+        session.close()
+    assert not [w for w in captured_warnings if "STREAM-ID REUSE" in w], captured_warnings
+
+
+def test_the_same_rule_still_catches_a_real_reuse_and_a_status_word_changes_nothing():
+    from streamselect.core.repositories.queue import is_rename
+    assert is_rename("LIVE | NHL FLORIDA - EDMONTON", "ENDED | NHL FLORIDA - EDMONTON")
+    assert is_rename("NEXT | NBA PACERS VS BUCKS", "LIVE | NBA PACERS VS BUCKS")
+    assert is_rename("LIVE | NBA PACERS VS BUCKS", "End | NBA PACERS VS BUCKS"), "END too"
+    assert not is_rename("LIVE | NHL FLORIDA - EDMONTON", "LIVE | NBA PACERS VS BUCKS")
+    assert not is_rename("EN - Jeeves And Wooster (1990)", "LAT| TNT HD")
