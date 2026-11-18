@@ -321,3 +321,26 @@ def test_a_listed_team_with_an_extra_word_stays_a_different_team():
     games, _, _ = find_games(_two_games() + junior, NHL, NOW)
     g = _game(games, "Buffalo Sabres")
     assert not {"j1", "j2"} & {f.channel_id for f in g.feeds}
+
+
+# ── A guide's typo and a guide's initial (owner, 2026-11-18: two rows for one game) ──
+
+def test_a_typo_and_an_initial_are_the_same_team():
+    """One guide writes "Florida Phanters", another "F. Panthers": both are the
+    Florida Panthers, so the game is one game with both feeds."""
+    games_in = [
+        ListingIn("p1", "COLL ZONE A", "LIVE | NHL: FLORIDA PHANTERS - EDMONTON OILERS | Fri 13 Nov 02:05 CET", "t1"),
+        ListingIn("p1", "COLL ZONE B", "EDMONTON OILERS VS. FLORIDA PHANTERS | Thu 12 Nov 8:05 PM ET", "t2"),
+        ListingIn(GUIDE, "Guide channel 4", "Hokej na ledu (M): F. Panthers - E. Oilers, NHL 2026/2027", "t3", START),
+    ]
+    games, _, _ = find_games(_two_games() + games_in, NHL, NOW)
+    oilers = [g for g in games if "Edmonton Oilers" in (g.team_a, g.team_b)]
+    assert len(oilers) == 1, [g.title for g in oilers]
+    assert {f.channel_id for f in oilers[0].feeds} == {"t1", "t2", "t3"}
+
+
+def test_a_word_with_other_letters_is_still_another_team():
+    """Kings and Wings differ by a letter, not by order: two teams."""
+    from streamselect.core.games.teams import match
+    assert match(("LOS", "ANGELES", "WINGS"), ("LOS", "ANGELES", "KINGS")) is None
+    assert match(("DETROIT", "KINGS"), ("DETROIT", "RED", "WINGS")) is None

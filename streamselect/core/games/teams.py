@@ -29,8 +29,20 @@ def _subsequence(abbr: str, word: str) -> bool:
     return word[:1] == abbr[:1] and all(c in it for c in abbr)
 
 
+def _same(word: str, team_word: str) -> bool:
+    """The same word, or a 5+-letter word with its letters swapped ("PHANTERS" for
+    "PANTHERS"): one guide's typo is not another team."""
+    return word == team_word or (len(word) >= 5 and sorted(word) == sorted(team_word))
+
+
+def _as_team(side: Side, team: Side) -> Side:
+    """*side* with each word that is a typo of a team word spelt as the team spells it."""
+    return tuple(next((t for t in team if _same(w, t)), w) for w in side)
+
+
 def match(side: Side, team: Side, allow_abbrev: bool = True) -> Optional[Match]:
     """'exact' if every side word is a team word; 'abbrev' via initials or a prefix."""
+    side = _as_team(side, team)
     if set(side) <= set(team):
         pos = [team.index(w) for w in side]
         if len(pos) >= 2 and pos == sorted(pos) and pos[-1] - pos[0] > len(pos) - 1:
@@ -51,6 +63,7 @@ def match(side: Side, team: Side, allow_abbrev: bool = True) -> Optional[Match]:
 
 def _gapped(side: Side, team: Side) -> bool:
     """Every side word is a team word, in order, with a team word left out between."""
+    side = _as_team(side, team)
     if not set(side) <= set(team):
         return False
     pos = [team.index(w) for w in side]
