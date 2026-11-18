@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+from streamselect.core import write_gate
 from streamselect.core.database import EpgProgramDB, ChannelDB
 from streamselect.core.epg_utils import now_utc as _now_utc, local_day_window as _local_day_window
 from streamselect.core.epg_utils import contiguous_guide_end as _contiguous_guide_end
@@ -82,10 +83,14 @@ def delete_programmes_chunked(
         ]
         if not ids:
             return total
-        session.query(EpgProgramDB).filter(EpgProgramDB.id.in_(ids)).delete(
-            synchronize_session=False
-        )
-        session.commit()
+        # The app's background-write gate per chunk, not per call: a caller
+        # holding it around the whole delete kept every other background writer
+        # waiting for the full run (the guide store, 2026-11-17).
+        with write_gate.background_write_gate():
+            session.query(EpgProgramDB).filter(EpgProgramDB.id.in_(ids)).delete(
+                synchronize_session=False
+            )
+            session.commit()
         total += len(ids)
 
 

@@ -406,169 +406,173 @@ class _EpgFetchMixin:
 
         channels, programmes = fetch.channels, fetch.programmes
         session = self.db.get_session()
-        with write_gate.background_write_gate():  # DB-10: this is the
-            # big chunked-commit programme store below — see module
-            # docstring "Reached only through..." for why this is a
-            # direct wrap rather than a session_scope(background=True).
-            try:
-                total_progs = len(programmes)
+        # The background-write gate is taken per write below (each batch, the
+        # provider stamp, and per chunk inside delete_programmes_chunked), not
+        # around the whole store: held for the whole run it blocked every other
+        # background writer for 26-57 s a night (measured 2026-11-17) while
+        # SQLite itself was only ever locked one ~0.2 s batch at a time.
+        try:
+            total_progs = len(programmes)
 
-                if fetch.partial:
-                    # EPG-2b: an evicted fetch only REPLACES the stored guide when
-                    # it holds more than what's already there — otherwise leave
-                    # the existing guide alone and let the next scheduler tick
-                    # (epg_last_fetched stays untouched below) retry the fetch.
-                    stored = session.query(EpgProgramDB).filter_by(
-                        provider_id=provider_id).count()
-                    if total_progs <= stored:
-                        logger.info(
-                            f"EPG: {provider_name} partial fetch ({total_progs}) did "
-                            f"not beat the stored guide ({stored}) — keeping it"
-                        )
-                        self._emit_or_abort(
-                            self._progress_done, notif_id or "",
-                            f"Guide fetch for {provider_name} paused for playback — "
-                            f"kept the current guide ({stored:,} programmes); will retry",
-                        )
-                        return
-
-                # Phase 2: channel matching — indeterminate (fast, no useful fraction)
-                self._emit_or_abort(self._progress_update,
-                    notif_id or "", 0, -1,
-                    "Matching channels to your streams…"
-                )
-
-                # Build channel match map: epg_id → channel_db_id
-                match_map = self._build_match_map(session, channels, provider_id)
-                logger.info(f"EPG: matched {len(match_map)} channels for {provider_name}")
-                # Denormalized display-name per epg_id, stored on each programme row so a
-                # later DB-only relink can fuzzy-match (tiers 2/3) without re-downloading.
-                chan_name_map = {ch.epg_id: ch.display_name for ch in channels}
-
-                # Phase 3: clear old guide — indeterminate (one DELETE, fast)
-                self._emit_or_abort(self._progress_update,
-                    notif_id or "", 0, -1, "Clearing old guide…"
-                )
-                # Chunked: this delete held the write lock 69.3s on a 3 GB database
-                # and failed every concurrent writer. Commits per chunk.
-                delete_programmes_chunked(
-                    session, EpgProgramDB.provider_id == provider_id
-                )
-
-                # Phase 4: bulk insert — now we know total, switch to determinate
-                self._emit_or_abort(self._progress_update,
-                    notif_id or "", 0, total_progs, f"Saving {total_progs:,} programmes…"
-                )
-
-                batch: list[EpgProgramDB] = []
-                min_start: datetime | None = None
-                saved = 0
-                _report_every = max(1, total_progs // 20)  # ~5% increments
-
-                for prog in programmes:
-                    channel_db_id = match_map.get(prog.channel_id)
-                    row = EpgProgramDB(
-                        provider_id    = provider_id,
-                        channel_epg_id = prog.channel_id,
-                        channel_db_id  = channel_db_id,
-                        channel_name   = chan_name_map.get(prog.channel_id, ""),
-                        title          = prog.title,
-                        description    = prog.description,
-                        start_time     = prog.start_time,
-                        stop_time      = prog.stop_time,
-                        is_live        = prog.is_live,
-                        is_new         = prog.is_new,
+            if fetch.partial:
+                # EPG-2b: an evicted fetch only REPLACES the stored guide when
+                # it holds more than what's already there — otherwise leave
+                # the existing guide alone and let the next scheduler tick
+                # (epg_last_fetched stays untouched below) retry the fetch.
+                stored = session.query(EpgProgramDB).filter_by(
+                    provider_id=provider_id).count()
+                if total_progs <= stored:
+                    logger.info(
+                        f"EPG: {provider_name} partial fetch ({total_progs}) did "
+                        f"not beat the stored guide ({stored}) — keeping it"
                     )
-                    batch.append(row)
+                    self._emit_or_abort(
+                        self._progress_done, notif_id or "",
+                        f"Guide fetch for {provider_name} paused for playback — "
+                        f"kept the current guide ({stored:,} programmes); will retry",
+                    )
+                    return
 
-                    if min_start is None or prog.start_time < min_start:
-                        min_start = prog.start_time
+            # Phase 2: channel matching — indeterminate (fast, no useful fraction)
+            self._emit_or_abort(self._progress_update,
+                notif_id or "", 0, -1,
+                "Matching channels to your streams…"
+            )
 
-                    if len(batch) >= 2000:
+            # Build channel match map: epg_id → channel_db_id
+            match_map = self._build_match_map(session, channels, provider_id)
+            logger.info(f"EPG: matched {len(match_map)} channels for {provider_name}")
+            # Denormalized display-name per epg_id, stored on each programme row so a
+            # later DB-only relink can fuzzy-match (tiers 2/3) without re-downloading.
+            chan_name_map = {ch.epg_id: ch.display_name for ch in channels}
+
+            # Phase 3: clear old guide — indeterminate (one DELETE, fast)
+            self._emit_or_abort(self._progress_update,
+                notif_id or "", 0, -1, "Clearing old guide…"
+            )
+            # Chunked: this delete held the write lock 69.3s on a 3 GB database
+            # and failed every concurrent writer. Commits per chunk.
+            delete_programmes_chunked(
+                session, EpgProgramDB.provider_id == provider_id
+            )
+
+            # Phase 4: bulk insert — now we know total, switch to determinate
+            self._emit_or_abort(self._progress_update,
+                notif_id or "", 0, total_progs, f"Saving {total_progs:,} programmes…"
+            )
+
+            batch: list[EpgProgramDB] = []
+            min_start: datetime | None = None
+            saved = 0
+            _report_every = max(1, total_progs // 20)  # ~5% increments
+
+            for prog in programmes:
+                channel_db_id = match_map.get(prog.channel_id)
+                row = EpgProgramDB(
+                    provider_id    = provider_id,
+                    channel_epg_id = prog.channel_id,
+                    channel_db_id  = channel_db_id,
+                    channel_name   = chan_name_map.get(prog.channel_id, ""),
+                    title          = prog.title,
+                    description    = prog.description,
+                    start_time     = prog.start_time,
+                    stop_time      = prog.stop_time,
+                    is_live        = prog.is_live,
+                    is_new         = prog.is_new,
+                )
+                batch.append(row)
+
+                if min_start is None or prog.start_time < min_start:
+                    min_start = prog.start_time
+
+                if len(batch) >= 2000:
+                    with write_gate.background_write_gate():
                         session.bulk_save_objects(batch)
                         session.commit()  # release lock between batches
-                        saved += len(batch)
-                        batch.clear()
-                        if saved % _report_every < 2000:
-                            pct = int(saved / total_progs * 100)
-                            self._emit_or_abort(self._progress_update,
-                                notif_id or "", saved, total_progs,
-                                f"Saving… {saved:,}/{total_progs:,} ({pct}%)",
-                            )
-
-                if batch:
-                    session.bulk_save_objects(batch)
-                    session.commit()
                     saved += len(batch)
-
-                # Update provider timestamps
-                now = now_utc()
-                provider = session.query(ProviderDB).filter_by(id=provider_id).first()
-                if provider:
-                    # Compute the honest guide depth — filler programmes (>12 h) are
-                    # excluded so multi-day placeholder slots do not inflate epg_data_end
-                    # and falsely indicate coverage far beyond the real schedule depth.
-                    honest_end = _compute_honest_guide_end(programmes)
-                    # EPG-2b: a partial fetch never stamps epg_last_fetched, so
-                    # needs_refresh() retries at the next scheduler tick instead of
-                    # believing this incomplete guide is the finished article.
-                    if not fetch.partial:
-                        provider.epg_last_fetched = now
-                        # This attempt reached the feed and parsed a guide, so
-                        # whatever the last one failed on no longer describes
-                        # reality (EPGF-1). A PARTIAL fetch deliberately clears
-                        # nothing: it does not stamp epg_last_fetched either, so
-                        # the row keeps saying what it said until a whole fetch
-                        # lands.
-                        provider.epg_last_fetch_error = None
-                        provider.epg_last_fetch_error_at = None
-                    provider.epg_data_start = min_start
-                    provider.epg_data_end = honest_end
-                    # The provider's feed can serve year-old data (one source returned a
-                    # Jan-2025 snapshot). Flag it so it's not mistaken for our bug — the
-                    # EPG view / provider editor surface this to the user via epg_is_stale.
-                    if honest_end is not None and honest_end < now:
-                        logger.warning(
-                            f"EPG: {provider_name} returned STALE guide data — latest "
-                            f"programme ends {honest_end:%Y-%m-%d} (before now). The provider's "
-                            f"XMLTV endpoint is out of date; nothing will appear in On Now."
+                    batch.clear()
+                    if saved % _report_every < 2000:
+                        pct = int(saved / total_progs * 100)
+                        self._emit_or_abort(self._progress_update,
+                            notif_id or "", saved, total_progs,
+                            f"Saving… {saved:,}/{total_progs:,} ({pct}%)",
                         )
 
+            if batch:
+                with write_gate.background_write_gate():
+                    session.bulk_save_objects(batch)
+                    session.commit()
+                saved += len(batch)
+
+            # Update provider timestamps
+            now = now_utc()
+            provider = session.query(ProviderDB).filter_by(id=provider_id).first()
+            if provider:
+                # Compute the honest guide depth — filler programmes (>12 h) are
+                # excluded so multi-day placeholder slots do not inflate epg_data_end
+                # and falsely indicate coverage far beyond the real schedule depth.
+                honest_end = _compute_honest_guide_end(programmes)
+                # EPG-2b: a partial fetch never stamps epg_last_fetched, so
+                # needs_refresh() retries at the next scheduler tick instead of
+                # believing this incomplete guide is the finished article.
+                if not fetch.partial:
+                    provider.epg_last_fetched = now
+                    # This attempt reached the feed and parsed a guide, so
+                    # whatever the last one failed on no longer describes
+                    # reality (EPGF-1). A PARTIAL fetch deliberately clears
+                    # nothing: it does not stamp epg_last_fetched either, so
+                    # the row keeps saying what it said until a whole fetch
+                    # lands.
+                    provider.epg_last_fetch_error = None
+                    provider.epg_last_fetch_error_at = None
+                provider.epg_data_start = min_start
+                provider.epg_data_end = honest_end
+                # The provider's feed can serve year-old data (one source returned a
+                # Jan-2025 snapshot). Flag it so it's not mistaken for our bug — the
+                # EPG view / provider editor surface this to the user via epg_is_stale.
+                if honest_end is not None and honest_end < now:
+                    logger.warning(
+                        f"EPG: {provider_name} returned STALE guide data — latest "
+                        f"programme ends {honest_end:%Y-%m-%d} (before now). The provider's "
+                        f"XMLTV endpoint is out of date; nothing will appear in On Now."
+                    )
+
+            with write_gate.background_write_gate():
                 session.commit()
 
-                # Age-based EPG hygiene: sweep expired programmes across ALL providers
-                # now that this fetch's write lock is released. Reuses this already-open
-                # session — safe under the single-worker executor invariant (no other
-                # EPG write can be in flight). Catches providers that stopped refreshing
-                # too, since this runs on every SUCCESSFUL fetch, not just this provider's.
-                # prune_expired(session) reuses the passed-in session; the chunked
-                # delete commits each chunk itself, so nothing is left uncommitted.
-                self.prune_expired(session)
+            # Age-based EPG hygiene: sweep expired programmes across ALL providers
+            # now that this fetch's write lock is released. Reuses this already-open
+            # session — safe under the single-worker executor invariant (no other
+            # EPG write can be in flight). Catches providers that stopped refreshing
+            # too, since this runs on every SUCCESSFUL fetch, not just this provider's.
+            # prune_expired(session) reuses the passed-in session; the chunked
+            # delete commits each chunk itself, so nothing is left uncommitted.
+            self.prune_expired(session)
 
-                count = session.query(EpgProgramDB).filter_by(provider_id=provider_id).count()
-                logger.info(f"EPG: stored {count:,} programmes for {provider_name}")
+            count = session.query(EpgProgramDB).filter_by(provider_id=provider_id).count()
+            logger.info(f"EPG: stored {count:,} programmes for {provider_name}")
 
-                self.refresh_finished.emit(provider_id, count)
-                done_msg = (
-                    f"{count:,} programmes loaded (partial — playback took the "
-                    f"connection; will complete later)" if fetch.partial
-                    else f"{count:,} programmes loaded"
-                )
-                self._emit_or_abort(self._progress_done, notif_id or "", done_msg)
+            self.refresh_finished.emit(provider_id, count)
+            done_msg = (
+                f"{count:,} programmes loaded (partial — playback took the "
+                f"connection; will complete later)" if fetch.partial
+                else f"{count:,} programmes loaded"
+            )
+            self._emit_or_abort(self._progress_done, notif_id or "", done_msg)
 
-            except XmltvAborted:
-                session.rollback()   # no half-written guide; finally still closes
-                raise
-            except Exception as e:
-                logger.error(f"EPG refresh failed for {provider_name}: {e}")
-                session.rollback()
-                self._record_fetch_failure(provider_id, e)
-                self.refresh_error.emit(provider_id, str(e))
-                self._emit_or_abort(self._progress_error, notif_id or "")
-                self._show_notification(
-                    "EPG Error", f"{provider_name}: {e}",
-                    type_="error", auto_dismiss_ms=6000,
-                )
-            finally:
-                session.close()
-                self._active_refreshes.discard(provider_id)
+        except XmltvAborted:
+            session.rollback()   # no half-written guide; finally still closes
+            raise
+        except Exception as e:
+            logger.error(f"EPG refresh failed for {provider_name}: {e}")
+            session.rollback()
+            self._record_fetch_failure(provider_id, e)
+            self.refresh_error.emit(provider_id, str(e))
+            self._emit_or_abort(self._progress_error, notif_id or "")
+            self._show_notification(
+                "EPG Error", f"{provider_name}: {e}",
+                type_="error", auto_dismiss_ms=6000,
+            )
+        finally:
+            session.close()
+            self._active_refreshes.discard(provider_id)

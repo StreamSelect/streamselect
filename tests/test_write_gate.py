@@ -294,7 +294,8 @@ def test_session_scope_background_ignored_for_read_only(db):
 #: files belong here too, alongside their DB-10 census entry in the PR.
 _MIN_GATED_SITES = {
     "streamselect/core/download_manager.py": 8,
-    "streamselect/core/epg_fetch.py": 3,
+    # 2 real sites; it read 3 while a comment quoted the kwarg (removed 2026-11-17).
+    "streamselect/core/epg_fetch.py": 2,
     "streamselect/core/epg_manager.py": 1,
     "streamselect/core/metadata_enrichment_queue.py": 2,
     "streamselect/core/metadata_manager.py": 1,
@@ -310,7 +311,8 @@ _MIN_GATED_SITES = {
 #: (a legacy get_session()/try/finally block, or MigrationManager's dispatch
 #: chokepoint) rather than session_scope(background=True).
 _MIN_DIRECT_WRAPS = {
-    "streamselect/core/epg_fetch.py": 1,       # _run_fetch's chunked programme store
+    "streamselect/core/epg_fetch.py": 3,       # _run_fetch: each programme batch, the stamp
+    "streamselect/core/repositories/epg.py": 1,  # delete_programmes_chunked: each chunk
     "streamselect/core/epg_manager.py": 1,     # _relink_worker
     "streamselect/core/migration_manager.py": 1,  # every migration task, incl. orphan sweep
 }
@@ -346,4 +348,47 @@ def test_background_writer_census_is_not_empty():
         total_direct_wraps += count
 
     assert total_kwarg_sites >= 30
-    assert total_direct_wraps >= 3
+    assert total_direct_wraps >= 6
+
+
+
+def test_the_guide_store_takes_the_gate_per_write_not_for_the_whole_run(db, monkeypatch):
+    """The guide store held the gate for its whole run (26-57 s a night, while
+    SQLite was locked one ~0.2 s batch at a time), so recordings and downloads
+    waited 15 s and gave up (owner's log, 2026-11-17). It now takes the gate per
+    write — each delete chunk, each insert batch, the provider stamp — so another
+    background writer waits one batch at most. Measured here as the number of
+    separate times the store takes the gate, and the longest it holds it."""
+    from tests.test_epg_fetch_evictable import _config, _seed_provider, _seed_stored_programmes
+    from tests.test_epg_shutdown_does_not_blame_hosts import _programmes
+    from streamselect.core.database import EpgProgramDB
+    from streamselect.core.epg_manager import EpgManager
+
+    _seed_provider(db)
+    _seed_stored_programmes(db, "p1", 12_000)          # three delete chunks of 5,000
+    monkeypatch.setattr("streamselect.core.epg_fetch.parse_xmltv_url",
+                        lambda url, timeout=180, on_progress=None: ([], _programmes(9_000)))
+
+    real = write_gate._gate
+    holds: list[float] = []
+
+    class _Counting:
+        def acquire(self, *a, **kw):
+            ok = real.acquire(*a, **kw)
+            self.t = time.perf_counter()
+            return ok
+
+        def release(self):
+            holds.append(time.perf_counter() - self.t)
+            real.release()
+
+    monkeypatch.setattr(write_gate, "_gate", _Counting())
+    manager = EpgManager(db, _config(), notifications=None)
+    worker = threading.Thread(target=manager._fetch_worker, args=("p1", "Prov"), kwargs={"notif_id": "n1"})
+    worker.start()
+    worker.join(30)
+    with db.session_scope(commit=False) as s:
+        assert s.query(EpgProgramDB).filter_by(provider_id="p1").count() == 9_000
+    # 3 delete chunks + 5 insert batches (2,000 each, the last 1,000) + the stamp.
+    assert len(holds) >= 9, f"the gate was taken {len(holds)} time(s) for the whole store"
+    assert max(holds) < sum(holds) / 2, "no single hold covers most of the store"
