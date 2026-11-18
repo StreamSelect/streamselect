@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from PyQt6 import sip
 from PyQt6.QtCore import QPoint, QRect, Qt
 from PyQt6.QtWidgets import QApplication
 
@@ -31,7 +32,7 @@ def _entry(i: int) -> QueueEntry:
 def _section(qapp):
     from streamselect.core.config import Config
 
-    _section.before = set(map(id, QApplication.topLevelWidgets()))
+    _section.before = _top_levels()
     sec = WatchQueueSection(Config(), db=None)
     sec.resize(260, 480)
     sec.show()
@@ -45,10 +46,18 @@ def _section(qapp):
     return sec
 
 
+def _top_levels() -> set[int]:
+    """The C++ addresses of the top-level widgets now. Not ``id()`` of the
+    Python wrappers: topLevelWidgets() hands back temporaries, Python reuses a
+    freed id, and the section's stray button could match a stale one and be
+    left alive — a teardown leak seen only in full runs (2026-11-17)."""
+    return {sip.unwrapinstance(w) for w in QApplication.topLevelWidgets()}
+
+
 def _destroy(sec) -> None:
     """The section and any top-level it made (a header button that is not parented)."""
     strays = [w for w in QApplication.topLevelWidgets()
-              if id(w) not in _section.before and w is not sec]
+              if sip.unwrapinstance(w) not in _section.before and w is not sec]
     destroy_widget(sec, *strays)
 
 
@@ -170,7 +179,7 @@ def test_a_section_filled_while_hidden_draws_its_rows_when_shown(qapp):
     fits, so no scroll range changes — the Show alone has to build the rows."""
     from streamselect.core.config import Config
 
-    _section.before = set(map(id, QApplication.topLevelWidgets()))
+    _section.before = _top_levels()
     sec = WatchQueueSection(Config(), db=None)
     sec.resize(260, 480)
     sec._populate_rows([_entry(i) for i in range(6)])
