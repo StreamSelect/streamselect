@@ -93,10 +93,11 @@ def test_rows_in_view_are_drawn_and_rows_far_below_are_not_built(qapp):
 def test_scrolling_builds_the_rows_that_come_into_view(qapp):
     sec = _section(qapp)
     try:
-        sec._list.scrollToBottom()                     # the list's own bar...
         outer = sec.content_scroll.verticalScrollBar()
-        outer.setValue(outer.maximum())                # ...and the section's
-        QApplication.processEvents()
+        for _ in range(5):                             # until the layout has settled:
+            sec._list.scrollToBottom()                 # the list's own bar...
+            outer.setValue(outer.maximum())            # ...and the section's
+            QApplication.processEvents()
         rows = _rows(sec)
         bottom = [r for r in rows if _in_view(sec, r)]
         assert bottom and rows[-1] in bottom
