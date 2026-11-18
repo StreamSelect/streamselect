@@ -115,6 +115,7 @@ class SportsView(ContentView):
         self._show_hidden: set[tuple] = set()
         self._playing: Optional[str] = None
         self._loaded = False
+        self._stale = False         # a finder run finished while off screen
         self._finding = False
         #: sport -> its settings (the first listed league's lengths), in listed order.
         self.sports: dict = sport_settings()
@@ -232,6 +233,17 @@ class SportsView(ContentView):
         """The finder stored its games: re-read, and drop "finding" when they arrive."""
         self._finding = False
         if self.isVisible():
+            self.reload()
+        else:
+            # Off screen now: re-read the moment it is shown, whatever shows it — a
+            # view brought back without on_activate kept the old order (owner,
+            # 2026-11-18: NHL not first until "A–Z" and back).
+            self._stale = True
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if self._stale:
+            self._stale = False
             self.reload()
 
     def set_playing(self, channel_id: Optional[str], video_bitrate=None) -> None:

@@ -1524,3 +1524,56 @@ def test_the_league_you_watch_most_comes_first_and_az_is_a_click_away(games_db, 
     _settle(qapp)
     assert view.config.sports_view_state["rank"] == "az" and view.rank_button.text() == "A–Z"
     assert tops()["AHL"] < tops()["NHL"], "A–Z on request"
+
+
+def test_the_order_follows_viewing_once_the_first_games_run_credits_it(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-18: at launch NHL was not first until "A–Z" and back. The view
+    opens before the games run credits any viewing; when the run finishes, the
+    re-read must put the watched league first without a click."""
+    from streamselect.core.games.models import GameDB
+    from streamselect.core.playback_models import PlaybackEventDB
+    with games_db.session_scope() as s:
+        g = s.query(GameDB).order_by(GameDB.team_a).first()
+        g.league = "AHL"                                   # two leagues, so the order shows
+    view = _view(games_db, qapp, owned_widgets, START - timedelta(minutes=30))
+
+    def first():
+        return min(("AHL", "NHL"), key=lambda lg: _rect(view, view.headers[f"hockey:league:{lg}"]).top())
+    assert first() == "AHL", "nothing watched yet: A–Z"
+    with games_db.session_scope() as s:
+        s.add(PlaybackEventDB(provider_id="p1", channel_id="w1", title="NHL: Jets vs Stars",
+                              started_at=NOW - timedelta(days=1), outcome="started", seconds_watched=900))
+    refresh_games(games_db, NOW)
+    with games_db.session_scope() as s:                  # the refresh re-stored the games
+        g = s.query(GameDB).order_by(GameDB.team_a).first()
+        g.league = "AHL"
+    view.finished_finding()
+    _settle(qapp)
+    assert first() == "NHL", "the re-read after the run puts the watched league first"
+
+
+def test_a_games_run_that_finishes_off_screen_is_read_when_the_view_is_shown(games_db, qapp, owned_widgets):
+    """A run finishing while Sports is hidden must not leave the old order on screen
+    when something shows the view again without activating it."""
+    from streamselect.core.games.models import GameDB
+    from streamselect.core.playback_models import PlaybackEventDB
+
+    def two_leagues():
+        with games_db.session_scope() as s:
+            s.query(GameDB).order_by(GameDB.team_a).first().league = "AHL"
+    two_leagues()
+    view = _view(games_db, qapp, owned_widgets, START - timedelta(minutes=30))
+
+    def first():
+        return min(("AHL", "NHL"), key=lambda lg: _rect(view, view.headers[f"hockey:league:{lg}"]).top())
+    assert first() == "AHL"
+    view.hide()
+    with games_db.session_scope() as s:
+        s.add(PlaybackEventDB(provider_id="p1", channel_id="w1", title="NHL: Jets vs Stars",
+                              started_at=NOW - timedelta(days=1), outcome="started", seconds_watched=900))
+    refresh_games(games_db, NOW)
+    two_leagues()
+    view.finished_finding()                 # off screen: nothing re-read yet
+    view.show()
+    _settle(qapp)
+    assert first() == "NHL", "shown again, it re-reads and the watched league comes first"
