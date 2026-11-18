@@ -113,7 +113,7 @@ def test_interrupted_store_prunes_nothing(fake_provider, tmp_db):
         )
         # And the row this pass WAS trying to write never landed either —
         # the whole batch (one INSERT..ON CONFLICT statement) failed atomically.
-        new_row = session.query(ChannelDB).filter_by(id="new_ch").one_or_none()
+        new_row = session.query(ChannelDB).filter_by(source_id="new_ch").one_or_none()
         assert new_row is None, (
             "the failed batch must not have partially landed"
         )
@@ -148,7 +148,7 @@ def test_completed_pass_still_prunes_with_the_gate_in_place(fake_provider, tmp_d
     try:
         stale = session.query(ChannelDB).filter_by(id="stale_ch").one_or_none()
         assert stale is None, "a genuinely vanished row must still be pruned on a completed pass"
-        new_row = session.query(ChannelDB).filter_by(id="new_ch").one_or_none()
+        new_row = session.query(ChannelDB).filter_by(source_id="new_ch").one_or_none()
         assert new_row is not None, "the freshly-served row must be stored"
     finally:
         session.close()

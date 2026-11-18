@@ -203,3 +203,38 @@ def legacy_index_drop_sql(conn: "Connection") -> list[str]:
         and "WHERE" not in existing[f"ix_channels_{col}"].upper()
     ]
     return drops
+
+
+#: The unique (source, type, number) index: the database decides which row a
+#: channel is (``core/repositories/channel_identity.py``). Created here rather
+#: than declared on the ORM, so ``QueryIndexTask`` never retries a unique build
+#: that a damaged database cannot satisfy on every launch, blocking the
+#: indexes sorted after it.
+CHANNEL_IDENTITY_INDEX = "ux_channels_identity"
+
+
+def identity_index_sql(conn: "Connection") -> list[str]:
+    """``CREATE UNIQUE INDEX`` for the channel identity, when it is missing and safe.
+
+    Every database so far satisfies it by construction: ids were built from
+    (source, number) and are unique, so (source, type, number) is too. The
+    duplicate check is the guard for a database that somehow does not: it
+    logs and skips instead of failing the launch, and ids still resolve
+    through ``ChannelIds`` without the index; it only stops enforcing.
+    """
+    exists = conn.execute(text(
+        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = :n"),
+        {"n": CHANNEL_IDENTITY_INDEX}).first()
+    if exists:
+        return []
+    clash = conn.execute(text(
+        "SELECT provider_id, media_type, source_id FROM channels "
+        "GROUP BY provider_id, media_type, source_id HAVING COUNT(*) > 1 LIMIT 1")).first()
+    if clash:
+        from loguru import logger
+        logger.warning("Channel identity index not created: more than one row is "
+                       "(source {}, {}, {}); the refresh still resolves ids by those columns",
+                       *clash)
+        return []
+    return [f"CREATE UNIQUE INDEX IF NOT EXISTS {CHANNEL_IDENTITY_INDEX} "
+            "ON channels (provider_id, media_type, source_id)"]

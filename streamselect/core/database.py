@@ -947,7 +947,7 @@ class Database:
                 # recreate exactly what this removes.
                 "DROP INDEX IF EXISTS ix_content_tags_channel_id",
                 "DROP INDEX IF EXISTS ix_content_tags_tag_id",
-            ] + legacy_channel_drops  # STORAGE-1a; shape-conditional, DB-11
+            ] + legacy_channel_drops + channel_index_policy.identity_index_sql(conn)  # DB-11; identity
             for idx_sql in index_migrations:
                 try:
                     conn.execute(text(idx_sql))

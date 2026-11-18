@@ -569,10 +569,14 @@ def _scripted_fetch_provider(monkeypatch, responses):
 
 
 def _idless_movies(session, provider_id: str, n: int) -> list[str]:
-    """Seed *n* fresh idless/unattempted movie candidates for *provider_id*."""
+    """Seed *n* fresh idless/unattempted movie candidates for *provider_id*.
+
+    Each call gets its own numbers: a source never lists two movies under one
+    number, and the (source, type, number) unique index enforces it."""
+    batch = uuid.uuid4().hex[:6]
     return [
         _channel(session, provider_id=provider_id, media_type="movie",
-                 detected_title=f"{provider_id}-{i}", source_id=f"{provider_id}-{i}")
+                 detected_title=f"{provider_id}-{i}", source_id=f"{provider_id}-{batch}-{i}")
         for i in range(n)
     ]
 

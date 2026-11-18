@@ -15,6 +15,7 @@ from streamselect.core.database import (
 from streamselect.core.episode_metadata_extract import extract_episode_metadata_fields
 from streamselect.core.repositories.stream_info import StreamInfoRepository
 from streamselect.core.repositories.provider import persist_url_stats
+from streamselect.core.repositories.channel_identity import repoint_queue_entries, resolve_channel_ids
 from streamselect.core.repositories.channel_change_detection import (
     diff_batch_for_upsert, force_recompute_for_changed_ids)
 from streamselect.core.repositories.channel_upsert import flush_channel_batch
@@ -190,18 +191,16 @@ class ProviderLoadThread(QThread):
         )
         _t_fetched = time.monotonic()
 
-        # Deduplicate by channel ID: some providers return the same stream_id in multiple
-        # category responses, producing duplicate channel.id values. Under no_autoflush the
-        # pending INSERT is not visible to merge()'s SELECT, causing UNIQUE constraint errors.
-        # Keep the last occurrence per ID (same result as repeated merge/UPDATE calls).
+        # Ids from the database's (source, type, number) index, BEFORE anything keys on
+        # them: live 25529 and series 25529 are two channels (channel_identity.py).
+        channels = resolve_channel_ids(self.db, self.provider.id, channels)
+        # Deduplicate by id: a source can list one channel in several categories.
         seen: dict[str, object] = {}
         for ch in channels:
             seen[ch.id] = ch
         if len(seen) < len(channels):
-            logger.warning(
-                f"{self.provider.name}: dropped {len(channels) - len(seen):,} duplicate "
-                f"channel IDs (same stream_id in multiple categories)"
-            )
+            logger.warning(f"{self.provider.name}: dropped {len(channels) - len(seen):,} channels "
+                           "listed more than once (same type and number in several categories)")
         channels = list(seen.values())
 
         total = len(channels)
@@ -220,6 +219,7 @@ class ProviderLoadThread(QThread):
 
         try:
             self._changed_detected_ids = self._store_channels(session, channels, total)
+            repoint_queue_entries(session, self.provider.id)
             self.progress.emit(_BAND_STORE[1], 100, f"Stored {total:,} channels")
 
             # Only now that the whole catalog stored cleanly: drop the rows this

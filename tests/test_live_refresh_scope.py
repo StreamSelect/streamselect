@@ -61,7 +61,7 @@ def test_live_only_leaves_movie_rows_unparsed_and_untagged(db):
     _load(db, "live_only")
     with db.session_scope(commit=False) as s:
         movie = s.query(ChannelDB).filter_by(id=f"{PID}_m").one()
-        live = s.query(ChannelDB).filter_by(id=f"{PID}_1").one()
+        live = s.query(ChannelDB).filter_by(provider_id=PID, media_type="live", source_id="1").one()
         assert live.detected_prefix == "UK"
         assert movie.detected_title is None and movie.detected_prefix is None
         assert movie.tag_fingerprint is None
