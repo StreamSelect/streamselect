@@ -21,7 +21,7 @@ from collections import deque
 from datetime import datetime
 from typing import Callable, Optional
 
-from PyQt6.QtCore import QSize, QTimer, Qt, pyqtSignal
+from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
 )
@@ -36,13 +36,13 @@ from streamselect.core.games.read import (
     mark_not_finished,
 )
 from streamselect.core.games.alerts import add_alert, alerts_for, load_alerts, remove_alerts, rule_for
-from streamselect.core.games.store import enabled_leagues, sport_settings
+from streamselect.core.games.store import sport_settings
 from streamselect.core.repositories.provider import ProviderRepository
 from streamselect.gui import cursor_affordance
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
-from streamselect.gui.chip_row import CHIP_COUNT, chip_widget
+from streamselect.gui.chip_row import labeled_chip
 from streamselect.gui.chips import ToggleChip
 from streamselect.gui.content_view import ContentView
 from streamselect.gui.flow_layout import FlowLayout
@@ -135,7 +135,7 @@ class SportsView(ContentView):
         self.cards: list[GameCard] = []
         self.rows: list[QWidget] = []          # a QPushButton, or a QLabel for an earlier day's finished game
         self.headers: dict[str, QWidget] = {}
-        self.live_marks: dict[str, QWidget] = {}   # sport header key -> its live chip
+        self.league_chips: dict[tuple[str, str], QWidget] = {}   # (sport, league) -> its chip
         self._sub_text_x = 0            # set by each sub-heading; its rows line up under its words
         #: The last few live bitrate readings (kb/s), averaged so the chip doesn't flicker.
         self._bitrates: deque = deque(maxlen=BITRATE_SAMPLES)
@@ -267,7 +267,7 @@ class SportsView(ContentView):
                 w.deleteLater()
             elif item.layout() is not None:
                 QWidget().setLayout(item.layout())
-        self.cards, self.rows, self.headers, self.live_marks = [], [], {}, {}
+        self.cards, self.rows, self.headers, self.league_chips = [], [], {}, {}
 
     def _render(self, error: bool = False) -> None:
         self._clear()
@@ -297,10 +297,9 @@ class SportsView(ContentView):
         if self.ordering == ORDER_TIME:
             self._render_by_time(games, now, folded)
         else:
-            for sport, settings in self.sports.items():
+            for sport in self.sports:
                 mine = [g for g in games if g.sport == sport]
-                live = sum(1 for g in mine if event_live(g, now, settings))
-                self._layout.addWidget(self._sport_header(sport, mine, live))
+                self._layout.addWidget(self._sport_header(sport, mine))
                 if f"sport:{sport}" not in folded:
                     self._render_sport(sport, mine, now, folded)
         self._layout.addStretch(1)
@@ -511,8 +510,9 @@ class SportsView(ContentView):
         self.headers[key] = band
         return band
 
-    def _sport_header(self, sport: str, games: list, live: int) -> QWidget:
-        """The sport's own header: its name, its leagues, how many are live; folds the segment."""
+    def _sport_header(self, sport: str, games: list) -> QWidget:
+        """The sport's own header: its name, a chip per league with games (with how
+        many are on now); folds the segment."""
         key = f"sport:{sport}"
         # The whole band folds, not just the name (owner report: only the word worked).
         band = _ClickableFrame()
@@ -532,21 +532,20 @@ class SportsView(ContentView):
         name = QLabel(sport.title())
         _theme.style(name, "PANEL_HEADLINE")
         h.addWidget(name)
-        leagues = sorted({g.league for g in games} or {s.league for s in enabled_leagues() if s.sport == sport})
-        meta = QLabel(" · ".join(leagues))
-        _theme.style(meta, "TEXT_SM_MUTED")
-        h.addWidget(meta)
-        if live:
-            # The app's live mark, the broadcast glyph and the number, instead of
-            # the words "3 live", in the bold outlined count chip the bands use
-            # (owner, 2026-11-17); the glyph in the chip's own text colour.
-            chip = chip_widget(CHIP_COUNT, str(live))
-            _icon_utils.set_button_icon(chip, "live", color=_theme.COLOR_TEXT)
-            chip.setIconSize(QSize(12, 12))
-            chip.setToolTip(f"{live} {sport} game{'s' if live != 1 else ''} on now")
-            h.addSpacing(4)
+        # One outlined chip per league with games here — none when nothing is
+        # listed — and a league with games on now carries the live mark and how
+        # many (owner, 2026-11-17: "when there are live games within a league
+        # they get the logo and #").
+        settings = self.sports.get(sport)
+        now = self._clock()
+        for league in sorted({g.league for g in games}):
+            on = sum(1 for g in games if g.league == league and settings is not None
+                     and event_live(g, now, settings))
+            chip = labeled_chip(league, on, "live")
+            chip.setToolTip(f"{league}: {on} game{'s' if on != 1 else ''} on now" if on
+                            else f"{league}: nothing on now")
             h.addWidget(chip)
-            self.live_marks[key] = chip
+            self.league_chips[(sport, league)] = chip
         h.addStretch(1)
         self.headers[key] = band
         return band

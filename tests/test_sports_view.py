@@ -1369,27 +1369,44 @@ def test_the_live_bitrate_is_averaged_across_polls(games_db, qapp, owned_widgets
     assert card.bitrate_chip is not None and card.bitrate_chip.text() == "6.0 Mb/s"
 
 
-def test_header_counts_are_outlined_chips_and_live_is_the_live_mark(games_db, qapp, owned_widgets):
-    """Owner, 2026-11-17: the bands' counts take the rows' outlined chip (not
-    clickable, it only stands out), and "3 live" is the app's live glyph and the
-    number, quiet like the leagues beside it."""
+def test_header_counts_are_outlined_chips_and_each_league_is_a_chip(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-17: the bands' counts take a bold outlined chip (not
+    clickable, it only stands out); the sport's heading has one outlined chip per
+    league with games, and a league with games on now carries the live mark and
+    how many — "NHL (•) 2". A league with nothing listed has no chip."""
+    from streamselect.gui.icon_utils import label_role
     view = _view(games_db, qapp, owned_widgets, LIVE_AT)
-    band = view.headers["hockey:on_now"]
-    heading = band.findChild(GroupHeading)
+    heading = view.headers["hockey:on_now"].findChild(GroupHeading)
     chip = heading.count_label
-    assert isinstance(chip, QPushButton) and chip.text() == "2"
+    assert isinstance(chip, QPushButton) and chip.text() == "2" and chip.font().bold()
     assert chip.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents), "not clickable"
     assert "border" in chip.styleSheet(), "outlined"
     assert chip.mapTo(view, QPoint(0, 0)).x() > heading.label.mapTo(view, QPoint(0, 0)).x() \
         + heading.label.width() - 1, "after its label"
-    assert chip.font().bold(), "the count is bold"
-    live = view.live_marks["sport:hockey"]
-    from streamselect.gui.icon_utils import button_role
-    assert button_role(live) == "live" and live.text() == "2", "the live glyph and the number"
-    assert isinstance(live, QPushButton) and "border" in live.styleSheet(), "outlined, like the counts"
-    assert live.font().bold()
-    assert live.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-    sport_band = view.headers["sport:hockey"]
-    texts = [w.text() for w in sport_band.findChildren(QLabel)]
-    assert not any("live" in t.lower() for t in texts), texts
-    assert live.toolTip() == "2 hockey games on now"
+
+    assert list(view.league_chips) == [("hockey", "NHL")], "one chip, for the one league with games"
+    nhl = view.league_chips[("hockey", "NHL")]
+    assert nhl.name_label.text() == "NHL"
+    assert label_role(nhl.icon_label) == "live" and nhl.count_label.text() == "2"
+    assert nhl.count_label.font().bold() and not nhl.name_label.font().bold()
+    assert nhl.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+    xs = [w.mapTo(view, QPoint(0, 0)).x() for w in (nhl.name_label, nhl.icon_label, nhl.count_label)]
+    assert xs == sorted(xs), "name, then the live mark, then the number"
+    assert nhl.rect().contains(nhl.count_label.geometry()), "all inside the one outline"
+    assert nhl.toolTip() == "NHL: 2 games on now"
+    band_texts = [w.text() for w in view.headers["sport:hockey"].findChildren(QLabel)]
+    assert not any("live" in t.lower() for t in band_texts), band_texts
+
+
+def test_a_league_with_nothing_on_now_shows_its_name_alone(games_db, qapp, owned_widgets):
+    view = _later_view(games_db, qapp, owned_widgets)
+    nhl = view.league_chips[("hockey", "NHL")]
+    assert nhl.name_label.text() == "NHL" and nhl.count_label is None and nhl.icon_label is None
+    assert nhl.toolTip() == "NHL: nothing on now"
+
+
+def test_each_league_with_games_gets_its_own_chip(games_db, qapp, owned_widgets):
+    view = _later_view(games_db, qapp, owned_widgets, league="AHL")
+    assert set(view.league_chips) == {("hockey", "AHL"), ("hockey", "NHL")}
+    xs = {lg: view.league_chips[("hockey", lg)].mapTo(view, QPoint(0, 0)).x() for lg in ("AHL", "NHL")}
+    assert xs["AHL"] < xs["NHL"], "leagues in name order"

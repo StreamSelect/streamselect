@@ -465,6 +465,38 @@ def _news_chip_style() -> str:
     )
 
 
+def labeled_chip(name: str, count: int = 0, icon: str = "") -> QWidget:
+    """An outlined chip holding a name and, when *count* is set, an *icon* role
+    and the count in bold — "NHL (•) 2" (the Sports heading's leagues, owner
+    2026-11-17). Not interactive, like :func:`chip_widget`: a click goes to
+    whatever hosts it.
+
+    A frame of labels rather than one chip button, because a button holds one
+    text and one icon, and this is a text, an icon and a bold number.
+    """
+    from PyQt6.QtWidgets import QFrame
+
+    frame = QFrame()
+    frame.setObjectName("chipGroup")
+    frame.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+    _theme.style(frame, "SIDEBAR_CHIP_GROUP")
+    lay = QHBoxLayout(frame)
+    lay.setContentsMargins(5, 0, 5, 0)      # = chip_geom's 5 px padding
+    lay.setSpacing(4)
+    frame.name_label = QLabel(name)
+    lay.addWidget(frame.name_label)
+    frame.icon_label = frame.count_label = None
+    if count:
+        if icon:
+            frame.icon_label = QLabel()
+            _icon_utils.set_label_icon(frame.icon_label, icon, 11)
+            lay.addWidget(frame.icon_label)
+        frame.count_label = QLabel(str(count))
+        frame.count_label.setProperty("chipCount", "true")
+        lay.addWidget(frame.count_label)
+    return frame
+
+
 def chip_widget(kind: str, text: str) -> QWidget:
     """One chip — a flat ``QPushButton`` whatever the kind.
 

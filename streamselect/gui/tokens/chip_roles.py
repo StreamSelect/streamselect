@@ -125,6 +125,18 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
                  f" border: 1px solid {accent};"),
             )
         },
+        # A chip that holds parts — a name, then an icon and a bold count —
+        # where a single chip button holds one text (chip_row.labeled_chip).
+        # The year chip's outline, colour and size; the count bold like
+        # SIDEBAR_CHIP_COUNT. Padding is the frame's layout margin (5 px), the
+        # same as chip_geom's.
+        "SIDEBAR_CHIP_GROUP": (
+            f"QFrame#chipGroup {{ border: 1px solid {border}; border-radius: {radius_sm};"
+            f" background: transparent; }}"
+            f"QFrame#chipGroup QLabel {{ color: {text}; font-size: {font_xs};"
+            f" background: transparent; border: none; padding: 0px; }}"
+            f"QFrame#chipGroup QLabel[chipCount=\"true\"] {{ font-weight: bold; }}"
+        ),
         # The strip itself. Sits on its own ground so the chips have something
         # to be distinct FROM.
         "FILTER_CHIP_BAR": (
