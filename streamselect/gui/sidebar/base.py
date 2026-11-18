@@ -44,7 +44,8 @@ class GroupHeading(QWidget):
     def __init__(self, text: str, count: int | None = None, *,
                  interactive: bool = False, tooltip: str = "", news: int = 0,
                  indent: int = 0, leading_mark: str = "",
-                 trailing_button: "QPushButton | None" = None, parent=None):
+                 trailing_button: "QPushButton | None" = None, count_chip: bool = False,
+                 parent=None):
         """
         Args:
             text: The group's name. Rendered uppercase by ``QFont`` capitalisation,
@@ -73,6 +74,8 @@ class GroupHeading(QWidget):
                 caller, the same way ``chip_row``'s row indent is, because the
                 widget cannot know how deep it has been put.
             tooltip: Hover text; a sensible default is supplied when interactive.
+            count_chip: Draw the count in the outlined chip the rows use (CHIP_YEAR,
+                not clickable) — the Sports bands (owner, 2026-11-17).
             trailing_button: An action belonging to the GROUP rather than a row
                 — History's per-group "forget these". Pinned past the stretch so
                 it lands in the same column on every heading. The caller's
@@ -109,16 +112,19 @@ class GroupHeading(QWidget):
         _theme.style(self.label, "SIDEBAR_GROUP_HEADING")
         row.addWidget(self.label)
 
-        self.count_label = QLabel()
-        _theme.style(self.count_label, "SIDEBAR_GROUP_HEADING_COUNT")
+        from streamselect.gui.chip_row import CHIP_NEWS, CHIP_YEAR, chip_widget
+        self._count_chip = count_chip
+        if count_chip:
+            self.count_label = chip_widget(CHIP_YEAR, "")
+            row.addSpacing(8)
+        else:
+            self.count_label = QLabel()
+            _theme.style(self.count_label, "SIDEBAR_GROUP_HEADING_COUNT")
         row.addWidget(self.count_label)
         self.set_count(count)
 
-        # The same filled pill the section header carries, so "+3" means the
-        # same thing at every level of the sidebar. Built through chip_row's
-        # CHIP_NEWS rather than a local sheet — that is the one definition of
-        # this pill, and it re-renders on a palette switch.
-        from streamselect.gui.chip_row import CHIP_NEWS, CHIP_YEAR, chip_widget
+        # The section header's filled pill, so "+3" means the same at every level;
+        # chip_row's CHIP_NEWS is its one definition (re-renders on a theme switch).
         self.news_chip = chip_widget(CHIP_NEWS, "")
         row.addSpacing(6)
         row.addWidget(self.news_chip)
@@ -153,7 +159,8 @@ class GroupHeading(QWidget):
         "12 of 597" while a find-in-queue filter is on, and the emphasis still
         belongs on that phrase rather than on the constant label.
         """
-        self.count_label.setText("" if count is None else f"  {count}")
+        self.count_label.setText("" if count is None else f"{count}" if self._count_chip
+                                 else f"  {count}")
         self.count_label.setVisible(count is not None)
 
     def set_news(self, news: int) -> None:
@@ -1036,18 +1043,10 @@ class CollapsibleSection(RowBudgetMixin, SectionContentCapMixin,
         news is painted in the accent because it is the one thing in a collapsed
         sidebar worth looking at.
         """
-        # A BUTTON, not a label, whenever the section has somewhere to go. Two
-        # reasons, and the second is the bug a user hit.
-        #
-        # The count was inert — a number stated beside an arrow that did the
-        # work. User report: "the count is a dead piece of content so the [count]->
-        # is what opens explore ... maybe we don't even need the arrow icon at
-        # all. maybe just put a hairline outline around the count."
-        #
-        # And a QLabel does not consume its mouse press, so the click reached
-        # _ClickableHeader and COLLAPSED the section: "clicking the count just
-        # collapses the section". A QPushButton consumes its own press, which
-        # is what keeps the two gestures apart.
+        # A BUTTON whenever the section has somewhere to go: the count opens
+        # Explore (user: "maybe just put a hairline outline around the count"),
+        # and a QLabel let the press through to _ClickableHeader, which COLLAPSED
+        # the section instead. A QPushButton consumes its own press.
         if self.EXPLORE_KEY:
             from streamselect.gui.explore_view import EXPLORE_SOURCES
 

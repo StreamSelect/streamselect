@@ -134,6 +134,7 @@ class SportsView(ContentView):
         self.cards: list[GameCard] = []
         self.rows: list[QWidget] = []          # a QPushButton, or a QLabel for an earlier day's finished game
         self.headers: dict[str, QWidget] = {}
+        self.live_marks: dict[str, tuple[QLabel, QLabel]] = {}   # sport header key -> (glyph, count)
         self._sub_text_x = 0            # set by each sub-heading; its rows line up under its words
         #: The last few live bitrate readings (kb/s), averaged so the chip doesn't flicker.
         self._bitrates: deque = deque(maxlen=BITRATE_SAMPLES)
@@ -265,7 +266,7 @@ class SportsView(ContentView):
                 w.deleteLater()
             elif item.layout() is not None:
                 QWidget().setLayout(item.layout())
-        self.cards, self.rows, self.headers = [], [], {}
+        self.cards, self.rows, self.headers, self.live_marks = [], [], {}, {}
 
     def _render(self, error: bool = False) -> None:
         self._clear()
@@ -494,7 +495,9 @@ class SportsView(ContentView):
             caret = QLabel()
             _icon_utils.set_label_icon(caret, "expand" if key in self._folded() else "collapse", 12)
             h.addWidget(caret)
-        heading = GroupHeading(label, count, tooltip=tip)
+        # The count in the rows' outlined chip: not clickable, it only makes the
+        # number stand out (owner, 2026-11-17).
+        heading = GroupHeading(label, count, tooltip=tip, count_chip=True)
         h.addWidget(heading, 1)
         if sub:
             # Where this heading's words start: the rows beneath line up there.
@@ -529,9 +532,23 @@ class SportsView(ContentView):
         _theme.style(name, "PANEL_HEADLINE")
         h.addWidget(name)
         leagues = sorted({g.league for g in games} or {s.league for s in enabled_leagues() if s.sport == sport})
-        meta = QLabel(" · ".join(leagues) + (f" · {live} live" if live else ""))
+        meta = QLabel(" · ".join(leagues))
         _theme.style(meta, "TEXT_SM_MUTED")
         h.addWidget(meta)
+        if live:
+            # The app's live mark, the broadcast glyph and the number, instead of
+            # the words "3 live"; quiet like the leagues beside it (owner, 2026-11-17:
+            # "a basic non-distracting look").
+            tip = f"{live} {sport} game{'s' if live != 1 else ''} on now"
+            mark, count = QLabel(), QLabel(str(live))
+            for w in (mark, count):
+                _theme.style(w, "TEXT_SM_MUTED")
+                w.setToolTip(tip)
+            _icon_utils.set_label_icon(mark, "live", 14)
+            h.addSpacing(4)
+            h.addWidget(mark)
+            h.addWidget(count)
+            self.live_marks[key] = (mark, count)
         h.addStretch(1)
         self.headers[key] = band
         return band
