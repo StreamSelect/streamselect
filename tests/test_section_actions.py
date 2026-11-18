@@ -122,7 +122,7 @@ class TestClearingOnlyTheOldEntries:
         from streamselect.core.database import ChannelDB
 
         session.add(ChannelDB(
-            id=cid, provider_id="p1", name=cid, source_id="s1",
+            id=cid, provider_id="p1", name=cid, source_id=cid,
             last_played=datetime.utcnow() - timedelta(days=days_ago),
             play_count=3,
         ))
@@ -166,6 +166,6 @@ class TestClearingOnlyTheOldEntries:
         db = self._db(tmp_path)
         with db.session_scope() as s:
             s.add(ChannelDB(id="never", provider_id="p1", name="never",
-                            source_id="s1"))
+                            source_id="never"))
         with db.session_scope() as s:
             assert RepositoryFactory(s).channels.clear_history_older_than(30) == 0

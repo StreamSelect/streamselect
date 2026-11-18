@@ -48,7 +48,7 @@ def _add_channel(session, *, name: str, category: str = "") -> str:
     cid = str(uuid.uuid4())
     session.add(ChannelDB(
         id=cid,
-        source_id="src1",
+        source_id=cid,
         provider_id="prov1",
         name=name,
         category=category,

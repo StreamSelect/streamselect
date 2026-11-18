@@ -39,7 +39,7 @@ def _insert_channel(db, cid: str, *, watched: bool = False, media_type: str = "m
     with db.session_scope() as session:
         session.add(ChannelDB(
             id=cid,
-            source_id="1",
+            source_id=cid,
             provider_id="p",
             name=f"Channel {cid[:8]}",
             media_type=media_type,

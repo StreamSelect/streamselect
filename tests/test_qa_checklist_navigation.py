@@ -69,7 +69,7 @@ def _insert(db, cid, *, media_type="movie", progress=0, completed=False, hidden=
     from streamselect.core.database import ChannelDB
     with db.session_scope() as session:
         session.add(ChannelDB(
-            id=cid, source_id="1", provider_id="p", name=f"Ch {cid}",
+            id=cid, source_id=cid, provider_id="p", name=f"Ch {cid}",
             media_type=media_type, watch_progress=progress,
             watch_completed=completed, is_hidden=hidden,
         ))

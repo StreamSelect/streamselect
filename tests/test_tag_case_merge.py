@@ -47,7 +47,7 @@ def db(tmp_path: Path):
 
 
 def _channel(session, cid: str) -> None:
-    session.add(ChannelDB(id=cid, source_id="s", provider_id="p",
+    session.add(ChannelDB(id=cid, source_id=cid, provider_id="p",
                           name=cid, media_type="movie"))
 
 

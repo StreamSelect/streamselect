@@ -56,7 +56,7 @@ def _build_old_shaped_db(path: Path) -> Database:
 def _seed_channels_and_tags(db: Database, n_channels: int) -> None:
     with db.session_scope() as session:
         for i in range(n_channels):
-            session.add(ChannelDB(id=f"p_{i}", source_id="s", provider_id="p",
+            session.add(ChannelDB(id=f"p_{i}", source_id=f"s{i}", provider_id="p",
                                   name=f"Channel {i}", media_type="movie"))
         session.add(TagDB(id=1, type="genre", value="Drama"))
         session.add(TagDB(id=2, type="genre", value="Comedy"))
@@ -212,7 +212,7 @@ def test_a_single_orm_insert_gets_a_channel_key(tmp_path):
     db = Database(f"sqlite:///{tmp_path / 'single.db'}")
     db.create_tables()
     with db.session_scope() as session:
-        session.add(ChannelDB(id="p_1", source_id="s", provider_id="p",
+        session.add(ChannelDB(id="p_1", source_id="s1", provider_id="p",
                               name="Test", media_type="movie"))
     with db.session_scope(commit=False) as session:
         channel = session.query(ChannelDB).filter_by(id="p_1").one()
@@ -230,7 +230,7 @@ def test_a_bulk_insert_gives_every_channel_a_distinct_key(tmp_path):
     db.create_tables()
     with db.session_scope() as session:
         for i in range(50):
-            session.add(ChannelDB(id=f"p_{i}", source_id="s", provider_id="p",
+            session.add(ChannelDB(id=f"p_{i}", source_id=f"s{i}", provider_id="p",
                                   name=f"Channel {i}", media_type="movie"))
     with db.session_scope(commit=False) as session:
         keys = [c.channel_key for c in session.query(ChannelDB).all()]
@@ -255,7 +255,7 @@ def test_a_channel_inserted_after_the_rebuild_can_still_be_tagged(tmp_path):
     db2.create_tables()
 
     with db2.session_scope() as session:
-        session.add(ChannelDB(id="new_channel", source_id="s", provider_id="p",
+        session.add(ChannelDB(id="new_channel", source_id="new", provider_id="p",
                               name="New", media_type="movie"))
 
     from streamselect.core.repositories.tag import TagRepository, _clear_tag_cache

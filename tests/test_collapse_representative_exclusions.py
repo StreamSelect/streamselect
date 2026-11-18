@@ -48,7 +48,7 @@ def _add(session, cid, *, key, quality=None, prefix=None, region=None,
     session.add(ChannelDB(
         id=cid, name=name or cid, content_key=key, media_type="movie",
         detected_quality=quality, detected_prefix=prefix, detected_region=region,
-        detected_title="T", provider_id="p1", source_id="s1", user_category=user_category,
+        detected_title="T", provider_id="p1", source_id=cid, user_category=user_category,
         category="",
     ))
 
