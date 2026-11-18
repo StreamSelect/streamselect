@@ -89,7 +89,12 @@ class TestTheRealSectionsDeclareThemselvesHonestly:
         from streamselect.gui.sidebar.queue import WatchQueueSection
 
         sec = WatchQueueSection(Config(config_dir=tmp_path), MagicMock())
-        assert all(a.destructive for a in sec.overflow_actions())
+        actions = {a.label: a for a in sec.overflow_actions()}
+        assert actions["Clear Watched"].destructive and actions["Clear All"].destructive
+        # Replacing can be undone, so it is not destructive; with no icon it is
+        # never promoted to a header button either.
+        swap = actions["Replace unavailable items…"]
+        assert not swap.destructive and not swap.icon
 
     def test_refresh_is_not_destructive(self, qapp, tmp_path):
         from streamselect.gui.sidebar.recommended import RecommendedSection

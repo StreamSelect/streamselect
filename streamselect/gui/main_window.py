@@ -23,6 +23,7 @@ from streamselect.core.update_checker import UpdateChecker
 from streamselect.core.runtime_env import is_installed_build
 from streamselect.core import profile_store
 from streamselect.gui.watchlist_write_notifier import install_watchlist_writes
+from streamselect.gui.queue_replace_dialog import open_queue_replace
 from streamselect.gui.time_display_settings import apply_time_display
 from streamselect.gui.main_window_streaming import _StreamingMixin
 from streamselect.gui.queue_end_prompt import _QueueEndPromptMixin
@@ -1076,9 +1077,8 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
             section.clearWatchedClicked.connect(self._clear_watched_queue)
             section.newMatchesClicked.connect(self._on_queue_new_matches_clicked)
             section.searchRequested.connect(self.search_for_title)
-            section.clearUnavailableClicked.connect(
-                lambda: self._clear_unavailable_queue(section)
-            )
+            section.clearUnavailableClicked.connect(lambda: self._clear_unavailable_queue(section))
+            section.replaceUnavailableClicked.connect(lambda: open_queue_replace(self, section))
             # Alerts Matched (topmost group) — SINGLE click: a channel row opens
             # details AND acks the match; a series row just opens details.
             # DOUBLE click (Wave 3 click-semantics fix): both kinds route through

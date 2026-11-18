@@ -129,6 +129,7 @@ class WatchQueueSection(LazyRowMixin, BackgroundRefreshMixin, CollapsibleSection
     clearQueueClicked             = pyqtSignal()           # demoted to the ⋯ overflow menu
     clearWatchedClicked           = pyqtSignal()
     clearUnavailableClicked       = pyqtSignal()           # request clear-unavailable
+    replaceUnavailableClicked     = pyqtSignal()           # ⋯ "Replace unavailable items…"
     newMatchesClicked             = pyqtSignal()           # open the new matched content
     searchRequested                = pyqtSignal(str)        # search_title for recovery
     # Alerts Matched (topmost group) — click routing separate from itemSelected
@@ -173,12 +174,8 @@ class WatchQueueSection(LazyRowMixin, BackgroundRefreshMixin, CollapsibleSection
         self._filter_btn.setCheckable(True)
         self._filter_btn.setFixedSize(22, 20)  # structural — matches the refresh btn
         self._filter_btn.setFlat(True)
-        # Boxed, like every other control at the right end of a section header.
-        # a user asked twice for this box to go — and then, seeing the whole
-        # row, asked for "[count] [...]" styled as Watch Alerts' own header
-        # buttons. Those readings agree: a LONE box beside unstyled content is
-        # what looked wrong, not the box. Three matching boxes read as one
-        # control group; one box and two bare things read as a mistake.
+        # Boxed like every header control: three matching boxes read as one
+        # group; a lone box beside bare ones looked wrong (user report).
         _theme.style(self._filter_btn, "PANEL_BTN")
         self._filter_btn.setToolTip("Find in queue")
         self._filter_btn.clicked.connect(self._toggle_filter_box)
@@ -186,6 +183,9 @@ class WatchQueueSection(LazyRowMixin, BackgroundRefreshMixin, CollapsibleSection
 
     def overflow_actions(self):
         return [
+            SectionAction("Replace unavailable items…",
+                          "Swap items on expired or switched-off sources for the same title "
+                          "on an active source", self.replaceUnavailableClicked.emit),
             SectionAction(
                 "Clear Watched",
                 "Remove finished items — partially watched titles stay",

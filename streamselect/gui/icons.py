@@ -725,6 +725,8 @@ VECTOR_KEYS: dict[str, str] = {
     "show_all": "mdi6.unfold-more-horizontal",
     "see_all_arrow": "mdi6.chevron-double-right",
     "redirect": "mdi6.arrow-u-right-top",
+    # Watch Queue "Replace unavailable items": queued copy -> the copy that replaces it.
+    "replace_with": "mdi6.arrow-right-thin",
     "hide_watched_filter": "mdi6.eye-check-outline",
     "visibility_toggle": "mdi6.eye",
     "analyze": "mdi6.chart-bar",

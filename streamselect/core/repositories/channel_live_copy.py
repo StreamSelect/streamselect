@@ -50,6 +50,39 @@ def _provider_state(provider: "Optional[ProviderDB]") -> str:
     return "disabled"  # is_active == False, and not expired
 
 
+def live_siblings(repos: "RepositoryFactory", requested: ChannelDB, hidden_ids: set,
+                  config: "Optional[Config]" = None) -> "list[ChannelDB]":
+    """The other copies of *requested*'s title on usable sources, best first.
+
+    Same ``content_key`` and media type, matching how the "Other Versions"
+    list (_bg_fetch_versions, main_window_metadata.py) groups; never a hidden
+    source or a hidden channel. Ranked by ``preference_engine.version_score``,
+    the ranking "Other Versions" uses for ``is_preferred``; ties keep query
+    order, and ``config=None`` skips scoring. Shared by the details pane
+    (:func:`resolve_live_copy`) and the Watch Queue's replace window
+    (``core/queue_replacement.py``), so the two can never pick differently.
+
+    A row with no ``content_key`` is its own singleton group by construction,
+    so it has no siblings — querying ``content_key == None`` would match every
+    other key-less row, which is wrong, so that case returns ``[]``.
+    """
+    if not requested.content_key:
+        return []
+    candidates = (
+        repos.session.query(ChannelDB)
+        .filter(ChannelDB.content_key == requested.content_key, ChannelDB.id != requested.id)
+        .all()
+    )
+    live = [c for c in candidates
+            if c.media_type == requested.media_type
+            and c.provider_id not in hidden_ids
+            and not c.is_hidden]
+    if config is None:
+        return live
+    from streamselect.core.preference_engine import version_score
+    return sorted(live, key=lambda c: -version_score(c, config))     # stable: ties keep order
+
+
 def resolve_live_copy(
     repos: "RepositoryFactory", channel_id: str, config: "Optional[Config]" = None
 ) -> "Optional[LiveCopy]":
@@ -88,38 +121,8 @@ def resolve_live_copy(
         return LiveCopy(dto=requested_dto, redirected_from=None, dead_source_name=None)
 
     # The requested copy is on a hidden (inactive/expired/orphaned) source.
-    # Find its live siblings — same content_key, matching how the "Other
-    # Versions" list (_bg_fetch_versions, main_window_metadata.py) groups.
-    # COALESCE(content_key, 'id:'||id): a row with no content_key is its own
-    # singleton group by construction, so it has no siblings to query for —
-    # querying content_key == None would (harmlessly) match every other
-    # content_key-less row, which is wrong, so that case just short-circuits.
-    live_siblings: "list[ChannelDB]" = []
-    if requested.content_key:
-        candidates = (
-            repos.session.query(ChannelDB)
-            .filter(
-                ChannelDB.content_key == requested.content_key,
-                ChannelDB.id != channel_id,
-            )
-            .all()
-        )
-        live_siblings = [
-            c for c in candidates
-            if c.media_type == requested.media_type
-            and c.provider_id not in hidden_ids
-            and not c.is_hidden
-        ]
-
-    best = None
-    best_score = None
-    if live_siblings:
-        from streamselect.core.preference_engine import version_score
-        for c in live_siblings:
-            score = version_score(c, config) if config is not None else 0
-            if best is None or score > best_score:
-                best = c
-                best_score = score
+    siblings = live_siblings(repos, requested, hidden_ids, config)
+    best = siblings[0] if siblings else None
 
     dead_provider = repos.session.get(ProviderDB, requested.provider_id)
     dead_state = _provider_state(dead_provider)
