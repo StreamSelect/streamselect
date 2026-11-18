@@ -42,7 +42,12 @@ class EventAlertNotifier(QObject):
         self._timer.timeout.connect(self.check)
 
     def start(self) -> None:
+        """Poll every 30 s, and once as soon as the event loop runs: the games
+        are already stored from the last session, and waiting a full interval
+        kept the tray's live-game icon off for 20-30 s after launch (owner,
+        2026-11-17)."""
         self._timer.start()
+        QTimer.singleShot(0, self.check)
 
     def shutdown(self) -> None:
         self._timer.stop()

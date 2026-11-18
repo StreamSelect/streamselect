@@ -839,6 +839,38 @@ def test_the_notifier_shows_the_notice_with_play_on_the_cards_channel(games_db, 
     assert label == "Play" and played == ["a1"]
 
 
+def test_the_alert_check_runs_at_start_not_one_poll_later(games_db, qapp):
+    """Owner, 2026-11-17: the tray took 20-25 s to show a live alerted game after
+    launch — the first check waited a whole 30 s poll. It runs once at start."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from streamselect.core.config import Config
+    from streamselect.core.games.alerts import THIS_EVENT, add_alert, rule_for
+    from streamselect.core.games.read import load_games
+    from streamselect.gui.event_alert_notifier import EventAlertNotifier
+    with games_db.session_scope() as s:
+        sabres = next(g for g in load_games(s, "hockey", set(), 1, 1) if g.team_a == "Buffalo Sabres")
+        add_alert(s, rule_for(THIS_EVENT, sabres))
+
+    def run_query(fn, cb, **_):
+        with games_db.session_scope(commit=False) as s:
+            res = fn(RepositoryFactory(s))
+        cb(res)
+
+    host = SimpleNamespace(_run_query=run_query, config=Config(), notification_manager=MagicMock())
+    notifier = EventAlertNotifier(host, lambda _cid: None, clock=lambda: LIVE_AT)
+    updates = []
+    notifier.updated.connect(lambda: updates.append([i.live for i in notifier.upcoming]))
+    try:
+        notifier.start()
+        assert not updates, "not synchronously inside start()"
+        qapp.processEvents()
+        assert updates == [[True]], "the live game is known as soon as the event loop runs"
+    finally:
+        notifier.shutdown()
+
+
 # ── the games list, rev 5 (SV-Q44-Q52) ────────────────────────────────────
 
 def _later_view(games_db, qapp, owned_widgets, *, shift=None, league=None):

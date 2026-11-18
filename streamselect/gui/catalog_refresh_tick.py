@@ -107,6 +107,8 @@ class _CatalogRefreshTickMixin:
         self.event_alert_notifier = EventAlertNotifier(self, self.play_channel_by_id, parent=self)
         self._register_cleanable("event_alert_notifier", self.event_alert_notifier.shutdown)
         self.event_alert_notifier.start()
+        # New games stored: check alerts now rather than at the next 30 s poll.
+        self.game_tracker.games_updated.connect(lambda _counts: self.event_alert_notifier.check())
         # The tray reads the notifier's alerted games, so it is built after it.
         self._setup_tray()
 
