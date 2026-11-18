@@ -283,23 +283,66 @@ def _near(a: QColor, b: QColor, tol=30) -> bool:
                                                (a.blue(), b.blue())))
 
 
-@pytest.mark.parametrize("badge", list(tray_mod._BADGES))
-def test_each_badge_keeps_the_app_icon_and_adds_its_disc_lower_right(qapp, badge):
+_CORNER = [b for b in tray_mod._BADGES if b != tray_state.BADGE_LIVE]
+
+
+def _disc_colour(badge, img):
+    """A pixel on the badge's disc, clear of its glyph (64 px icon)."""
+    return img.pixelColor(32, 5) if badge == tray_state.BADGE_LIVE else img.pixelColor(61, 46)
+
+
+def _icon_for(badge):
+    glyph, token = tray_mod._BADGES[badge]
+    icon = (tray_mod.live_icon(glyph, token) if badge == tray_state.BADGE_LIVE
+            else tray_mod.badged_icon(_blue_icon(), glyph, token))
+    return icon.pixmap(64, 64).toImage()
+
+
+@pytest.mark.parametrize("badge", _CORNER)
+def test_each_corner_badge_keeps_the_app_icon_and_adds_a_cut_out_disc(qapp, badge):
     from streamselect.gui import theme
     glyph, token = tray_mod._BADGES[badge]
-    img = tray_mod.badged_icon(_blue_icon(), glyph, token).pixmap(64, 64).toImage()
+    img = _icon_for(badge)
     assert img.pixelColor(8, 8) == QColor(0, 0, 255), "the app icon still shows"
-    edge = img.pixelColor(64 - 3, 64 - 18)          # on the disc, clear of the glyph
+    edge = _disc_colour(badge, img)
     assert _near(edge, QColor(getattr(theme, token))), f"a {token} disc, bottom-right"
-    centre = img.pixelColor(64 - 18, 64 - 18)
+    centre = img.pixelColor(64 - 22, 64 - 22)
     assert centre != edge, "the disc carries a mark, not a plain dot"
+    d = round(64 * tray_mod.BADGE_SHARE)
+    gap = img.pixelColor(64 - d // 2, 64 - d - 2)    # just above the disc, inside the logo
+    assert gap.alpha() == 0, "a clear ring cuts the badge out of the logo"
 
 
-def test_the_three_badges_look_different_and_none_is_red(qapp):
-    imgs = [tray_mod.badged_icon(_blue_icon(), g, t).pixmap(64, 64).toImage()
-            for g, t in tray_mod._BADGES.values()]
-    assert len({i.pixelColor(61, 46).name() for i in imgs}) == 3
-    assert all(not _near(i.pixelColor(61, 46), QColor(229, 57, 53), tol=60) for i in imgs), \
+def test_the_corner_badge_is_big_enough_to_read_at_tray_size(qapp):
+    """Owner, 2026-11-17: "should the notification alert be so small". At 22 px
+    it was a 12 px disc; it is now two-thirds of the icon."""
+    img = tray_mod.badged_icon(_blue_icon(), "tray_alert_badge", "COLOR_TRAY_ALERT") \
+        .pixmap(22, 22).toImage()
+    from streamselect.gui import theme
+    fill = QColor(theme.COLOR_TRAY_ALERT)
+    widest = 0
+    for y in range(22):
+        xs = [x for x in range(22) if _near(img.pixelColor(x, y), fill, tol=60)]
+        widest = max(widest, max(xs) - min(xs) + 1 if xs else 0)
+    assert widest >= 14, f"disc {widest} px wide at 22 px (was 12)"
+
+
+def test_a_live_game_replaces_the_whole_icon_with_a_full_disc(qapp):
+    from streamselect.gui import theme
+    img = _icon_for(tray_state.BADGE_LIVE)
+    fill = QColor(theme.COLOR_TRAY_LIVE)
+    assert _near(img.pixelColor(32, 5), fill) and _near(img.pixelColor(5, 32), fill), \
+        "the disc spans the icon"
+    assert img.pixelColor(32, 32) != img.pixelColor(32, 5), "with its glyph in the middle"
+    blue = QColor(0, 0, 255)
+    assert not any(_near(img.pixelColor(x, y), blue, tol=40)
+                   for x in range(0, 64, 4) for y in range(0, 64, 4)), "no small logo to squint at"
+
+
+def test_the_three_states_look_different_and_none_is_red(qapp):
+    colours = [_disc_colour(b, _icon_for(b)) for b in tray_mod._BADGES]
+    assert len({c.name() for c in colours}) == 3
+    assert all(not _near(c, QColor(229, 57, 53), tol=60) for c in colours), \
         "the red alarm disc is retired (owner, 2026-11-16)"
 
 
@@ -319,10 +362,12 @@ def test_the_icon_follows_alerts_updates_and_a_live_game(qapp, config):
     host = _Host(config)
     ctl = tray_mod.TrayController(host, clock=lambda: NOW)
     try:
+        def probe(img):
+            return img.pixelColor(61, 46).name(), img.pixelColor(32, 5).name()
+
         def badge():
-            return ctl._icon.icon().pixmap(64, 64).toImage().pixelColor(61, 46).name()
-        disc = {b: tray_mod.badged_icon(_blue_icon(), g, t).pixmap(64, 64).toImage()
-                .pixelColor(61, 46).name() for b, (g, t) in tray_mod._BADGES.items()}
+            return probe(ctl._icon.icon().pixmap(64, 64).toImage())
+        disc = {b: probe(_icon_for(b)) for b in tray_mod._BADGES}
         plain = badge()
         ctl.message("Still running", "…")
         assert not ctl.unseen and badge() == plain, "the hide notice is not an alert"

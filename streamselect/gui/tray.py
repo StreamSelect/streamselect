@@ -57,12 +57,31 @@ _BADGES = {
 }
 
 
+def _glyph_disc(p: QPainter, disc: QRect, glyph: str, fill: str, share: float) -> None:
+    """A *fill* disc with *glyph* at *share* of its width, in its on-fill colour."""
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(fill))
+    p.drawEllipse(disc)
+    glyph_px = max(6, round(disc.width() * share))
+    mark = QRect(0, 0, glyph_px, glyph_px)
+    mark.moveCenter(disc.center())
+    p.drawPixmap(mark, role_pixmap(glyph, theme.on_fill(fill), glyph_px))
+
+
+#: The corner badge's width as a share of the icon. It was 0.55: at a 22 px
+#: tray that is a 12 px disc with a 10 px glyph, merged into the logo (owner,
+#: 2026-11-17: "should the notification alert be so small").
+BADGE_SHARE = 0.68
+
+
 def badged_icon(base: QIcon, glyph: str = "tray_alert_badge",
                 fill_token: str = "COLOR_TRAY_ALERT") -> QIcon:
     """*base* with a *glyph* on a disc in its lower-right corner.
 
     The app's own icon stays recognisable, so the tray is still easy to find
-    (owner, 2026-11-16: a generic notification icon made it hard to spot).
+    (owner, 2026-11-16: a generic notification icon made it hard to spot). A
+    transparent ring is cut out of the logo around the disc, so the badge reads
+    as its own shape on any panel colour instead of merging into the logo.
     """
     out = QIcon()
     fill = getattr(theme, fill_token)
@@ -72,15 +91,36 @@ def badged_icon(base: QIcon, glyph: str = "tray_alert_badge",
         p = QPainter(pm)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         base.paint(p, QRect(0, 0, size, size))
-        d = max(8, round(size * 0.55))
+        d = max(10, round(size * BADGE_SHARE))
         disc = QRect(size - d, size - d, d, d)
+        ring = max(1, round(size / 16))
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(fill))
-        p.drawEllipse(disc)
-        glyph_px = max(6, round(d * 0.8))
-        mark = QRect(0, 0, glyph_px, glyph_px)
-        mark.moveCenter(disc.center())
-        p.drawPixmap(mark, role_pixmap(glyph, theme.on_fill(fill), glyph_px))
+        p.setBrush(QColor(0, 0, 0))
+        p.drawEllipse(disc.adjusted(-ring, -ring, ring, ring))
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        _glyph_disc(p, disc, glyph, fill, 0.8)
+        p.end()
+        out.addPixmap(pm)
+    return out
+
+
+def live_icon(glyph: str = "sports", fill_token: str = "COLOR_TRAY_LIVE") -> QIcon:
+    """The whole tray icon while an alerted game is live: *glyph* on a full disc.
+
+    A corner badge is too small to notice at tray size for something that is
+    on NOW (owner, 2026-11-17), so the icon itself changes; the plain logo
+    returns when the game ends, and the tooltip and menu still name the game.
+    """
+    out = QIcon()
+    fill = getattr(theme, fill_token)
+    for size in _BADGE_SIZES:
+        pm = QPixmap(size, size)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        inset = max(0, round(size / 32))
+        _glyph_disc(p, QRect(inset, inset, size - 2 * inset, size - 2 * inset), glyph, fill, 0.7)
         p.end()
         out.addPixmap(pm)
     return out
@@ -108,7 +148,8 @@ class TrayController(QObject):
         self._watch_items: list[tray_state.TrayItem] = []
         self._message_target: str | None = None
         self._plain_icon = QApplication.windowIcon()
-        self._badge_icons = {badge: badged_icon(self._plain_icon, glyph, token)
+        self._badge_icons = {badge: (live_icon(glyph, token) if badge == tray_state.BADGE_LIVE
+                                     else badged_icon(self._plain_icon, glyph, token))
                              for badge, (glyph, token) in _BADGES.items()}
         #: Notification kinds sent since the menu or window was last opened.
         self._unseen: set[str] = set()
