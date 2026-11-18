@@ -119,6 +119,7 @@ def _seam_self(db_obj, refresh_mock):
     me = SimpleNamespace()
     me.db = db_obj
     me.executor = _SyncExecutor()
+    me.refresh_queue_manager = SimpleNamespace(last_drain_kinds=frozenset({"full"}))
     me._refresh_provider_dependent_views = refresh_mock
     # Emulate the queued signal → slot connection: emit(n) invokes the slot now.
     me._propagation_finished = SimpleNamespace(
@@ -312,3 +313,22 @@ def test_on_propagation_finished_refreshes_only_on_positive():
 
     _ON_PROP(me, 7)
     refresh.assert_called_once()
+
+
+def test_seam_skips_the_sweep_after_a_live_only_refresh(monkeypatch):
+    """A drain of live-only refreshes changed no movie or series: the sweep, which
+    walks every VOD row, has nothing new to adopt and must not run (2026-11-17)."""
+    import streamselect.gui.main_window_providers as mwp
+
+    repos = MagicMock()
+    repos.channels.propagate_tmdb_from_title_siblings.return_value = 0
+    monkeypatch.setattr(mwp, "RepositoryFactory", lambda session: repos)
+    refresh = MagicMock()
+    me = _seam_self(MagicMock(), refresh)
+    me.refresh_queue_manager.last_drain_kinds = frozenset({"live_only"})
+    _ON_ALL(me)
+    repos.channels.propagate_tmdb_from_title_siblings.assert_not_called()
+
+    me.refresh_queue_manager.last_drain_kinds = frozenset({"live_only", "full"})
+    _ON_ALL(me)
+    repos.channels.propagate_tmdb_from_title_siblings.assert_called_once_with()

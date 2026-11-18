@@ -759,6 +759,13 @@ class _ProviderMixin:
         media_type-only grouping, year-compat remake guard, fill-empty-only,
         generated-data-only) the migration and the ingestion hook call.
         """
+        if self.refresh_queue_manager.last_drain_kinds <= {"live_only"}:
+            # Live channels only: no movie or series changed, so there is nothing
+            # new to adopt — and the pass walks every VOD row (423,000 measured),
+            # in Python, beside a UI that is often building its filters.
+            logger.debug("post-refresh title-sibling propagation skipped: live-only refresh")
+            return
+
         def _worker() -> None:
             try:
                 with self.db.session_scope() as session:

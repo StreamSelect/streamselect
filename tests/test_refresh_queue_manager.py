@@ -593,6 +593,33 @@ class TestAllRefreshesFinished:
         assert fired == [True], "seam must fire on drain even after a failure"
 
 
+    def test_the_drain_says_which_kinds_of_refresh_ran(self, qapp):
+        """Listeners skip work a live-only batch cannot have changed (the VOD
+        re-sweep); each drained batch reports only its own kinds."""
+        p1 = _make_db_provider("p1", "Provider 1")
+        p2 = _make_db_provider("p2", "Provider 2")
+        t1 = _FakeThread(_make_provider_model("p1", "Provider 1"), None)
+        t2 = _FakeThread(_make_provider_model("p2", "Provider 2"), None)
+        t1.start = lambda: None
+        t2.start = lambda: None
+        manager, repo_factory, thread_factory, nm = _build_manager(
+            {"p1": t1, "p2": t2}, [p1, p2]
+        )
+        seen = []
+        manager.all_refreshes_finished.connect(lambda: seen.append(manager.last_drain_kinds))
+        with (
+            patch("streamselect.gui.refresh_queue_manager.RepositoryFactory", repo_factory),
+            patch("streamselect.gui.refresh_queue_manager.ProviderLoadProcess", side_effect=thread_factory),
+        ):
+            manager.enqueue("p1", "Provider 1", kind="live_only")
+            t1._fire_finished(True)
+            qapp.processEvents()
+            manager.enqueue("p2", "Provider 2", kind="full")
+            t2._fire_finished(False, "Connection refused")
+            qapp.processEvents()
+        assert seen == [frozenset({"live_only"}), frozenset({"full"})]
+
+
 class TestShutdown:
     """shutdown() must drop pending items but not kill a running thread."""
 

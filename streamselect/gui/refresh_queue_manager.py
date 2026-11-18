@@ -126,6 +126,13 @@ class RefreshQueueManager(QObject):
         self._queue: list[_QueueEntry] = []
         # provider_ids currently in the queue OR running — for dedup
         self._queued_ids: set[str] = set()
+        #: The refresh kinds ("full", "live_only") the last drained batch ran,
+        #: read by ``all_refreshes_finished`` listeners: a batch of live-only
+        #: refreshes changed no movie or series, so the whole-library VOD
+        #: re-sweep has nothing new to find (2026-11-17: it walked 423,000 rows
+        #: after every launch's live refresh, beside the UI building its filters).
+        self.last_drain_kinds: frozenset[str] = frozenset()
+        self._drain_kinds: set[str] = set()
 
         # The singleton overview notification id (None when idle)
         self._overview_notif_id: str | None = None
@@ -392,7 +399,7 @@ class RefreshQueueManager(QObject):
         )
         entry.pct = 100 if success else 0
         self._queued_ids.discard(entry.provider_id)
-
+        self._drain_kinds.add(entry.kind)       # failed too: it may have written part
         self._emit_queue_changed()
 
         # Remove the entry from the queue — it's finished
@@ -408,6 +415,7 @@ class RefreshQueueManager(QObject):
         # per drained batch (analogous to MigrationManager.all_finished).
         if not self._queue:
             self._dismiss_overview()
+            self.last_drain_kinds, self._drain_kinds = frozenset(self._drain_kinds), set()
             self.all_refreshes_finished.emit()
 
     # ------------------------------------------------------------------
