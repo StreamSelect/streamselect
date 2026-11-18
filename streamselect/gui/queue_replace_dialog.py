@@ -31,7 +31,7 @@ left can be revisited from the same menu any time.
 from __future__ import annotations
 
 from loguru import logger
-from PyQt6.QtCore import QEvent, Qt
+from PyQt6.QtCore import QEvent, QSize, Qt
 from PyQt6.QtGui import QBrush, QColor, QCursor
 from PyQt6.QtWidgets import (
     QAbstractItemView, QButtonGroup, QComboBox, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView, QLabel,
@@ -116,6 +116,11 @@ class QueueReplaceDialog(QDialog):
         self.tree.setColumnCount(5)
         self.tree.setHeaderLabels(["In your queue", "", "Replace with", "Note", ""])
         self.tree.setUniformRowHeights(True)
+        # Every row, header or not, gets this height. With uniform heights the
+        # list sizes all rows by the FIRST one, and a header (text only) made
+        # every row 17 px under 25 px drop-downs after a scope switch (owner's
+        # "smooshed" rows); hovering re-laid it out, which hid the cause.
+        self._row_size = QSize(0, max(QComboBox().sizeHint().height(), 24) + 2)   # 0: a -1 width is an invalid size Qt ignores
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         header = self.tree.header()
         header.setStretchLastSection(False)
@@ -150,6 +155,7 @@ class QueueReplaceDialog(QDialog):
         if not rows:
             return None
         group = QTreeWidgetItem([f"{title} ({len(rows)})"])
+        group.setSizeHint(COL_OLD, self._row_size)
         font = group.font(COL_OLD)
         font.setBold(True)
         group.setFont(COL_OLD, font)
@@ -240,6 +246,7 @@ class QueueReplaceDialog(QDialog):
             for s in rows:
                 old = f"{describe(s.old)} · {_STATE_WORDS.get(s.state, s.state)}"
                 item = QTreeWidgetItem([old, "", "", ""])
+                item.setSizeHint(COL_OLD, self._row_size)
                 item.setToolTip(COL_OLD, old)
                 group.addChild(item)
                 combo = None

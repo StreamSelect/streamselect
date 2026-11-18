@@ -357,3 +357,32 @@ def test_only_the_row_under_the_mouse_shows_its_trash_and_a_highlight(db, qapp, 
     hover(b)
     assert trash_b.isVisible() and trash_a.isVisible(), "a struck row keeps its button"
     assert a.background(COL_OLD).style() == Qt.BrushStyle.NoBrush, "highlight followed the mouse"
+
+
+def test_rows_fit_their_drop_downs_before_and_after_switching_the_sources(db, qapp, owned_widgets):
+    """Owner: after switching to "Expired, switched-off and removed sources" the
+    rows were "smooshed" — every row took a text-only header's 17 px height,
+    under 25 px drop-downs, until a hover re-laid the list out."""
+    _seed(db)
+    dlg, _rows = _dialog(db, qapp, owned_widgets)
+
+    def drop_downs_fit():
+        seen = 0
+        for _s, item, combo in dlg._rows:
+            if combo is None:
+                continue
+            row = dlg.tree.visualItemRect(item)
+            assert row.height() >= combo.sizeHint().height(), "the row is tall enough"
+            assert combo.height() >= combo.sizeHint().height() - 1, "not squashed"
+            assert abs(combo.geometry().center().y() - row.center().y()) <= 2, "on its own row"
+            seen += 1
+        heights = {dlg.tree.visualItemRect(i).height() for _s, i, _c in dlg._rows}
+        heights.add(dlg.tree.visualItemRect(dlg.tree.topLevelItem(0)).height())
+        assert len(heights) == 1, f"headers and rows share one height: {heights}"
+        return seen
+
+    assert drop_downs_fit()
+    dlg.everything.setChecked(True)
+    for _ in range(3):
+        qapp.processEvents()
+    assert drop_downs_fit()
