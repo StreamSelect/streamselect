@@ -7,7 +7,7 @@ start time with the time shown once, and any game opens the same channel list.
 Two orderings: By sport (Sport ▸ League ▸ day) or By time (every sport in one
 list, each row naming its sport · league).
 Section headers sit on the sidebar's header band and fold (Finished starts
-folded); the sort order, the "Less certain games" toggle and the folds are
+folded); the grouping, the "Less certain games" toggle and the folds are
 remembered (``Config.sports_view_state``). The user's preferred channel and
 hidden channels are kept per league (``Config.game_channel_prefs``).
 
@@ -56,7 +56,6 @@ from streamselect.gui.similar_lightbox_card import _ClickableFrame
 #: gets its own section (owner, 2026-11-13: hockey is one segment, not the view).
 #: Re-render this often while open: progress bars and on-now/finished move with the clock.
 TICK_MS = 60_000
-SORT_EARLIEST, SORT_LATEST = "earliest", "latest"
 ORDER_SPORT, ORDER_TIME = "sport", "time"
 FINISHED = "finished"
 #: Live bitrate readings averaged for the WATCHING chip (one per player poll).
@@ -151,10 +150,6 @@ class SportsView(ContentView):
 
     def _prefs(self, league_key: str) -> dict:
         return self.config.game_channel_prefs.setdefault(league_key, {})
-
-    @property
-    def sort_order(self) -> str:
-        return self._state().get("sort", SORT_EARLIEST)
 
     @property
     def ordering(self) -> str:
@@ -313,7 +308,9 @@ class SportsView(ContentView):
                 on_now.append((g, state))
             else:
                 (later if state == UPCOMING else finished).append(g)
-        on_now.sort(key=lambda gs: gs[0].start_utc, reverse=self.sort_order == SORT_LATEST)
+        # Always earliest first: an "Earliest / Latest first" toggle reordered only these
+        # cards and read as doing nothing; removed (owner, 2026-11-18).
+        on_now.sort(key=lambda gs: gs[0].start_utc)
         return on_now, later, finished
 
     def _render_sport(self, sport: str, games: list, now: datetime, folded: set) -> None:
@@ -624,7 +621,7 @@ class SportsView(ContentView):
         return band
 
     def _toolbar(self) -> QWidget:
-        """View-wide controls (they apply to every sport): sort order, less certain games."""
+        """View-wide controls (they apply to every sport): grouping, less certain games."""
         box = QWidget()
         h = QHBoxLayout(box)
         h.setContentsMargins(0, 0, 0, 0)
@@ -639,13 +636,6 @@ class SportsView(ContentView):
             else "Grouped by sport, then league — click to list every sport together by start time")
         self.order_button.clicked.connect(self._toggle_order)
         h.addWidget(self.order_button)
-        self.sort_button = QPushButton("Earliest first" if self.sort_order == SORT_EARLIEST else "Latest first")
-        self.sort_button.setFlat(True)
-        _icon_utils.set_button_icon(self.sort_button, "sort")
-        _theme.style(self.sort_button, "LINK_BTN_SM")
-        self.sort_button.setToolTip("Order the games on now by when they started — click to reverse")
-        self.sort_button.clicked.connect(self._toggle_sort)
-        h.addWidget(self.sort_button)
         self.less_certain_chip = ToggleChip("Less certain games", enabled=self.less_certain)
         self.less_certain_chip.setToolTip("Also show games only one collection lists (dashed outline)")
         self.less_certain_chip.toggled_changed.connect(self._toggle_less_certain)
@@ -764,11 +754,6 @@ class SportsView(ContentView):
         folded = self._folded()
         folded.symmetric_difference_update({key})
         self._state()["folded"] = sorted(folded)
-        self._save()
-        QTimer.singleShot(0, self._render)
-
-    def _toggle_sort(self) -> None:
-        self._state()["sort"] = SORT_LATEST if self.sort_order == SORT_EARLIEST else SORT_EARLIEST
         self._save()
         QTimer.singleShot(0, self._render)
 

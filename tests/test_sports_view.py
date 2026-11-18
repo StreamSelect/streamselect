@@ -451,15 +451,19 @@ def test_mark_as_finished_moves_the_game_to_finished(games_db, qapp, owned_widge
     assert [c.game.title for c in view.cards] == ["Buffalo Sabres vs Chicago Blackhawks"]
 
 
-def test_the_sort_order_flips_and_is_remembered(games_db, qapp, owned_widgets):
+def test_on_now_is_earliest_first_and_there_is_no_sort_toggle(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-18: "Earliest / Latest first" reordered only the On now cards
+    and read as doing nothing; removed. Cards run earliest first."""
+    from dataclasses import replace
     view = _view(games_db, qapp, owned_widgets, LIVE_AT)
-    assert view.sort_button.text() == "Earliest first"
-    first = [c.game.title for c in view.cards]
-    view.sort_button.click()
+    a, b = sorted(view._raw, key=lambda g: g.title)
+    view._raw = [replace(a, start_utc=START + timedelta(minutes=10)), b]
+    view._render()
     _settle(qapp)
-    assert view.config.sports_view_state["sort"] == "latest"
-    assert view.sort_button.text() == "Latest first"
-    assert sorted(first) == sorted(c.game.title for c in view.cards)
+    xs = {c.game.title: _rect(view, c).left() for c in view.cards}
+    assert xs[b.title] < xs[a.title], "the earlier game's card comes first"
+    texts = [w.text() for w in view.findChildren(QPushButton) if w.isVisibleTo(view)]
+    assert not [t for t in texts if "first" in t.lower()], texts
 
 
 def test_less_certain_games_appear_dashed_when_the_toggle_is_on(db, qapp, owned_widgets):
