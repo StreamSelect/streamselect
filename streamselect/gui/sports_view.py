@@ -320,26 +320,85 @@ class SportsView(ContentView):
         """One sport's segment: On now, the days to come, Finished (keys prefixed by sport).
 
         The league is said once (SV-Q48/49): a sport with one league names it only in
-        its header; a sport with several gets a heading per league over its days.
+        its header; a sport with several gets a band per league, and under it that
+        league's own On now, days and Finished in a frame under its centred banner
+        (Sports Desk rev 13, C4; SV-Q84/Q98). Cards then carry no league line.
         """
-        on_now, later, finished = self._split(games, now)
         leagues = sorted({g.league for g in games})
-        several = len(leagues) > 1
-        self._on_now_section(f"{sport}:on_now", on_now, now,
-                             meta=(lambda g: g.league) if several else (lambda g: ""))
-        if several:
-            for league in leagues:
-                mine = [g for g in later if g.league == league]
-                if not mine:
-                    continue
-                key = f"{sport}:league:{league}"
-                self._layout.addWidget(self._header(key, league, len(mine), foldable=True,
-                                                    what=f"the {league} games list"))
-                if key not in folded:
-                    self._day_sections(f"{sport}:{league}", mine, now, folded, sub=True)
-        else:
-            self._day_sections(sport, later, now, folded)
-        self._finished_section(sport, finished, now, folded)
+        if len(leagues) < 2:
+            self._sections(sport, games, now, folded)
+            return
+        for league in leagues:
+            mine = [g for g in games if g.league == league]
+            key = f"{sport}:league:{league}"
+            self._layout.addWidget(self._league_banner(key, league, mine, now))
+            if key in folded:
+                continue
+            panel = QFrame()
+            panel.setObjectName("leaguePanel")
+            _theme.style(panel, "LEAGUE_PANEL")
+            inner = QVBoxLayout(panel)
+            inner.setContentsMargins(10, 2, 10, 10)
+            inner.setSpacing(6)
+            outer, self._layout = self._layout, inner     # the sections build into the frame
+            try:
+                self._sections(f"{sport}:{league}", mine, now, folded, sub=1)
+            finally:
+                self._layout = outer
+            self._layout.addWidget(panel)
+            self.headers[f"{key}:panel"] = panel
+
+    def _league_banner(self, key: str, league: str, games: list, now: datetime) -> QWidget:
+        """A league's name, larger, centred between two rules, with its logo and a
+        chip: how many games, and how many are on now — or, with none on, when the
+        next starts ("14 (•) 7:00 PM", owner 2026-11-18). Folds the league."""
+        band = _ClickableFrame()
+        cursor_affordance.set_clickable(band)
+        band.setToolTip(f"{'Expand' if key in self._folded() else 'Collapse'} the {league} games list")
+        band.clicked.connect(lambda k=key: self._toggle_fold(k))
+        h = QHBoxLayout(band)
+        h.setContentsMargins(0, 12, 0, 0)
+        h.setSpacing(10)
+
+        def rule() -> QWidget:
+            line = QWidget()
+            line.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+            line.setFixedHeight(1)
+            _theme.style(line, "FOOTER_DIVIDER")
+            return line
+        h.addWidget(rule(), 1, Qt.AlignmentFlag.AlignVCenter)
+        caret = QLabel()
+        _icon_utils.set_label_icon(caret, "expand" if key in self._folded() else "collapse", 12)
+        h.addWidget(caret)
+        logo = self._league_logo(next((g.league_logo for g in games if g.league_logo), ""))
+        if logo is not None and not logo.isNull():
+            mark = QLabel()
+            mark.setPixmap(logo.scaled(24, 24, Qt.AspectRatioMode.KeepAspectRatio,
+                                       Qt.TransformationMode.SmoothTransformation))
+            h.addWidget(mark)
+        title = QLabel(league)
+        _theme.style(title, "LEAGUE_TITLE")
+        h.addWidget(title)
+        settings = self.sports.get(games[0].sport) if games else None
+        on = sum(1 for g in games if settings is not None and event_live(g, now, settings))
+        upcoming = sorted(g.start_utc for g in games if g.start_utc > now)
+        chip = labeled_chip(str(len(games)), on or (fmt_time(upcoming[0]) if upcoming else 0), "live")
+        chip.setToolTip(f"{league}: {len(games)} game{'s' if len(games) != 1 else ''}, "
+                        + (f"{on} on now" if on else f"next at {fmt_time(upcoming[0])}" if upcoming
+                           else "nothing still to come"))
+        h.addWidget(chip)
+        h.addWidget(rule(), 1, Qt.AlignmentFlag.AlignVCenter)
+        band.title, band.chip = title, chip
+        self.headers[key] = band
+        return band
+
+    def _sections(self, prefix: str, games: list, now: datetime, folded: set, *, sub: int = 0) -> None:
+        """On now, the days to come and Finished for *games*; ``sub`` = how many
+        levels in their headings sit (1 under a league's band)."""
+        on_now, later, finished = self._split(games, now)
+        self._on_now_section(f"{prefix}:on_now", on_now, now, meta=lambda g: "", sub=sub)
+        self._day_sections(prefix, later, now, folded, sub=sub)
+        self._finished_section(prefix, finished, now, folded, sub=sub)
 
     def _render_by_time(self, games: list, now: datetime, folded: set) -> None:
         """By time (SV-Q50): every sport in one list; rows and cards name sport · league."""
@@ -350,13 +409,15 @@ class SportsView(ContentView):
         self._day_sections(ALL, later, now, folded, label_of=label)
         self._finished_section(ALL, finished, now, folded, label_of=label)
 
-    def _on_now_section(self, key: str, on_now: list, now: datetime, meta: Callable) -> None:
+    def _on_now_section(self, key: str, on_now: list, now: datetime, meta: Callable,
+                        sub: int = 0) -> None:
         """Absent when nothing is on (owner, 2026-11-17): an "On now 0" band and a
         "Next:" line only repeated the first day's games listed right below."""
         if not on_now:
             return
-        self._layout.addWidget(self._header(key, "On now", len(on_now), foldable=True,
-                                            what="the list of games on now"))
+        # No count: the league's chip right above says how many are on (owner, 2026-11-18).
+        self._layout.addWidget(self._header(key, "On now", None, foldable=True,
+                                            what="the list of games on now", sub=sub))
         if key in self._folded():
             return                           # folded like any other section (owner, 2026-11-13)
         opened = [gs for gs in on_now if _game_key(gs[0]) == self._open]
@@ -365,7 +426,7 @@ class SportsView(ContentView):
         rest = [gs for gs in on_now if gs not in opened]
         if rest:
             grid_host = QWidget()
-            grid = FlowLayout(grid_host, spacing=10)
+            grid = FlowLayout(grid_host, spacing=10, centre=True)   # SV-Q95/Q96: a centred block
             for g, state in rest:
                 grid.addWidget(self._card(g, state, now, meta=meta(g)))
             self._layout.addWidget(grid_host)
@@ -375,7 +436,7 @@ class SportsView(ContentView):
         return browse_day_separator_label(start_utc, now, today="Today")      # SV-Q44
 
     def _day_sections(self, prefix: str, later: list, now: datetime, folded: set, *,
-                      sub: bool = False, label_of: Optional[Callable] = None) -> None:
+                      sub: int = 0, label_of: Optional[Callable] = None) -> None:
         days: dict = {}
         for g in sorted(later, key=lambda g: g.start_utc):
             days.setdefault(to_local(g.start_utc).date(), []).append(g)
@@ -384,15 +445,16 @@ class SportsView(ContentView):
             self._layout.addWidget(self._header(key, self._day_label(gs[0].start_utc, now),
                                                 len(gs), foldable=True, sub=sub))
             if key not in folded:
-                self._time_groups(gs, playable=False, label_of=label_of, sub=sub)
+                self._time_groups(gs, playable=False, label_of=label_of, sub=bool(sub))
 
     def _finished_section(self, prefix: str, finished: list, now: datetime, folded: set, *,
-                          label_of: Optional[Callable] = None) -> None:
+                          label_of: Optional[Callable] = None, sub: int = 0) -> None:
         if not finished:
             return
         key = f"{prefix}:{FINISHED}"
-        self._layout.addWidget(self._header(key, "Finished", len(finished), foldable=True,
-                                            what="the finished games list"))
+        # No count: the games are over (owner, 2026-11-18).
+        self._layout.addWidget(self._header(key, "Finished", None, foldable=True,
+                                            what="the finished games list", sub=sub))
         if key in folded:
             return
         done = sorted(finished, key=lambda g: g.start_utc, reverse=True)
@@ -401,16 +463,16 @@ class SportsView(ContentView):
             by_day.setdefault(to_local(g.start_utc).date(), []).append(g)
         today = to_local(now).date()
         if list(by_day) == [today]:
-            self._time_groups(done, playable=True, label_of=label_of)
+            self._time_groups(done, playable=True, label_of=label_of, sub=bool(sub))
             return
         # One sub-section per day, most recent first (owner, 2026-11-13) — also when
         # every game is from one EARLIER day: a bare "9:05 PM" under Finished read as
         # tonight's (owner, 2026-11-14).
         for day, gs in by_day.items():
-            sub = f"{key}:{day.isoformat()}"
-            self._layout.addWidget(self._header(sub, past_day_label(gs[0].start_utc, now), len(gs),
-                                                foldable=True, sub=True))
-            if sub not in folded:
+            day_key = f"{key}:{day.isoformat()}"
+            self._layout.addWidget(self._header(day_key, past_day_label(gs[0].start_utc, now), None,
+                                                foldable=True, sub=sub + 1))
+            if day_key not in folded:
                 self._time_groups(gs, playable=True, label_of=label_of, sub=True)
 
     def _time_groups(self, games: list, *, playable: bool,
@@ -460,8 +522,8 @@ class SportsView(ContentView):
             _theme.style(b, "PANEL_BODY")
             self._layout.addWidget(b)
 
-    def _header(self, key: str, label: str, count: int, *, foldable: bool,
-                controls: Optional[QWidget] = None, sub: bool = False, what: str = "") -> QWidget:
+    def _header(self, key: str, label: str, count: Optional[int], *, foldable: bool,
+                controls: Optional[QWidget] = None, sub: int = 0, what: str = "") -> QWidget:
         """A section header on the sidebar's header band (SECTION_HEADER_TINT).
 
         A foldable one folds on a click ANYWHERE on the band — caret, label or empty
@@ -469,8 +531,9 @@ class SportsView(ContentView):
         the sidebar's own ``_ClickableHeader``; the heading inside stays passive so
         one click is one toggle.
 
-        ``sub`` is a heading INSIDE a section (Finished's days): indented, on no band
-        of its own, so it reads as part of the section above it.
+        ``sub`` is a heading INSIDE a section (Finished's days, a league's sections):
+        indented one step per level, on no band of its own, so it reads as part of
+        the heading above it.
 
         ``what`` names the list in the tooltip ("Collapse Tomorrow's games list");
         by default it comes from a day label (``_games_list_name``).
@@ -489,7 +552,7 @@ class SportsView(ContentView):
             band.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
             _theme.style(band, "SECTION_HEADER_TINT")
         h = QHBoxLayout(band)
-        h.setContentsMargins(6 + (sub_indent() if sub else 0), 3, 6, 3)
+        h.setContentsMargins(6 + sub_indent() * int(sub), 3, 6, 3)
         h.setSpacing(6)
         if foldable:
             caret = QLabel()

@@ -18,7 +18,7 @@ from PyQt6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
 from streamselect.core.games.read import (
     ENDING, ON_NOW, OVER, UPCOMING, GameDTO, GameFeedDTO, arrange_feeds, game_state, load_games,
 )
-from streamselect.core.epg_utils import to_local
+from streamselect.core.epg_utils import fmt_time, to_local
 from streamselect.core.games.store import enabled_leagues, refresh_games
 from streamselect.core.repositories import RepositoryFactory
 from streamselect.gui.sidebar.base import GroupHeading
@@ -1375,15 +1375,20 @@ def test_header_counts_are_outlined_chips_and_each_league_is_a_chip(games_db, qa
     league with games, and a league with games on now carries the live mark and
     how many — "NHL (•) 2". A league with nothing listed has no chip."""
     from streamselect.gui.icon_utils import label_role
-    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
-    heading = view.headers["hockey:on_now"].findChild(GroupHeading)
+    later = _later_view(games_db, qapp, owned_widgets)
+    heading = later.headers[next(k for k in later.headers if ":day:" in k)].findChild(GroupHeading)
     chip = heading.count_label
+    view = later
     assert isinstance(chip, QPushButton) and chip.text() == "2" and chip.font().bold()
     assert chip.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents), "not clickable"
     assert "border" in chip.styleSheet(), "outlined"
     assert chip.mapTo(view, QPoint(0, 0)).x() > heading.label.mapTo(view, QPoint(0, 0)).x() \
         + heading.label.width() - 1, "after its label"
 
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    on_now = view.headers["hockey:on_now"].findChild(GroupHeading)
+    assert on_now.count_label.isHidden(), (
+        "On now has no count: the league chip says how many (owner, 2026-11-18)")
     assert list(view.league_chips) == [("hockey", "NHL")], "one chip, for the one league with games"
     nhl = view.league_chips[("hockey", "NHL")]
     assert nhl.name_label.text() == "NHL"
@@ -1410,3 +1415,66 @@ def test_each_league_with_games_gets_its_own_chip(games_db, qapp, owned_widgets)
     assert set(view.league_chips) == {("hockey", "AHL"), ("hockey", "NHL")}
     xs = {lg: view.league_chips[("hockey", lg)].mapTo(view, QPoint(0, 0)).x() for lg in ("AHL", "NHL")}
     assert xs["AHL"] < xs["NHL"], "leagues in name order"
+
+
+
+# ── Several leagues: a centred banner and a frame each (Sports Desk rev 13, C4) ──
+
+def _two_league_view(games_db, qapp, owned_widgets, now):
+    from dataclasses import replace
+    view = _view(games_db, qapp, owned_widgets, now)
+    a, b = sorted(view._raw, key=lambda g: g.title)
+    view._raw = [a, replace(b, league="AHL")]
+    view._render()
+    _settle(qapp)
+    return view
+
+
+def _rect(view, w):
+    from PyQt6.QtCore import QRect
+    return QRect(w.mapTo(view, QPoint(0, 0)), w.size())
+
+
+def test_each_league_has_a_centred_larger_banner_over_a_frame_holding_its_sections(
+        games_db, qapp, owned_widgets):
+    view = _two_league_view(games_db, qapp, owned_widgets, START - timedelta(minutes=30))
+    centre = _rect(view, view._body).center().x()
+    for league in ("AHL", "NHL"):
+        banner = view.headers[f"hockey:league:{league}"]
+        title = _rect(view, banner.title)
+        assert abs(title.center().x() - centre) < 60, f"{league} centred: {title.center().x()} vs {centre}"
+        day = next(k for k in view.headers if k.startswith(f"hockey:{league}:day:"))
+        panel = _rect(view, view.headers[f"hockey:league:{league}:panel"])
+        assert panel.contains(_rect(view, view.headers[day])), f"{league}'s days sit inside its frame"
+        assert panel.top() >= _rect(view, banner).center().y(), "the frame hangs from the banner"
+    day_label = view.headers[next(k for k in view.headers if ":day:" in k)].findChild(GroupHeading).label
+    assert view.headers["hockey:league:NHL"].title.fontInfo().pixelSize() > day_label.fontInfo().pixelSize(), (
+        "the league's name is larger than a section heading")
+    ahl, nhl = (_rect(view, view.headers[f"hockey:league:{lg}"]).top() for lg in ("AHL", "NHL"))
+    assert ahl < nhl, "leagues in name order"
+
+
+def test_with_nothing_on_a_league_chip_shows_the_next_start_and_with_games_on_how_many(
+        games_db, qapp, owned_widgets):
+    from streamselect.gui.icon_utils import label_role
+    later = _two_league_view(games_db, qapp, owned_widgets, START - timedelta(minutes=30))
+    chip = later.headers["hockey:league:NHL"].chip
+    assert chip.name_label.text() == "1" and label_role(chip.icon_label) == "live"
+    assert chip.count_label.text() == fmt_time(START), "nothing on: when the next starts"
+    live = _two_league_view(games_db, qapp, owned_widgets, LIVE_AT)
+    assert live.headers["hockey:league:NHL"].chip.count_label.text() == "1", "one on now"
+
+
+def test_on_now_cards_sit_centred_in_the_space(games_db, qapp, owned_widgets):
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    cards = [_rect(view, c) for c in view.cards]
+    host = _rect(view, view.cards[0].parentWidget())
+    left = min(c.left() for c in cards) - host.left()
+    right = host.right() - max(c.right() for c in cards)
+    assert left > 20 and abs(left - right) <= 2, f"centred: {left} px left, {right} px right"
+
+
+def test_finished_has_no_count(games_db, qapp, owned_widgets):
+    view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=5))
+    key = next(k for k in view.headers if k.endswith(":finished"))
+    assert view.headers[key].findChild(GroupHeading).count_label.isHidden()

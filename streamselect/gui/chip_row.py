@@ -465,11 +465,12 @@ def _news_chip_style() -> str:
     )
 
 
-def labeled_chip(name: str, count: int = 0, icon: str = "") -> QWidget:
+def labeled_chip(name: str, count: "int | str" = 0, icon: str = "") -> QWidget:
     """An outlined chip holding a name and, when *count* is set, an *icon* role
     and the count in bold — "NHL (•) 2" (the Sports heading's leagues, owner
-    2026-11-17). Not interactive, like :func:`chip_widget`: a click goes to
-    whatever hosts it.
+    2026-11-17). *count* may be a text: a league banner's next start time,
+    "14 (•) 7:00 PM" (owner, 2026-11-18). Not interactive, like
+    :func:`chip_widget`: a click goes to whatever hosts it.
 
     A frame of labels rather than one chip button, because a button holds one
     text and one icon, and this is a text, an icon and a bold number.

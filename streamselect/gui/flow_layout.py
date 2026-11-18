@@ -44,7 +44,7 @@ class FlowLayout(QLayout):
                  h_spacing: "int | None" = None,
                  v_spacing: "int | None" = None,
                  prefer_one_line: bool = False,
-                 align_right: bool = False) -> None:
+                 align_right: bool = False, centre: bool = False) -> None:
         super().__init__(parent)
         self._items: list[QWidgetItem] = []
         # A box layout hands a child its sizeHint() when there is room. Ours is
@@ -55,6 +55,10 @@ class FlowLayout(QLayout):
         # Each wrapped line hugs the right edge — an action bar that wraps
         # instead of clipping, without losing its right alignment.
         self._align_right = align_right
+        # The lines centred as one block: the widest line is centred and every
+        # other line starts at its left edge, so wrapped items keep their columns
+        # (Sports' On now cards, Sports Desk SV-Q95/Q96).
+        self._centre = centre
         # A chip row usually wants tighter rows than columns, so the two are
         # separable; `spacing` sets both unless one is named explicitly.
         self._h_spacing = spacing if h_spacing is None else h_spacing
@@ -143,10 +147,16 @@ class FlowLayout(QLayout):
         row_height = 0
         line: list[tuple] = []   # (item, x, hint) placed on the current line
 
+        placed: list[tuple] = []  # (item, x, y, hint) held back to centre the block
+
         def place_line() -> None:
             if dry_run or not line:
                 return
             _, last_x, last_hint = line[-1]
+            if self._centre:
+                placed.extend((it, ix, y, ih) for it, ix, ih in line)
+                line.clear()
+                return
             shift = (effective.right() + 1 - (last_x + last_hint.width())) if self._align_right else 0
             for it, ix, ih in line:
                 it.setGeometry(QRect(QPoint(ix + max(0, shift), y), ih))
@@ -183,6 +193,11 @@ class FlowLayout(QLayout):
             row_height = max(row_height, h)
 
         place_line()
+        if placed:
+            widest = max(ix + ih.width() for _, ix, _, ih in placed) - effective.x()
+            shift = max(0, (effective.width() - widest) // 2)
+            for it, ix, iy, ih in placed:
+                it.setGeometry(QRect(QPoint(ix + shift, iy), ih))
         return y + row_height - rect.y() + margins.bottom()
 
 

@@ -86,6 +86,18 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
             f"color: {_('COLOR_TEXT')}; padding: 5px 8px 5px 5px; font-size: {_('FONT_MD')};"
             f" background: transparent;"
         ),
+        # A league's name in its banner when a sport has several leagues (Sports Desk
+        # rev 13, C4): larger than a section heading, centred between two rules.
+        "LEAGUE_TITLE": (
+            f"color: {_('COLOR_TEXT_HI')}; font-size: {_('FONT_XL')}; font-weight: bold;"
+            " letter-spacing: 2px;"
+        ),
+        # The league's frame: its banner is the top edge, so no top border.
+        "LEAGUE_PANEL": (
+            f"QFrame#leaguePanel {{ border: 1px solid {_('COLOR_LINE')}; border-top: none;"
+            f" border-bottom-left-radius: {_('RADIUS_MD')}; border-bottom-right-radius: {_('RADIUS_MD')};"
+            " background: transparent; }"
+        ),
         # "EPG": this listing came from the programme guide, which is less reliable.
         "GAME_GUIDE_CHIP": (
             f"color: {_('COLOR_MUTED_2')}; border: 1px solid {_('COLOR_BORDER')};"
