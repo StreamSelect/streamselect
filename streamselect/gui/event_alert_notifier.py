@@ -54,13 +54,15 @@ class EventAlertNotifier(QObject):
 
     def check(self) -> None:
         now = self._clock()
-        sports = list(sport_settings())
+        settings = sport_settings(getattr(self._host.config, "sport_settings_overrides", None))
+        sports = list(settings)
+        watched_after = min((s.watched_after_s for s in settings.values()), default=60)
 
         def query(repos):
             alerts = load_alerts(repos.session)
             # A one-event rule outlives its event by nothing useful: delete it here,
             # on the poll that already reads the rules.
-            gone = expired_event_rules(alerts, now)
+            gone = expired_event_rules(alerts, now, settings)
             if gone:
                 remove_alerts(repos.session, gone)
                 alerts = [a for a in alerts if a.id not in gone]
@@ -68,7 +70,7 @@ class EventAlertNotifier(QObject):
                 return [], [], {}
             hidden = set(ProviderRepository(repos.session).get_hidden_provider_ids())
             games = [g for sp in sports for g in load_games(repos.session, sp, hidden, 1, 2)]
-            return games, alerts, load_watch_history(repos.session)
+            return games, alerts, load_watch_history(repos.session, watched_after)
         # A failed read or rule clean-up is logged; the next poll (30 s) tries again.
         self._host._run_query(query, self._on_data, commit=True,
                               on_error=lambda exc: logger.warning("Event alerts: check failed: {}", exc))
@@ -77,15 +79,17 @@ class EventAlertNotifier(QObject):
         games, alerts, history = result if result else ([], [], {})
         config = self._host.config
         now = self._clock()
+        settings = sport_settings(getattr(config, "sport_settings_overrides", None))
 
         def arranged(game):
-            return arrange_feeds(game, config.game_channel_prefs.get(game.league_key, {}), history, now)
-        self.upcoming = alerted_items(games, alerts, now, arranged)
+            return arrange_feeds(game, config.game_channel_prefs.get(game.league_key, {}), history, now,
+                                 settings.get(game.sport))
+        self.upcoming = alerted_items(games, alerts, now, arranged, settings)
         self.updated.emit()
         if not alerts:
             return
         for key, game, title in due_notices(games, alerts, self._clock(),
-                                            int(config.event_alert_lead_minutes), self._sent):
+                                            int(config.event_alert_lead_minutes), self._sent, settings):
             self._sent.add(key)
             game = arranged(game)
             feed = best_feed(game)
@@ -98,13 +102,13 @@ class EventAlertNotifier(QObject):
                 alert="game", open_target="view:sports")
 
 
-def alerted_items(games, alerts, now, arranged=lambda g: g) -> list[TrayItem]:
+def alerted_items(games, alerts, now, arranged=lambda g: g, settings=None) -> list[TrayItem]:
     """The games an alert matches, as tray menu items; live ones marked LIVE.
 
     A live game carries the feed a click plays: the first of *arranged* (the
     user's preferred collection first, as on its card).
     """
-    settings = sport_settings()
+    settings = settings if settings is not None else sport_settings()
     out = []
     for game in games:
         if not any(a.matches(game) for a in alerts):

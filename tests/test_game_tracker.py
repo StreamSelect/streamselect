@@ -11,7 +11,7 @@ from streamselect.gui import game_tracker as gt
 def test_the_launch_timer_does_not_queue_a_second_run_behind_one_in_flight(qapp):
     release, calls = threading.Event(), []
 
-    def slow_refresh(_db):
+    def slow_refresh(_db, **_kw):
         calls.append(1)
         release.wait(5)
         return {}
@@ -31,7 +31,7 @@ def test_the_launch_timer_does_not_queue_a_second_run_behind_one_in_flight(qapp)
 
 def test_the_launch_run_happens_when_nothing_ran_and_not_again_after(qapp):
     calls = []
-    with mock.patch.object(gt, "refresh_games", lambda _db: calls.append(1) or {}):
+    with mock.patch.object(gt, "refresh_games", lambda _db, **_kw: calls.append(1) or {}):
         tracker = gt.GameTracker(db=None)
         try:
             tracker.request_first()
@@ -46,7 +46,7 @@ def test_the_launch_run_happens_when_nothing_ran_and_not_again_after(qapp):
 def test_a_real_change_still_runs_again_after_a_run_in_flight(qapp):
     release, calls = threading.Event(), []
 
-    def slow_refresh(_db):
+    def slow_refresh(_db, **_kw):
         calls.append(1)
         release.wait(5)
         return {}

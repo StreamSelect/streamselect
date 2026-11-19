@@ -412,9 +412,12 @@ def test_settings_dialog_saves_partial_threshold(tmp_path):
 
     from streamselect.gui.settings_dialog import SettingsDialog
     dialog = SettingsDialog.__new__(SettingsDialog)
-    from tests.conftest import wire_settings_content_widgets, wire_settings_signal_widgets
+    from tests.conftest import (
+        wire_settings_content_widgets, wire_settings_signal_widgets, wire_settings_sports_widgets,
+    )
     wire_settings_content_widgets(dialog)
     wire_settings_signal_widgets(dialog)
+    wire_settings_sports_widgets(dialog)
     dialog.config = config
 
     # Build a minimal mock for the spinner

@@ -9,6 +9,9 @@ deactivates it through the one seam.
 
 from __future__ import annotations
 
+from PyQt6.QtWidgets import QDialog
+
+from streamselect.core.games import tuning
 from streamselect.gui.sports_view import SportsView
 
 
@@ -33,6 +36,39 @@ class _SportsViewMixin:
             tracker.finding_started.connect(lambda: view.set_finding(True))
             tracker.games_updated.connect(lambda _counts: view.finished_finding())
         return view
+
+    def maybe_offer_improved_defaults(self) -> None:
+        """After an update: if a default moved for a Sports setting the user had set,
+        ask keep-mine or take-new, once (SS-Q8/Q9). Values the user never set have
+        already moved with the default; "don't ask again" keeps theirs for good."""
+        config = self.config
+        items = tuning.improved(config.sport_settings_overrides)
+        if not items:
+            return
+        overrides = dict(config.sport_settings_overrides)
+        if not config.ask_about_improved_defaults:
+            for item in items:
+                tuning.keep_mine(overrides, item)     # noted, so nothing piles up to ask later
+        else:
+            from streamselect.gui.improved_defaults_dialog import ImprovedDefaultsDialog
+            dlg = ImprovedDefaultsDialog(items, self)
+            accepted = dlg.exec() == QDialog.DialogCode.Accepted
+            dlg.apply_to(overrides, accepted)
+            if dlg.never.isChecked():
+                config.ask_about_improved_defaults = False
+        config.sport_settings_overrides = overrides
+        config.save()
+        self._apply_sports_settings()
+
+    def _apply_sports_settings(self) -> None:
+        """Settings ▸ Sports was saved: every Sports surface takes the new numbers."""
+        view = self.__dict__.get("sports_view")
+        if view is not None:
+            view.settings_changed()
+        self._refresh_sports_alerts()
+        tracker = self.__dict__.get("game_tracker")
+        if tracker is not None:
+            tracker.request()          # listing windows and finder numbers may have changed
 
     def _refresh_sports_alerts(self) -> None:
         """Re-read the Watch Alerts Sports group (a bell changed, or games were re-found)."""

@@ -1631,23 +1631,10 @@ def wire_style_menu_actions(host) -> None:
 # Hand-listing these on each test double is what made three separate slices go
 # red (an earlier change/an earlier change density, an earlier change collapse-variants, an earlier change theme) — each time the
 # fix was one more stub in one more file. One factory instead.
-_SETTINGS_APPLIED_HOOKS = (
-    "_apply_sidebar_visibility",
-    "_refresh_recommendation_views",
-    "_apply_channel_list_density",
-    "_apply_sidebar_row_density",
-    "apply_configured_theme",
-    "_apply_time_display_setting",
-    "_apply_collapse_variants_setting",
-    "_apply_adult_mode_setting",
-    "_sync_split_toggle",
-    "_apply_discover_reload_setting",
-    "_apply_menu_bar_setting",
-    "_apply_tray_setting",
-    "_refresh_vod_alerts_section",
-    "_restart_series_monitor_scheduler",
-    "_apply_player_settings",
-)
+# The app's own list (gui/settings_apply.HANDLERS), never a hand-kept copy: a copy
+# missed every handler added after it was written (an enumeration never sees what
+# nobody remembered to add).
+from streamselect.gui.settings_apply import HANDLERS as _SETTINGS_APPLIED_HOOKS  # noqa: E402
 
 
 def wire_settings_dialog_hooks(host, **overrides) -> None:
@@ -3385,6 +3372,14 @@ def mock_settings_recording_widgets(dlg) -> None:
     dlg._rec_pad_end_spin.value.return_value = 15
 
 
+def wire_settings_sports_widgets(dlg) -> None:
+    """Attach the Settings → Sports page to a skeleton dialog (``_load_values`` /
+    ``_save_values`` load and save it like every other tab)."""
+    from streamselect.gui.settings_sports_tab import SportsSettingsPage
+
+    dlg._sports_page = SportsSettingsPage()
+
+
 def wire_settings_widgets(dlg) -> None:
     """Attach EVERY settings tab's widgets to a skeleton dialog.
 
@@ -3412,6 +3407,7 @@ def wire_settings_widgets(dlg) -> None:
     wire_settings_downloads_widgets(dlg)
     wire_settings_recording_widgets(dlg)
     wire_settings_tray_widgets(dlg)
+    wire_settings_sports_widgets(dlg)
 
 
 def settings_config_double(**overrides):

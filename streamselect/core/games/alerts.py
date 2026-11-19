@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Iterable
+from typing import Iterable, Mapping, Optional
 
 from sqlalchemy import select
 
@@ -105,12 +105,13 @@ def alerts_for(game: GameDTO, alerts: Iterable[EventAlert]) -> list[EventAlert]:
     return [a for a in alerts if a.matches(game)]
 
 
-#: How long after the start an "it's starting" notice may still fire (a poll can be late).
-START_GRACE = 600
+#: The bundled defaults, for a caller that passes no sport's settings.
+_BASE = SportSettings("", "", ())
 
 
 def due_notices(games: Iterable[GameDTO], alerts: list[EventAlert], now, lead_minutes: int,
-                sent: set[str]) -> list[tuple[str, GameDTO, str]]:
+                sent: set[str], settings: Optional[Mapping[str, SportSettings]] = None,
+                ) -> list[tuple[str, GameDTO, str]]:
     """The notices to send now: ``(notice key, game, title)``, each once (SV-Q43).
 
     One ``lead_minutes`` before an alerted event starts ("Starting in 15 minutes"),
@@ -123,7 +124,9 @@ def due_notices(games: Iterable[GameDTO], alerts: list[EventAlert], now, lead_mi
             continue
         key = game_key(g)
         since_start = (now - g.start_utc).total_seconds()
-        if 0 <= since_start <= START_GRACE and f"start|{key}" not in sent:
+        # "Starting now" may still go out a little late (a poll can be): the sport's start_grace.
+        grace = (settings or {}).get(g.sport, _BASE).start_grace.total_seconds()
+        if 0 <= since_start <= grace and f"start|{key}" not in sent:
             out.append((f"start|{key}", g, "Starting now"))
         elif (lead_minutes > 0 and g.start_utc - timedelta(minutes=lead_minutes) <= now < g.start_utc
               and f"lead|{key}" not in sent):
@@ -132,29 +135,26 @@ def due_notices(games: Iterable[GameDTO], alerts: list[EventAlert], now, lead_mi
     return out
 
 
-#: A play that began up to this long before an event's start counts as watching it
-#: (tuning in for the warm-up).
-WATCH_EARLY = timedelta(minutes=15)
-#: A one-event rule is deleted this long after its event started: past any event's length.
-EVENT_RULE_KEEP = timedelta(hours=12)
+def watched_game_ids(session, games: list[GameDTO],
+                     settings: Optional[Mapping[str, SportSettings]] = None) -> set[int]:
+    """Games the user has started watching: a play of one of its channels from the
+    sport's ``watch_early`` before its start onward (tuning in for the warm-up)."""
+    def early(g: GameDTO) -> timedelta:
+        return (settings or {}).get(g.sport, _BASE).watch_early
 
-
-def watched_game_ids(session, games: list[GameDTO]) -> set[int]:
-    """Games the user has started watching: a play of one of its channels from
-    :data:`WATCH_EARLY` before its start onward."""
     by_channel: dict[str, list[GameDTO]] = {}
     for g in games:
         for f in g.playable:
             by_channel.setdefault(f.channel_id, []).append(g)
     if not by_channel:
         return set()
-    since = min(g.start_utc for g in games) - WATCH_EARLY
+    since = min(g.start_utc - early(g) for g in games)
     rows = session.execute(
         select(PlaybackEventDB.channel_id, PlaybackEventDB.started_at)
         .where(PlaybackEventDB.channel_id.in_(list(by_channel)),
                PlaybackEventDB.started_at >= since,
                PlaybackEventDB.outcome.in_(("started", "dropped")))).all()
-    return {g.id for cid, at in rows for g in by_channel[cid] if at >= g.start_utc - WATCH_EARLY}
+    return {g.id for cid, at in rows for g in by_channel[cid] if at >= g.start_utc - early(g)}
 
 
 def waiting_events(games: Iterable[GameDTO], alerts: list[EventAlert], now: datetime,
@@ -170,8 +170,9 @@ def waiting_events(games: Iterable[GameDTO], alerts: list[EventAlert], now: date
             and game_state(g, now, settings[g.sport]) != OVER]
 
 
-def expired_event_rules(alerts: Iterable[EventAlert], now: datetime) -> list[str]:
-    """Ids of one-event rules whose event started more than :data:`EVENT_RULE_KEEP` ago."""
+def expired_event_rules(alerts: Iterable[EventAlert], now: datetime,
+                        settings: Optional[Mapping[str, SportSettings]] = None) -> list[str]:
+    """Ids of one-event rules whose event started more than its sport's ``alert_keep`` ago."""
     out = []
     for a in alerts:
         if not a.event:
@@ -180,6 +181,7 @@ def expired_event_rules(alerts: Iterable[EventAlert], now: datetime) -> list[str
             start = datetime.fromisoformat(a.event.rsplit("|", 1)[1])
         except (IndexError, ValueError):
             continue
-        if now - start > EVENT_RULE_KEEP:
+        sport = a.event.split("/", 1)[0]          # the event key starts "sport/league|"
+        if now - start > (settings or {}).get(sport, _BASE).alert_keep:
             out.append(a.id)
     return out

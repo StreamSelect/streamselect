@@ -96,7 +96,10 @@ class _CatalogRefreshTickMixin:
 
         # Games (two sides + a start) are re-found from the stored listings
         # whenever they change: a drained refresh queue or a guide refresh.
-        self.game_tracker = GameTracker(self.db, parent=self)
+        self.game_tracker = GameTracker(
+            self.db, parent=self, overrides=lambda: dict(self.config.sport_settings_overrides))
+        # After an update that moved a Sports default the user had set: ask, once.
+        QTimer.singleShot(2000, self.maybe_offer_improved_defaults)
         self._register_cleanable("game_tracker", self.game_tracker.shutdown)
         self.refresh_queue_manager.all_refreshes_finished.connect(self.game_tracker.request)
         self.epg_manager.refresh_finished.connect(self.game_tracker.request)

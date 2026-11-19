@@ -1430,6 +1430,13 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     game_channel_prefs: dict = Field(default_factory=dict)
     # Event alerts: minutes before the start to notify (0 = only at the start); SV-Q43.
     event_alert_lead_minutes: int = 15
+    # Settings ▸ Sports: ONLY the values the user set, {sport: {key: [value,
+    # default_when_set]}} (core/games/tuning.py). Unset values follow the bundled
+    # defaults, so an improved default reaches them; the stored default lets the
+    # "Some defaults were improved" prompt ask about the ones the user set.
+    sport_settings_overrides: dict = Field(default_factory=dict, json_schema_extra=PROFILE)
+    # "Tell me when a default I changed is improved" (SS-Q9); off = keep mine, never ask.
+    ask_about_improved_defaults: bool = Field(default=True, json_schema_extra=PROFILE)
 
     # Series monitor — user-opted series tracked for new episode arrivals.
     # Each entry is a plain dict:

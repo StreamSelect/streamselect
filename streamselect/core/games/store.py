@@ -11,6 +11,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timedelta
 from functools import lru_cache
+from typing import Mapping, Optional
 
 import yaml
 from loguru import logger
@@ -19,8 +20,9 @@ from sqlalchemy import delete, or_, select
 from streamselect.core.database import Database, ChannelDB, EpgProgramDB
 from streamselect.core.epg_utils import now_utc, to_local
 from streamselect.core.event_datetime import DEFAULT_EVENT_DURATION
+from streamselect.core.games import tuning
 from streamselect.core.games.finder import (
-    GUIDE, WATCH_WINDOW_DAYS, ListingIn, Memory, PlayIn, SportSettings, _learn_clocks, find_games,
+    GUIDE, ListingIn, Memory, PlayIn, SportSettings, _learn_clocks, find_games,
 )
 from streamselect.core.games.listing_text import (
     MATCHUP_LIKE_PATTERNS, NOT_PLAIN_GLOB, league_matcher, norm,
@@ -32,24 +34,34 @@ from streamselect.core.special_content import _BUNDLED_DEFINITIONS
 
 
 @lru_cache(maxsize=1)
-def enabled_leagues() -> tuple[SportSettings, ...]:
-    """The leagues the finder runs for, from ``game_finder_leagues`` in the bundled definitions."""
+def _league_words() -> tuple[tuple[str, str, tuple[str, ...]], ...]:
     with open(_BUNDLED_DEFINITIONS) as f:
         data = yaml.safe_load(f) or {}
     return tuple(
-        SportSettings(sport, league, tuple(str(w) for w in words))
+        (sport, league, tuple(str(w) for w in words))
         for sport, leagues in (data.get("game_finder_leagues") or {}).items()
         for league, words in (leagues or {}).items() if words)
 
 
-def sport_settings() -> dict[str, SportSettings]:
-    """sport -> its settings (the first listed league's lengths), in listed order.
+def enabled_leagues(overrides: Optional[Mapping] = None) -> tuple[SportSettings, ...]:
+    """The leagues the finder runs for (``game_finder_leagues`` in the bundled
+    definitions), each with its sport's numbers: the sport's defaults, then the
+    user's own choices (*overrides*, ``Config.sport_settings_overrides``; the core
+    never reads Config itself)."""
+    per_sport = {sport: tuning.settings_kwargs(tuning.values(sport, overrides))
+                 for sport, _league, _words in _league_words()}
+    return tuple(SportSettings(sport, league, words, **per_sport[sport])
+                 for sport, league, words in _league_words())
+
+
+def sport_settings(overrides: Optional[Mapping] = None) -> dict[str, SportSettings]:
+    """sport -> its settings, in listed order.
 
     The one place a reader gets "the sports there are": the Sports view, the
     Watch Alerts Sports group and the event-alert notifier all loop over this.
     """
     out: dict[str, SportSettings] = {}
-    for league in enabled_leagues():
+    for league in enabled_leagues(overrides):
         out.setdefault(league.sport, league)
     return out
 
@@ -82,10 +94,10 @@ def _memory_from_json(d: dict | None) -> Memory:
     return m
 
 
-def _recent_plays(session, now: datetime) -> list[PlayIn]:
-    """Plays that showed a picture in the last :data:`WATCH_WINDOW_DAYS`, each under
-    the channel name it had then, on the viewer's local day."""
-    since = now - timedelta(days=WATCH_WINDOW_DAYS)
+def _recent_plays(session, now: datetime, days: int) -> list[PlayIn]:
+    """Plays that showed a picture in the last *days*, each under the channel name
+    it had then, on the viewer's local day."""
+    since = now - timedelta(days=days)
     rows = session.execute(
         select(PlaybackEventDB.id, PlaybackEventDB.title, PlaybackEventDB.started_at,
                PlaybackEventDB.seconds_watched)
@@ -159,8 +171,11 @@ def _read_listings(session, settings: SportSettings, now: datetime, hidden: set[
     return listings
 
 
-def refresh_games(db: Database, now: datetime | None = None) -> dict[str, int]:
+def refresh_games(db: Database, now: datetime | None = None,
+                  overrides: Optional[Mapping] = None) -> dict[str, int]:
     """Find every enabled league's games and replace them in the database.
+
+    *overrides*: the user's Sports settings (``Config.sport_settings_overrides``).
 
     Returns:
         league key -> number of Level 1 games stored (for the log line).
@@ -173,8 +188,9 @@ def refresh_games(db: Database, now: datetime | None = None) -> dict[str, int]:
     with db.session_scope(commit=False) as session:
         known = tuple(c for row in session.query(GameFinderMemoryDB).all()
                       for c in _learn_clocks(_memory_from_json(row.memory).clock_samples).values())
-        plays = _recent_plays(session, now)
-    for settings in enabled_leagues():
+        leagues = enabled_leagues(overrides)
+        plays = _recent_plays(session, now, max((s.most_watched_days for s in leagues), default=0))
+    for settings in leagues:
         t0 = time.monotonic()
         key = _finder_key(settings)
         with db.session_scope(commit=False) as session:

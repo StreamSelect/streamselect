@@ -28,44 +28,64 @@ from streamselect.core.games.listing_text import (
     HOME_SECOND, StatedTime, candidate_days, find_date, find_time, league_matcher, matchups,
     matchups_with_separator, norm,
 )
+from streamselect.core.games import tuning
 from streamselect.core.games.teams import Side, TeamBook, team_display
 
 #: The source value a guide (EPG) programme carries instead of a provider id.
 GUIDE = "guide"
 
 
+#: The bundled defaults (``sports_definitions.yaml`` ``sport_defaults.default``): the
+#: fallback for a SportSettings built without a sport's own values. Never typed here
+#: (owner, 2026-11-18: nothing about the user experience hardcoded).
+_D = tuning.settings_kwargs(tuning.defaults())
+
+
 @dataclass(frozen=True)
 class SportSettings:
-    """The few per-sport numbers; everything else is shared by every sport."""
+    """One league's words and its sport's numbers (Settings ▸ Sports; tuning.SPECS
+    says what each means). Built by ``store.enabled_leagues`` from the sport's
+    defaults and the user's choices; the field defaults are the bundled defaults."""
 
     sport: str
     league: str
     words: tuple[str, ...]
-    #: Two listings of the same pair within this are one game. Hockey: listings
-    #: of one game spread up to ~70 min (pregame, padded slots).
-    same_game: timedelta = timedelta(minutes=90)
-    #: A dateless name unchanged on its channel this long is stale. Real game
-    #: listings lived at most ~41 h (up ~25 h ahead, gone ~16 h after).
-    stale_after: timedelta = timedelta(hours=48)
+    #: Two listings of the same pair within this are one game (hockey: one game's
+    #: listings spread up to ~70 min: pregame, padded slots).
+    same_game: timedelta = _D["same_game"]
+    #: A dateless name unchanged on its channel this long is stale (real listings
+    #: lived at most ~41 h).
+    stale_after: timedelta = _D["stale_after"]
     #: Replays were seen up to ~1.5 days after the game.
-    replay_within: timedelta = timedelta(hours=72)
-    window_back: timedelta = timedelta(hours=18)
-    window_ahead: timedelta = timedelta(hours=36)
+    replay_within: timedelta = _D["replay_within"]
+    window_back: timedelta = _D["window_back"]
+    window_ahead: timedelta = _D["window_ahead"]
     #: A teamless guide programme joins a game only when exactly one game starts this close.
-    teamless_guide_within: timedelta = timedelta(minutes=15)
-    #: Nothing says a game has ended, so "on now" is a length. Hockey: the guide's
-    #: live slots ran 150-190 min, and on 2026-11-12 every game was over within
-    #: 3h12 (one went to overtime). Past usual_length a game is "likely ending";
-    #: past long_limit it is over.
-    usual_length: timedelta = timedelta(hours=2, minutes=45)
-    long_limit: timedelta = timedelta(hours=3, minutes=30)
-
-
-#: A collection's zone-less time agrees with an anchor within this many minutes
-#: (listings often carry the pregame or a padded start).
-CLOCK_AGREE_MIN = 40
-#: Clock evidence older than this is forgotten.
-CLOCK_KEEP = timedelta(days=14)
+    teamless_guide_within: timedelta = _D["teamless_guide_within"]
+    #: Nothing says a game has ended, so "on now" is a length: past usual_length a
+    #: game is "likely ending"; past long_limit it is over.
+    usual_length: timedelta = _D["usual_length"]
+    long_limit: timedelta = _D["long_limit"]
+    #: "Not finished — still on" keeps a game on this much longer, offered this
+    #: long after its start.
+    still_on_adds: timedelta = _D["still_on_adds"]
+    still_on_window: timedelta = _D["still_on_window"]
+    #: A one-game alert is deleted this long after its game started.
+    alert_keep: timedelta = _D["alert_keep"]
+    #: "Starting now" may still be sent this long after the start (a late poll).
+    start_grace: timedelta = _D["start_grace"]
+    #: A play this long or longer counts as watched (shorter = trying a channel).
+    watched_after_s: int = _D["watched_after_s"]
+    #: A play from this long before a game's start counts as watching it.
+    watch_early: timedelta = _D["watch_early"]
+    #: Days of viewing behind the "Most watched" order.
+    most_watched_days: int = _D["most_watched_days"]
+    #: A channel report counts this many days (times the number of reports).
+    report_days: int = _D["report_days"]
+    #: A collection's zone-less time agrees with an anchor within this many minutes.
+    clock_agree_min: int = _D["clock_agree_min"]
+    #: Clock evidence older than this is forgotten.
+    clock_keep: timedelta = _D["clock_keep"]
 
 
 @dataclass(frozen=True)
@@ -91,14 +111,12 @@ class Memory:
     #: game title -> starts of earlier Level 1 games with those teams
     confirmed: dict[str, set[datetime]] = field(default_factory=dict)
     #: play id -> (local day "YYYY-MM-DD", seconds) for plays credited to this league
-    #: (:func:`credit_plays`), kept :data:`WATCH_WINDOW_DAYS`: the league's "most watched"
+    #: (:func:`credit_plays`), kept ``SportSettings.most_watched_days``: the league's "most watched"
     #: rank. Kept rather than recomputed so a play stays credited after the teams it
     #: named leave the listings.
     watched: dict[int, tuple[str, int]] = field(default_factory=dict)
 
 
-#: How far back viewing counts toward a league's rank (owner, 2026-11-18: days watched).
-WATCH_WINDOW_DAYS = 30
 
 
 @dataclass(frozen=True)
@@ -272,7 +290,8 @@ def _anchor_times(work: list[_L]) -> dict[frozenset, list[datetime]]:
     return anchors
 
 
-def _clock_samples(work: list[_L], anchors, memory: Memory, now: datetime, same_game: timedelta):
+def _clock_samples(work: list[_L], anchors, memory: Memory, now: datetime, same_game: timedelta,
+                   keep: timedelta = _D["clock_keep"]):
     fresh: dict[tuple[str, str], dict[str, tuple[int, datetime]]] = collections.defaultdict(dict)
     for L in work:
         pk = _pair_key(L)
@@ -295,11 +314,11 @@ def _clock_samples(work: list[_L], anchors, memory: Memory, now: datetime, same_
     merged = {k: dict(v) for k, v in memory.clock_samples.items()}
     for k, games in fresh.items():
         merged.setdefault(k, {}).update(games)
-    return {k: {g: v for g, v in games.items() if now - v[1] <= CLOCK_KEEP}
+    return {k: {g: v for g, v in games.items() if now - v[1] <= keep}
             for k, games in merged.items()}
 
 
-def _learn_clocks(samples) -> dict[tuple[str, str], Clock]:
+def _learn_clocks(samples, agree_min: int = _D["clock_agree_min"]) -> dict[tuple[str, str], Clock]:
     clocks = {}
     for (src, coll), games in samples.items():
         diffs = [d for d, _ in games.values()]
@@ -309,7 +328,7 @@ def _learn_clocks(samples) -> dict[tuple[str, str], Clock]:
         def pick(step):
             best = None
             for c in range(-720, 841, step):
-                score = sum(abs(x - c) <= CLOCK_AGREE_MIN for x in diffs)
+                score = sum(abs(x - c) <= agree_min for x in diffs)
                 key = (score, -sum(abs(x - c) for x in diffs))
                 if best is None or key > best[0]:
                     best = (key, c, score)
@@ -418,7 +437,7 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
             borrows from them (:func:`_with_borrowed`).
         plays: recent plays (:class:`PlayIn`); those that were this league join
             ``memory.watched`` (:func:`credit_plays`), which drops days past
-            :data:`WATCH_WINDOW_DAYS`.
+            ``settings.most_watched_days``.
 
     Returns:
         (games in the window and outside it, the memory for the next run, learned clocks)
@@ -443,8 +462,8 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
     work = _read(seeded + widened, book, league, now)
 
     anchors = _anchor_times(work)
-    samples = _clock_samples(work, anchors, memory, now, settings.same_game)
-    clocks = _with_borrowed(_learn_clocks(samples), known, work)
+    samples = _clock_samples(work, anchors, memory, now, settings.same_game, settings.clock_keep)
+    clocks = _with_borrowed(_learn_clocks(samples, settings.clock_agree_min), known, work)
     _place_times(work, anchors, clocks, now)
     first_seen = _mark_stale(work, memory, now, settings.stale_after)
 
@@ -504,7 +523,7 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
         # 19:00 in another, an hour apart (2026-11-17). Unconfirmed: less certain.
         borrowed = [L.utc for L in g["timed"] if L.time_from == "borrowed"]
         if (g["level"] == 1 and borrowed and len(borrowed) == len(g["timed"])
-                and (max(borrowed) - min(borrowed)).total_seconds() / 60 > CLOCK_AGREE_MIN):
+                and (max(borrowed) - min(borrowed)).total_seconds() / 60 > settings.clock_agree_min):
             g["level"] = 2
         g["replay"] = False
     airings: dict[tuple, set[datetime]] = collections.defaultdict(set)
@@ -549,7 +568,7 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
             confirmed.setdefault(g.title, set()).add(g.start_utc)
     current = {(L.src.channel_id, L.src.name) for L in work}
     first_seen = {k: v for k, v in first_seen.items() if k in current}
-    oldest = (now - timedelta(days=WATCH_WINDOW_DAYS)).date().isoformat()
+    oldest = (now - timedelta(days=settings.most_watched_days)).date().isoformat()
     watched = {pid: v for pid, v in {**memory.watched, **credit_plays(plays, book, league)}.items()
                if v[0] >= oldest}
     return games, Memory(samples, first_seen, confirmed, watched), list(clocks.values())

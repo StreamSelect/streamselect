@@ -27,9 +27,12 @@ class GameTracker(QObject):
     #: Emitted when a run starts, so an open view can say it is looking rather than "0".
     finding_started = pyqtSignal()
 
-    def __init__(self, db, parent=None):
+    def __init__(self, db, parent=None, overrides=None):
+        """*overrides*: returns the user's Sports settings (``Config.sport_settings_overrides``)
+        for each run; None runs on the bundled defaults."""
         super().__init__(parent)
         self._db = db
+        self._overrides = overrides or (lambda: None)
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="games")
         self._lock = threading.Lock()
         self._running = False
@@ -70,7 +73,7 @@ class GameTracker(QObject):
     def _run(self) -> None:
         while True:
             try:
-                counts = refresh_games(self._db)
+                counts = refresh_games(self._db, overrides=self._overrides())
                 self.has_run = True
                 self.games_updated.emit(counts)
             except Exception:

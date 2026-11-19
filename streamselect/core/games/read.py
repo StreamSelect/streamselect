@@ -205,7 +205,6 @@ WatchHistory = dict[str, tuple[Optional[datetime], int, int]]
 #: a game whose card should have offered the channel then watched for minutes; the play
 #: log separates bails (seconds) from watches (minutes) cleanly. A play still running
 #: (no seconds yet) counts as watched.
-WATCHED_MIN_SECONDS = 60
 _PLAY_CAP_S = int(DEFAULT_EVENT_DURATION.total_seconds())
 
 
@@ -219,9 +218,10 @@ _REPORT_WORDS = {DIDNT_PLAY: "nothing showing", WRONG_CONTENT: "not this game"}
 #: too, so reports can be added up per collection later (analytics). The first
 #: collection-keyed store, ``"reports"``, is kept as written and no longer read.
 CHANNEL_REPORTS = "channel_reports"
-#: A report counts this long after the latest one, times the number of reports
-#: (owner, SV-Q38: 30 days to start; more reports extend the tracking).
-REPORT_DAYS = 30
+#: The bundled defaults, for a caller that passes no sport's settings. A report
+#: counts ``report_days`` after the latest one, times the number of reports
+#: (owner, SV-Q38); the numbers themselves are Settings ▸ Sports values.
+_BASE = SportSettings("", "", ())
 
 
 def game_key(game: GameDTO) -> str:
@@ -230,7 +230,7 @@ def game_key(game: GameDTO) -> str:
 
 
 def active_reports(reports: list[dict], game: GameDTO, last_watched: Optional[datetime],
-                   now: datetime) -> tuple[tuple[str, ...], int]:
+                   now: datetime, report_days: int = _BASE.report_days) -> tuple[tuple[str, ...], int]:
     """The report kinds that count on one collection for one game, and how many
     reports stand behind them; ``((), 0)`` when none does (rules: ``report_text``)."""
     relevant = [r for r in reports if r.get("kind") == DIDNT_PLAY
@@ -239,13 +239,13 @@ def active_reports(reports: list[dict], game: GameDTO, last_watched: Optional[da
         return (), 0
     latest = max(datetime.fromisoformat(r["at"]) for r in relevant)
     n = len(relevant) - (1 if last_watched is not None and last_watched > latest else 0)
-    if n <= 0 or now > latest + timedelta(days=REPORT_DAYS * n):
+    if n <= 0 or now > latest + timedelta(days=report_days * n):
         return (), 0
     return tuple(sorted({r.get("kind") for r in relevant})), n
 
 
 def report_text(reports: list[dict], game: GameDTO, last_watched: Optional[datetime],
-                now: datetime) -> str:
+                now: datetime, report_days: int = _BASE.report_days) -> str:
     """The active report on one collection for one game, as its icon's tooltip; "" if none.
 
     ``reports``: the stored list for the channel, each ``{"kind", "at", "game"?, ...}``.
@@ -253,7 +253,7 @@ def report_text(reports: list[dict], game: GameDTO, last_watched: Optional[datet
     report cancels one report — a feed that came back earns its place back. A
     "not this game" report counts for its own game; "nothing showing" for every game.
     """
-    active, n = active_reports(reports, game, last_watched, now)
+    active, n = active_reports(reports, game, last_watched, now, report_days)
     if not active:
         return ""
     kinds = [_REPORT_WORDS.get(k, k) for k in active]
@@ -262,7 +262,7 @@ def report_text(reports: list[dict], game: GameDTO, last_watched: Optional[datet
 
 
 def arrange_feeds(game: GameDTO, prefs: dict, history: WatchHistory,
-                  now: Optional[datetime] = None) -> GameDTO:
+                  now: Optional[datetime] = None, settings: Optional[SportSettings] = None) -> GameDTO:
     """Hide what the user hid for this league, then order the rest (owner, SV-Q27/Q28).
 
     Order: the user's PREFERRED collection; else the collection they last watched
@@ -283,8 +283,9 @@ def arrange_feeds(game: GameDTO, prefs: dict, history: WatchHistory,
     if now is not None and reports:
         def reported(f: GameFeedDTO) -> GameFeedDTO:
             mine, watched = reports.get(f.channel_id, []), history.get(channel_history_key(f.channel_id), (None,))[0]
-            return replace(f, report=report_text(mine, game, watched, now),
-                           reported=active_reports(mine, game, watched, now)[0])
+            days = (settings or _BASE).report_days
+            return replace(f, report=report_text(mine, game, watched, now, days),
+                           reported=active_reports(mine, game, watched, now, days)[0])
         keep = [reported(f) if f.channel_id in reports else f for f in keep]
 
     def key(f: GameFeedDTO):
@@ -295,23 +296,18 @@ def arrange_feeds(game: GameDTO, prefs: dict, history: WatchHistory,
     return replace(game, feeds=tuple(sorted(keep, key=key)), hidden=tuple(gone))
 
 
-#: "Not finished" keeps a game on this much longer: enough for overtime or a
-#: shootout; the user can say it again, or Mark as finished when it really ends.
-NOT_FINISHED_FOR = timedelta(minutes=30)
-#: Only a game that started this recently can be brought back: last week's game
-#: cannot still be on.
-NOT_FINISHED_WINDOW = timedelta(hours=12)
-
-
-def can_mark_not_finished(game: GameDTO, now: datetime) -> bool:
+def can_mark_not_finished(game: GameDTO, now: datetime, settings: Optional[SportSettings] = None) -> bool:
     """Whether "Not finished" makes sense for a finished *game* (owner, 2026-11-17:
-    a game that went into extra time drops out of On now and needs bringing back)."""
-    return game.start_utc <= now < game.start_utc + NOT_FINISHED_WINDOW
+    a game that went into extra time drops out of On now and needs bringing back):
+    it started within the sport's ``still_on_window`` (last week's game cannot
+    still be on)."""
+    return game.start_utc <= now < game.start_utc + (settings or _BASE).still_on_window
 
 
-def mark_not_finished(session, game: GameDTO, now: datetime) -> None:
-    """Put *game* back on, until :data:`NOT_FINISHED_FOR` from *now*."""
-    mark_finished(session, game, now + NOT_FINISHED_FOR)
+def mark_not_finished(session, game: GameDTO, now: datetime, settings: Optional[SportSettings] = None) -> None:
+    """Put *game* back on for the sport's ``still_on_adds`` from *now*: enough for
+    overtime; the user can say it again, or Mark as finished when it really ends."""
+    mark_finished(session, game, now + (settings or _BASE).still_on_adds)
 
 
 def mark_finished(session, game: GameDTO, ended_at: datetime) -> None:
@@ -326,14 +322,16 @@ def channel_history_key(channel_id: Optional[str]) -> str:
     return f"channel:{channel_id}"
 
 
-def load_watch_history(session) -> WatchHistory:
+def load_watch_history(session, watched_after_s: int = _BASE.watched_after_s) -> WatchHistory:
     """Plays that showed a picture, grouped by the played channel's source and collection,
     and per channel under ``channel_history_key``.
 
-    The "last watched" time counts only plays of at least :data:`WATCHED_MIN_SECONDS`
-    (or still running); minutes and plays count everything that showed a picture.
+    The "last watched" time counts only plays of at least *watched_after_s* (Settings ▸
+    Sports "A play counts as watched after"; still running counts); minutes and plays
+    count everything that showed a picture. The history spans sports, so a caller with
+    several passes the most lenient (smallest) value.
     """
-    watched = PlaybackEventDB.seconds_watched.is_(None) | (PlaybackEventDB.seconds_watched >= WATCHED_MIN_SECONDS)
+    watched = PlaybackEventDB.seconds_watched.is_(None) | (PlaybackEventDB.seconds_watched >= watched_after_s)
     rows = session.execute(
         select(ChannelDB.provider_id, ChannelDB.category,
                func.max(case((watched, PlaybackEventDB.started_at), else_=None)),

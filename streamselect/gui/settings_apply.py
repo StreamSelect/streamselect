@@ -69,6 +69,9 @@ HANDLERS: tuple[str, ...] = (
     "_apply_discover_reload_setting",
     # Launch flags never reach an open player window, and windows are reused.
     "_apply_player_settings",
+    # Settings ▸ Sports: game lengths decide what is on now, listing windows what is
+    # found — the Sports view and Watch Alerts re-read, and the finder runs again.
+    "_apply_sports_settings",
 )
 
 _ACTIVE = "_settings_apply_active"

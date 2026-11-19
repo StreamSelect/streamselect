@@ -32,7 +32,7 @@ from streamselect.core.epg_utils import browse_day_separator_label, fmt_time, no
 from streamselect.core.games.read import (
     event_is_live as event_live,
     CHANNEL_REPORTS, ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, arrange_feeds, best_feed, game_key, game_state,
-    NOT_FINISHED_FOR, can_mark_not_finished, load_games, load_watch_history, mark_finished,
+    can_mark_not_finished, load_games, load_watch_history, mark_finished,
     mark_not_finished,
 )
 from streamselect.core.games.alerts import add_alert, alerts_for, load_alerts, remove_alerts, rule_for
@@ -118,7 +118,7 @@ class SportsView(ContentView):
         self._stale = False         # a finder run finished while off screen
         self._finding = False
         #: sport -> its settings (the first listed league's lengths), in listed order.
-        self.sports: dict = sport_settings()
+        self.sports: dict = sport_settings(config.sport_settings_overrides)
 
         self._tick = QTimer(self)
         self._tick.setInterval(TICK_MS)
@@ -220,6 +220,13 @@ class SportsView(ContentView):
     def on_deactivate(self) -> None:
         self._tick.stop()
 
+    def settings_changed(self) -> None:
+        """Settings ▸ Sports was saved: take the new numbers (game lengths decide
+        what is on now) and re-read."""
+        self.sports = sport_settings(self.config.sport_settings_overrides)
+        if self._loaded:
+            self.reload()
+
     def reload(self) -> None:
         """Re-read the stored games and the play log off the UI thread, then render."""
         top = 2 if self.less_certain else 1
@@ -227,7 +234,8 @@ class SportsView(ContentView):
         def query(repos):
             hidden = set(ProviderRepository(repos.session).get_hidden_provider_ids())
             games = [g for sp in self.sports for g in load_games(repos.session, sp, hidden, 1, top)]
-            return (games, load_watch_history(repos.session), load_alerts(repos.session),
+            watched_after = min((s.watched_after_s for s in self.sports.values()), default=60)
+            return (games, load_watch_history(repos.session, watched_after), load_alerts(repos.session),
                     load_league_watch(repos.session))
         self._run_query(query, self._on_games, token_ref=self._token, on_error=self._on_error)
 
@@ -302,7 +310,8 @@ class SportsView(ContentView):
     def _games(self) -> list[GameDTO]:
         out = []
         for g in self._raw:
-            g = arrange_feeds(g, self._prefs(g.league_key), self._history, self._clock())
+            g = arrange_feeds(g, self._prefs(g.league_key), self._history, self._clock(),
+                              self.sports.get(g.sport))
             if g.playable:
                 out.append(g)
         return out
@@ -780,11 +789,11 @@ class SportsView(ContentView):
         else:
             row = QLabel(g.matchup)
             _theme.style(row, "GAME_ROW_PAST")
-            back = can_mark_not_finished(g, self._clock())
+            back = can_mark_not_finished(g, self._clock(), self.sports.get(g.sport))
             row.setToolTip(f"{when} · Finished" + (" · right-click if it is still on" if back else ""))
         row.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         line = GameLine(when, first=first, times=times)
-        if not openable and can_mark_not_finished(g, self._clock()):
+        if not openable and can_mark_not_finished(g, self._clock(), self.sports.get(g.sport)):
             line.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             line.customContextMenuRequested.connect(
                 lambda pos, game=g, w=line: self._finished_menu(game, w.mapToGlobal(pos)))
@@ -928,15 +937,17 @@ class SportsView(ContentView):
         """Right-click on a finished game: bring it back if it went into extra time."""
         menu = QMenu(self)
         act = menu.addAction("Not finished — still on")
-        act.setToolTip("Put this game back in On now for another "
-                       f"{int(NOT_FINISHED_FOR.total_seconds() // 60)} minutes")
+        adds = self.sports[game.sport].still_on_adds if game.sport in self.sports else None
+        act.setToolTip("Put this game back in On now"
+                       + (f" for another {int(adds.total_seconds() // 60)} minutes" if adds else ""))
         menu.setToolTipsVisible(True)
         act.triggered.connect(lambda: self._mark_not_finished(game))
         menu.exec(at)
 
     def _mark_not_finished(self, game: GameDTO) -> None:
         now = self._clock()
-        self._run_query(lambda repos: mark_not_finished(repos.session, game, now),
+        settings = self.sports.get(game.sport)
+        self._run_query(lambda repos: mark_not_finished(repos.session, game, now, settings),
                         lambda _r: self.reload(), commit=True,
                         on_error=lambda exc: self._write_failed("Not finished", exc))
 

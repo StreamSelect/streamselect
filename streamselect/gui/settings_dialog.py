@@ -20,6 +20,7 @@ from streamselect.gui.settings_dialog_tabs import SettingsTabsMixin
 from streamselect.gui.settings_downloads_tab import SettingsDownloadsTabMixin
 from streamselect.gui.settings_tray_tab import SettingsTrayTabMixin
 from streamselect.gui.settings_recording_tab import SettingsRecordingTabMixin
+from streamselect.gui.settings_sports_tab import SPORTS_HELP, SportsSettingsPage
 from streamselect.gui.three_panel_section_nav import ThreePanelSectionNav
 
 _SIDEBAR_SECTION_LABELS: dict[str, str] = {
@@ -221,6 +222,7 @@ SECTIONS: tuple[tuple[str, str, str, str], ...] = (
      "the source while it runs, so on an account limited to a single "
      "connection it competes with playback — which is why it defaults to "
      "once a day rather than hourly."),
+    ("sports", "Sports", "_build_sports_tab", SPORTS_HELP),
     ("tray", "System Tray", "_build_tray_tab",
      "Whether closing the window leaves StreamSelect running in the system tray "
      "(the menu bar on macOS), and which alerts it then shows as system "
@@ -420,6 +422,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
             else self._live_refresh_mode_combo.findData("manual")
         )
         self._event_alert_lead_spin.setValue(self.config.event_alert_lead_minutes)
+        self._sports_page.load(c)
 
         # PLAT-1 — Content ▸ Discover shelves. getattr with the model default,
         # so a config written before this field existed loads rather than raises.
@@ -692,6 +695,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
         c.filter_adult_mode = self._adult_mode_combo.currentData() or "hide"
         c.live_refresh_mode = self._live_refresh_mode_combo.currentData() or "manual"
         c.event_alert_lead_minutes = self._event_alert_lead_spin.value()
+        self._sports_page.save(c)
         c.discover_platform_shelf_min_titles = self._platform_shelf_min_spin.value()
 
         # Downloads — read live by download_manager.py on every scheduler
@@ -817,6 +821,11 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
 
         c.save()
         logger.info("Settings saved")
+
+    def _build_sports_tab(self) -> SportsSettingsPage:
+        """Settings ▸ Sports (gui/settings_sports_tab.py)."""
+        self._sports_page = SportsSettingsPage()
+        return self._sports_page
 
     def _apply(self):
         self._save_values()

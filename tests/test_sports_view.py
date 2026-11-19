@@ -396,7 +396,6 @@ def test_no_finished_game_opens_a_channel_list(games_db, qapp, owned_widgets):
 def test_not_finished_puts_a_game_back_on_now_for_a_while(games_db, qapp, owned_widgets):
     """Owner, 2026-11-17: a game that went into extra time drops into Finished;
     right-click, Not finished, and it is back in On now with its channels."""
-    from streamselect.core.games.read import NOT_FINISHED_FOR
     later = START + timedelta(hours=4)
     clock = {"now": later}
     view = _view(games_db, qapp, owned_widgets, later)
@@ -410,7 +409,7 @@ def test_not_finished_puts_a_game_back_on_now_for_a_while(games_db, qapp, owned_
     back = next(g for g in view._raw if g.team_a == "Buffalo Sabres")
     assert game_state(back, later, view.sports["hockey"]) == ENDING, "likely ending: past its usual length"
     assert any(c.game.team_a == "Buffalo Sabres" for c in view.cards), "a card in On now again"
-    after = later + NOT_FINISHED_FOR
+    after = later + view.sports["hockey"].still_on_adds
     assert game_state(back, after, view.sports["hockey"]) == OVER, "it finishes again by itself"
 
 

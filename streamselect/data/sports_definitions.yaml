@@ -219,6 +219,36 @@ league_keywords:
   WWE:
     - wwe
 
+# sport_defaults:
+#   Each sport's game timings (core/games/tuning.py; Settings ▸ Sports shows and
+#   changes them — owner, 2026-11-18: "predefined but flexible"). ``default`` holds
+#   every value; a sport's own block lists only what differs from it. Units are in
+#   the setting (tuning.SPECS): game lengths in minutes, then min / h / days / s as
+#   the page shows them. Changing a default here reaches every user who never set
+#   that value; a user who did is asked once ("Some defaults were improved").
+#   The defaults were measured on hockey listings (2026-11-08 to -18).
+sport_defaults:
+  default:
+    usual_length: 165       # min (2 h 45)
+    long_limit: 210         # min (3 h 30)
+    still_on_adds: 30       # min
+    still_on_window: 12     # h
+    listed_back: 18         # h
+    listed_ahead: 36        # h
+    alert_keep: 12          # h after the start
+    start_grace: 10         # min
+    watched_after: 60       # s
+    watch_early: 15         # min before the start
+    most_watched_days: 30   # days
+    report_days: 30         # days
+    same_game: 90           # min
+    replay_within: 72       # h
+    stale_after: 48         # h
+    guide_join: 15          # min
+    clock_agree: 40         # min
+    clock_keep: 14          # days
+  hockey: {}
+
 # game_finder_leagues:
 #   Sport -> league -> the starting words for finding that league's GAMES (two sides
 #   + a start), matched as whole words against channel names, collection names and

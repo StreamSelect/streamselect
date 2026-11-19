@@ -82,7 +82,8 @@ class SportsGroupMixin:
         executor = self.__dict__.get("_executor")
         if executor is None or self.db is None:
             return
-        settings = sport_settings()
+        settings = sport_settings(getattr(self.config, "sport_settings_overrides", None))
+        watched_after = min((s.watched_after_s for s in settings.values()), default=60)
 
         def work():
             try:
@@ -93,8 +94,8 @@ class SportsGroupMixin:
                     hidden = set(ProviderRepository(session).get_hidden_provider_ids())
                     games = [g for sp in settings for g in load_games(session, sp, hidden, 1, 2)]
                     waiting = waiting_events(games, alerts, now_utc(), settings,
-                                             watched_game_ids(session, games))
-                    return waiting, (load_watch_history(session) if waiting else {})
+                                             watched_game_ids(session, games, settings))
+                    return waiting, (load_watch_history(session, watched_after) if waiting else {})
             except Exception as exc:  # noqa: BLE001 — any failure: keep the last rows
                 logger.warning("Watch Alerts Sports: could not read alerted events: {}", exc)
                 return None
@@ -110,7 +111,9 @@ class SportsGroupMixin:
         games, history = result
         now = now_utc()
         prefs = getattr(self.config, "game_channel_prefs", {}) or {}
-        self._sports_games = [arrange_feeds(g, prefs.get(g.league_key, {}), history, now) for g in games]
+        settings = sport_settings(getattr(self.config, "sport_settings_overrides", None))
+        self._sports_games = [arrange_feeds(g, prefs.get(g.league_key, {}), history, now, settings.get(g.sport))
+                              for g in games]
         self._render_sports()
 
     # ── drawing ──────────────────────────────────────────────────────────
@@ -123,7 +126,7 @@ class SportsGroupMixin:
         self._sports_hdr_container.setVisible(bool(games))
         self._sports_list.setVisible(bool(games) and not self._sports_collapsed)
         if games and not self._sports_collapsed:
-            settings = sport_settings()
+            settings = sport_settings(getattr(self.config, "sport_settings_overrides", None))
             now = now_utc()
             for g in games:
                 self._add_sports_row(g, settings[g.sport], now)
