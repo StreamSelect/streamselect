@@ -70,9 +70,12 @@ class SportsHeadersMixin:
         self._layout.addWidget(line)
 
     def _toggle_league(self, sport: str, league: str) -> None:
+        hiding = league_key(sport, league) not in self.hidden_leagues
         self._state()[HIDDEN_LEAGUES] = sorted(self.hidden_leagues ^ {league_key(sport, league)})
         self._save()
         self._render()
+        if hiding:
+            self.leagueHidden.emit(sport, league)
 
     def _league_banner(self, key: str, league: str, games: list, now: datetime) -> QWidget:
         """A league's name, larger, centred between two rules, with its logo and a

@@ -28,6 +28,9 @@ class _SportsViewMixin:
             # The card's "Hide this channel everywhere…" is the app's own Hide.
             view.hideEverywhereRequested.connect(lambda cid: self._bulk_hide_channels([cid]))
             view.alertsChanged.connect(self._refresh_sports_alerts)
+            # First-time help: the Sports tour, then one-off tips (sports_tips).
+            view.rendered.connect(self._offer_sports_tips)
+            view.leagueHidden.connect(self._offer_league_hidden_tip)
             view.setVisible(False)
             self._list_layout.addWidget(view)
             # A run starting says "finding" instead of a premature 0; new games stored
@@ -36,6 +39,14 @@ class _SportsViewMixin:
             tracker.finding_started.connect(lambda: view.set_finding(True))
             tracker.games_updated.connect(lambda _counts: view.finished_finding())
         return view
+
+    def _offer_sports_tips(self) -> None:
+        from streamselect.gui.sports_tips import on_rendered
+        on_rendered(self, self.sports_view)
+
+    def _offer_league_hidden_tip(self, sport: str, league: str) -> None:
+        from streamselect.gui.sports_tips import on_league_hidden
+        on_league_hidden(self, self.sports_view, sport, league)
 
     def maybe_offer_improved_defaults(self) -> None:
         """After an update: if a default moved for a Sports setting the user had set,
@@ -89,7 +100,6 @@ class _SportsViewMixin:
         view.setVisible(True)
         self.stats_label.setText("Sports")
         view.on_activate()
-        self._offer_view_tip("sports")
 
     def on_sports_view_toggle(self) -> None:
         if self.sports_chip.is_enabled():

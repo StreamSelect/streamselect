@@ -3,7 +3,7 @@
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QCheckBox, QComboBox, QFormLayout,
-    QListWidgetItem,
+    QListWidgetItem, QWidget,
 )
 from loguru import logger
 
@@ -825,7 +825,13 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
     def _build_sports_tab(self) -> SportsSettingsPage:
         """Settings ▸ Sports (gui/settings_sports_tab.py)."""
         self._sports_page = SportsSettingsPage()
+        self._sports_page.lengthEdited.connect(self._offer_length_tip)
         return self._sports_page
+
+    def _offer_length_tip(self, row: QWidget) -> None:
+        """The first time a game's length is changed: say the value is kept (TQ3)."""
+        from streamselect.gui.just_in_time_tips import show_tip_once
+        show_tip_once(self, "sports_length", row)
 
     def _apply(self):
         self._save_values()

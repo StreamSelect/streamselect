@@ -70,10 +70,32 @@ TIPS: dict[str, Tip] = {
         "Watchlist keeps the shows you follow, On Now shows what's airing, and "
         "Browse lists the schedule.",
     ),
-    "view_sports": Tip(
-        "Sports",
-        "Games on right now, each with every channel showing it, then what's on "
-        "later. Click a game to list its channels; double-click to play the best one.",
+    # Sports: a short tour the first time it shows games (sports_tips), then these.
+    "sports_channels": Tip(
+        "A game's channels",
+        "Every channel showing this game, the best first. Click one to play it. "
+        "Right-click a channel to make it PREFERRED for the league, hide it, or report "
+        "\"Nothing showing\" or \"Not this game\", so it drops down the list next time.",
+    ),
+    "sports_finished_bell": Tip(
+        "Alerts after a game",
+        "A finished game's bell can't alert you to this game any more, but it can alert "
+        "you to either team's next game, or the next time these two meet.",
+    ),
+    "sports_still_on": Tip(
+        "Still playing?",
+        "If a game listed as finished is still going, in overtime say, right-click it "
+        "and choose \"Not finished — still on\" to put it back in On now.",
+    ),
+    "sports_league_hidden": Tip(
+        "League hidden",
+        "Hidden from this list only: its games are still found and its alerts still "
+        "come. Click the dashed chip to show it again.",
+    ),
+    "sports_length": Tip(
+        "Game length",
+        "Your value is kept for this sport, even when an update changes the default. "
+        "Reset brings the default back.",
     ),
     "view_discover": Tip(
         "Discover",
@@ -93,7 +115,6 @@ TIPS: dict[str, Tip] = {
 #: chip it rings (the chip the user just clicked).
 VIEW_TIPS: dict[str, tuple[str, str]] = {
     "epg": ("view_epg", "epg_chip"),
-    "sports": ("view_sports", "sports_chip"),
     "discover": ("view_discover", "discover_chip"),
     "recipe": ("view_recipe", "recipe_chip"),
 }

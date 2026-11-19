@@ -18,7 +18,7 @@ from __future__ import annotations
 import copy
 from typing import Optional
 
-from PyQt6.QtCore import QTime, Qt
+from PyQt6.QtCore import QTime, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QPushButton, QSpinBox,
     QTimeEdit, QToolButton, QVBoxLayout, QWidget,
@@ -105,6 +105,9 @@ class _Row:
 
 class SportsSettingsPage(QWidget):
     """The Sports page. Builds without a config; :meth:`load` fills it."""
+
+    #: The user changed a game's length (usual or longest): its row, for a first-time tip.
+    lengthEdited = pyqtSignal(QWidget)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -223,6 +226,8 @@ class SportsSettingsPage(QWidget):
         row = self._sender_row()
         if row is not None:
             self.edit(row.spec.key, row.value())
+            if row.spec.key in ("usual_length", "long_limit"):
+                self.lengthEdited.emit(row.box)
 
     def _on_reset(self, *_args) -> None:
         row = self._sender_row()

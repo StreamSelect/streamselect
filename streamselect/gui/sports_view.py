@@ -94,6 +94,8 @@ class SportsView(SportsHeadersMixin, ContentView):
     channelSelected = pyqtSignal(str)         # channel id: the details pane follows an opened game
     hideEverywhereRequested = pyqtSignal(str)  # channel id: the app's own Hide
     alertsChanged = pyqtSignal()              # a bell added or removed a rule: Watch Alerts re-reads
+    rendered = pyqtSignal()                   # the list was rebuilt: the host may offer a tip (sports_tips)
+    leagueHidden = pyqtSignal(str, str)       # sport, league: a chip hid its league
 
     def __init__(self, db, config, run_query: Callable, parent=None, *,
                  clock: Callable[[], datetime] = now_utc, image_cache=None):
@@ -140,6 +142,7 @@ class SportsView(SportsHeadersMixin, ContentView):
         self.rows: list[QWidget] = []          # a QPushButton, or a QLabel for an earlier day's finished game
         self.headers: dict[str, QWidget] = {}
         self.league_chips: dict[tuple[str, str], QWidget] = {}   # (sport, league) -> its chip
+        self.open_list = self.toolbar = None
         self._sub_text_x = 0            # set by each sub-heading; its rows line up under its words
         #: The last few live bitrate readings (kb/s), averaged so the chip doesn't flicker.
         self._bitrates: deque = deque(maxlen=BITRATE_SAMPLES)
@@ -325,6 +328,7 @@ class SportsView(SportsHeadersMixin, ContentView):
             elif item.layout() is not None:
                 QWidget().setLayout(item.layout())
         self.cards, self.rows, self.headers, self.league_chips = [], [], {}, {}
+        self.open_list = self.toolbar = None   # the open game's channel list; the toolbar
 
     def _render(self, error: bool = False) -> None:
         self._clear()
@@ -365,6 +369,7 @@ class SportsView(SportsHeadersMixin, ContentView):
                     self._message_line("All leagues hidden. Click a league to show it.")
                 self._render_sport(sport, shown, now, folded)
         self._layout.addStretch(1)
+        self.rendered.emit()
 
     def _split(self, games: list, now: datetime) -> tuple[list, list, list]:
         """(on now as (game, state), later, finished) — each game by its own sport's lengths."""
@@ -633,6 +638,7 @@ class SportsView(SportsHeadersMixin, ContentView):
         self.less_certain_chip.setToolTip("Also show games only one collection lists (dashed outline)")
         self.less_certain_chip.toggled_changed.connect(self._toggle_less_certain)
         h.addWidget(self.less_certain_chip)
+        self.toolbar = box
         return box
 
     def _card(self, g: GameDTO, state: str, now: datetime, *, expanded: bool = False,
@@ -668,7 +674,7 @@ class SportsView(SportsHeadersMixin, ContentView):
             self._render()
 
     def _channel_list(self, g: GameDTO) -> ChannelList:
-        lst = ChannelList(g, preferred_key=self._prefs(g.league_key).get("preferred"),
+        lst = self.open_list = ChannelList(g, preferred_key=self._prefs(g.league_key).get("preferred"),
                           playing_id=self._playing, show_hidden=_game_key(g) in self._show_hidden)
         lst.play.connect(self.playRequested)
         lst.prefer.connect(self._set_preferred)
@@ -710,11 +716,14 @@ class SportsView(SportsHeadersMixin, ContentView):
             back = can_mark_not_finished(g, self._clock(), self.sports.get(g.sport))
             row.setToolTip(f"{when} · Finished" + (" · right-click if it is still on" if back else ""))
         row.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        row.finished = playable                # ("playable" marks a finished game here) for sports_tips
+        row.still_on = False
         line = GameLine(when, first=first, times=times)
         if not openable and can_mark_not_finished(g, self._clock(), self.sports.get(g.sport)):
             line.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             line.customContextMenuRequested.connect(
                 lambda pos, game=g, w=line: self._finished_menu(game, w.mapToGlobal(pos)))
+            row.still_on = True
         h = line.row_layout
         h.addWidget(row, 1)
         if label:
