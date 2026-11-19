@@ -267,3 +267,13 @@ def test_the_page_opens_on_all_sports_and_shows_each_setting_where_it_is_set(qap
     assert row.note.geometry().left() > row.editor.geometry().right(), "the note follows the value"
     page.edit("listed_ahead", 12)
     assert row.note.text() == "default 36 h ahead" and row.reset.isVisible(), "now hockey's own"
+
+
+def test_the_hint_beside_the_sport_picker_is_not_cut_off(qapp, owned_widgets):
+    from PyQt6.QtWidgets import QLabel
+    page = _page(qapp, owned_widgets)
+    page.resize(760, 900)          # the Settings dialog's page width
+    qapp.processEvents()
+    hint = next(lb for lb in page.findChildren(QLabel) if lb.text().startswith("A sport's own value"))
+    assert hint.width() >= hint.sizeHint().width(), "the whole hint fits"
+    assert hint.geometry().right() < page.reset_all.geometry().left()

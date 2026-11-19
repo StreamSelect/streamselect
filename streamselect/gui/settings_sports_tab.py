@@ -125,7 +125,7 @@ class SportsSettingsPage(QWidget):
                                     "give it its own")
         self.sport_combo.currentIndexChanged.connect(self._on_sport)
         top.addWidget(self.sport_combo)
-        hint = QLabel("A sport's own value wins over All sports; leagues use their sport's.")
+        hint = QLabel("A sport's own value wins over All sports.")
         _theme.style(hint, "TEXT_SM_MUTED")
         top.addWidget(hint)
         top.addStretch(1)
