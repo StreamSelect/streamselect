@@ -62,6 +62,11 @@ class SportSettings:
     window_ahead: timedelta = _D["window_ahead"]
     #: A teamless guide programme joins a game only when exactly one game starts this close.
     teamless_guide_within: timedelta = _D["teamless_guide_within"]
+    #: A guide-only game this far from the league's usual start times is a replay;
+    #: used once that many confirmed games' starts are known, kept that many days.
+    usual_hours_off: timedelta = _D["usual_hours_off"]
+    usual_hours_min_games: int = _D["usual_hours_min_games"]
+    usual_hours_keep_days: int = _D["usual_hours_keep_days"]
     #: Nothing says a game has ended, so "on now" is a length: past usual_length a
     #: game is "likely ending"; past long_limit it is over.
     usual_length: timedelta = _D["usual_length"]
@@ -115,6 +120,9 @@ class Memory:
     #: rank. Kept rather than recomputed so a play stays credited after the teams it
     #: named leave the listings.
     watched: dict[int, tuple[str, int]] = field(default_factory=dict)
+    #: starts of this league's confirmed (Level 1) games, kept ``usual_hours_keep_days``:
+    #: the times its games usually start (a guide-only game far from them is a replay).
+    usual_starts: set[datetime] = field(default_factory=set)
 
 
 
@@ -543,9 +551,39 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
         if earlier:
             g["level"], g["replay"] = 3, True
 
+    # Usual start times (owner, 2026-11-19): a game only the guide lists, starting far
+    # from when this league's confirmed games start, is a rerun — Eurosport's
+    # morning-after NBA games were read as games that morning.
+    usual = {u for u in memory.usual_starts if now - u <= timedelta(days=settings.usual_hours_keep_days)}
+    usual |= {g["utc"] for g in G if g["level"] == 1}
+    if len(usual) >= settings.usual_hours_min_games:
+        usual_min = [u.hour * 60 + u.minute for u in usual]
+        off = settings.usual_hours_off.total_seconds() / 60
+        for g in G:
+            if g["level"] != 2 or not all(L.src.source == GUIDE for L in g["timed"]):
+                continue
+            m = g["utc"].hour * 60 + g["utc"].minute
+            if min(min(abs(m - x), 1440 - abs(m - x)) for x in usual_min) > off:
+                g["level"], g["replay"] = 3, True
+
+    # Team clash (owner, 2026-11-19): a team plays one game at a time. Of two games
+    # sharing a team and overlapping, the one with more evidence stands (confirmed,
+    # more collections, earlier); the other is a replay or a leftover listing.
+    kept: list[dict] = []
+    for g in sorted((g for g in G if g["level"] in (1, 2)), key=lambda g: (g["level"], -g["colls"], g["utc"])):
+        if any(g["pair"] & k["pair"] and abs(g["utc"] - k["utc"]) < settings.usual_length for k in kept):
+            g["level"], g["replay"] = 3, True
+        else:
+            kept.append(g)
+
     # Teamless guide programmes: a feed, never evidence, when exactly one game starts close by.
     for L in work:
         if L.src.source != GUIDE or L.kind != "nomatchup" or L.utc is None or not L.src.channel_id:
+            continue
+        # A programme dated another day (a magazine show, "Basket Room … 16/11/2026")
+        # is not this game, whatever it is near.
+        stated = find_date(norm(L.src.name), L.utc)
+        if stated is not None and abs(stated.date() - L.utc.date()) > timedelta(days=1):
             continue
         near = [g for g in G if g["level"] in (1, 2) and abs(g["utc"] - L.utc) <= settings.teamless_guide_within]
         if len(near) == 1:
@@ -564,11 +602,15 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
 
     confirmed = {k: {u for u in v if now - u <= settings.replay_within} for k, v in memory.confirmed.items()}
     for g in games:
-        if g.level == 1:
+        # A past game behind the listing window that two collections agree on is
+        # remembered too, so the replay rule has the original even on a league's
+        # first run (owner, 2026-11-19: "seed memory on first run").
+        if g.level == 1 or (g.level == 4 and g.collections >= 2 and g.start_utc < lo):
             confirmed.setdefault(g.title, set()).add(g.start_utc)
     current = {(L.src.channel_id, L.src.name) for L in work}
     first_seen = {k: v for k, v in first_seen.items() if k in current}
     oldest = (now - timedelta(days=settings.most_watched_days)).date().isoformat()
     watched = {pid: v for pid, v in {**memory.watched, **credit_plays(plays, book, league)}.items()
                if v[0] >= oldest}
-    return games, Memory(samples, first_seen, confirmed, watched), list(clocks.values())
+    usual_out = {u for u in usual if now - u <= timedelta(days=settings.usual_hours_keep_days)}
+    return games, Memory(samples, first_seen, confirmed, watched, usual_out), list(clocks.values())

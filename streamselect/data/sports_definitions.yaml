@@ -247,6 +247,9 @@ sport_defaults:
     guide_join: 15          # min
     clock_agree: 40         # min
     clock_keep: 14          # days
+    usual_hours_off: 3      # h: a guide-only game this far from usual start times is a replay
+    usual_hours_games: 5    # confirmed games before usual start times are used
+    usual_hours_keep: 30    # days of confirmed start times kept
   hockey: {}
   # Basketball (NBA trial, 2026-11-18). Watched by the owner the first night: two
   # games listed at 8:00 PM had 90 s and 3 min left in the 4th at about 9:25 —

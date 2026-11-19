@@ -406,3 +406,69 @@ def test_a_number_in_a_team_name_stays_and_other_numbers_go():
     lg = league_matcher(["NBA"])
     assert clean_side("SAN FRANCISCO 49ERS", lg) == ("SAN", "FRANCISCO", "49ERS")
     assert clean_side("HEAT 18TH 4K", lg) == ("HEAT", "TH", "K"), "as before: digits off ordinals and quality"
+
+
+# ── replays the finder must not read as games (owner, 2026-11-19) ─────────
+# Seen: Eurosport's morning-after NBA airings, guide-only, read as games on the
+# NBA's first day; a team in two overlapping games; a dated magazine show joined.
+
+def test_a_guide_only_game_far_from_the_usual_start_times_is_a_replay():
+    usual = {datetime(2026, 11, d, 1, 5) for d in range(6, 11)}          # five nights at 01:05
+    morning = [ListingIn(GUIDE, "EUROSPORT 1", "NHL: St. Louis Blues - Utah Mammoth", "e1",
+                         datetime(2026, 11, 13, 11, 15))]
+    games, mem, _ = find_games(_two_games() + morning, NHL, NOW, Memory(usual_starts=usual))
+    g = _game(games, "Utah Mammoth")
+    assert (g.level, g.replay) == (3, True)
+    assert datetime(2026, 11, 13, 1, 5) in mem.usual_starts, "tonight's confirmed games join the usual times"
+
+    evening = [ListingIn(GUIDE, "EUROSPORT 1", "NHL: St. Louis Blues - Utah Mammoth", "e1",
+                         datetime(2026, 11, 13, 2, 30))]
+    games, _, _ = find_games(_two_games() + evening, NHL, NOW, Memory(usual_starts=usual))
+    assert _game(games, "Utah Mammoth").level == 2, "at the usual time: still a game"
+    games, _, _ = find_games(_two_games() + morning, NHL, NOW)
+    assert _game(games, "Utah Mammoth").level == 2, "too few confirmed games to know the usual times"
+
+
+def test_a_team_in_two_overlapping_games_keeps_the_better_evidenced_one():
+    clash = [ListingIn(GUIDE, "Guide channel 9", "NHL: Buffalo Sabres - Toronto Maple Leafs", "g9",
+                       datetime(2026, 11, 13, 2, 0))]
+    games, _, _ = find_games(_two_games() + clash, NHL, NOW)
+    assert _game(games, "Toronto Maple Leafs").replay and _game(games, "Toronto Maple Leafs").level == 3
+    assert _game(games, "Chicago Blackhawks").level == 1, "the confirmed game stands"
+    later = [ListingIn(GUIDE, "Guide channel 9", "NHL: Buffalo Sabres - Toronto Maple Leafs", "g9",
+                       datetime(2026, 11, 13, 4, 30))]                     # after the first has ended
+    games, _, _ = find_games(_two_games() + later, NHL, NOW)
+    assert _game(games, "Toronto Maple Leafs").level == 2
+
+
+def test_a_teamless_guide_programme_dated_another_day_joins_no_game():
+    lone = [ListingIn("p1", "COLL ZONE A", "NHL: Los Angeles Kings vs New York Islanders | Fri 13 Nov 04:05 CET", "k1"),
+            ListingIn("p1", "COLL ZONE B", "NEW YORK ISLANDERS VS. LOS ANGELES KINGS | Thu 12 Nov 10:05 PM ET", "k2"),
+            ListingIn(GUIDE, "Guide channel 2", "NHL Magazine 11/11/2026", "g3", datetime(2026, 11, 13, 3, 0))]
+    games, _, _ = find_games(_two_games() + lone, NHL, NOW)
+    assert all(f.channel_id != "g3" for f in _game(games, "Los Angeles Kings").feeds)
+
+
+def test_a_past_game_behind_the_window_is_remembered_for_the_replay_rule():
+    """First run of a league: the original airs before the listing window, the rerun after."""
+    original = [ListingIn("p1", "COLL ZONE A", "NHL: Boston Bruins vs Montreal Canadiens | Wed 11 Nov 23:00 CET", "o1"),
+                ListingIn("p2", "COLL ZONE B", "NHL: Montreal Canadiens vs Boston Bruins | Wed 11 Nov 23:00 CET", "o2")]
+    games, mem, _ = find_games(_two_games() + original, NHL, NOW)
+    assert datetime(2026, 11, 11, 22, 0) in mem.confirmed["Boston Bruins vs Montreal Canadiens"]
+    rerun = [ListingIn(GUIDE, "EUROSPORT 1", "NHL: Boston Bruins - Montreal Canadiens", "e1",
+                       datetime(2026, 11, 13, 10, 0))]
+    games, _, _ = find_games(_two_games() + rerun, NHL, NOW, mem)           # the original has gone
+    g = _game(games, "Boston Bruins")
+    assert (g.level, g.replay) == (3, True)
+
+
+def test_the_guide_is_read_back_as_far_as_the_replay_rule_looks(db):
+    from streamselect.core.games.store import _read_listings
+    _seed_db(db)
+    with db.session_scope() as s:
+        s.add(EpgProgramDB(provider_id="p1", channel_epg_id="g7", channel_db_id="a1", channel_name="Guide 7",
+                           title="NHL: Boston Bruins - Montreal Canadiens",
+                           start_time=NOW - timedelta(hours=30), stop_time=NOW - timedelta(hours=27)))
+    with db.session_scope(commit=False) as s:
+        names = [li.name for li in _read_listings(s, NHL, NOW, set()) if li.source == GUIDE]
+    assert "NHL: Boston Bruins - Montreal Canadiens" in names, "30 h back: inside the 72 h replay look-back"

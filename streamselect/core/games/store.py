@@ -78,6 +78,7 @@ def _memory_to_json(m: Memory) -> dict:
         "first_seen": [[cid, name, seen.isoformat()] for (cid, name), seen in m.first_seen.items()],
         "confirmed": {title: sorted(u.isoformat() for u in starts) for title, starts in m.confirmed.items()},
         "watched": [[pid, day, secs] for pid, (day, secs) in m.watched.items()],
+        "usual_starts": sorted(u.isoformat() for u in m.usual_starts),
     }
 
 
@@ -91,6 +92,7 @@ def _memory_from_json(d: dict | None) -> Memory:
         m.confirmed[title] = {datetime.fromisoformat(u) for u in starts}
     for pid, day, secs in (d or {}).get("watched", []):
         m.watched[int(pid)] = (str(day), int(secs))
+    m.usual_starts = {datetime.fromisoformat(u) for u in (d or {}).get("usual_starts", [])}
     return m
 
 
@@ -164,7 +166,10 @@ def _read_listings(session, settings: SportSettings, now: datetime, hidden: set[
     guide = session.execute(
         select(EpgProgramDB.provider_id, EpgProgramDB.channel_db_id, EpgProgramDB.channel_epg_id,
                EpgProgramDB.channel_name, EpgProgramDB.title, EpgProgramDB.start_time)
-        .where(EpgProgramDB.start_time.between(now - settings.window_back, now + settings.window_ahead))
+        # Back as far as the replay rule looks (as much as the guide keeps): the
+        # original of a rerun is then found even on a league's first run (finder).
+        .where(EpgProgramDB.start_time.between(now - max(settings.window_back, settings.replay_within),
+                                               now + settings.window_ahead))
         .where(or_(*(EpgProgramDB.title.ilike(f"%{w}%") for w in settings.words)))).all()
     listings += [ListingIn(GUIDE, cname or epg_id or "", title or "", cdb, start)
                  for pid, cdb, epg_id, cname, title, start in guide if pid not in hidden]

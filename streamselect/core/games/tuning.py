@@ -61,7 +61,7 @@ class Spec:
     key: str
     label: str
     group: str
-    unit: str            # "hm" (minutes, shown as h/min), "min", "h", "days", "s"
+    unit: str            # "hm" (minutes, shown as h/min), "min", "h", "days", "s", "n" (a count)
     lo: int
     hi: int
     suffix: str
@@ -76,7 +76,7 @@ class Spec:
     def as_field(self, value: int):
         """The value as the ``SportSettings`` field wants it: a duration, or a plain
         number for the fields named for their unit (``_min``, ``_s``, ``_days``)."""
-        if self.field.endswith(("_min", "_s", "_days")):
+        if self.field.endswith(("_min", "_s", "_days", "_games")):
             return int(value)
         unit = {"hm": "minutes", "min": "minutes", "h": "hours", "days": "days", "s": "seconds"}
         return timedelta(**{unit[self.unit]: value})
@@ -134,6 +134,16 @@ SPECS: tuple[Spec, ...] = (
          "learned", "clock_agree_min", scope=ALL_ONLY),
     Spec("clock_keep", "Keep clock evidence for:", ADVANCED, "days", 1, 90, " days",
          "How long the start times a clock was learned from are kept", "clock_keep", scope=ALL_ONLY),
+    Spec("usual_hours_off", "A guide-only game is a replay this far from usual start times:", ADVANCED,
+         "h", 1, 12, " h", "A game only the guide lists, starting this far from the times this "
+         "league's confirmed games start, is a rerun (a morning-after replay abroad)",
+         "usual_hours_off"),
+    Spec("usual_hours_games", "Usual start times need at least:", ADVANCED, "n", 1, 50,
+         " confirmed games", "How many confirmed games a league needs before its usual start "
+         "times are used", "usual_hours_min_games"),
+    Spec("usual_hours_keep", "Remember start times for:", ADVANCED, "days", 7, 365, " days",
+         "How long confirmed games' start times are kept to learn a league's usual times",
+         "usual_hours_keep_days"),
 )
 BY_KEY: dict[str, Spec] = {s.key: s for s in SPECS}
 
