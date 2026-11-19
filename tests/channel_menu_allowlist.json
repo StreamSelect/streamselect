@@ -84,6 +84,10 @@
     {
       "entry": "streamselect/gui/game_card.py::GameCard.build_context_menu",
       "reason": "game card menu (Mark as finished; nothing showing / not this game on the card's own channel, the same reports as its channel rows) - game-shaped, not channel-shaped."
+    },
+    {
+      "entry": "streamselect/gui/sports_view.py::SportsView._finished_menu",
+      "reason": "a finished game's row menu (\"Not finished - still on\") - acts on a game, not a channel."
     }
   ]
 }
