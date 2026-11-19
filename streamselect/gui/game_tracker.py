@@ -75,8 +75,11 @@ class GameTracker(QObject):
             try:
                 counts = refresh_games(self._db, overrides=self._overrides())
                 self.has_run = True
-                self.games_updated.emit(counts)
+                if not self._closed:          # shut down mid-run: nobody left to tell
+                    self.games_updated.emit(counts)
             except Exception:
+                if self._closed:              # the database closed under the run
+                    return
                 logger.exception("Game finder run failed")
                 self.games_updated.emit({})    # a view waiting on "finding" must not wait forever
             with self._lock:

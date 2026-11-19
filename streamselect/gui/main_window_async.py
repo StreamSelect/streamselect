@@ -84,7 +84,15 @@ class _AsyncMixin:
                     rating/hide-from-alerts toggles) — the scope commits on
                     success, exactly like Database.session_scope()'s own
                     default, moving the write off the UI thread.
+
+        Once the window is closing (``_shutting_down``, set first in closeEvent)
+        nothing is submitted: the executor is shut down during teardown, and a
+        late caller (a background run finishing after close) would raise
+        "cannot schedule new futures after shutdown" into the Qt event loop.
         """
+        if self.__dict__.get("_shutting_down"):
+            logger.debug("_run_query: window closing — query dropped")
+            return
         if token_ref is not None:
             token_ref[0] += 1
         token = token_ref[0] if token_ref is not None else None

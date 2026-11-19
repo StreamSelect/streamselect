@@ -264,3 +264,16 @@ def test_stale_result_dropped_when_superseded():
         subject._on_query_result(queued)
 
     assert received == [], "superseded result must be dropped"
+
+
+def test_a_query_after_the_window_started_closing_is_dropped_not_raised():
+    """v1.0.9's tagged macOS run: the game finder finished after the window closed,
+    its games_updated asked the alert notifier to check, and _run_query submitted to
+    the executor closeEvent had already shut down — "cannot schedule new futures after
+    shutdown" in the Qt event loop."""
+    subject = _make_subject()
+    subject._shutting_down = True            # closeEvent sets this FIRST
+    subject.executor.shutdown(wait=True)     # ...then tears the pool down
+    called = []
+    subject._run_query(lambda repos: called.append(1), called.append)   # must not raise
+    assert called == [] and subject._query_result.emitted == []

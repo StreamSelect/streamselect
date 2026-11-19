@@ -61,3 +61,42 @@ def test_a_real_change_still_runs_again_after_a_run_in_flight(qapp):
             assert len(calls) == 2
         finally:
             tracker.shutdown()
+
+
+def test_a_run_that_finishes_after_shutdown_tells_nobody(qapp):
+    """The run in flight when the window closes must not emit games_updated: its
+    listeners (the alert notifier) run queries on a pool that is gone (v1.0.9 tag run)."""
+    release, emitted = threading.Event(), []
+
+    def slow_refresh(_db, **_kw):
+        release.wait(5)
+        return {"hockey/NHL": 1}
+
+    with mock.patch.object(gt, "refresh_games", slow_refresh):
+        tracker = gt.GameTracker(db=None)
+        tracker.games_updated.connect(emitted.append)
+        tracker.request()
+        tracker.shutdown()                 # the window closes mid-run
+        release.set()
+        pool = tracker._pool
+        pool.shutdown(wait=True)
+        qapp.processEvents()
+        assert emitted == []
+
+
+def test_a_run_that_fails_because_the_database_closed_says_nothing(qapp):
+    release, emitted = threading.Event(), []
+
+    def failing_refresh(_db, **_kw):
+        release.wait(5)
+        raise RuntimeError("database closed")
+
+    with mock.patch.object(gt, "refresh_games", failing_refresh):
+        tracker = gt.GameTracker(db=None)
+        tracker.games_updated.connect(emitted.append)
+        tracker.request()
+        tracker.shutdown()
+        release.set()
+        tracker._pool.shutdown(wait=True)
+        qapp.processEvents()
+        assert emitted == []
