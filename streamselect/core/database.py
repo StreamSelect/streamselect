@@ -378,6 +378,7 @@ class ProviderDB(Base):
     epg_last_fetched = Column(DateTime, nullable=True)      # When EPG was last downloaded
     epg_data_start = Column(DateTime, nullable=True)        # Earliest start_time in fetched EPG data
     epg_data_end = Column(DateTime, nullable=True)          # Latest stop_time in fetched EPG data
+    epg_last_start = Column(DateTime, nullable=True)        # Latest START in fetched EPG data: when the guide runs out (refresh timing)
     epg_refresh_hours_before = Column(Integer, default=48)  # Refresh when data expires within N hours
     epg_enabled = Column(Boolean, default=True)  # If False, skip EPG fetch and exclude from EPG surfaces
     epg_refresh_interval = Column(String, default="default")  # Per-source throttle: "default"|"every_open"|"4h"|…|"when_stale"

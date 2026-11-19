@@ -467,6 +467,7 @@ class _EpgFetchMixin:
             # 288,213-programme guide (measured 2026-11-17).
             batch: list[dict] = []
             min_start: datetime | None = None
+            max_start: datetime | None = None    # when the guide runs out (refresh timing)
             saved = 0
             _report_every = max(1, total_progs // 20)  # ~5% increments
 
@@ -488,6 +489,8 @@ class _EpgFetchMixin:
 
                 if min_start is None or prog.start_time < min_start:
                     min_start = prog.start_time
+                if max_start is None or prog.start_time > max_start:
+                    max_start = prog.start_time
 
                 if len(batch) >= 2000:
                     with write_gate.background_write_gate():
@@ -531,6 +534,7 @@ class _EpgFetchMixin:
                     provider.epg_last_fetch_error_at = None
                 provider.epg_data_start = min_start
                 provider.epg_data_end = honest_end
+                provider.epg_last_start = max_start
                 # The provider's feed can serve year-old data (one source returned a
                 # Jan-2025 snapshot). Flag it so it's not mistaken for our bug — the
                 # EPG view / provider editor surface this to the user via epg_is_stale.

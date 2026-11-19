@@ -514,6 +514,7 @@ class ProviderEditorView(_NewSourceMixin, _ConnectionTestMixin, _AccountInfoMixi
             self._set_epg_status_label(
                 effective_epg_url, db_prov.epg_data_end,
                 epg_data_start=getattr(db_prov, "epg_data_start", None),
+                last_fetched=db_prov.epg_last_fetched, last_start=db_prov.epg_last_start,
                 last_fetch_error=db_prov.epg_last_fetch_error,
                 last_fetch_error_at=db_prov.epg_last_fetch_error_at,
                 has_url_override=bool(epg_url_override),

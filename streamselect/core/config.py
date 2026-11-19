@@ -1127,6 +1127,11 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     epg_notification_minutes_before: int = 15
     epg_auto_refresh: bool = True
     epg_refresh_interval_hours: int = 24
+    # Refresh this long before the guide's last programme START (owner, 2026-11-18:
+    # "it knows when it runs out"), on Auto and on a fixed interval alike, so a guide
+    # never runs dry before the next fetch. A shipped default; its Settings row comes
+    # with the "fixed timings become settings" work (ROADMAP).
+    epg_refresh_before_runout_minutes: int = Field(default=60, json_schema_extra=PROFILE)
     # Age-based EPG hygiene: how long (hours) an EXPIRED programme (stop_time in the
     # past) is kept before EpgManager.prune_expired() sweeps it, run after every
     # successful fetch. Floor of 6h is enforced in prune_expired(), not here, so a

@@ -602,6 +602,45 @@ def epg_auto_delta(epg_data_start: "datetime | None",
     return half
 
 
+def epg_auto_refresh_delta(last_fetched: "datetime | None", last_start: "datetime | None",
+                           epg_data_start: "datetime | None",
+                           epg_data_end: "datetime | None") -> timedelta:
+    """The Auto refresh interval: half of what the last fetch had AHEAD of it.
+
+    Measured 2026-11-18 (owner): a source serving ~24 h of programme starts
+    ahead, plus the 24 h of past programmes kept by ``epg_retention_hours``,
+    read as a ~60 h "depth" to :func:`epg_auto_delta`, so Auto waited ~30 h and
+    the guide ran out every day before the next fetch. What matters is how far
+    ahead the guide reached when it was fetched: ``last_start`` (the latest
+    programme START, stored at fetch) minus ``last_fetched``. Half of that,
+    clamped to [6 h, 7 d] like before.
+
+    Falls back to :func:`epg_auto_delta` when there is no latest start yet (a
+    guide fetched before it was recorded) or it was already past at fetch (a
+    feed stale at source — the caller throttles that).
+    """
+    if last_fetched is not None and last_start is not None and last_start > last_fetched:
+        half = (last_start - last_fetched) / 2
+        return min(max(half, EPG_AUTO_MIN_DELTA), EPG_AUTO_MAX_DELTA)
+    return epg_auto_delta(epg_data_start, epg_data_end)
+
+
+def epg_runs_out_soon(last_fetched: "datetime | None", last_start: "datetime | None",
+                      margin: timedelta, now: "datetime | None" = None) -> bool:
+    """True when the guide is within *margin* of its last programme start and
+    the last fetch came BEFORE that window opened.
+
+    The second half stops a loop: a fetch inside the window that brought
+    nothing newer leaves ``last_start`` where it was, and asking again every
+    tick would only re-download the same guide. Once nothing can start at all,
+    the expiry floor (``EpgManager.needs_refresh``) takes over.
+    """
+    if last_fetched is None or last_start is None or last_start <= last_fetched:
+        return False
+    window_opens = last_start - margin
+    return (now or now_utc()) >= window_opens and last_fetched < window_opens
+
+
 def epg_interval_delta(value: str) -> timedelta | None:
     """Map an interval enum value to a timedelta.
 
@@ -687,6 +726,8 @@ def guide_freshness(
     epg_data_end: datetime | None,
     *,
     epg_data_start: datetime | None = None,
+    last_fetched: datetime | None = None,
+    last_start: datetime | None = None,
     last_fetch_error: str | None = None,
     last_fetch_error_at: datetime | None = None,
     has_url_override: bool = False,
@@ -755,10 +796,16 @@ def guide_freshness(
     auto_note = ""
     if epg_data_start is not None:
         depth_days = (epg_data_end - epg_data_start).total_seconds() / 86400
-        resolved_hours = epg_auto_delta(epg_data_start, epg_data_end).total_seconds() / 3600
+        resolved_hours = epg_auto_refresh_delta(
+            last_fetched, last_start, epg_data_start, epg_data_end).total_seconds() / 3600
         resolved_str = (
             f"{resolved_hours:.0f}h" if resolved_hours < 24
             else f"{resolved_hours / 24:.0f}d"
         )
-        auto_note = f" · Auto: ~{depth_days:.0f}-day feed → refreshing ~every {resolved_str}"
+        if last_fetched is not None and last_start is not None and last_start > last_fetched:
+            ahead_h = (last_start - last_fetched).total_seconds() / 3600
+            ahead = f"{ahead_h:.0f}h" if ahead_h < 48 else f"{ahead_h / 24:.0f} days"
+            auto_note = f" · Auto: guide reaches ~{ahead} ahead → refreshing ~every {resolved_str}"
+        else:
+            auto_note = f" · Auto: ~{depth_days:.0f}-day feed → refreshing ~every {resolved_str}"
     return GuideFreshness("current", f"Current — guide through {day}{auto_note}")

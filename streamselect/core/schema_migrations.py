@@ -21,6 +21,7 @@ COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("providers",    "epg_last_fetched",         "DATETIME"),
     ("providers",    "epg_data_start",           "DATETIME"),
     ("providers",    "epg_data_end",             "DATETIME"),
+    ("providers",    "epg_last_start",           "DATETIME"),
     ("providers",    "epg_refresh_hours_before", "INTEGER DEFAULT 48"),
     ("watch_queue",  "channel_name",             "TEXT NOT NULL DEFAULT ''"),
     ("watch_queue",  "media_type",               "TEXT NOT NULL DEFAULT ''"),

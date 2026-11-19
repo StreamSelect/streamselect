@@ -192,7 +192,7 @@ class _GuideSettingsMixin:
 
     def _set_epg_status_label(
         self, epg_url, epg_data_end, epg_data_start=None, *,
-        last_fetch_error=None, last_fetch_error_at=None, has_url_override=False,
+        last_fetched=None, last_start=None, last_fetch_error=None, last_fetch_error_at=None, has_url_override=False,
     ) -> None:
         """Populate both EPG-guide status lines (Account Info's "EPG guide:" and
         Settings' "Guide freshness:" — one computation, two displays) from the
@@ -209,6 +209,9 @@ class _GuideSettingsMixin:
             epg_data_end:        Latest non-filler programme stop (UTC-naive).
             epg_data_start:      Earliest programme start (UTC-naive); used only
                                  for the Auto depth annotation.
+            last_fetched:        ``epg_last_fetched``; with *last_start*, how far
+                                 ahead the guide reached, which sets Auto.
+            last_start:          ``epg_last_start``: the latest programme start.
             last_fetch_error:    ``ProviderDB.epg_last_fetch_error`` — the
                                  condensed cause of the last FAILED fetch.
             last_fetch_error_at: When that failure happened (UTC-naive).
@@ -221,6 +224,7 @@ class _GuideSettingsMixin:
         fresh = guide_freshness(
             epg_url, epg_data_end,
             epg_data_start=epg_data_start,
+            last_fetched=last_fetched, last_start=last_start,
             last_fetch_error=last_fetch_error,
             last_fetch_error_at=last_fetch_error_at,
             has_url_override=has_url_override,

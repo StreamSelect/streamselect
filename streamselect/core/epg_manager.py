@@ -24,6 +24,8 @@ from streamselect.core.epg_fetch import _EpgFetchMixin
 from streamselect.core.epg_matching import build_match_map
 from streamselect.core.epg_utils import (
     epg_auto_delta,
+    epg_auto_refresh_delta,
+    epg_runs_out_soon,
     epg_is_stale,
     epg_interval_delta,
     now_utc,
@@ -88,6 +90,8 @@ class EpgManager(_EpgFetchMixin, QObject):
         self._notif_check_pending = False
         self._notification_timer: QTimer | None = None
         self._scheduler_timer: QTimer | None = None
+        #: Fires shortly before the soonest guide runs out (``_arm_runout_timer``).
+        self._runout_timer: QTimer | None = None
         self._notify.connect(self._do_notify)
         self._watch_alert.connect(self._do_watch_alert)
         self._progress_update.connect(self._do_progress_update)
@@ -253,6 +257,11 @@ class EpgManager(_EpgFetchMixin, QObject):
         # otherwise re-fetch forever.
         return epg_repo.has_future_programmes(ids, after=last_fetched)
 
+    def runout_margin(self) -> timedelta:
+        """How long before the guide's last programme start to refresh
+        (``Config.epg_refresh_before_runout_minutes``)."""
+        return timedelta(minutes=int(self.config.epg_refresh_before_runout_minutes))
+
     def needs_refresh(
         self, provider: ProviderDB, epg_repo: EpgRepository | None = None,
     ) -> bool:
@@ -331,6 +340,11 @@ class EpgManager(_EpgFetchMixin, QObject):
         expiry_floor = not guide_stale_at_source and self._guide_ran_out_of_starts(
             provider.id, last_fetched, guide_expired, epg_repo
         )
+        # The guide is about to run out (owner, 2026-11-18: "it knows when it runs
+        # out"): refresh shortly BEFORE its last programme start, on Auto and on a
+        # fixed interval alike — the floor above only fires once it has run out.
+        last_start = getattr(provider, "epg_last_start", None)
+        runs_out_soon = epg_runs_out_soon(last_fetched, last_start, self.runout_margin())
 
         if effective == "every_open":
             return True
@@ -347,9 +361,10 @@ class EpgManager(_EpgFetchMixin, QObject):
             # Self-tuning: half the guide depth, clamped to [6 h, 7 d].
             # Expiry floor refreshes immediately when the guide ran out (unless the
             # feed is stale at source — see above, where the throttle governs).
-            if expiry_floor:
+            if expiry_floor or runs_out_soon:
                 return True
-            delta = epg_auto_delta(data_start, data_end)
+            # Half of what the last fetch had AHEAD of it (epg_auto_refresh_delta).
+            delta = epg_auto_refresh_delta(last_fetched, last_start, data_start, data_end)
             return now_utc() - last_fetched >= delta
 
         # Time-based interval
@@ -360,8 +375,9 @@ class EpgManager(_EpgFetchMixin, QObject):
             return True
 
         # Expiry floor: refresh immediately if the guide ran out mid-interval
-        # (unless the feed is stale at source — the interval throttle governs there).
-        if expiry_floor:
+        # (unless the feed is stale at source — the interval throttle governs there),
+        # or is about to.
+        if expiry_floor or runs_out_soon:
             return True
 
         return now_utc() - last_fetched >= delta
@@ -484,6 +500,7 @@ class EpgManager(_EpgFetchMixin, QObject):
                 provider.epg_last_fetched = None
                 provider.epg_data_start = None
                 provider.epg_data_end = None
+                provider.epg_last_start = None
             if own_session:
                 session.commit()
             logger.info(
@@ -818,13 +835,53 @@ class EpgManager(_EpgFetchMixin, QObject):
         self._scheduler_timer.setInterval(self._SCHEDULER_INTERVAL_MS)
         self._scheduler_timer.timeout.connect(self.refresh_all_if_needed)
         self._scheduler_timer.start()
+        # The hourly tick counts from launch, so on its own it notices a guide that
+        # ran out up to an hour late. This one is set for the moment it matters:
+        # shortly before the soonest guide's last programme start, re-set after
+        # every fetch (owner, 2026-11-18: "it knows when it runs out").
+        self._runout_timer = QTimer(self)
+        self._runout_timer.setSingleShot(True)
+        self._runout_timer.timeout.connect(self._on_runout_timer)
+        self.refresh_finished.connect(self._arm_runout_timer)
+        self._arm_runout_timer()
         logger.info("EPG periodic refresh scheduler started (1-hour tick)")
+
+    def runout_due_at(self) -> datetime | None:
+        """When the soonest guide enters its run-out window (UTC-naive), if later than now."""
+        if not self.config.epg_auto_refresh:
+            return None
+        margin, now = self.runout_margin(), now_utc()
+        with self.db.session_scope(commit=False) as session:
+            hidden = set(RepositoryFactory(session).providers.get_hidden_provider_ids())
+            starts = [p.epg_last_start for p in session.query(ProviderDB).filter_by(is_active=True)
+                      if p.id not in hidden and getattr(p, "epg_enabled", True)
+                      and p.epg_last_start is not None]
+        due = [s - margin for s in starts if s - margin > now]
+        return min(due) if due else None
+
+    def _arm_runout_timer(self, *_args) -> None:
+        if self._runout_timer is None:
+            return
+        due = self.runout_due_at()
+        self._runout_timer.stop()
+        if due is None:
+            return           # nothing ahead: the hourly tick and the expiry floor cover it
+        ms = int((due - now_utc()).total_seconds() * 1000)
+        self._runout_timer.start(min(max(ms, 0), 2**31 - 1))   # QTimer's longest wait (~24 days)
+        logger.info(f"EPG: guide refresh before it runs out scheduled for {to_local(due):%a %H:%M}")
+
+    def _on_runout_timer(self) -> None:
+        self.refresh_all_if_needed()
+        self._arm_runout_timer()   # nothing fetched (source off, say): set it for the next one
 
     def stop_scheduler(self) -> None:
         """Stop the periodic refresh scheduler."""
         if self._scheduler_timer:
             self._scheduler_timer.stop()
             self._scheduler_timer = None
+        if self._runout_timer:
+            self._runout_timer.stop()
+            self._runout_timer = None
 
     def start_notification_timer(self) -> None:
         """Start a 60-second repeating timer to check for watchlist shows starting soon."""
