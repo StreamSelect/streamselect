@@ -32,15 +32,33 @@ def league_key(sport: str, league: str) -> str:
     return f"{sport}/{league}"
 
 
+def _bell(px: int = 11) -> QLabel:
+    """The bell of a set alert, in its colour (SIDEBAR_CHIP_GROUP's chipAlert)."""
+    bell = QLabel()
+    bell.setProperty("chipAlert", "true")
+    _icon_utils.set_label_icon(bell, "alert", px)
+    return bell
+
+
+def add_alert_mark(chip: QWidget, alerted: int) -> QLabel:
+    """Append a bell and how many have an alert set to a ``labeled_chip``; returns
+    that count (the chip's own live mark and count, if any, stay as they are)."""
+    bell = _bell()
+    count = QLabel(str(alerted))
+    count.setProperty("chipCount", "true")
+    lay = chip.layout()
+    lay.addWidget(bell)
+    lay.addWidget(count)
+    count.bell = bell
+    return count
+
+
 def alert_count_chip(total: int, alerted: int) -> QWidget:
     """A collapsed list's count when some of its games have an alert set:
     "12 (bell) 1", the bell in a set alert's colour (owner, 2026-11-18)."""
-    chip = labeled_chip(str(total), alerted, "alert")
-    chip.icon_label.setProperty("chipAlert", "true")
-    # Re-polish: the bell was painted in the label's colour when the chip was built;
-    # the new property changes that colour, and the label repaints its icon with it.
-    chip.icon_label.style().unpolish(chip.icon_label)
-    chip.icon_label.style().polish(chip.icon_label)
+    chip = labeled_chip(str(total))
+    chip.count_label = add_alert_mark(chip, alerted)
+    chip.icon_label = chip.count_label.bell
     chip.setToolTip(f"{total} game{'s' if total != 1 else ''}, {alerted} with an alert set")
     return chip
 
@@ -130,6 +148,13 @@ class SportsHeadersMixin:
         chip.setToolTip(f"{league}: {ahead} game{'s' if ahead != 1 else ''} on now or still to come"
                         + (f", {len(on_now)} on now" if on_now else f", next at {nxt}" if nxt else ""))
         chip.setVisible(ahead > 0)
+        # Collapsed, the chip also says how many have an alert set (owner, 2026-11-18):
+        # "13 (•) 1 (bell) 2".
+        alerted = sum(1 for g in [g for g, _s in on_now] + later if alerts_for(g, self._alerts))
+        band.alert_label = None
+        if key in self._folded() and alerted:
+            band.alert_label = add_alert_mark(chip, alerted)
+            chip.setToolTip(chip.toolTip() + f", {alerted} with an alert set")
         h.addWidget(chip)
         h.addWidget(rule(), 1, Qt.AlignmentFlag.AlignVCenter)
         band.title, band.chip = title, chip

@@ -1783,3 +1783,24 @@ def test_no_alert_no_bell_even_collapsed(games_db, qapp, owned_widgets):
 def _theme_colour(name):
     from streamselect.gui import theme
     return getattr(theme, name)
+
+
+def test_a_collapsed_league_banner_counts_its_alerted_games_too(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-18: collapsing a league lost the alert; its banner chip carries it."""
+    _alert_sabres(games_db)
+    view = _later_view(games_db, qapp, owned_widgets)
+    key = "hockey:league:NHL"
+    assert view.headers[key].alert_label is None, "open: the rows show it"
+    view._toggle_fold(key)
+    _settle(qapp)
+    band = view.headers[key]
+    chip, count = band.chip, band.alert_label
+    assert count.isVisible() and count.text() == "1" and count.font().bold()
+    bell = next(lb for lb in chip.findChildren(QLabel) if lb.property("chipAlert") == "true")
+    assert chip.rect().contains(bell.geometry()) and chip.rect().contains(count.geometry()), "inside the one chip"
+    assert _rect(view, chip.name_label).left() < _rect(view, bell).left() < _rect(view, count).left()
+    image = view.grab(_rect(view, bell)).toImage()
+    bg = QColor(image.pixel(0, 0))
+    ink = [QColor(image.pixel(x, y)) for x in range(image.width()) for y in range(image.height())]
+    ink = max((c for c in ink if not _near(c, bg, 30)), key=lambda c: c.saturation())
+    assert _near(ink, QColor(_theme_colour("COLOR_ACCENT"))), "a set alert's colour"
