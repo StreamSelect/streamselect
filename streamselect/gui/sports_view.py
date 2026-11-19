@@ -18,6 +18,7 @@ Reads only what the game finder stored (``core/games``) through the host's
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import replace
 from datetime import datetime
 from typing import Callable, Optional
 
@@ -60,6 +61,9 @@ ORDER_SPORT, ORDER_TIME = "sport", "time"
 #: days come first, or A–Z. Never-watched ones always follow, A–Z.
 RANK_WATCHED, RANK_AZ = "watched", "az"
 FINISHED = "finished"
+#: How long a redraw holds the scroll position while the old widgets are deleted
+#: and the scroll area resizes the new ones (two event-loop passes; generous).
+RESTORE_SCROLL_MS = 250
 #: Live bitrate readings averaged for the WATCHING chip (one per player poll).
 BITRATE_SAMPLES = 5
 #: The section-key prefix for By time, where one list holds every sport.
@@ -127,7 +131,9 @@ class SportsView(SportsHeadersMixin, ContentView):
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea(self)
+        scroll = self._scroll = QScrollArea(self)
+        self._scroll_target: Optional[int] = None    # where a redraw must leave the list (_render)
+        scroll.verticalScrollBar().rangeChanged.connect(self._restore_scroll)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         # The centre panel never scrolls sideways: cards wrap, long names elide.
@@ -143,6 +149,7 @@ class SportsView(SportsHeadersMixin, ContentView):
         self.headers: dict[str, QWidget] = {}
         self.league_chips: dict[tuple[str, str], QWidget] = {}   # (sport, league) -> its chip
         self.open_list = self.toolbar = None
+        self._open_order: dict = {}     # open game -> its list's order, kept after PREFERRED (_channel_list)
         self._sub_text_x = 0            # set by each sub-heading; its rows line up under its words
         #: The last few live bitrate readings (kb/s), averaged so the chip doesn't flicker.
         self._bitrates: deque = deque(maxlen=BITRATE_SAMPLES)
@@ -331,6 +338,31 @@ class SportsView(SportsHeadersMixin, ContentView):
         self.open_list = self.toolbar = None   # the open game's channel list; the toolbar
 
     def _render(self, error: bool = False) -> None:
+        """Rebuild the list where it was scrolled to: every change (PREFERRED, a hidden
+        channel, the minute tick) redraws it, and the content must not move under the
+        pointer (owner report 2026-11-14: making a channel PREFERRED jumped the list)."""
+        bar = self._scroll.verticalScrollBar()
+        # Where the list is now — unless a redraw a moment ago left it mid-rebuild,
+        # too short to show where it was: then that earlier position still stands.
+        if self._scroll_target is None or bar.maximum() >= self._scroll_target:
+            self._scroll_target = bar.value()
+        self._build(error)
+        self._restore_scroll()
+        # The old widgets go on the next event-loop pass (deleteLater), which empties
+        # the range for a moment and then refills it; hold the position until that
+        # has settled, re-applying it on every rangeChanged meanwhile.
+        QTimer.singleShot(RESTORE_SCROLL_MS, self._end_restore_scroll)
+
+    def _restore_scroll(self, *_args) -> None:
+        """Put the list back where it was (also on the bar's ``rangeChanged``)."""
+        if self._scroll_target is not None:
+            self._scroll.verticalScrollBar().setValue(self._scroll_target)
+
+    def _end_restore_scroll(self) -> None:
+        self._restore_scroll()
+        self._scroll_target = None
+
+    def _build(self, error: bool = False) -> None:
         self._clear()
         if not self._loaded:
             self._message("Loading games…", "")
@@ -687,6 +719,14 @@ class SportsView(SportsHeadersMixin, ContentView):
             self._render()
 
     def _channel_list(self, g: GameDTO) -> ChannelList:
+        # PREFERRED never reorders the open list under the pointer (owner report
+        # 2026-11-14): _set_preferred keeps the order the list had, until it closes or
+        # a report / hide re-ranks it on purpose. The card still plays the new best.
+        key = _game_key(g)
+        order = self._open_order.get(key) if key == self._open else None
+        if order:
+            rank = {cid: i for i, cid in enumerate(order)}
+            g = replace(g, feeds=tuple(sorted(g.feeds, key=lambda f: rank.get(f.channel_id, len(rank)))))
         lst = self.open_list = ChannelList(g, preferred_key=self._prefs(g.league_key).get("preferred"),
                           playing_id=self._playing, show_hidden=_game_key(g) in self._show_hidden)
         lst.play.connect(self.playRequested)
@@ -759,6 +799,7 @@ class SportsView(SportsHeadersMixin, ContentView):
     def _toggle_open(self, game: GameDTO) -> None:
         key = _game_key(game)
         self._open = None if key == self._open else key
+        self._open_order.clear()          # a list (re)opens in the current ranking
         if self._open is not None:
             feed = best_feed(game)
             if feed is not None:
@@ -792,6 +833,8 @@ class SportsView(SportsHeadersMixin, ContentView):
         QTimer.singleShot(0, self._render)
 
     def _set_preferred(self, game: GameDTO, feed) -> None:
+        if self.open_list is not None and _game_key(game) == self._open:
+            self._open_order[self._open] = [r.feed.channel_id for r in self.open_list.rows]
         prefs = self._prefs(game.league_key)
         if feed is None:
             prefs.pop("preferred", None)
@@ -801,6 +844,7 @@ class SportsView(SportsHeadersMixin, ContentView):
         QTimer.singleShot(0, self._render)
 
     def _hide(self, game: GameDTO, feed, scope: str) -> None:
+        self._open_order.clear()          # a report / hide re-ranks the list on purpose
         if scope == HIDE_EVERYWHERE:
             self.hideEverywhereRequested.emit(feed.channel_id)
             return
@@ -815,6 +859,7 @@ class SportsView(SportsHeadersMixin, ContentView):
         QTimer.singleShot(0, self._render)
 
     def _unhide(self, game: GameDTO, feed) -> None:
+        self._open_order.clear()          # a report / hide re-ranks the list on purpose
         prefs = self._prefs(game.league_key)
         for field, value in (("hidden_channels", feed.channel_id), ("hidden_collections", feed.collection_key)):
             if value in prefs.get(field, []):
@@ -840,6 +885,7 @@ class SportsView(SportsHeadersMixin, ContentView):
     def _report(self, game: GameDTO, feed, kind: str) -> None:
         """Record a report against the channel, for this league (``CHANNEL_REPORTS``);
         its collection and name ride along, for adding reports up later."""
+        self._open_order.clear()          # a report / hide re-ranks the list on purpose
         if not feed.channel_id:
             return
         entry = {"kind": kind, "at": self._clock().isoformat(),
@@ -853,6 +899,7 @@ class SportsView(SportsHeadersMixin, ContentView):
     def _unreport(self, game: GameDTO, feed, kind: str) -> None:
         """Take one report kind back for this channel: every "nothing showing", or this
         game's "not this game" — what the ticked menu item stood for."""
+        self._open_order.clear()          # a report / hide re-ranks the list on purpose
         reports = self._prefs(game.league_key).get(CHANNEL_REPORTS) or {}
         mine = reports.get(feed.channel_id)
         if not mine:
@@ -868,6 +915,7 @@ class SportsView(SportsHeadersMixin, ContentView):
         QTimer.singleShot(0, self._render)
 
     def _clear_reports(self, game: GameDTO, feed) -> None:
+        self._open_order.clear()          # a report / hide re-ranks the list on purpose
         reports = self._prefs(game.league_key).get(CHANNEL_REPORTS) or {}
         if reports.pop(feed.channel_id, None) is not None:
             self._save()

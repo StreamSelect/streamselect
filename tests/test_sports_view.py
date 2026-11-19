@@ -1804,3 +1804,39 @@ def test_a_collapsed_league_banner_counts_its_alerted_games_too(games_db, qapp, 
     ink = [QColor(image.pixel(x, y)) for x in range(image.width()) for y in range(image.height())]
     ink = max((c for c in ink if not _near(c, bg, 30)), key=lambda c: c.saturation())
     assert _near(ink, QColor(_theme_colour("COLOR_ACCENT"))), "a set alert's colour"
+
+
+def test_making_a_channel_preferred_does_not_move_the_list(games_db, qapp, owned_widgets):
+    """Owner report 2026-11-14: clicking PREFERRED jumped the list down. The redraw
+    keeps the scroll position, and the clicked row stays where it was."""
+    from streamselect.gui.game_card import ChannelRow
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    view.resize(1000, 300)                                   # short: the list scrolls
+    _card(view, "Sabres").more_chip.click()
+    _settle(qapp)
+    bar = view._scroll.verticalScrollBar()
+    assert bar.maximum() > 0, "the list is taller than the view"
+    row = view.cards[0].findChildren(ChannelRow)[-1]
+    bar.setValue(bar.maximum() // 2 or 1)
+    _settle(qapp)
+    before_scroll = bar.value()
+    channel = row.feed.channel_id
+    y_before = row.mapTo(view, QPoint(0, 0)).y()
+    row.pref_chip.click()
+    _settle(qapp)
+    assert bar.value() == before_scroll, f"scrolled from {before_scroll} to {bar.value()}"
+    after = next(r for r in view.cards[0].findChildren(ChannelRow) if r.feed.channel_id == channel)
+    assert abs(after.mapTo(view, QPoint(0, 0)).y() - y_before) <= 2, "the clicked row stays under the pointer"
+
+
+def test_the_minute_tick_keeps_the_list_where_it_was(games_db, qapp, owned_widgets):
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    view.resize(1000, 300)
+    _settle(qapp)
+    bar = view._scroll.verticalScrollBar()
+    assert bar.maximum() > 0
+    bar.setValue(bar.maximum())
+    at = bar.value()
+    view._tick.timeout.emit()
+    _settle(qapp)
+    assert bar.value() == at
