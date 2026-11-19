@@ -47,6 +47,7 @@ from streamselect.gui.content_view import ContentView
 from streamselect.gui.flow_layout import FlowLayout
 from streamselect.gui.game_card import (
     HIDE_CHANNEL, HIDE_COLLECTION, HIDE_EVERYWHERE, AlertBell, ChannelList, GameCard, GameLine,
+    preferred_feed_id,
 )
 from streamselect.gui.sidebar.base import GroupHeading, _ClickableHeader
 from streamselect.gui.similar_lightbox_card import _ClickableFrame
@@ -723,11 +724,13 @@ class SportsView(SportsHeadersMixin, ContentView):
         # 2026-11-14): _set_preferred keeps the order the list had, until it closes or
         # a report / hide re-ranks it on purpose. The card still plays the new best.
         key = _game_key(g)
+        preferred = self._prefs(g.league_key).get("preferred")
+        chosen = preferred_feed_id(g, preferred)      # from the ranked order: what the card plays
         order = self._open_order.get(key) if key == self._open else None
         if order:
             rank = {cid: i for i, cid in enumerate(order)}
             g = replace(g, feeds=tuple(sorted(g.feeds, key=lambda f: rank.get(f.channel_id, len(rank)))))
-        lst = self.open_list = ChannelList(g, preferred_key=self._prefs(g.league_key).get("preferred"),
+        lst = self.open_list = ChannelList(g, preferred_key=preferred, preferred_channel=chosen,
                           playing_id=self._playing, show_hidden=_game_key(g) in self._show_hidden)
         lst.play.connect(self.playRequested)
         lst.prefer.connect(self._set_preferred)

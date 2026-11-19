@@ -1840,3 +1840,39 @@ def test_the_minute_tick_keeps_the_list_where_it_was(games_db, qapp, owned_widge
     view._tick.timeout.emit()
     _settle(qapp)
     assert bar.value() == at
+
+
+def test_a_package_preference_shows_on_one_row_never_a_reported_one(qapp, owned_widgets):
+    """Owner report 2026-11-14 / decision 2026-11-18: preferring one Sportsnet channel lit
+    PREFERRED on every channel in the package, a reported one too. It shows on ONE row:
+    the channel the card plays from that package, the first not reported."""
+    from dataclasses import replace
+    from streamselect.gui.game_card import ChannelList
+    reported = replace(_feed("east", "SPORTSNET"), report="Nothing showing")
+    feeds = (reported, _feed("ontario", "SPORTSNET"), _feed("pacific", "SPORTSNET"), _feed("tsn", "TSN"))
+    game = GameDTO(1, "hockey", "NHL", "A", "B", START, 1, False, 2, feeds)
+    lst = owned_widgets.own(ChannelList(game, preferred_key=feeds[1].collection_key,
+                                        playing_id=None, show_hidden=False))
+    lst.resize(700, 200)
+    lst.show()
+    qapp.processEvents()
+    # The solid chip (a row's own preference), not the dashed one hover offers.
+    lit = [r.feed.channel_id for r in lst.rows if r._preferred]
+    assert lit == ["ontario"], lit
+    ontario = lst.rows[1]
+    assert ontario.pref_chip.isVisible() and ontario.pref_chip.toolTip().startswith("Your preferred channel")
+    assert lst.rows[0].feed.channel_id == "east" and not lst.rows[0]._preferred, (
+        "a reported channel never shows PREFERRED")
+
+
+def test_the_view_lights_the_channel_the_card_plays(games_db, qapp, owned_widgets):
+    from streamselect.gui.game_card import ChannelRow
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    _card(view, "Sabres").more_chip.click()
+    _settle(qapp)
+    row = view.cards[0].findChildren(ChannelRow)[-1]
+    row.pref_chip.click()
+    _settle(qapp)
+    card = view.cards[0]
+    lit = [r for r in card.findChildren(ChannelRow) if r._preferred]
+    assert [r.feed.channel_id for r in lit] == [card.top_feed.channel_id]

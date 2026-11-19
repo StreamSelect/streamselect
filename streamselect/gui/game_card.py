@@ -297,8 +297,21 @@ def _add_in_slot(row: QHBoxLayout, chip: Optional[QWidget], width: int) -> None:
     row.addWidget(slot)
 
 
+def preferred_feed_id(game: GameDTO, preferred_key: Optional[str]) -> Optional[str]:
+    """The one channel a package preference stands for: the first of *game*'s
+    playable feeds (in their order) from that package that is not reported."""
+    return next((f.channel_id for f in game.playable
+                 if f.collection_key == preferred_key and not f.report), None)
+
+
 class ChannelList(QWidget):
-    """Every channel showing a game, then "N hidden channels · show" when some are hidden."""
+    """Every channel showing a game, then "N hidden channels · show" when some are hidden.
+
+    A preference is saved per package (``preferred_key``), but PREFERRED shows on ONE
+    row: the channel the card plays from that package, the first not reported (owner,
+    2026-11-18). ``preferred_channel`` names it when the rows are not in ranked order
+    (an open list keeps its order after PREFERRED); by default it is the first such row.
+    """
 
     play = pyqtSignal(str)
     prefer = pyqtSignal(object, object)       # GameDTO, GameFeedDTO | None
@@ -309,16 +322,18 @@ class ChannelList(QWidget):
     clearReportsRequested = pyqtSignal(object, object)  # GameDTO, GameFeedDTO
 
     def __init__(self, game: GameDTO, *, preferred_key: Optional[str], playing_id: Optional[str],
-                 show_hidden: bool, parent=None):
+                 show_hidden: bool, preferred_channel: Optional[str] = None, parent=None):
         super().__init__(parent)
         self.game = game
+        if preferred_channel is None and preferred_key:
+            preferred_channel = preferred_feed_id(game, preferred_key)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(1)
         self.rows: list[ChannelRow] = []
         slots = chip_slots([*game.playable, *(game.hidden if show_hidden else ())])
         for f in game.playable:
-            r = ChannelRow(f, game.league, preferred=f.collection_key == preferred_key,
+            r = ChannelRow(f, game.league, preferred=bool(f.channel_id) and f.channel_id == preferred_channel,
                            playing=f.channel_id == playing_id, slots=slots)
             r.play.connect(self.play)
             r.prefer.connect(lambda feed: self.prefer.emit(self.game, feed))
