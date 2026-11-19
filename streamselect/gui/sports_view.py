@@ -49,7 +49,7 @@ from streamselect.gui.game_card import (
 )
 from streamselect.gui.sidebar.base import GroupHeading, _ClickableHeader
 from streamselect.gui.similar_lightbox_card import _ClickableFrame
-from streamselect.gui.sports_view_headers import SportsHeadersMixin
+from streamselect.gui.sports_view_headers import SportsHeadersMixin, alert_count_chip
 
 #: Sports are not named here: every sport with a league in ``game_finder_leagues``
 #: gets its own section (owner, 2026-11-13: hockey is one segment, not the view).
@@ -464,10 +464,23 @@ class SportsView(SportsHeadersMixin, ContentView):
             days.setdefault(to_local(g.start_utc).date(), []).append(g)
         for day, gs in days.items():
             key = f"{prefix}:day:{day.isoformat()}"
-            self._layout.addWidget(self._header(key, self._day_label(gs[0].start_utc, now),
-                                                len(gs), foldable=True, sub=sub))
+            band = self._header(key, self._day_label(gs[0].start_utc, now), len(gs), foldable=True, sub=sub)
+            self._layout.addWidget(band)
+            alerted = sum(1 for g in gs if alerts_for(g, self._alerts))
+            if key in folded and alerted:
+                self._alert_count(band, len(gs), alerted)
             if key not in folded:
                 self._time_groups(gs, playable=False, label_of=label_of, sub=bool(sub))
+
+    def _alert_count(self, band: QWidget, total: int, alerted: int) -> None:
+        """A collapsed day with alerted games says so in its count: "12 (bell) 1", the
+        bell in a set alert's colour (owner, 2026-11-18). Open, the rows show it."""
+        heading = band.findChild(GroupHeading)
+        chip = alert_count_chip(total, alerted)
+        lay = heading.layout()
+        lay.insertWidget(lay.indexOf(heading.count_label) + 1, chip)
+        heading.count_label.hide()
+        band.alert_chip = chip
 
     def _finished_section(self, prefix: str, finished: list, now: datetime, folded: set, *,
                           label_of: Optional[Callable] = None, sub: int = 0) -> None:

@@ -41,6 +41,7 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
     muted      = _("COLOR_MUTED")
     warn       = _("COLOR_WARN")
     accent     = _("COLOR_ACCENT_BLUE")
+    alert_on   = _("COLOR_ACCENT")          # the bell's colour when an alert is set
     radius_sm  = _("RADIUS_SM")
     font_md    = _("FONT_MD")
     font_sm    = _("FONT_SM")
@@ -140,6 +141,9 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
             # dashed and greyer — the dash says "off" without colour alone.
             f"QFrame#chipGroup[off=\"true\"] {{ border: 1px dashed {muted}; }}"
             f"QFrame#chipGroup[off=\"true\"] QLabel {{ color: {muted}; }}"
+            # The bell in a day's count while it is collapsed ("12 (bell) 1", owner
+            # 2026-11-18): the colour of a set alert's bell.
+            f"QFrame#chipGroup QLabel[chipAlert=\"true\"] {{ color: {alert_on}; }}"
         ),
         # The strip itself. Sits on its own ground so the chips have something
         # to be distinct FROM.

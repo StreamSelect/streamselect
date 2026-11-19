@@ -16,6 +16,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
 from streamselect.core.epg_utils import fmt_time
+from streamselect.core.games.alerts import alerts_for
 from streamselect.core.games.read import event_is_live as event_live
 from streamselect.gui import cursor_affordance
 from streamselect.gui import icon_utils as _icon_utils
@@ -29,6 +30,19 @@ HIDDEN_LEAGUES = "hidden_leagues"
 
 def league_key(sport: str, league: str) -> str:
     return f"{sport}/{league}"
+
+
+def alert_count_chip(total: int, alerted: int) -> QWidget:
+    """A collapsed list's count when some of its games have an alert set:
+    "12 (bell) 1", the bell in a set alert's colour (owner, 2026-11-18)."""
+    chip = labeled_chip(str(total), alerted, "alert")
+    chip.icon_label.setProperty("chipAlert", "true")
+    # Re-polish: the bell was painted in the label's colour when the chip was built;
+    # the new property changes that colour, and the label repaints its icon with it.
+    chip.icon_label.style().unpolish(chip.icon_label)
+    chip.icon_label.style().polish(chip.icon_label)
+    chip.setToolTip(f"{total} game{'s' if total != 1 else ''}, {alerted} with an alert set")
+    return chip
 
 
 class _LeagueToggle(QFrame):
@@ -156,6 +170,15 @@ class SportsHeadersMixin:
         count.setVisible(bool(on_now or later))
         h.addWidget(count)
         band.count = count
+        # Collapsed, it says how many of those have an alert set, as a collapsed
+        # day does: "12 (bell) 1" (owner, 2026-11-18). Open, the rows show it.
+        ahead = [g for g, _state in on_now] + later
+        alerted = sum(1 for g in ahead if alerts_for(g, self._alerts))
+        band.alert_chip = None
+        if key in self._folded() and alerted:
+            band.alert_chip = alert_count_chip(len(ahead), alerted)
+            h.insertWidget(h.indexOf(count) + 1, band.alert_chip)
+            count.hide()
         # One outlined chip per league with games here — none when nothing is
         # listed — and a league with games on now carries the live mark and how
         # many (owner, 2026-11-17: "when there are live games within a league

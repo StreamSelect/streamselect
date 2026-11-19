@@ -1720,3 +1720,67 @@ def test_hidden_leagues_leave_the_count_and_hiding_all_says_so(games_db, qapp, o
     note = view.findChild(QLabel, "allLeaguesHidden")
     assert note is not None and note.isVisible() and "Click a league to show it" in note.text()
     assert not view.cards and not view.rows
+
+
+# ── a collapsed list says how many of its games have alerts (owner, 2026-11-18) ──
+
+def _alert_sabres(games_db):
+    from streamselect.core.games.alerts import THIS_EVENT, add_alert, rule_for
+    from streamselect.core.games.read import load_games
+    with games_db.session_scope() as s:
+        sabres = next(g for g in load_games(s, "hockey", set(), 1, 1) if g.team_a == "Buffalo Sabres")
+        add_alert(s, rule_for(THIS_EVENT, sabres))
+
+
+def _bell_colour(view, chip) -> QColor:
+    """The bell as painted on the view (a lone grab composites it over transparency)."""
+    from collections import Counter
+    image = view.grab(_rect(view, chip.icon_label)).toImage()
+    bg = QColor(image.pixel(0, 0))
+    ink = [QColor(image.pixel(x, y)) for x in range(image.width()) for y in range(image.height())]
+    ink = [c for c in ink if not _near(c, bg, 30)]
+    return max(ink, key=lambda c: c.saturation())
+
+
+def test_a_collapsed_day_counts_its_alerted_games_beside_a_bell(games_db, qapp, owned_widgets):
+    _alert_sabres(games_db)
+    view = _later_view(games_db, qapp, owned_widgets)
+    key = next(k for k in view.headers if ":day:" in k)
+    heading = view.headers[key].findChild(GroupHeading)
+    assert getattr(view.headers[key], "alert_chip", None) is None and heading.count_label.isVisible(), (
+        "open: the rows show the alert, the count stays plain")
+    view._toggle_fold(key)
+    _settle(qapp)
+    band = view.headers[key]
+    chip = band.alert_chip
+    assert chip.isVisible() and chip.name_label.text() == "2" and chip.count_label.text() == "1"
+    assert not band.findChild(GroupHeading).count_label.isVisible(), "one count, not two"
+    xs = [_rect(view, w).left() for w in (chip.name_label, chip.icon_label, chip.count_label)]
+    assert xs == sorted(xs), "games, the bell, then how many have alerts"
+    assert _near(_bell_colour(view, chip), QColor(_theme_colour("COLOR_ACCENT"))), "a set alert's colour"
+
+
+def test_a_collapsed_sport_counts_its_alerted_games_too(games_db, qapp, owned_widgets):
+    _alert_sabres(games_db)
+    view = _later_view(games_db, qapp, owned_widgets)
+    assert view.headers["sport:hockey"].alert_chip is None, "open: nothing extra"
+    view._toggle_fold("sport:hockey")
+    _settle(qapp)
+    band = view.headers["sport:hockey"]
+    chip = band.alert_chip
+    assert chip.isVisible() and chip.name_label.text() == "2" and chip.count_label.text() == "1"
+    assert not band.count.isVisible()
+    assert _rect(view, chip).left() > _rect(view, next(
+        lb for lb in band.findChildren(QLabel) if lb.text() == "Hockey")).right(), "after the name"
+
+
+def test_no_alert_no_bell_even_collapsed(games_db, qapp, owned_widgets):
+    view = _later_view(games_db, qapp, owned_widgets)
+    view._toggle_fold("sport:hockey")
+    _settle(qapp)
+    assert view.headers["sport:hockey"].alert_chip is None and view.headers["sport:hockey"].count.isVisible()
+
+
+def _theme_colour(name):
+    from streamselect.gui import theme
+    return getattr(theme, name)
