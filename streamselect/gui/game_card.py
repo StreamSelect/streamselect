@@ -495,7 +495,12 @@ class MatchupTitle(QWidget):
                 continue
             side = QLabel(text)
             side.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-            side.setWordWrap(True)
+            # One line, never wrapped: a wrapping label asks for a second line's
+            # height in its size hint even when the name fits, and the flow of cards
+            # sizes each card by that hint — "Wilkes Barre Scranton Penguins" made
+            # its card a line taller than the rest (owner report, 2026-11-18).
+            # Ignored: a name wider than the card is cut at its edges, never widens it.
+            side.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
             side.setProperty("alerted", "true" if alerted else "false")
             _theme.style(side, "GAME_CARD_TITLE")
             col.addWidget(side)
@@ -602,6 +607,7 @@ class GameCard(QFrame):
         # The play line: what a click (or a double-click on the card) plays.
         playing = next((f for f in game.playable if f.channel_id == playing_id), None)
         self.top_feed = playing or (game.playable[0] if game.playable else None)
+        self.watching = playing is not None
         line = self.play_line = PlayLine(live)
         line.clicked.connect(self._play_top)
         pl = QHBoxLayout(line)
@@ -618,7 +624,9 @@ class GameCard(QFrame):
                 word = QLabel("WATCHING")
                 _theme.style(word, "GAME_PLAYING")
                 pl.addWidget(word)
-            tip = "Click to play on this channel (double-clicking the card does the same)"
+            tip = ("You're watching this — click to " + ("hide" if expanded else "show")
+                   + " the other channels" if playing
+                   else "Click to play on this channel (double-clicking the card does the same)")
         else:
             tip = "This channel plays the game once it starts"
         if self.top_feed is not None:
@@ -690,8 +698,14 @@ class GameCard(QFrame):
             self.bitrate_chip.setVisible(True)
 
     def _play_top(self) -> None:
-        if self.top_feed is not None and self.top_feed.channel_id and self.state != UPCOMING:
-            self.play.emit(self.top_feed.channel_id)
+        if self.top_feed is None or not self.top_feed.channel_id or self.state == UPCOMING:
+            return
+        if self.watching:
+            # Already playing it: a click opens or closes the channel list instead of
+            # restarting the stream (owner, 2026-11-18).
+            self.toggled.emit(self.game)
+            return
+        self.play.emit(self.top_feed.channel_id)
 
     def paintEvent(self, event) -> None:  # noqa: N802 (Qt API)
         """The card itself, then the league's logo, barely there, centred on the

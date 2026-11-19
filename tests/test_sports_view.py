@@ -1577,3 +1577,40 @@ def test_a_games_run_that_finishes_off_screen_is_read_when_the_view_is_shown(gam
     view.show()
     _settle(qapp)
     assert first() == "NHL", "shown again, it re-reads and the watched league comes first"
+
+
+def _live_card(team_b, playing_id=None, expanded=False):
+    from streamselect.gui.game_card import GameCard
+    feeds = tuple(GameFeedDTO(c, "FLO 1", "US| COLL", False, "zone", "p1", "US| COLL", "US") for c in ("x", "y"))
+    g = GameDTO(1, "hockey", "AHL", "Milwaukee Admirals", team_b, START, 1, False, 2, feeds)
+    return GameCard(g, ON_NOW, LIVE_AT, HOCKEY.usual_length, playing_id=playing_id, expanded=expanded)
+
+
+def test_a_long_team_name_does_not_make_its_card_taller(qapp, owned_widgets):
+    """Owner, 2026-11-18: "Wilkes Barre Scranton Penguins" made its card a line
+    taller (156 -> 177 px) and the extra went to the stretched US chip."""
+    from streamselect.gui.flow_layout import FlowLayout
+    host = owned_widgets.own(QWidget())
+    flow = FlowLayout(host, spacing=10)
+    short, long_ = _live_card("Manitoba Moose"), _live_card("Wilkes Barre Scranton Penguins")
+    flow.addWidget(short)
+    flow.addWidget(long_)
+    host.resize(700, 400)
+    host.show()
+    _settle(qapp)
+    assert long_.height() == short.height(), (long_.height(), short.height())
+    chips = [lb for lb in long_.findChildren(QLabel) if lb.text() == "US"]
+    assert chips and chips[0].height() < 30, "the region chip keeps its own height"
+
+
+def test_clicking_watching_opens_the_channels_instead_of_restarting_the_stream(qapp, owned_widgets):
+    card = owned_widgets.own(_live_card("Manitoba Moose", playing_id="x"))
+    played, toggled = [], []
+    card.play.connect(played.append)
+    card.toggled.connect(toggled.append)
+    QTest.mouseClick(card.play_line, Qt.MouseButton.LeftButton)
+    assert played == [] and len(toggled) == 1, "watching: the click shows the channels"
+    other = owned_widgets.own(_live_card("Manitoba Moose"))
+    other.play.connect(played.append)
+    QTest.mouseClick(other.play_line, Qt.MouseButton.LeftButton)
+    assert played == ["x"], "not watching: the click plays"
