@@ -383,3 +383,11 @@ def test_a_refresh_stores_the_leagues_watched_days(db):
     with db.session_scope(commit=False) as s:
         days, secs = load_league_watch(s)["hockey/NHL"]
     assert len(days) == 2 and secs == 1800, (days, secs)
+
+
+def test_a_name_written_as_one_word_or_two_is_one_team():
+    """One listing writes "Boro/Vetlanda HC", another "BoroVetlanda HC" (2026-11-18)."""
+    from streamselect.core.games.teams import match
+    assert match(("BOROVETLANDA", "HC"), ("BORO", "VETLANDA", "HC")) == "exact"
+    assert match(("BORO", "VETLANDA", "HC"), ("BOROVETLANDA", "HC")) == "exact"
+    assert match(("BOROVETLANDA",), ("BORO", "VETLANDA", "HC")) is None, "only the whole name joined"

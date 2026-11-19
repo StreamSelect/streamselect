@@ -179,6 +179,19 @@ class SportsView(ContentView):
             return (-len(days), -secs, name.lower())
         return sorted(names, key=key)
 
+    def _active_first(self, names: list, games_of: Callable, now: datetime) -> list:
+        """*names* (already in the chosen order) with those that have a game on now or
+        still to come first; those with only finished games after (owner, 2026-11-18)."""
+        def active(name) -> bool:
+            on_now, later, _ = self._split(games_of(name), now)
+            return bool(on_now or later)
+        flags = {n: active(n) for n in names}
+        return [n for n in names if flags[n]] + [n for n in names if not flags[n]]
+
+    def _league_order(self, sport: str, games: list) -> list:
+        ranked = self._ranked(sorted({g.league for g in games}), lambda lg: self._league_watch(sport, lg))
+        return self._active_first(ranked, lambda lg: [g for g in games if g.league == lg], self._clock())
+
     @property
     def ordering(self) -> str:
         """By sport (the default) or By time (SV-Q50)."""
@@ -333,7 +346,8 @@ class SportsView(ContentView):
         if self.ordering == ORDER_TIME:
             self._render_by_time(games, now, folded)
         else:
-            for sport in self._ranked(list(self.sports), self._sport_watch):
+            for sport in self._active_first(self._ranked(list(self.sports), self._sport_watch),
+                                            lambda sp: [g for g in games if g.sport == sp], now):
                 mine = [g for g in games if g.sport == sport]
                 self._layout.addWidget(self._sport_header(sport, mine))
                 if f"sport:{sport}" not in folded:
@@ -362,7 +376,7 @@ class SportsView(ContentView):
         league's own On now, days and Finished in a frame under its centred banner
         (Sports Desk rev 13, C4; SV-Q84/Q98). Cards then carry no league line.
         """
-        leagues = self._ranked(sorted({g.league for g in games}), lambda lg: self._league_watch(sport, lg))
+        leagues = self._league_order(sport, games)
         if len(leagues) < 2:
             self._sections(sport, games, now, folded)
             return
@@ -649,7 +663,7 @@ class SportsView(ContentView):
         # they get the logo and #").
         settings = self.sports.get(sport)
         now = self._clock()
-        for league in self._ranked(sorted({g.league for g in games}), lambda lg: self._league_watch(sport, lg)):
+        for league in self._league_order(sport, games):
             on = sum(1 for g in games if g.league == league and settings is not None
                      and event_live(g, now, settings))
             chip = labeled_chip(league, on, "live")

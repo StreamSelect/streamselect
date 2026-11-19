@@ -1614,3 +1614,22 @@ def test_clicking_watching_opens_the_channels_instead_of_restarting_the_stream(q
     other.play.connect(played.append)
     QTest.mouseClick(other.play_line, Qt.MouseButton.LeftButton)
     assert played == ["x"], "not watching: the click plays"
+
+
+def test_a_league_with_only_finished_games_goes_below_ones_with_games_to_come(
+        games_db, qapp, owned_widgets):
+    """Owner, 2026-11-18: leagues with nothing on and nothing upcoming go last,
+    whatever the order — even above-ranked by viewing or by name."""
+    from dataclasses import replace
+    view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=4))
+    a, b = sorted(view._raw, key=lambda g: g.title)
+    done = replace(a, league="AHL")                                    # AHL: finished only
+    later = replace(b, start_utc=START + timedelta(hours=6))           # NHL: still to come
+    view._raw = [done, later]
+    view._watch = {"hockey/AHL": (frozenset({"2026-11-10", "2026-11-11", "2026-11-12"}), 9000)}
+    view._render()
+    _settle(qapp)
+    tops = {lg: _rect(view, view.headers[f"hockey:league:{lg}"]).top() for lg in ("AHL", "NHL")}
+    assert tops["NHL"] < tops["AHL"], "NHL has a game to come; AHL's are all over"
+    chips = {lg: _rect(view, view.league_chips[("hockey", lg)]).left() for lg in ("AHL", "NHL")}
+    assert chips["NHL"] < chips["AHL"], "the sport header's chips agree"

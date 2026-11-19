@@ -43,6 +43,8 @@ def _as_team(side: Side, team: Side) -> Side:
 def match(side: Side, team: Side, allow_abbrev: bool = True) -> Optional[Match]:
     """'exact' if every side word is a team word; 'abbrev' via initials or a prefix."""
     side = _as_team(side, team)
+    if len(side) != len(team) and "".join(side) == "".join(team):
+        return "exact"   # one listing's "BORO/VETLANDA" is another's "BOROVETLANDA"
     if set(side) <= set(team):
         pos = [team.index(w) for w in side]
         if len(pos) >= 2 and pos == sorted(pos) and pos[-1] - pos[0] > len(pos) - 1:

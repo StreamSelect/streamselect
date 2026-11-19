@@ -244,3 +244,25 @@ game_finder_leagues:
     # one collection, so its games are less certain until a second lists them.
     Hockeyallsvenskan:
       - Hockeyallsvenskan
+    # TRIAL (owner, 2026-11-18): one snapshot, each game in 4-5 collections with
+    # learned clocks. Not yet through the test above.
+    Liiga:
+      - Liiga
+      - SM-liiga
+    # TRIAL (owner, 2026-11-18): one snapshot, 3 games in 3-5 collections. Not the
+    # bare "CHL": that is also Chile's country code (and the Canadian junior league).
+    Champions Hockey League:
+      - Champions Hockey League
+    # TRIAL (owner, 2026-11-18): one snapshot, 3 confirmed games; listings state
+    # date and zone.
+    Hockey Ettan:
+      - Hockey Ettan
+      - Hockeyettan
+    # TRIAL (owner, 2026-11-18): one snapshot, one game in one collection.
+    Metal Ligaen:
+      - Metal Ligaen
+    # NOT LISTED (2026-11-18): DEL — the word "DEL" took in Spanish/Italian "del"
+    # (alpine skiing) and handball; "Deutsche Eishockey Liga" / "PENNY DEL" found
+    # nothing. OHL, QMJHL, WHL, SHL, ECHL, KHL, NLA, DEL2, Extraliga: no listing
+    # named them that day, so nothing to check; each league run reads every
+    # listing, so an empty league still costs seconds per refresh.
