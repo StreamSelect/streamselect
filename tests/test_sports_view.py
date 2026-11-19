@@ -980,6 +980,10 @@ def test_every_other_start_time_group_is_faintly_tinted(games_db, qapp, owned_wi
     # A day's heading inside a league frame has no band to compare with: faint = a
     # few levels per channel at most.
     assert 0 < apart(shade[1], shade[0]) <= 24, f"faint: {shade[0].name()} {shade[1].name()}"
+    day = view.headers[next(k for k in view.headers if ":day:" in k)]
+    ground = fill(day)
+    assert apart(shade[0], ground) > 0 and shade[1].rgb() == ground.rgb(), (
+        "the FIRST group is tinted, so it stands apart from the heading above it (owner, 2026-11-18)")
 
 
 def test_the_day_header_says_today(games_db, qapp, owned_widgets):

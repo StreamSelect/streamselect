@@ -505,7 +505,9 @@ class SportsView(SportsHeadersMixin, ContentView):
     def _time_groups(self, games: list, *, playable: bool,
                      label_of: Optional[Callable] = None, sub: bool = False) -> None:
         """Rows grouped by start time, the time shown once per group, every other
-        group on a very faint tint (SV-Q45-Q47). *games* arrive in display order.
+        group on a very faint tint (SV-Q45-Q47), starting with the first, so the
+        first rows stand apart from the heading above them (owner, 2026-11-18).
+        *games* arrive in display order.
 
         ``sub``: the rows sit under a sub-heading (Finished's days, a league's days)
         and line up under its TEXT (owner report 2026-11-14), measured off the
@@ -524,7 +526,7 @@ class SportsView(SportsHeadersMixin, ContentView):
         for i, start in enumerate(dict.fromkeys(g.start_utc for g in games)):
             group = QWidget()
             group.setObjectName("gameTimeGroup")
-            if i % 2:
+            if i % 2 == 0:
                 group.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
                 _theme.style(group, "GAME_TIME_GROUP")
             col = QVBoxLayout(group)
