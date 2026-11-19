@@ -385,9 +385,7 @@ class ProviderDB(Base):
     epg_url_override = Column(String, nullable=True)  # User-supplied XMLTV URL; blank/NULL = use auto-built epg_url
     # The HOST that last served a parseable guide, remembered so the next fetch
     # and the displayed URL start from a host known to work rather than from
-    # whichever one happens to sit first in `urls`.
-    #
-    # A host, deliberately — never the built URL. The `epg_url` column above is
+    # whichever one happens to sit first in `urls`. A host, deliberately — never the built URL. The `epg_url` column above is
     # a cached full URL including credentials, with no invalidation, and a
     # re-subscription on the same row left it serving the previous account's
     # credentials for 11 days behind a green AUTODETECTED badge. Storing only
