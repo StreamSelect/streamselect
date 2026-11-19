@@ -10,7 +10,17 @@ from PyQt6.QtCore import QRect, QPoint
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from streamselect.core.repositories import RepositoryFactory
-from tests.test_sports_view import LIVE_AT, START, games_db  # noqa: F401  (fixture)
+from streamselect.core.games.store import refresh_games
+from tests.test_game_finder import NOW, _seed_db
+from tests.test_sports_view import LIVE_AT, START
+
+
+@pytest.fixture
+def sports_db(db):
+    """The Sports view tests' games (tests/test_sports_view.py ``games_db``)."""
+    _seed_db(db)
+    refresh_games(db, NOW)
+    return db
 
 
 class _Host(QWidget):
@@ -32,9 +42,9 @@ class _Host(QWidget):
         lay.addWidget(self.sports_view)
 
 
-def _host(games_db, qapp, owned_widgets, tmp_path, now=LIVE_AT):
+def _host(db, qapp, owned_widgets, tmp_path, now=LIVE_AT):
     from streamselect.gui.sports_tips import on_league_hidden, on_rendered
-    host = owned_widgets.own(_Host(games_db, tmp_path, now))
+    host = owned_widgets.own(_Host(db, tmp_path, now))
     view = host.sports_view
     view.rendered.connect(lambda: on_rendered(host, view))
     view.leagueHidden.connect(lambda sp, lg: on_league_hidden(host, view, sp, lg))
@@ -62,8 +72,8 @@ def _ringed(host, widget) -> bool:
     return hole is not None and hole.intersects(QRect(widget.mapTo(host, QPoint(0, 0)), widget.size()))
 
 
-def test_the_first_time_sports_shows_games_its_tour_starts_on_its_own(games_db, qapp, owned_widgets, tmp_path):
-    host, view = _host(games_db, qapp, owned_widgets, tmp_path)
+def test_the_first_time_sports_shows_games_its_tour_starts_on_its_own(sports_db, qapp, owned_widgets, tmp_path):
+    host, view = _host(sports_db, qapp, owned_widgets, tmp_path)
     assert _wait(qapp, lambda: _overlay(host) is not None), "the tour starts by itself (TQ2)"
     tour = _overlay(host)
     titles = [s.title for s in tour._stops]
@@ -71,7 +81,8 @@ def test_the_first_time_sports_shows_games_its_tour_starts_on_its_own(games_db, 
     assert not any("Settings" in s.body for s in tour._stops), "Settings is not in the tour (owner)"
     assert "Less certain" in tour._stops[-1].body
     assert _ringed(host, view.headers["sport:hockey"]), "stop 1 rings the sport header"
-    tour.next(); tour.next(); tour.next()
+    for _ in range(3):
+        tour.next()
     assert _ringed(host, view.cards[0]), "stop 4 rings a game on now"
     assert "sports_tour" in host.config.tips_seen
     tour.end()
@@ -83,16 +94,16 @@ def test_the_first_time_sports_shows_games_its_tour_starts_on_its_own(games_db, 
     assert _overlay(host) is None, "once per profile"
 
 
-def test_with_no_game_on_now_the_tour_leaves_those_stops_out(games_db, qapp, owned_widgets, tmp_path):
-    host, view = _host(games_db, qapp, owned_widgets, tmp_path, now=START - timedelta(hours=3))
+def test_with_no_game_on_now_the_tour_leaves_those_stops_out(sports_db, qapp, owned_widgets, tmp_path):
+    host, view = _host(sports_db, qapp, owned_widgets, tmp_path, now=START - timedelta(hours=3))
     assert not view.cards and view.rows
     assert _wait(qapp, lambda: _overlay(host) is not None)
     titles = [s.title for s in _overlay(host)._stops]
     assert "A game on now" not in titles and "Alerts" in titles, "the bell of a game to come instead"
 
 
-def test_one_off_tips_wait_for_the_tour_then_come_at_their_moment(games_db, qapp, owned_widgets, tmp_path):
-    host, view = _host(games_db, qapp, owned_widgets, tmp_path)
+def test_one_off_tips_wait_for_the_tour_then_come_at_their_moment(sports_db, qapp, owned_widgets, tmp_path):
+    host, view = _host(sports_db, qapp, owned_widgets, tmp_path)
     assert _wait(qapp, lambda: _overlay(host) is not None)
     _overlay(host).end()
     qapp.processEvents()
@@ -103,8 +114,8 @@ def test_one_off_tips_wait_for_the_tour_then_come_at_their_moment(games_db, qapp
     assert "sports_channels" in host.config.tips_seen
 
 
-def test_hiding_a_league_explains_it_once(games_db, qapp, owned_widgets, tmp_path):
-    host, view = _host(games_db, qapp, owned_widgets, tmp_path)
+def test_hiding_a_league_explains_it_once(sports_db, qapp, owned_widgets, tmp_path):
+    host, view = _host(sports_db, qapp, owned_widgets, tmp_path)
     host.config.tips_seen = ["sports_tour", "sports_channels", "sports_finished_bell", "sports_still_on"]
     view._toggle_league("hockey", "NHL")
     assert _wait(qapp, lambda: _overlay(host) is not None)
@@ -136,8 +147,8 @@ def test_changing_a_games_length_in_settings_explains_it_is_kept(qapp, owned_wid
     assert tour.hole().intersects(QRect(row.mapTo(dlg, QPoint(0, 0)), row.size()))
 
 
-def test_opening_finished_games_explains_their_bell_then_still_on(games_db, qapp, owned_widgets, tmp_path):
-    host, view = _host(games_db, qapp, owned_widgets, tmp_path, now=START + timedelta(hours=4))
+def test_opening_finished_games_explains_their_bell_then_still_on(sports_db, qapp, owned_widgets, tmp_path):
+    host, view = _host(sports_db, qapp, owned_widgets, tmp_path, now=START + timedelta(hours=4))
     host.config.tips_seen = ["sports_tour", "sports_channels"]
     key = next(k for k in view.headers if k.endswith(":finished"))
     view._toggle_fold(key)                                   # Finished starts folded: open it
