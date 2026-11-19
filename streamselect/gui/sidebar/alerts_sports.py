@@ -158,6 +158,7 @@ class SportsGroupMixin:
 
     def _toggle_sports_group(self) -> None:
         self._sports_collapsed = not self._sports_collapsed
+        self._save_folds()
         self._render_sports()
 
     def _on_sports_double_clicked(self, item: QListWidgetItem) -> None:

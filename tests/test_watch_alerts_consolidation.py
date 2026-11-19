@@ -50,6 +50,7 @@ class _FakeConfig:
     def __init__(self):
         self.monitored_series = []
         self.vod_watch_alerts = []
+        self.sidebar_section_states = {}   # where Watch Alerts keeps its group folds
 
     def save(self):
         pass
@@ -325,10 +326,16 @@ class TestSeriesClickRouting:
         assert heading.receivers(heading.clicked) == 1, (
             "the Series heading is not wired to anything — the inert-divider bug"
         )
-        section._toggle_series_group()
-        assert section._series_collapsed is True
-        section._toggle_series_group()
-        assert section._series_collapsed is False
+        try:
+            section._toggle_series_group()
+            assert section._series_collapsed is True
+            section._toggle_series_group()
+            assert section._series_collapsed is False
+        finally:
+            # A toggle now saves the folds (save_soon parks a timer on the section),
+            # which keeps this skeleton's list alive past the test: destroy it.
+            from tests.conftest import destroy_widget
+            destroy_widget(section._vod_list)
 
 
 # ===========================================================================

@@ -156,3 +156,37 @@ def test_clicking_records_the_choice(qapp):
     assert section._user_expansion == {}, (
         "the automatic pass recorded a choice the user never made — that would "
         "freeze the budget out on the very first refresh")
+
+
+# ---------------------------------------------------------------------------
+# 3. Across a restart (owner, 2026-11-18: "they must be expanding on their own")
+# ---------------------------------------------------------------------------
+
+
+def test_collapsed_groups_and_show_rows_stay_collapsed_after_a_restart(qapp, tmp_path):
+    from streamselect.core.config import Config
+    from streamselect.gui.sidebar.alerts import WatchAlertsSection
+    from tests.conftest import destroy_widget
+
+    cfg = Config(config_dir=tmp_path)
+    first = WatchAlertsSection(cfg, db=None)
+    first._user_expansion["Stargate SG-1"] = False      # what a row click records
+    first._toggle_series_group()
+    first._toggle_stream_monitoring()
+    first._toggle_epg()                                  # last: its own toggle must save
+
+    again = WatchAlertsSection(cfg, db=None)            # the next launch, same config
+    try:
+        assert again._epg_collapsed and again._series_collapsed and again._retry_collapsed
+        assert not again._sports_collapsed and not again._keyword_collapsed, "only what was shut"
+        assert again._retry_list.isHidden(), "Stream Monitoring's list is drawn collapsed"
+        assert again._user_expansion == {"Stargate SG-1": False}
+
+        from streamselect.gui.sidebar.alerts_common import _ROLE_GROUP_KEY
+        section, _tree, groups, rows = _section_with_rows(1, 3)
+        groups[0].setData(0, _ROLE_GROUP_KEY, "Stargate SG-1")
+        section._user_expansion = dict(again._user_expansion)
+        section._apply_expansion()
+        assert not groups[0].isExpanded(), "the room-fitting pass leaves the restored choice shut"
+    finally:
+        destroy_widget(first, again)

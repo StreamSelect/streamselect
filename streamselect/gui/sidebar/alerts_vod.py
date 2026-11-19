@@ -162,6 +162,7 @@ class MoviesSeriesMixin:
     def _toggle_series_group(self) -> None:
         """Collapse/expand the monitored-series group."""
         self._series_collapsed = not self._series_collapsed
+        self._save_folds()
         self.refresh_vod_rules()
 
     def _toggle_keyword_group(self) -> None:
@@ -172,6 +173,7 @@ class MoviesSeriesMixin:
         grammar means both behave the same way.
         """
         self._keyword_collapsed = not self._keyword_collapsed
+        self._save_folds()
         self.refresh_vod_rules()
 
     def _show_idle_only_notice(self, watching: int) -> None:

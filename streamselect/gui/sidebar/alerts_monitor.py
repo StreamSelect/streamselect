@@ -22,6 +22,7 @@ class StreamMonitoringMixin:
 
     def _toggle_stream_monitoring(self) -> None:
         self._retry_collapsed = not self._retry_collapsed
+        self._save_folds()
         if self._retry_collapsed:
             self._retry_list.hide()
         else:

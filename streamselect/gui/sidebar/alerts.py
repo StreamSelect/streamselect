@@ -31,6 +31,7 @@ from streamselect.gui.sidebar.base import (
     CollapsibleSection, GroupHeading, make_seamless,
 )
 from streamselect.gui.sidebar.alerts_epg import EpgGroupMixin
+from streamselect.gui.sidebar.alerts_folds import AlertFoldsMixin
 from streamselect.gui.sidebar.alerts_monitor import StreamMonitoringMixin
 from streamselect.gui.sidebar.alerts_sports import SportsGroupMixin
 from streamselect.gui.sidebar.alerts_vod import MoviesSeriesMixin
@@ -59,6 +60,7 @@ _NEWS_KINDS = (
 
 
 class WatchAlertsSection(
+    AlertFoldsMixin,
     SportsGroupMixin,
     EpgGroupMixin,
     MoviesSeriesMixin,
@@ -438,6 +440,7 @@ class WatchAlertsSection(
         # sizes to its rows (_fit_to_rows) and the slack collects here.
         self.content_layout.addStretch(1)
         self.set_empty(True)
+        self._restore_folds()     # the groups and show rows the user collapsed last time
 
     # ------------------------------------------------------------------
     # Overall empty-state

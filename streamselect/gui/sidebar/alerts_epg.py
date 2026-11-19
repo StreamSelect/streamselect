@@ -112,6 +112,7 @@ class EpgGroupMixin:
 
     def _toggle_epg(self) -> None:
         self._epg_collapsed = not self._epg_collapsed
+        self._save_folds()
         self.alerts_tree.setVisible(not self._epg_collapsed and self._epg_has_rows)
         self._update_epg_toggle_label(self.__dict__.get("_epg_count", 0))
 
@@ -539,7 +540,9 @@ class EpgGroupMixin:
                 # item's expanded state dies with it, so without this the
                 # automatic budget pass re-opens what the user just shut —
                 # user report: "they don't stay collapsed."
+                self._user_expansion.pop(k, None)    # re-added last: most recent kept
                 self._user_expansion[k] = i.isExpanded()
+                self._save_folds()
                 self.fit_to_rows(self.alerts_tree)
 
             # The ROW opens the row — the title, the time, the marker, the empty

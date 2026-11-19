@@ -1485,6 +1485,12 @@ def wire_watch_alerts_group_state(section) -> None:
     """
     section._keyword_collapsed = False
     section._series_collapsed = False
+    # Every group flag and the remembered show-row choices: a toggle now saves
+    # them all (alerts_folds._save_folds, owner 2026-11-18).
+    section._epg_collapsed = False
+    section._sports_collapsed = False
+    section._retry_collapsed = False
+    section._user_expansion = {}
 
 
 def wire_settings_density_widget(dlg) -> None:
