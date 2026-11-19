@@ -391,3 +391,18 @@ def test_a_name_written_as_one_word_or_two_is_one_team():
     assert match(("BOROVETLANDA", "HC"), ("BORO", "VETLANDA", "HC")) == "exact"
     assert match(("BORO", "VETLANDA", "HC"), ("BOROVETLANDA", "HC")) == "exact"
     assert match(("BOROVETLANDA",), ("BORO", "VETLANDA", "HC")) is None, "only the whole name joined"
+
+
+def test_a_number_in_a_team_name_stays_and_other_numbers_go():
+    """Measured 2026-11-18: the NBA's 76ers came out "Philadelphia Ers"."""
+    nba = SportSettings("basketball", "NBA", ("NBA",))
+    listings = [
+        ListingIn("p1", "COLL ZONE A", "NBA: Philadelphia 76ers vs Boston Celtics | Fri 13 Nov 02:05 CET | PPV 4", "a1"),
+        ListingIn("p1", "COLL ZONE B", "NBA | Boston Celtics @ Philadelphia 76ers | Thu 12 Nov 8:05 PM ET 4K", "b1"),
+    ]
+    games, _, _ = find_games(listings, nba, NOW)
+    assert [(g.team_a, g.team_b, g.level) for g in games] == [("Boston Celtics", "Philadelphia 76ers", 1)]
+    from streamselect.core.games.listing_text import clean_side, league_matcher
+    lg = league_matcher(["NBA"])
+    assert clean_side("SAN FRANCISCO 49ERS", lg) == ("SAN", "FRANCISCO", "49ERS")
+    assert clean_side("HEAT 18TH 4K", lg) == ("HEAT", "TH", "K"), "as before: digits off ordinals and quality"

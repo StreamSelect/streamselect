@@ -57,6 +57,9 @@ MATCHUP_LIKE_PATTERNS = tuple(f"% {sep} %" for sep in _SEPARATORS) + ("% VS. %",
 NOT_PLAIN_GLOB = "*[^ -~]*"
 _CLOCK_IN_SIDE_RE = re.compile(r"\d{1,2}(:\d{2}){1,2}\s*(AM|PM)?|\d{1,2}\s*(AM|PM)(?![A-Z])")
 _STRIP_WORDS = set(MONTH_WORD) | set(WEEKDAY_WORD) | {"AM", "PM"} | set(ZONE_LABELS)
+#: A number that is part of a team's name: digits then 3+ letters ("76ERS", "49ERS"),
+#: never an ordinal ("18TH"), a quality mark ("4K", "1080P") or a frame rate ("60FPS").
+_NAME_NUMBER_RE = re.compile(r"\d+(?!FPS$)[A-Z]{3,}")
 
 
 class StatedTime(NamedTuple):
@@ -177,7 +180,10 @@ def clean_side(part: str, league: re.Pattern[str]) -> Optional[Side]:
     """The words of one side, without clock times, league words, dates and zone labels."""
     p = _CLOCK_IN_SIDE_RE.sub(" ", part)
     p = league.sub(" ", p)
-    p = re.sub(r"[^A-Z ]", " ", p.replace(".", ""))
+    p = re.sub(r"[^A-Z0-9 ]", " ", p.replace(".", ""))
+    # A number is kept only as part of a name ("76ERS", "49ERS"); bare numbers,
+    # ordinals ("18TH") and quality marks ("4K", "1080P") go.
+    p = " ".join(w if _NAME_NUMBER_RE.fullmatch(w) else re.sub(r"[0-9]", " ", w) for w in p.split())
     words: list[str] = []
     prev_single = False
     for w in p.split():

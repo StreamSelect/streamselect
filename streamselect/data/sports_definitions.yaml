@@ -248,6 +248,11 @@ sport_defaults:
     clock_agree: 40         # min
     clock_keep: 14          # days
   hockey: {}
+  # Basketball (NBA trial, 2026-11-18): from only 10 guide slots naming an NBA game —
+  # median 2 h 26, 90th percentile 3 h. Re-measure once more games are seen.
+  basketball:
+    usual_length: 150       # min (2 h 30)
+    long_limit: 195         # min (3 h 15: overtime)
 
 # game_finder_leagues:
 #   Sport -> league -> the starting words for finding that league's GAMES (two sides
@@ -296,3 +301,9 @@ game_finder_leagues:
     # nothing. OHL, QMJHL, WHL, SHL, ECHL, KHL, NLA, DEL2, Extraliga: no listing
     # named them that day, so nothing to check; each league run reads every
     # listing, so an empty league still costs seconds per refresh.
+  basketball:
+    # TRIAL (owner, 2026-11-18): the second sport, to build the Sports view for more
+    # than one. One snapshot: 13 confirmed, 13 less certain, clean team names. Not
+    # yet through the test above.
+    NBA:
+      - NBA

@@ -59,7 +59,9 @@ def test_the_finder_and_view_get_the_users_numbers():
     nhl = next(s for s in enabled_leagues(overrides) if s.league == "NHL")
     assert nhl.usual_length == timedelta(hours=3) and nhl.window_ahead == timedelta(hours=12)
     assert nhl.report_days == 7 and nhl.long_limit == timedelta(minutes=210), "unset values: defaults"
-    assert all(s.usual_length == timedelta(hours=3) for s in enabled_leagues(overrides)), "every league of the sport"
+    hockey = [s for s in enabled_leagues(overrides) if s.sport == "hockey"]
+    assert len(hockey) > 1 and all(s.usual_length == timedelta(hours=3) for s in hockey), "every league of the sport"
+    assert all(s.usual_length == timedelta(minutes=150) for s in enabled_leagues(overrides) if s.sport == "basketball"), "not another sport's"
     assert sport_settings()["hockey"].usual_length == timedelta(minutes=165)
 
 
@@ -180,3 +182,25 @@ def test_settings_changed_gives_the_view_the_new_numbers(db, qapp, owned_widgets
 def test_the_apply_hook_is_registered():
     from streamselect.gui import settings_apply
     assert "_apply_sports_settings" in settings_apply.HANDLERS
+
+
+def test_basketball_is_a_second_sport_with_its_own_defaults_on_the_page(qapp, owned_widgets):
+    """Owner 2026-11-18: NBA is the second trial league; basketball gets its own
+    Settings values (its games are shorter than hockey's)."""
+    from streamselect.core.games.store import sport_settings
+    sports = sport_settings()
+    assert list(sports)[:2] == ["hockey", "basketball"]
+    assert sports["basketball"].league == "NBA"
+    assert sports["basketball"].usual_length == timedelta(minutes=150)
+    assert sports["hockey"].usual_length == timedelta(minutes=165), "hockey keeps its own"
+    page = _page(qapp, owned_widgets)
+    combo = page.sport_combo
+    assert [combo.itemText(i) for i in range(combo.count())][:2] == ["Hockey", "Basketball"]
+    combo.setCurrentIndex(1)
+    qapp.processEvents()
+    assert page.rows["usual_length"].value() == 150 and page.reset_all.text() == "Reset Basketball to defaults"
+    page.edit("usual_length", 140)
+    combo.setCurrentIndex(0)
+    qapp.processEvents()
+    assert page.rows["usual_length"].value() == 165, "a basketball edit leaves hockey alone"
+    assert page._overrides == {"basketball": {"usual_length": [140, 150]}}
