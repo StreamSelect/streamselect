@@ -182,13 +182,19 @@ class _ActionBar:
             b.setGeometry(10 + 40 * i, 4, 36, 24)
 
 
-class _Cast:
+class _Cast(QWidget):
+    """The details pane's Cast section: a director row and a cast row."""
+
     def __init__(self, parent):
-        self.chip = QPushButton("Nathan Fielder", parent)
-        self.chip.setGeometry(10, 120, 120, 24)
+        super().__init__(parent)
+        self.setGeometry(0, 100, 300, 90)
+        self.director = QPushButton("Jeremy Kasten", self)
+        self.director.setGeometry(100, 30, 120, 24)
+        self.chip = QPushButton("Nathan Fielder", self)
+        self.chip.setGeometry(100, 60, 120, 24)
 
     def person_chips(self, role):
-        return [self.chip] if role == "cast" else []
+        return {"director": [self.director], "cast": [self.chip]}.get(role, [])
 
 
 class _Pane(QWidget):
@@ -219,9 +225,36 @@ def test_the_first_title_explains_like_not_interested_and_dislike_then_cast(host
     tip._next_btn.click()
     offer_details_tips(host)
     assert _wait(qapp, lambda: host.__dict__.get("_tour") is not None)
-    chip = host.details_pane._cast.chip
+    cast = host.details_pane._cast
     assert host._tour._title.text() == "Cast and crew"
-    assert host._tour.hole().contains(QRect(chip.mapTo(host, QPoint(0, 0)), chip.size()))
+    # Owner, 2026-11-19: the whole section is ringed, not the first name.
+    for w in (cast, cast.director, cast.chip):
+        assert host._tour.hole().contains(QRect(w.mapTo(host, QPoint(0, 0)), w.size()))
+
+
+def test_the_ring_follows_the_cast_when_the_pane_shifts_under_the_card(host, qapp):
+    """Owner, 2026-11-19: the cast ring sat on empty space a row above the names.
+    The pane was still filling when the card opened and a late row pushed the
+    section down; the ring, measured once, stayed behind. It now follows."""
+    from streamselect.gui.just_in_time_tips import offer_details_tips
+
+    host.config.tips_seen = ["rating"]
+    host.details_pane = _Pane(host)
+    host.details_pane.show()
+    qapp.processEvents()
+    offer_details_tips(host)
+    assert _wait(qapp, lambda: host.__dict__.get("_tour") is not None)
+    cast = host.details_pane._cast
+    cast.move(cast.x(), cast.y() + 45)          # a row arrived above it
+    qapp.processEvents()
+
+    def ringed() -> bool:
+        return host._tour.hole().contains(QRect(cast.mapTo(host, QPoint(0, 0)), cast.size()))
+    assert _wait(qapp, ringed, 1.0)
+    card = host._tour._card.geometry()
+    assert not card.intersects(QRect(cast.chip.mapTo(host, QPoint(0, 0)), cast.chip.size())), \
+        "the card follows the ring off the names"
+    host._tour.end()
 
 
 def test_a_cast_name_scrolled_out_of_view_waits_then_is_ringed_where_it_is(host, qapp):
@@ -239,7 +272,7 @@ def test_a_cast_name_scrolled_out_of_view_waits_then_is_ringed_where_it_is(host,
     inner.resize(280, 1200)
     pane.setWidget(inner)
     pane._cast = _Cast(inner)
-    pane._cast.chip.setGeometry(10, 1000, 120, 24)     # far below the viewport
+    pane._cast.move(0, 950)                             # far below the viewport
     host.config.tips_seen = ["rating"]
     host.details_pane = pane
     pane.show()
@@ -249,7 +282,7 @@ def test_a_cast_name_scrolled_out_of_view_waits_then_is_ringed_where_it_is(host,
     assert not _wait(qapp, lambda: host.__dict__.get("_tour") is not None, 1.0)
     assert "people" not in host.config.tips_seen, "an unshown tip is not 'seen'"
 
-    pane.ensureWidgetVisible(pane._cast.chip)
+    pane.ensureWidgetVisible(pane._cast)
     qapp.processEvents()
     offer_details_tips(host)
     assert _wait(qapp, lambda: host.__dict__.get("_tour") is not None)

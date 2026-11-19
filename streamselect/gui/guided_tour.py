@@ -23,7 +23,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
-from PyQt6.QtCore import QEvent, QRect, QRectF, QSize, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QRect, QRectF, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPainter, QPainterPath, QPen
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QMainWindow, QPushButton, QVBoxLayout, QWidget,
@@ -159,6 +159,11 @@ def _clear(box) -> None:
 _RING_PAD = 6
 _CARD_WIDTH = 340
 _MARGIN = 16
+#: How often the ring re-measures its target. A pane can still be laying out
+#: when the card opens (a late async row above the cast pushed the names down
+#: a row, leaving the ring on empty space), and no event reaches the overlay
+#: when an ANCESTOR of the target moves — so it looks, rather than listens.
+_TRACK_MS = 150
 
 
 class TourOverlay(QWidget):
@@ -217,6 +222,9 @@ class TourOverlay(QWidget):
             for w in (self._step, self._back_btn, self._end_btn):
                 w.hide()
         host.installEventFilter(self)
+        self._tracker = QTimer(self)
+        self._tracker.setInterval(_TRACK_MS)
+        self._tracker.timeout.connect(self._track)
 
     # ── driving it ──────────────────────────────────────────────────────────
 
@@ -226,6 +234,7 @@ class TourOverlay(QWidget):
         self.raise_()
         self.setFocus()
         self._go(0)
+        self._tracker.start()
 
     def next(self) -> None:
         if self._index + 1 >= len(self._stops):
@@ -238,6 +247,7 @@ class TourOverlay(QWidget):
             self._go(self._index - 1)
 
     def end(self) -> None:
+        self._tracker.stop()
         self._host.removeEventFilter(self)
         self.hide()
         self.deleteLater()
@@ -266,6 +276,17 @@ class TourOverlay(QWidget):
         self._hole = self._target_rect(stop)
         self._place_card()
         self.update()
+
+    def _track(self) -> None:
+        """Move the ring (and its card) if the target moved since it was measured."""
+        try:
+            hole = self._target_rect(self._stops[self._index])
+        except RuntimeError:        # the target was deleted under the card
+            hole = None
+        if hole != self._hole:
+            self._hole = hole
+            self._place_card()
+            self.update()
 
     def _fill_themes(self, show: bool) -> None:
         from streamselect.gui.tour_theme_picker import ThemeList

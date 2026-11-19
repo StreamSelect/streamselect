@@ -149,8 +149,13 @@ def reset_tips(host) -> int:
 
 
 def show_tip_once(host, key: str, target: QWidget,
-                  area: Callable[[QWidget], QRect] | None = None) -> bool:
+                  area: Callable[[QWidget], QRect] | None = None,
+                  on_screen: QWidget | None = None) -> bool:
     """Show tip *key* ringing *target*, unless it was shown before.
+
+    *on_screen*, when given, is what must be visible for the tip to show
+    (default: *target*) — the cast tip rings the whole section but waits
+    until a name in it is on screen, not just its header.
 
     Waits ``SETTLE_MS`` and then re-checks everything — the window is up,
     nothing else (the tour, another tip) is on screen, the target is visible —
@@ -161,11 +166,11 @@ def show_tip_once(host, key: str, target: QWidget,
     """
     if seen(host, key) or key not in TIPS:
         return False
-    QTimer.singleShot(SETTLE_MS, lambda: _show_now(host, key, target, area))
+    QTimer.singleShot(SETTLE_MS, lambda: _show_now(host, key, target, area, on_screen))
     return True
 
 
-def _show_now(host, key: str, target: QWidget, area=None) -> None:
+def _show_now(host, key: str, target: QWidget, area=None, on_screen=None) -> None:
     from streamselect.gui.guided_tour import TourOverlay, TourStop
 
     if seen(host, key) or host.__dict__.get("_tour") is not None:
@@ -173,7 +178,9 @@ def _show_now(host, key: str, target: QWidget, area=None) -> None:
     try:
         # On screen, not merely shown: a cast name scrolled below the details
         # pane's viewport waits for a later title (an unshown tip is not "seen").
-        ready = host.isVisible() and target.isVisible() and not target.visibleRegion().isEmpty()
+        needed = on_screen if on_screen is not None else target
+        ready = (host.isVisible() and target.isVisible() and needed.isVisible()
+                 and not needed.visibleRegion().isEmpty())
     except RuntimeError:        # the target was deleted while we waited
         return
     if not ready:
@@ -232,7 +239,7 @@ def _span(buttons: list[QWidget]) -> Callable[[QWidget], QRect]:
 
 
 def offer_details_tips(host) -> None:
-    """The details pane has filled with a title: explain rating, then cast.
+    """The details pane has filled with a title: explain rating, then cast and crew.
 
     One tip at a time — ``_show_now`` skips while another is on screen, and
     an unshown tip is not marked seen — so the cast tip waits for a later
@@ -252,4 +259,6 @@ def offer_details_tips(host) -> None:
     if cast is not None and not seen(host, "people"):
         chips = cast.person_chips("director") + cast.person_chips("cast")
         if chips and chips[0].isVisibleTo(host):
-            show_tip_once(host, "people", chips[0])
+            # Ring the whole section — header, directors and cast — since every
+            # name in it works the same way (owner, 2026-11-19).
+            show_tip_once(host, "people", cast, on_screen=chips[0])
