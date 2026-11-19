@@ -248,11 +248,14 @@ sport_defaults:
     clock_agree: 40         # min
     clock_keep: 14          # days
   hockey: {}
-  # Basketball (NBA trial, 2026-11-18): from only 10 guide slots naming an NBA game —
-  # median 2 h 26, 90th percentile 3 h. Re-measure once more games are seen.
+  # Basketball (NBA trial, 2026-11-18). Watched by the owner the first night: two
+  # games listed at 8:00 PM had 90 s and 3 min left in the 4th at about 9:25 —
+  # about 1 h 40 from the listed start to the end. (Ten guide slots said 2 h 26:
+  # a guide slot is the broadcast's length, not the game's.) Re-measure as more
+  # games are watched; overtime adds about 15 min a period.
   basketball:
-    usual_length: 150       # min (2 h 30)
-    long_limit: 195         # min (3 h 15: overtime)
+    usual_length: 105       # min (1 h 45)
+    long_limit: 135         # min (2 h 15: one overtime)
 
 # game_finder_leagues:
 #   Sport -> league -> the starting words for finding that league's GAMES (two sides

@@ -56,7 +56,7 @@ class ImprovedDefaultsDialog(QDialog):
         self.take: list[QRadioButton] = []
         for r, item in enumerate(self.items, start=1):
             spec = tuning.BY_KEY[item.key]
-            grid.addWidget(QLabel(f"<b>{item.sport.title()}</b> · {spec.label.rstrip(':')}"), r, 0)
+            grid.addWidget(QLabel(f"<b>{tuning.sport_label(item.sport)}</b> · {spec.label.rstrip(':')}"), r, 0)
             keep = QRadioButton(spec.text(item.yours))
             keep.setToolTip("Keep your value")
             new = QRadioButton(spec.text(item.new))

@@ -1,11 +1,13 @@
 """Settings ▸ Sports: each sport's game timings (design "Sports Settings" rev 1,
 SS-Q1–Q11, owner 2026-11-18).
 
-One page per dialog, a sport picker at the top; every value is that sport's
-(``core/games/tuning.SPECS`` says what each is and where it shows). Only values
-the user SETS are stored — set equal to the default, it is still theirs — and a
-row the user set shows its default (or "set by you") and a Reset. Advanced (how
-games are found) starts collapsed.
+One page per dialog, a picker at the top: **All sports** (values for every sport
+that sets none of its own, owner 2026-11-18), then each sport. A setting shows only
+where it may be set (``tuning.Spec.scope``): game length per sport, "Most watched"
+and the clocks for all sports, the rest at both. Only values the user SETS are
+stored — set equal to the default, it is still theirs — and a row the user set
+shows its default (or "set by you") and a Reset; a sport's row that follows All
+sports says so. Advanced (how games are found) starts collapsed.
 
 The page edits a working copy of ``Config.sport_settings_overrides``; the dialog
 calls :meth:`SportsSettingsPage.load` and :meth:`SportsSettingsPage.save`.
@@ -31,9 +33,9 @@ from streamselect.gui import theme as _theme
 #: The Settings page's help text (the dialog's right-hand column).
 SPORTS_HELP = (
     "How long each sport's games run, which games are listed, and how alerts and viewing "
-    "are counted. Every value starts at a measured default; one you set shows its default "
-    "and a Reset beside it, and stays as you set it when a default changes later. Each "
-    "sport keeps its own values.")
+    "are counted. All sports sets a value for every sport; a sport can set its own. Every "
+    "value starts at a measured default; one you set shows its default and a Reset beside "
+    "it, and stays as you set it when a default changes later.")
 
 
 class _Row:
@@ -84,13 +86,17 @@ class _Row:
             self.editor.setValue(value)
         self.editor.blockSignals(False)
 
-    def show_choice(self, mine: Optional[list], default: int) -> None:
-        """A value the user set shows its default (or that it is theirs) and a Reset."""
+    def show_choice(self, mine: Optional[list], default: int, follows: Optional[int] = None) -> None:
+        """A value the user set shows its default (or that it is theirs) and a Reset;
+        a sport's value that follows the All sports choice (*follows*) says so."""
         if mine is None:
-            self.note.setText("")
-            self.note.hide()
+            self.note.setText("from All sports" if follows is not None else "")
+            self.note.setToolTip("Set under All sports; set it here to give this sport its own"
+                                 if follows is not None else "")
+            self.note.setVisible(follows is not None)
             self.reset.hide()
             return
+        self.note.setToolTip("")
         self.note.setText("set by you" if int(mine[0]) == default else f"default {self.spec.text(default)}")
         self.note.show()
         self.reset.setToolTip(f"Back to the default, {self.spec.text(default)}, and follow it from now on")
@@ -103,8 +109,8 @@ class SportsSettingsPage(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._overrides: dict = {}
-        self._sports = list(sport_settings()) or ["hockey"]
-        self._sport = self._sports[0]
+        self._sports = [tuning.ALL, *sport_settings()]
+        self._sport = tuning.ALL
         self.rows: dict[str, _Row] = {}
 
         lay = QVBoxLayout(self)
@@ -114,11 +120,12 @@ class SportsSettingsPage(QWidget):
         top.addWidget(QLabel("Sport:"))
         self.sport_combo = QComboBox()
         for sport in self._sports:
-            self.sport_combo.addItem(sport.title(), sport)
-        self.sport_combo.setToolTip("Each sport keeps its own values")
+            self.sport_combo.addItem(tuning.sport_label(sport), sport)
+        self.sport_combo.setToolTip("All sports sets values for every sport; pick a sport to "
+                                    "give it its own")
         self.sport_combo.currentIndexChanged.connect(self._on_sport)
         top.addWidget(self.sport_combo)
-        hint = QLabel("Each sport has its own values; leagues use their sport's.")
+        hint = QLabel("A sport's own value wins over All sports; leagues use their sport's.")
         _theme.style(hint, "TEXT_SM_MUTED")
         top.addWidget(hint)
         top.addStretch(1)
@@ -130,11 +137,14 @@ class SportsSettingsPage(QWidget):
         lay.addLayout(top)
 
         forms: dict[str, QFormLayout] = {}
+        self._boxes: dict[str, QGroupBox] = {}
+        self._forms = forms
         for group in tuning.GROUPS:
             box = QGroupBox("" if group == tuning.ADVANCED else group)
             form = QFormLayout(box)
             form.setSpacing(8)
             forms[group] = form
+            self._boxes[group] = box
             if group == tuning.ADVANCED:
                 self.advanced_toggle = QToolButton()
                 self.advanced_toggle.setText(group)
@@ -188,12 +198,21 @@ class SportsSettingsPage(QWidget):
         vals = tuning.values(self._sport, self._overrides)
         defs = tuning.defaults(self._sport)
         mine = tuning.chosen(self._overrides, self._sport)
+        follows = tuning.inherited(self._sport, self._overrides)
         for key, row in self.rows.items():
+            here = row.spec.settable_for(self._sport)
+            self._forms[row.spec.group].setRowVisible(row.box, here)
             row.show_value(vals[key])
-            row.show_choice(mine.get(key), defs[key])
-        self.reset_all.setText(f"Reset {self._sport.title()} to defaults")
+            row.show_choice(mine.get(key), defs[key], follows.get(key))
+        # A group with nothing settable here (game length under All sports) goes.
+        for group, box in self._boxes.items():
+            if group != tuning.ADVANCED:
+                box.setVisible(any(r.spec.settable_for(self._sport)
+                                   for r in self.rows.values() if r.spec.group == group))
+        label = tuning.sport_label(self._sport)
+        self.reset_all.setText(f"Reset {label} to defaults")
         self.reset_all.setEnabled(bool(mine))
-        self.reset_all.setToolTip(f"Every {self._sport.title()} value back to its default")
+        self.reset_all.setToolTip(f"Every {label} value back to its default")
 
     def _sender_row(self) -> Optional[_Row]:
         sender = self.sender()
@@ -223,6 +242,10 @@ class SportsSettingsPage(QWidget):
     def _reset_sport(self) -> None:
         tuning.reset(self._overrides, self._sport)
         self._show()
+
+    def select_sport(self, sport: str) -> None:
+        """Show *sport*'s values (or :data:`tuning.ALL`'s)."""
+        self.sport_combo.setCurrentIndex(max(0, self.sport_combo.findData(sport)))
 
     def _on_sport(self, _index: int) -> None:
         self._sport = self.sport_combo.currentData() or self._sport

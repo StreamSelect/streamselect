@@ -61,7 +61,7 @@ def test_the_finder_and_view_get_the_users_numbers():
     assert nhl.report_days == 7 and nhl.long_limit == timedelta(minutes=210), "unset values: defaults"
     hockey = [s for s in enabled_leagues(overrides) if s.sport == "hockey"]
     assert len(hockey) > 1 and all(s.usual_length == timedelta(hours=3) for s in hockey), "every league of the sport"
-    assert all(s.usual_length == timedelta(minutes=150) for s in enabled_leagues(overrides) if s.sport == "basketball"), "not another sport's"
+    assert all(s.usual_length == timedelta(minutes=105) for s in enabled_leagues(overrides) if s.sport == "basketball"), "not another sport's"
     assert sport_settings()["hockey"].usual_length == timedelta(minutes=165)
 
 
@@ -79,11 +79,12 @@ def test_a_longer_usual_length_keeps_a_game_on_now_longer():
 
 # ── the page ──────────────────────────────────────────────────────────────
 
-def _page(qapp, owned_widgets, overrides=None):
+def _page(qapp, owned_widgets, overrides=None, sport="hockey"):
     from types import SimpleNamespace
     from streamselect.gui.settings_sports_tab import SportsSettingsPage
     page = owned_widgets.own(SportsSettingsPage())
     page.load(SimpleNamespace(sport_settings_overrides=overrides or {}, ask_about_improved_defaults=True))
+    page.select_sport(sport)
     page.resize(900, 900)
     page.show()
     qapp.processEvents()
@@ -191,16 +192,78 @@ def test_basketball_is_a_second_sport_with_its_own_defaults_on_the_page(qapp, ow
     sports = sport_settings()
     assert list(sports)[:2] == ["hockey", "basketball"]
     assert sports["basketball"].league == "NBA"
-    assert sports["basketball"].usual_length == timedelta(minutes=150)
+    assert sports["basketball"].usual_length == timedelta(minutes=105)
     assert sports["hockey"].usual_length == timedelta(minutes=165), "hockey keeps its own"
     page = _page(qapp, owned_widgets)
     combo = page.sport_combo
-    assert [combo.itemText(i) for i in range(combo.count())][:2] == ["Hockey", "Basketball"]
-    combo.setCurrentIndex(1)
+    assert [combo.itemText(i) for i in range(combo.count())][:3] == ["All sports", "Hockey", "Basketball"]
+    page.select_sport("basketball")
     qapp.processEvents()
-    assert page.rows["usual_length"].value() == 150 and page.reset_all.text() == "Reset Basketball to defaults"
+    assert page.rows["usual_length"].value() == 105 and page.reset_all.text() == "Reset Basketball to defaults"
     page.edit("usual_length", 140)
-    combo.setCurrentIndex(0)
+    page.select_sport("hockey")
     qapp.processEvents()
     assert page.rows["usual_length"].value() == 165, "a basketball edit leaves hockey alone"
-    assert page._overrides == {"basketball": {"usual_length": [140, 150]}}
+    assert page._overrides == {"basketball": {"usual_length": [140, 105]}}
+
+
+# ── All sports (owner 2026-11-18) ────────────────────────────────────────
+
+def test_an_all_sports_value_reaches_every_sport_that_sets_none_of_its_own():
+    overrides: dict = {}
+    tuning.set_choice(overrides, tuning.ALL, "listed_ahead", 24)
+    tuning.set_choice(overrides, "basketball", "listed_ahead", 12)
+    assert tuning.values("hockey", overrides)["listed_ahead"] == 24, "follows All sports"
+    assert tuning.values("basketball", overrides)["listed_ahead"] == 12, "its own wins"
+    assert tuning.inherited("hockey", overrides) == {"listed_ahead": 24}
+    assert tuning.inherited("basketball", overrides) == {}
+    from streamselect.core.games.store import sport_settings
+    s = sport_settings(overrides)
+    assert s["hockey"].window_ahead == timedelta(hours=24) and s["basketball"].window_ahead == timedelta(hours=12)
+
+
+def test_each_setting_is_set_only_where_it_makes_sense():
+    overrides: dict = {}
+    with pytest.raises(ValueError):
+        tuning.set_choice(overrides, tuning.ALL, "usual_length", 120)     # game length: per sport
+    with pytest.raises(ValueError):
+        tuning.set_choice(overrides, "hockey", "most_watched_days", 7)    # ranks sports: all only
+    tuning.set_choice(overrides, tuning.ALL, "most_watched_days", 7)
+    assert tuning.values("hockey", overrides)["most_watched_days"] == 7
+    assert tuning.values("basketball", overrides)["most_watched_days"] == 7
+    stale = {"hockey": {"most_watched_days": [90, 30]}, tuning.ALL: {"usual_length": [100, 165]}}
+    assert tuning.values("hockey", stale)["most_watched_days"] == 30, "a value stored where it can't be set is ignored"
+    assert tuning.values("hockey", stale)["usual_length"] == 165
+
+
+def test_an_improved_default_under_all_sports_is_asked_about(moved_default):
+    moved_default["default"]["listed_ahead"] = 48
+    overrides = {tuning.ALL: {"listed_ahead": [24, 36]}}
+    [item] = tuning.improved(overrides)
+    assert (item.sport, item.key, item.yours, item.new) == (tuning.ALL, "listed_ahead", 24, 48)
+    assert tuning.sport_label(item.sport) == "All sports"
+
+
+def test_the_page_opens_on_all_sports_and_shows_each_setting_where_it_is_set(qapp, owned_widgets):
+    from streamselect.gui.settings_sports_tab import SportsSettingsPage
+    from types import SimpleNamespace
+    page = owned_widgets.own(SportsSettingsPage())
+    page.load(SimpleNamespace(sport_settings_overrides={tuning.ALL: {"listed_ahead": [24, 36]}},
+                              ask_about_improved_defaults=True))
+    page.resize(900, 900)
+    page.show()
+    qapp.processEvents()
+    assert page.sport_combo.currentText() == "All sports"
+    assert not page._boxes[tuning.GAME].isVisible(), "game length is per sport"
+    assert page.rows["most_watched_days"].editor.isVisible()
+    assert page.rows["listed_ahead"].value() == 24 and page.rows["listed_ahead"].reset.isVisible()
+    page.select_sport("hockey")
+    qapp.processEvents()
+    assert page._boxes[tuning.GAME].isVisible() and page.rows["usual_length"].editor.isVisible()
+    assert not page.rows["most_watched_days"].editor.isVisible(), "ranks sports: All sports only"
+    row = page.rows["listed_ahead"]
+    assert row.value() == 24 and row.note.text() == "from All sports" and row.note.isVisible()
+    assert not row.reset.isVisible(), "nothing of hockey's own to reset"
+    assert row.note.geometry().left() > row.editor.geometry().right(), "the note follows the value"
+    page.edit("listed_ahead", 12)
+    assert row.note.text() == "default 36 h ahead" and row.reset.isVisible(), "now hockey's own"

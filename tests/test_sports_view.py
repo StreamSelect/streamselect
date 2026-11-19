@@ -267,23 +267,23 @@ def test_past_its_usual_length_a_game_stays_on_now_marked_likely_ending(games_db
 
 def test_finished_starts_folded_and_the_fold_is_remembered(games_db, qapp, owned_widgets):
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=5))
-    assert view.cards == [] and "hockey:finished" in view.headers and view.rows == []
-    view._toggle_fold("hockey:finished")
+    assert view.cards == [] and "hockey:NHL:finished" in view.headers and view.rows == []
+    view._toggle_fold("hockey:NHL:finished")
     _settle(qapp)
     assert len(view.rows) == 2
-    assert "hockey:finished" not in view.config.sports_view_state["folded"]
+    assert "hockey:NHL:finished" not in view.config.sports_view_state["folded"]
 
 
 def test_each_sport_is_its_own_segment_with_a_header_that_folds(games_db, qapp, owned_widgets):
     """Owner, 2026-11-13: hockey is one segment of Sports, not the whole view —
     every sport with a league gets its own header and its own sections."""
     view = _view(games_db, qapp, owned_widgets, LIVE_AT)
-    assert "sport:hockey" in view.headers and "hockey:on_now" in view.headers
-    sport_hdr, on_now = view.headers["sport:hockey"], view.headers["hockey:on_now"]
+    assert "sport:hockey" in view.headers and "hockey:NHL:on_now" in view.headers
+    sport_hdr, on_now = view.headers["sport:hockey"], view.headers["hockey:NHL:on_now"]
     assert sport_hdr.mapTo(view, QPoint(0, 0)).y() < on_now.mapTo(view, QPoint(0, 0)).y()
     view._toggle_fold("sport:hockey")
     _settle(qapp)
-    assert view.cards == [] and "hockey:on_now" not in view.headers, "the whole segment folds"
+    assert view.cards == [] and "hockey:NHL:on_now" not in view.headers, "the whole segment folds"
 
 
 def test_a_click_anywhere_on_the_sport_header_folds_it(games_db, qapp, owned_widgets):
@@ -305,7 +305,7 @@ def test_a_section_header_folds_from_its_caret_its_label_or_empty_space_once_per
         games_db, qapp, owned_widgets):
     """Owner report: clicking the caret did nothing; only the label folded the section."""
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=5))
-    key = "hockey:finished"                       # foldable; starts folded (SV-Q21)
+    key = "hockey:NHL:finished"                       # foldable; starts folded (SV-Q21)
     assert key in view.headers and key in view._folded()
     view._toggle_fold(key)
     _settle(qapp)
@@ -316,12 +316,12 @@ def test_a_section_header_folds_from_its_caret_its_label_or_empty_space_once_per
 
     band = view.headers[key]
     caret = band.findChildren(QLabel)[0]                         # the first thing on the band
-    assert caret.mapTo(band, QPoint(0, 0)).x() < 20, "the caret leads the band"
+    label = band.findChild(GroupHeading)
+    assert caret.mapTo(band, QPoint(0, 0)).x() < label.mapTo(band, QPoint(0, 0)).x(), "the caret leads the band"
     click(caret)
     assert key in view._folded(), "the caret folds"
     click(view.headers[key], QPoint(view.headers[key].width() - 10, 8))
     assert key not in view._folded(), "empty space unfolds"
-    from streamselect.gui.sidebar.base import GroupHeading
     click(view.headers[key].findChild(GroupHeading))
     assert key in view._folded(), "the label folds, exactly once per click"
 
@@ -330,11 +330,11 @@ def test_on_now_folds_like_the_other_sections(games_db, qapp, owned_widgets):
     """Owner, 2026-11-13: On now folds too."""
     view = _view(games_db, qapp, owned_widgets, LIVE_AT)
     assert view.cards, "games on now show as cards"
-    band = view.headers["hockey:on_now"]
+    band = view.headers["hockey:NHL:on_now"]
     QTest.mouseClick(band, Qt.MouseButton.LeftButton, pos=QPoint(8, band.height() // 2))
     _settle(qapp)
-    assert "hockey:on_now" in view._folded() and view.cards == [], "folded: no cards"
-    assert "hockey:on_now" in view.headers, "the header stays to unfold it"
+    assert "hockey:NHL:on_now" in view._folded() and view.cards == [], "folded: no cards"
+    assert "hockey:NHL:on_now" in view.headers, "the header stays to unfold it"
 
 
 def _copy_game_a_day_earlier(db, team_a: str) -> None:
@@ -357,15 +357,15 @@ def test_finished_games_from_different_days_get_a_sub_section_per_day(games_db, 
     """Owner, 2026-11-13: Finished showed times with no day, so games from two days read as one."""
     _copy_game_a_day_earlier(games_db, "Buffalo Sabres")
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=5))
-    view._toggle_fold("hockey:finished")
+    view._toggle_fold("hockey:NHL:finished")
     _settle(qapp)
-    days = [k for k in view.headers if k.startswith("hockey:finished:")]
+    days = [k for k in view.headers if k.startswith("hockey:NHL:finished:")]
     assert len(days) == 2, sorted(view.headers)
     tops = [view.headers[k].mapTo(view, QPoint(0, 0)).y() for k in days]
     labels = [view.headers[k].findChild(GroupHeading).label.text() for k in days]
     assert tops == sorted(tops) and days == sorted(days, reverse=True), "most recent day first"
     assert "Tonight" not in " ".join(labels), labels
-    finished = view.headers["hockey:finished"]
+    finished = view.headers["hockey:NHL:finished"]
     assert all(view.headers[k].findChild(GroupHeading).mapTo(view, QPoint(0, 0)).x()
                > finished.findChild(GroupHeading).mapTo(view, QPoint(0, 0)).x() for k in days), (
         "a day sits indented inside Finished")
@@ -381,7 +381,7 @@ def test_no_finished_game_opens_a_channel_list(games_db, qapp, owned_widgets):
     _copy_game_a_day_earlier(games_db, "Buffalo Sabres")
     later = START + timedelta(hours=4)          # every game over; still START's local day
     view = _view(games_db, qapp, owned_widgets, later)
-    view._toggle_fold("hockey:finished")
+    view._toggle_fold("hockey:NHL:finished")
     _settle(qapp)
     rows = [r for r in view.rows if r.text()]
     assert rows and all(isinstance(r, QLabel) for r in rows), "no finished game is clickable"
@@ -400,7 +400,7 @@ def test_not_finished_puts_a_game_back_on_now_for_a_while(games_db, qapp, owned_
     clock = {"now": later}
     view = _view(games_db, qapp, owned_widgets, later)
     view._clock = lambda: clock["now"]
-    view._toggle_fold("hockey:finished")
+    view._toggle_fold("hockey:NHL:finished")
     _settle(qapp)
     sabres = next(g for g in view._raw if g.team_a == "Buffalo Sabres")
     assert game_state(sabres, later, view.sports["hockey"]) == OVER
@@ -417,7 +417,7 @@ def test_a_finished_games_bell_offers_only_team_and_matchup_alerts(games_db, qap
     """Owner, 2026-11-13: an alert for a game that is over has no point, but an alert
     for its teams does."""
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=4))
-    view._toggle_fold("hockey:finished")
+    view._toggle_fold("hockey:NHL:finished")
     _settle(qapp)
     row = next(r for r in view.rows if "Sabres" in r.text())
     labels = [a.text() for a in row.bell.build_menu().actions()]
@@ -428,9 +428,9 @@ def test_a_finished_games_bell_offers_only_team_and_matchup_alerts(games_db, qap
 
 def test_finished_games_all_from_one_day_have_no_sub_section(games_db, qapp, owned_widgets):
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=5))
-    view._toggle_fold("hockey:finished")
+    view._toggle_fold("hockey:NHL:finished")
     _settle(qapp)
-    assert not [k for k in view.headers if k.startswith("hockey:finished:")] and view.rows
+    assert not [k for k in view.headers if k.startswith("hockey:NHL:finished:")] and view.rows
 
 
 def test_a_remembered_finished_fold_from_before_sport_segments_carries_over(games_db, qapp, owned_widgets):
@@ -638,11 +638,11 @@ def test_a_header_tooltip_names_the_list_it_collapses(games_db, qapp, owned_widg
     assert _games_list_name("Tomorrow · Sat Nov 14") == "Tomorrow's games list"
     assert _games_list_name("Sun Nov 15") == "the games list for Sun Nov 15"
     view = _view(games_db, qapp, owned_widgets, LIVE_AT)
-    assert view.headers["hockey:on_now"].toolTip() == "Collapse the list of games on now"
+    assert view.headers["hockey:NHL:on_now"].toolTip() == "Collapse the list of games on now"
     assert view.headers["sport:hockey"].toolTip() == "Collapse every Hockey list"
-    view.headers["hockey:on_now"].clicked.emit()
+    view.headers["hockey:NHL:on_now"].clicked.emit()
     _settle(qapp)
-    assert view.headers["hockey:on_now"].toolTip() == "Expand the list of games on now"
+    assert view.headers["hockey:NHL:on_now"].toolTip() == "Expand the list of games on now"
     tips = [w.toolTip() for w in view.findChildren(QWidget) if w.toolTip()]
     assert not [t for t in tips if "fold" in t.lower()], "a tooltip still says fold"
 
@@ -913,15 +913,15 @@ def test_with_nothing_on_there_is_no_on_now_band_and_the_days_follow_the_sport(
     """Owner, 2026-11-17: "On now 0" with a "Next:" line was wasted space, and the
     next game is the first row of the day listed right below."""
     view = _later_view(games_db, qapp, owned_widgets)
-    assert "hockey:on_now" not in view.headers
+    assert "hockey:NHL:on_now" not in view.headers
     shown = [w.text() for w in view.findChildren(QLabel) if w.isVisible()]
     assert not [t for t in shown if t.startswith("Next:") or "on right now" in t], shown
-    days = [k for k in view.headers if k.startswith("hockey:day:")]
+    days = [k for k in view.headers if k.startswith("hockey:NHL:day:")]
     assert days, "the coming games are still listed"
-    sport = view.headers["sport:hockey"]
+    banner = view.headers["hockey:league:NHL"]
     first_day = min((view.headers[k] for k in days), key=lambda h: h.mapTo(view, QPoint(0, 0)).y())
-    gap = first_day.mapTo(view, QPoint(0, 0)).y() - (sport.mapTo(view, QPoint(0, 0)).y() + sport.height())
-    assert 0 <= gap < first_day.height(), f"the first day sits right under the sport ({gap} px)"
+    gap = first_day.mapTo(view, QPoint(0, 0)).y() - (banner.mapTo(view, QPoint(0, 0)).y() + banner.height())
+    assert 0 <= gap < first_day.height(), f"the first day sits right under the league's banner ({gap} px)"
 
 
 def _lines(view):
@@ -970,13 +970,12 @@ def test_every_other_start_time_group_is_faintly_tinted(games_db, qapp, owned_wi
                               for y in range(image.height())).most_common(1)[0][0])
     groups = [ln.parentWidget() for ln in lines]
     shade = [fill(g) for g in groups]
-    header = view.headers[next(k for k in view.headers if ":day:" in k)]
-    band = fill(header)
     assert shade[0].rgb() != shade[1].rgb(), "the second group is tinted"
     def apart(a: QColor, b: QColor) -> int:
         return abs(a.red() - b.red()) + abs(a.green() - b.green()) + abs(a.blue() - b.blue())
-    assert 0 < apart(shade[1], shade[0]) < apart(band, shade[0]), (
-        f"fainter than a header band: {shade[0].name()} {shade[1].name()} {band.name()}")
+    # A day's heading inside a league frame has no band to compare with: faint = a
+    # few levels per channel at most.
+    assert 0 < apart(shade[1], shade[0]) <= 24, f"faint: {shade[0].name()} {shade[1].name()}"
 
 
 def test_the_day_header_says_today(games_db, qapp, owned_widgets):
@@ -1049,9 +1048,9 @@ def test_finished_games_all_from_an_earlier_day_still_say_which_day(games_db, qa
     later = START + timedelta(hours=23)
     assert to_local(later).date() > to_local(START).date(), "the clock is on the next local day"
     view = _view(games_db, qapp, owned_widgets, later)
-    view._toggle_fold("hockey:finished")
+    view._toggle_fold("hockey:NHL:finished")
     _settle(qapp)
-    days = [k for k in view.headers if k.startswith("hockey:finished:")]
+    days = [k for k in view.headers if k.startswith("hockey:NHL:finished:")]
     assert len(days) == 1 and view.rows
     assert view.headers[days[0]].findChild(GroupHeading).label.text().startswith("Yesterday")
 
@@ -1072,7 +1071,7 @@ def test_finished_titles_start_where_todays_do(games_db, qapp, owned_widgets):
     right of the clickable ones."""
     _copy_game_a_day_earlier(games_db, "Buffalo Sabres")
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=4))
-    view._toggle_fold("hockey:finished")
+    view._toggle_fold("hockey:NHL:finished")
     _settle(qapp)
     past = next(r for r in view.rows if "Ottawa Senators" in r.text())
     today = next(r for r in view.rows if r.text() and "Ottawa Senators" not in r.text())
@@ -1214,9 +1213,9 @@ def test_rows_under_a_finished_day_line_up_under_its_heading_text(games_db, qapp
     """Owner reports, 2026-11-14: yesterday's game sat flush left under Finished, then
     one step in but still not under the word "Yesterday"."""
     view = _view(games_db, qapp, owned_widgets, START + timedelta(hours=23))
-    view._toggle_fold("hockey:finished")
+    view._toggle_fold("hockey:NHL:finished")
     _settle(qapp)
-    day = next(k for k in view.headers if k.startswith("hockey:finished:"))
+    day = next(k for k in view.headers if k.startswith("hockey:NHL:finished:"))
     words = view.headers[day].findChild(GroupHeading).label
     words_x = words.mapTo(view, QPoint(0, 0)).x()
     lines = _lines(view)
@@ -1389,7 +1388,7 @@ def test_header_counts_are_outlined_chips_and_each_league_is_a_chip(games_db, qa
         + heading.label.width() - 1, "after its label"
 
     view = _view(games_db, qapp, owned_widgets, LIVE_AT)
-    on_now = view.headers["hockey:on_now"].findChild(GroupHeading)
+    on_now = view.headers["hockey:NHL:on_now"].findChild(GroupHeading)
     assert on_now.count_label.isHidden(), (
         "On now has no count: the league chip says how many (owner, 2026-11-18)")
     assert list(view.league_chips) == [("hockey", "NHL")], "one chip, for the one league with games"
@@ -1632,3 +1631,17 @@ def test_a_league_with_only_finished_games_goes_below_ones_with_games_to_come(
     assert tops["NHL"] < tops["AHL"], "NHL has a game to come; AHL's are all over"
     chips = {lg: _rect(view, view.league_chips[("hockey", lg)]).left() for lg in ("AHL", "NHL")}
     assert chips["NHL"] < chips["AHL"], "the sport header's chips agree"
+
+
+def test_a_sport_with_one_league_still_has_its_banner_and_frame(games_db, qapp, owned_widgets):
+    """Owner 2026-11-18: Basketball's one league (NBA) gets the banner Hockey's leagues
+    have, not bare sections under the sport header."""
+    view = _view(games_db, qapp, owned_widgets, START - timedelta(minutes=30))
+    assert {g.league for g in view._raw} == {"NHL"}, "one league"
+    banner = view.headers["hockey:league:NHL"]
+    panel = _rect(view, view.headers["hockey:league:NHL:panel"])
+    day = next(k for k in view.headers if k.startswith("hockey:NHL:day:"))
+    assert banner.isVisible() and panel.contains(_rect(view, view.headers[day])), "its days sit in its frame"
+    assert panel.top() >= _rect(view, banner).center().y()
+    centre = _rect(view, view._body).center().x()
+    assert abs(_rect(view, banner.title).center().x() - centre) < 60, "centred like the others"

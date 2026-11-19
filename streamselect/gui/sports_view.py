@@ -380,15 +380,12 @@ class SportsView(ContentView):
     def _render_sport(self, sport: str, games: list, now: datetime, folded: set) -> None:
         """One sport's segment: On now, the days to come, Finished (keys prefixed by sport).
 
-        The league is said once (SV-Q48/49): a sport with one league names it only in
-        its header; a sport with several gets a band per league, and under it that
-        league's own On now, days and Finished in a frame under its centred banner
-        (Sports Desk rev 13, C4; SV-Q84/Q98). Cards then carry no league line.
+        Every league gets a band, and under it that league's own On now, days and
+        Finished in a frame under its centred banner (Sports Desk rev 13, C4;
+        SV-Q84/Q98) — a sport with one league too, so Basketball's NBA looks like
+        Hockey's leagues (owner, 2026-11-18). Cards then carry no league line.
         """
         leagues = self._league_order(sport, games)
-        if len(leagues) < 2:
-            self._sections(sport, games, now, folded)
-            return
         for league in leagues:
             mine = [g for g in games if g.league == league]
             key = f"{sport}:league:{league}"
@@ -514,6 +511,16 @@ class SportsView(ContentView):
         if not finished:
             return
         key = f"{prefix}:{FINISHED}"
+        # Finished starts folded (SV-Q21) — every league's too, the first time its
+        # list appears; after that the user's fold is remembered either way.
+        st = self._state()
+        seen = st.setdefault("finished_seen", [])
+        if key not in seen:
+            seen.append(key)
+            if key not in folded:
+                folded.add(key)
+                st["folded"] = sorted(set(st.get("folded", [])) | {key})
+            self._save()
         # No count: the games are over (owner, 2026-11-18).
         self._layout.addWidget(self._header(key, "Finished", None, foldable=True,
                                             what="the finished games list", sub=sub))
