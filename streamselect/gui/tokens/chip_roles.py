@@ -136,6 +136,10 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
             f"QFrame#chipGroup QLabel {{ color: {text}; font-size: {font_xs};"
             f" background: transparent; border: none; padding: 0px; }}"
             f"QFrame#chipGroup QLabel[chipCount=\"true\"] {{ font-weight: bold; }}"
+            # Toggled off (a Sports league hidden from the list, owner 2026-11-18):
+            # dashed and greyer — the dash says "off" without colour alone.
+            f"QFrame#chipGroup[off=\"true\"] {{ border: 1px dashed {muted}; }}"
+            f"QFrame#chipGroup[off=\"true\"] QLabel {{ color: {muted}; }}"
         ),
         # The strip itself. Sits on its own ground so the chips have something
         # to be distinct FROM.

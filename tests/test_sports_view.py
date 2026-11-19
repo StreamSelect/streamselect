@@ -290,15 +290,19 @@ def test_a_click_anywhere_on_the_sport_header_folds_it(games_db, qapp, owned_wid
     """Owner report: only the word "Hockey" folded the segment, not the rest of its header."""
     view = _view(games_db, qapp, owned_widgets, LIVE_AT)
     band = view.headers["sport:hockey"]
-    spot = QPoint(band.width() - 20, band.height() // 2)        # empty space at the right
+    spot = QPoint(band.width() // 2, band.height() // 2)        # the space between name and chips
     QTest.mouseClick(band, Qt.MouseButton.LeftButton, pos=spot)
     _settle(qapp)
     assert "sport:hockey" in view._folded() and view.cards == []
     band = view.headers["sport:hockey"]
-    meta = next(lb for lb in band.findChildren(QLabel) if "NHL" in lb.text())
-    QTest.mouseClick(meta, Qt.MouseButton.LeftButton)
+    name = next(lb for lb in band.findChildren(QLabel) if lb.text() == "Hockey")
+    QTest.mouseClick(name, Qt.MouseButton.LeftButton)
     _settle(qapp)
-    assert "sport:hockey" not in view._folded() and view.cards, "a click on the league line opens it"
+    assert "sport:hockey" not in view._folded() and view.cards, "a click on the name opens it"
+    chip = view.league_chips[("hockey", "NHL")].parentWidget()
+    QTest.mouseClick(chip, Qt.MouseButton.LeftButton)
+    _settle(qapp)
+    assert "sport:hockey" not in view._folded(), "a league chip is its own control (owner, 2026-11-18)"
 
 
 def test_a_section_header_folds_from_its_caret_its_label_or_empty_space_once_per_click(
@@ -1400,7 +1404,7 @@ def test_header_counts_are_outlined_chips_and_each_league_is_a_chip(games_db, qa
     xs = [w.mapTo(view, QPoint(0, 0)).x() for w in (nhl.name_label, nhl.icon_label, nhl.count_label)]
     assert xs == sorted(xs), "name, then the live mark, then the number"
     assert nhl.rect().contains(nhl.count_label.geometry()), "all inside the one outline"
-    assert nhl.toolTip() == "NHL: 2 games on now"
+    assert nhl.parentWidget().toolTip() == "Hide the NHL games", "the chip is a show/hide control"
     band_texts = [w.text() for w in view.headers["sport:hockey"].findChildren(QLabel)]
     assert not any("live" in t.lower() for t in band_texts), band_texts
 
@@ -1409,7 +1413,7 @@ def test_a_league_with_nothing_on_now_shows_its_name_alone(games_db, qapp, owned
     view = _later_view(games_db, qapp, owned_widgets)
     nhl = view.league_chips[("hockey", "NHL")]
     assert nhl.name_label.text() == "NHL" and nhl.count_label is None and nhl.icon_label is None
-    assert nhl.toolTip() == "NHL: nothing on now"
+    assert nhl.parentWidget().toolTip() == "Hide the NHL games"
 
 
 def test_each_league_with_games_gets_its_own_chip(games_db, qapp, owned_widgets):
@@ -1645,3 +1649,70 @@ def test_a_sport_with_one_league_still_has_its_banner_and_frame(games_db, qapp, 
     assert panel.top() >= _rect(view, banner).center().y()
     centre = _rect(view, view._body).center().x()
     assert abs(_rect(view, banner.title).center().x() - centre) < 60, "centred like the others"
+
+
+# ── league chips show / hide their league (owner, 2026-11-18) ────────────
+
+def _toggle(view, league):
+    return view.league_chips[("hockey", league)].parentWidget()
+
+
+def test_league_chips_sit_on_the_right_apart_from_the_sport_name(games_db, qapp, owned_widgets):
+    view = _two_league_view(games_db, qapp, owned_widgets, LIVE_AT)
+    band = view.headers["sport:hockey"]
+    name = next(lb for lb in band.findChildren(QLabel) if lb.text() == "Hockey")
+    chips = [_rect(view, _toggle(view, lg)) for lg in ("NHL", "AHL")]
+    name_r = _rect(view, name)
+    assert min(c.left() for c in chips) > name_r.right() + band.width() // 3, "a clear gap after the name"
+    assert _rect(view, band).right() - max(c.right() for c in chips) < 20, "against the right edge"
+
+
+def test_clicking_a_league_chip_hides_that_league_and_leaves_the_sport_open(games_db, qapp, owned_widgets):
+    view = _two_league_view(games_db, qapp, owned_widgets, LIVE_AT)
+    assert _toggle(view, "AHL").toolTip() == "Hide the AHL games"
+    QTest.mouseClick(_toggle(view, "AHL"), Qt.MouseButton.LeftButton)
+    _settle(qapp)
+    assert "sport:hockey" not in view._folded(), "the click is the chip's, not the sport header's"
+    assert "hockey:league:AHL" not in view.headers and "hockey:league:NHL" in view.headers
+    assert all(c.game.league == "NHL" for c in view.cards) and view.cards
+    assert view.config.sports_view_state["hidden_leagues"] == ["hockey/AHL"], "remembered"
+    off = view.league_chips[("hockey", "AHL")]
+    assert off.property("off") == "true" and _toggle(view, "AHL").toolTip() == "Show the AHL games"
+    assert off.count_label is not None, "a hidden league still shows its games on now"
+    QTest.mouseClick(_toggle(view, "AHL"), Qt.MouseButton.LeftButton)
+    _settle(qapp)
+    assert "hockey:league:AHL" in view.headers and view.config.sports_view_state["hidden_leagues"] == []
+
+
+def test_a_hidden_chip_is_drawn_dashed_and_greyer(games_db, qapp, owned_widgets):
+    view = _two_league_view(games_db, qapp, owned_widgets, LIVE_AT)
+
+    def top_edge(chip):
+        img = chip.grab().toImage()
+        bg = QColor(img.pixel(0, img.height() // 2))
+        # the border's row: the one drawn across most of the width (solid) — read the
+        # same row before and after
+        rows = [[QColor(img.pixel(x, y)) for x in range(3, img.width() - 3)] for y in range(img.height() // 2)]
+        row = max(rows, key=lambda r: sum(not _near(c, bg, 12) for c in r))
+        drawn = [c for c in row if not _near(c, bg, 12)]
+        return len(drawn) / len(row), drawn
+
+    solid, _ = top_edge(view.league_chips[("hockey", "AHL")])
+    QTest.mouseClick(_toggle(view, "AHL"), Qt.MouseButton.LeftButton)
+    _settle(qapp)
+    dashed, _ = top_edge(view.league_chips[("hockey", "AHL")])
+    assert solid > 0.9 and dashed < 0.8, f"solid {solid:.2f} -> dashed {dashed:.2f}"
+
+
+def test_hidden_leagues_leave_the_count_and_hiding_all_says_so(games_db, qapp, owned_widgets):
+    view = _two_league_view(games_db, qapp, owned_widgets, LIVE_AT)
+    count = view.headers["sport:hockey"].count
+    assert count.text() == "2"
+    QTest.mouseClick(_toggle(view, "AHL"), Qt.MouseButton.LeftButton)
+    _settle(qapp)
+    assert view.headers["sport:hockey"].count.text() == "1", "the count matches the list"
+    QTest.mouseClick(_toggle(view, "NHL"), Qt.MouseButton.LeftButton)
+    _settle(qapp)
+    note = view.findChild(QLabel, "allLeaguesHidden")
+    assert note is not None and note.isVisible() and "Click a league to show it" in note.text()
+    assert not view.cards and not view.rows
