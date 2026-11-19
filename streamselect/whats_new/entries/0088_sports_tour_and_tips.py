@@ -2,7 +2,7 @@ from streamselect.whats_new import WhatsNewEntry
 
 ENTRY = WhatsNewEntry(
     id=88,
-    version="1.0.8",
+    version="1.0.9",
     date="2026-11-18",
     title="Sports: a short tour, and tips the first time you need them",
     items=(
