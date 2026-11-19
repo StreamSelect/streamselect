@@ -1734,7 +1734,6 @@ def _alert_sabres(games_db):
 
 def _bell_colour(view, chip) -> QColor:
     """The bell as painted on the view (a lone grab composites it over transparency)."""
-    from collections import Counter
     image = view.grab(_rect(view, chip.icon_label)).toImage()
     bg = QColor(image.pixel(0, 0))
     ink = [QColor(image.pixel(x, y)) for x in range(image.width()) for y in range(image.height())]
