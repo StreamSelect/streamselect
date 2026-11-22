@@ -98,7 +98,7 @@ class SportsView(SportsHeadersMixin, ContentView):
     playRequested = pyqtSignal(str)           # channel id
     channelSelected = pyqtSignal(str)         # channel id: the details pane follows an opened game
     hideEverywhereRequested = pyqtSignal(str)  # channel id: the app's own Hide
-    alertsChanged = pyqtSignal()              # a bell added or removed a rule: Watch Alerts re-reads
+    alertsChanged = pyqtSignal()              # a bell or a game's state changed: Watch Alerts + tray re-read
     rendered = pyqtSignal()                   # the list was rebuilt: the host may offer a tip (sports_tips)
     leagueHidden = pyqtSignal(str, str)       # sport, league: a chip hid its league
 
@@ -939,11 +939,17 @@ class SportsView(SportsHeadersMixin, ContentView):
         now = self._clock()
         settings = self.sports.get(game.sport)
         self._run_query(lambda repos: mark_not_finished(repos.session, game, now, settings),
-                        lambda _r: self.reload(), commit=True,
+                        lambda _r: self._state_written(), commit=True,
                         on_error=lambda exc: self._write_failed("Not finished", exc))
 
     def _mark_finished(self, game: GameDTO) -> None:
         ended = self._clock()
         self._run_query(lambda repos: mark_finished(repos.session, game, ended),
-                        lambda _r: self.reload(), commit=True,
+                        lambda _r: self._state_written(), commit=True,
                         on_error=lambda exc: self._write_failed("Mark as finished", exc))
+
+    def _state_written(self) -> None:
+        """A game was marked finished / still on: redraw, and tell the alert surfaces now —
+        the tray's live icon otherwise waited for the notifier's 30 s poll (owner, 2026-11-22)."""
+        self.reload()
+        self.alertsChanged.emit()

@@ -417,6 +417,40 @@ def test_not_finished_puts_a_game_back_on_now_for_a_while(games_db, qapp, owned_
     assert game_state(back, after, view.sports["hockey"]) == OVER, "it finishes again by itself"
 
 
+def test_marking_a_game_finished_or_still_on_tells_the_alert_surfaces_at_once(
+        games_db, qapp, owned_widgets):
+    """Owner, 2026-11-22: an alerted game marked finished left the tray's live icon on
+    for ~30 s, until the notifier's next poll. The write now signals alertsChanged,
+    after it landed (so the re-read sees it), both ways."""
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    order: list[str] = []
+    real_reload = view.reload
+    view.reload = lambda: (order.append("reload"), real_reload())[1]
+    view.alertsChanged.connect(lambda: order.append("alerts"))
+    sabres = next(g for g in view._raw if g.team_a == "Buffalo Sabres")
+    view._mark_finished(sabres)
+    assert order == ["reload", "alerts"]
+    order.clear()
+    view._mark_not_finished(sabres)
+    assert order == ["reload", "alerts"]
+
+
+def test_the_hosts_alert_refresh_rechecks_the_tray_now():
+    """The one handler every alert change reaches also runs the event-alert check the
+    tray icon follows; a host built before the notifier simply skips it."""
+    from unittest.mock import MagicMock
+
+    from streamselect.gui.main_window_sports import _SportsViewMixin
+
+    host = _SportsViewMixin()
+    host.sidebar_sections = {"alerts": MagicMock()}
+    host._refresh_sports_alerts()                       # no notifier yet: no error
+    host.event_alert_notifier = MagicMock()
+    host._refresh_sports_alerts()
+    host.sidebar_sections["alerts"].refresh_sports.assert_called()
+    host.event_alert_notifier.check.assert_called_once_with()
+
+
 def test_a_finished_games_bell_offers_only_team_and_matchup_alerts(games_db, qapp, owned_widgets):
     """Owner, 2026-11-13: an alert for a game that is over has no point, but an alert
     for its teams does."""

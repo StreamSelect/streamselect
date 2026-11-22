@@ -6,7 +6,7 @@ from loguru import logger
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton, QSizePolicy, QApplication,
 )
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QPixmap
 
 from streamselect.core.region_codes import normalize_region_code
@@ -237,15 +237,10 @@ class _PosterSection(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Poster area: a full-width gray card with the slim action rail FLOATING over its
-        # LEFT edge.  Previously the rail was a side-by-side COLUMN that shrank the gray
-        # card by its own 48px (so the card never reached the pane width); now the card
-        # (poster_frame/poster_label) fills the full content width and the rail OVERLAYS
-        # the card's left edge via a QGridLayout cell overlap — both occupy cell (0,0) and
-        # the rail is left-aligned, so it no longer claims a column.  The poster (VOD) /
-        # logo (live) is centred in the full-width card; the live header (live) shows in
-        # row 1 beneath it.  Play/Resume + Watch Later are NOT in the rail — they graduate
-        # to full-width rows in the OUTER column below this block (see end of _setup).
+        # Poster area: a full-width card with the slim action rail over its LEFT edge (a
+        # QGridLayout cell overlap: both in cell (0,0), rail left-aligned, no column of its
+        # own). Poster/logo centred in the card; the live header in row 1 beneath it.
+        # Play/Resume + Watch Later are full-width rows below this block (end of _setup).
         self._content_col = QWidget()
         cc_layout = QGridLayout(self._content_col)
         cc_layout.setContentsMargins(0, 0, 0, 0)
@@ -254,6 +249,9 @@ class _PosterSection(QWidget):
         # Poster label (VOD) — the gray card.  Fills grid cell (0, 0) so its gray
         # background spans the full content width (no longer shrunk by a rail column).
         self._poster_frame = QWidget()
+        # The label's width cap is re-derived when the FRAME resizes: a capped label
+        # cannot grow, so it never resizes itself and a narrow-pane cap stuck (2026-11-22).
+        self._poster_frame.installEventFilter(self)
         pf_layout = QVBoxLayout(self._poster_frame)
         # Inset the poster content by the rail width so the poster image (and its gray
         # card) starts to the RIGHT of the action rail — the rail sits in the left gutter
@@ -262,11 +260,8 @@ class _PosterSection(QWidget):
         pf_layout.setContentsMargins(self._RAIL_W, 0, 0, 0)
 
         self.poster_label = _PosterLabel()
-        # Alignment is NOT set here — _PosterLabel derives it from whether it is
-        # currently holding an image (left-aligned art so the floating action
-        # rail overlays the poster, centred text for the empty-card message).
-        # Setting it once here is what pinned "No poster available" to the left
-        # border of an otherwise empty frame.
+        # Alignment is NOT set here: _PosterLabel derives it from its content (setting it
+        # once pinned "No poster available" to the empty frame's left border).
         self.poster_label.setFixedHeight(self._POSTER_FIXED_H)  # hard height — buttons never move
         # The poster must SUBORDINATE to the pane width, never drive it.  A QLabel
         # holding a pixmap reports minimumSizeHint().width() == pixmap width with a
@@ -806,6 +801,11 @@ class _PosterSection(QWidget):
             self._apply_scaled_logo()
         else:
             self._apply_scaled_poster()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt API)
+        if obj is self.__dict__.get("_poster_frame") and event.type() == QEvent.Type.Resize:
+            self._rescale_current_image()
+        return False
 
     def _on_poster_clicked(self) -> None:
         """Emit poster_enlarged with the full-res pixmap when the poster is clicked."""

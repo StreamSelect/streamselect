@@ -317,3 +317,26 @@ class TestPosterPlaceholderIsCentred:
         # Non-zero on both sides, so "equal margins" cannot be satisfied by art
         # that fills the card edge to edge, nor by 0 == 0.
         assert left_margin > 0 and right_margin > 0
+
+
+def test_poster_fills_the_box_height_after_the_pane_widens(qapp):
+    """Owner, 2026-11-22: a 2:3 poster sat ~340 px tall in the 430 px box, with dark
+    bands above and below and unused width beside it. The label's width cap was only
+    re-derived when the LABEL resized; capped while the pane was narrow, it could not
+    grow, so it never resized again and the cap never lifted. Widening the pane must
+    let the poster fit the full box height (the 2:3 art is narrower than the room)."""
+    poster = _poster_section(_make_config())
+    poster.resize(240, 600)
+    poster.show()
+    for _ in range(5):
+        qapp.processEvents()
+    poster.resize(420, 600)              # the pane widens: ~370 px of card for the art
+    for _ in range(5):
+        qapp.processEvents()
+    pix = poster.poster_label.pixmap()
+    box_h = poster._POSTER_FIXED_H
+    assert pix.height() == box_h, (
+        f"poster drawn {pix.width()}x{pix.height()} in a {box_h} px box: "
+        "dead bands above and below although the card has the width for full height")
+    assert pix.width() <= poster.poster_label.width(), "the art stays inside the card"
+    poster.close()

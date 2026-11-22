@@ -82,10 +82,15 @@ class _SportsViewMixin:
             tracker.request()          # listing windows and finder numbers may have changed
 
     def _refresh_sports_alerts(self) -> None:
-        """Re-read the Watch Alerts Sports group (a bell changed, or games were re-found)."""
+        """A bell, a game's state or the stored games changed: every alert surface re-reads
+        now — the Watch Alerts Sports group, and the event-alert check the tray's live
+        icon follows (else up to its 30 s poll late)."""
         section = self.sidebar_sections.get("alerts")
         if section is not None:
             section.refresh_sports()
+        notifier = self.__dict__.get("event_alert_notifier")
+        if notifier is not None:
+            notifier.check()
 
     def switch_to_sports_view(self) -> None:
         """Switch the content area to the Sports view."""
