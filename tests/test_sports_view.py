@@ -22,6 +22,7 @@ from streamselect.core.epg_utils import fmt_time, to_local
 from streamselect.core.games.store import enabled_leagues, refresh_games
 from streamselect.core.repositories import RepositoryFactory
 from streamselect.gui.sidebar.base import GroupHeading
+from streamselect.gui.sports_view import RESTORE_SCROLL_MS
 from tests.test_game_finder import NOW, START, _seed_db
 
 HOCKEY = next(s for s in enabled_leagues() if s.sport == "hockey")
@@ -1872,6 +1873,7 @@ def test_making_a_channel_preferred_does_not_move_the_list(games_db, qapp, owned
     view.resize(1000, 300)                                   # short: the list scrolls
     _card(view, "Sabres").more_chip.click()
     _settle(qapp)
+    QTest.qWait(RESTORE_SCROLL_MS + 50)                      # that redraw's hold is over
     bar = view._scroll.verticalScrollBar()
     assert bar.maximum() > 0, "the list is taller than the view"
     row = view.cards[0].findChildren(ChannelRow)[-1]
@@ -1934,3 +1936,18 @@ def test_the_view_lights_the_channel_the_card_plays(games_db, qapp, owned_widget
     card = view.cards[0]
     lit = [r for r in card.findChildren(ChannelRow) if r._preferred]
     assert [r.feed.channel_id for r in lit] == [card.top_feed.channel_id]
+
+
+def test_scrolling_during_a_redraws_hold_is_not_undone(games_db, qapp, owned_widgets):
+    """A redraw holds the scroll position for a moment while it rebuilds; the user
+    scrolling in that moment must win, not snap back when the hold ends."""
+    from PyQt6.QtWidgets import QAbstractSlider
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    view.resize(1000, 300)
+    _card(view, "Sabres").more_chip.click()             # a redraw: its hold starts
+    _settle(qapp)
+    bar = view._scroll.verticalScrollBar()
+    assert bar.maximum() > 0
+    bar.triggerAction(QAbstractSlider.SliderAction.SliderToMaximum)   # the user, mid-hold
+    QTest.qWait(RESTORE_SCROLL_MS + 50)
+    assert bar.value() == bar.maximum(), "the hold ended by putting the list back"

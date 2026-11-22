@@ -230,3 +230,80 @@ def test_no_takes_back_only_what_the_queue_marked(db):
     assert e3["watch_completed"] is False
     assert e4["watch_completed"] is False
     assert e4["watch_progress"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 6. The first episode is offered too (owner, 2026-11-22).
+# ---------------------------------------------------------------------------
+
+def test_the_run_closing_reports_the_first_episode_too(db):
+    _seed_episode(db, "e1", 1)
+    _seed_episode(db, "e2", 2)
+    host = _streaming_host(db)
+
+    host._watch_tracking["k"] = {
+        "media_type": "episode", "played_via": "manual",
+        "queue": [{"content_id": "e1"}, {"content_id": "e2"}], "last_seen_pos": 1,
+    }
+    host.player_manager.active_keys.return_value = []
+    host.player_manager.last_exit_reason.return_value = "End of file"
+    host._watch_checkpoint_timer = MagicMock()
+    host._queue_end_detected = MagicMock()
+
+    host._watch_checkpoint_tick()
+
+    host._queue_end_detected.emit.assert_called_once_with(["e2"], "e1")
+
+
+def test_not_watching_the_first_episode_takes_back_its_mark(db):
+    _seed_episode(db, "e1", 1)
+    _seed_episode(db, "e9", 9)
+    with db.session_scope() as session:
+        repos = RepositoryFactory(session)
+        repos.episodes.record_watch_progress("e1", 1.0, 1.0, 0.9, "manual")   # finished as the run moved on
+        repos.episodes.record_watch_progress("e9", 900, 1500, 0.9, "manual")  # in progress: nothing to undo
+
+    host = _prompt_host(db)
+    host._bg_unmark_first_episode("e1")
+    host._bg_unmark_first_episode("e9")
+
+    assert _episode_fields(db, "e1")["watch_completed"] is False
+    assert _episode_fields(db, "e9")["watch_progress"] == 900
+
+
+def _answer_prompt(monkeypatch, *, accept: bool, untick_first: bool):
+    from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog
+    from streamselect.gui.queue_end_prompt import _QueueEndPromptMixin
+
+    QApplication.instance() or QApplication([])
+    host = _QueueEndPromptMixin.__new__(_QueueEndPromptMixin)
+    host.config = MagicMock(prompt_after_autoplay=True)
+    host.executor = MagicMock()
+    host.navigate_to = MagicMock()
+    init = QDialog.__init__
+    monkeypatch.setattr(QDialog, "__init__", lambda self, _parent=None: init(self))
+    seen = {}
+
+    def _exec(dlg):
+        (box,) = dlg.findChildren(QCheckBox)
+        seen["text"], seen["checked"] = box.text(), box.isChecked()
+        if untick_first:
+            box.setChecked(False)
+        return QDialog.DialogCode.Accepted if accept else QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(QDialog, "exec", _exec)
+    host._on_queue_end_detected(["e2", "e3"], "e1")
+    return host, seen
+
+
+def test_the_question_offers_the_first_episode_ticked(monkeypatch):
+    host, seen = _answer_prompt(monkeypatch, accept=True, untick_first=False)
+    assert seen == {"text": "I watched the first episode, too", "checked": True}
+    host.executor.submit.assert_called_once_with(host._bg_promote_queue_episodes, ["e2", "e3"])
+
+
+def test_unticking_the_first_episode_unmarks_it_whatever_the_answer(monkeypatch):
+    for accept in (True, False):
+        host, _ = _answer_prompt(monkeypatch, accept=accept, untick_first=True)
+        calls = [c.args for c in host.executor.submit.call_args_list]
+        assert (host._bg_unmark_first_episode, "e1") in calls

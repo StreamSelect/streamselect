@@ -245,7 +245,7 @@ def test_tick_emits_queue_end_when_auto_advanced():
 
     host._watch_checkpoint_tick()
 
-    host._queue_end_detected.emit.assert_called_once_with(["ep2", "ep3"])
+    host._queue_end_detected.emit.assert_called_once_with(["ep2", "ep3"], "ep1")
 
 
 def test_tick_does_not_emit_when_no_auto_advance():

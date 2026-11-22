@@ -970,7 +970,7 @@ class CollapsibleSection(RowBudgetMixin, SectionContentCapMixin,
         # The ARROW, not the columns glyph. Spec item 14 calls this "→
         # escalation" and the render draws an arrow; `explore_columns_icon` (⤢)
         # was describing the destination's layout instead of the action.
-        btn = QPushButton()
+        btn = QPushButton(self, visible=False)   # parented: unparented, it leaked as a window
         _icon_utils.set_button_icon(btn, "explore", color=_theme.COLOR_ACCENT_BLUE)
         btn.setIconSize(QSize(14, 14))
         btn.setFlat(True)

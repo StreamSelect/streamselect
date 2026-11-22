@@ -1,6 +1,8 @@
 """HistorySection."""
 
-from PyQt6.QtWidgets import QPushButton, QListWidget, QListWidgetItem
+from loguru import logger
+from PyQt6.QtGui import QAction
+from PyQt6.QtWidgets import QLabel, QPushButton, QListWidget, QListWidgetItem
 from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from streamselect.gui.row_activation import connect_row_activation
 
@@ -15,6 +17,7 @@ from streamselect.gui.sidebar.background_refresh import BackgroundRefreshMixin
 from streamselect.gui.sidebar.base import (
     GroupHeading, SectionAction, CollapsibleSection, make_seamless,
 )
+from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
 
@@ -24,6 +27,11 @@ from streamselect.gui import theme as _theme
 #: could only ever show a handful of rows, and once scrolling could reveal more
 #: it became the ceiling a viewer hits rather than a height anyone chose.
 HISTORY_ROW_LIMIT = 300
+
+#: The kinds History can leave out, in menu order: (media type, what the menu calls it).
+#: Live is the one people turn off: most live entries are event slots whose names change
+#: with each game, and they crowd out the films and episodes (owner, 2026-11-22).
+HISTORY_KINDS = (("live", "Live channels"), ("movie", "Movies"), ("series", "Series"))
 
 
 #: The episode this row names, kept off ``UserRole`` — that holds the channel
@@ -124,10 +132,63 @@ class HistorySection(BackgroundRefreshMixin, CollapsibleSection):
         connect_row_activation(self.history_list, self.on_history_item_selected)
         make_seamless(self.history_list)
         self.content_layout.addWidget(self.history_list)
+        self._add_kind_toggles()
 
         # The destructive bulk action lives in the ⋯ overflow, like Watch
         # Queue's — a full-width button charged ~29px a session for something
         # you use once in a while.
+
+    # --- which kinds show ---
+    def _hidden_kinds(self) -> set[str]:
+        return {k for k in (self.config.history_hidden_kinds or []) if k in dict(HISTORY_KINDS)}
+
+    def _add_kind_toggles(self) -> None:
+        """A "Show" group of three ticks at the top of the ⋯ menu."""
+        menu = self.__dict__.get("_overflow_menu")
+        if menu is None:
+            return
+        before = menu.actions()[0] if menu.actions() else None
+        hidden = self._hidden_kinds()
+        self._kind_actions: dict[str, QAction] = {}
+        menu.insertSection(before, "Show")
+        for kind, label in HISTORY_KINDS:
+            action = QAction(label, menu)
+            action.setCheckable(True)
+            action.setChecked(kind not in hidden)
+            action.setToolTip(f"Show or hide {label.lower()} in History")
+            action.toggled.connect(lambda on, k=kind: self.set_kind_shown(k, on))
+            menu.insertAction(before, action)
+            self._kind_actions[kind] = action
+        menu.insertSeparator(before)
+
+    def set_kind_shown(self, kind: str, shown: bool) -> None:
+        """Show or hide one kind of entry, remembered across launches."""
+        hidden = self._hidden_kinds()
+        hidden = hidden - {kind} if shown else hidden | {kind}
+        self.config.history_hidden_kinds = [k for k, _ in HISTORY_KINDS if k in hidden]
+        action = self.__dict__.get("_kind_actions", {}).get(kind)
+        if action is not None and action.isChecked() != shown:
+            action.blockSignals(True)
+            action.setChecked(shown)
+            action.blockSignals(False)
+        try:
+            _cfgsave.save_soon(self)
+        except Exception as exc:  # noqa: BLE001 — never break the toggle on a save fault
+            logger.warning(f"Could not save History's shown kinds: {exc}")
+        self.refresh()
+
+    def _add_hidden_note(self, hidden: set[str]) -> None:
+        """Say what is left out, so a shorter History never reads as lost history."""
+        names = [label for kind, label in HISTORY_KINDS if kind in hidden]
+        text = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+        item = QListWidgetItem(self.history_list)
+        item.setFlags(Qt.ItemFlag.NoItemFlags)
+        note = QLabel(f"{text} hidden")
+        note.setToolTip("Show them again from the ⋯ menu")
+        _theme.style(note, "TEXT_SM_MUTED")
+        note.setContentsMargins(6, 2, 6, 2)
+        item.setSizeHint(QSize(0, note.sizeHint().height()))
+        self.history_list.setItemWidget(item, note)
 
     # --- BackgroundRefreshMixin hooks ---
     def _refresh_list(self) -> QListWidget:
@@ -166,6 +227,10 @@ class HistorySection(BackgroundRefreshMixin, CollapsibleSection):
         self.set_empty(len(dtos) == 0)
         if not dtos:
             return
+        hidden = self._hidden_kinds()
+        if hidden:
+            self._add_hidden_note(hidden)
+            dtos = [d for d in dtos if (d.media_type or "").lower() not in hidden]
 
         # One pass, in the order the DTOs already arrive (newest first), so the
         # groups come out newest-first too without a second sort.

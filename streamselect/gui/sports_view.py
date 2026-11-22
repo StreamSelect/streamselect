@@ -22,6 +22,7 @@ from dataclasses import replace
 from datetime import datetime
 from typing import Callable, Optional
 
+from PyQt6 import sip
 from PyQt6.QtCore import QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QFrame, QHBoxLayout, QLabel, QMenu, QPushButton, QScrollArea, QSizePolicy, QVBoxLayout, QWidget,
@@ -43,6 +44,7 @@ from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
 from streamselect.gui.chips import ToggleChip
+from streamselect.gui.sports_freshness import build_freshness_row, listings_text
 from streamselect.gui.content_view import ContentView
 from streamselect.gui.flow_layout import FlowLayout
 from streamselect.gui.game_card import (
@@ -101,6 +103,7 @@ class SportsView(SportsHeadersMixin, ContentView):
     alertsChanged = pyqtSignal()              # a bell or a game's state changed: Watch Alerts + tray re-read
     rendered = pyqtSignal()                   # the list was rebuilt: the host may offer a tip (sports_tips)
     leagueHidden = pyqtSignal(str, str)       # sport, league: a chip hid its league
+    listingsRefreshRequested = pyqtSignal()   # the listings line's Refresh (sports_freshness)
 
     def __init__(self, db, config, run_query: Callable, parent=None, *,
                  clock: Callable[[], datetime] = now_utc, image_cache=None):
@@ -123,6 +126,8 @@ class SportsView(SportsHeadersMixin, ContentView):
         self._loaded = False
         self._stale = False         # a finder run finished while off screen
         self._finding = False
+        self.listings_state: dict = {"when": None}   # the listings line's state (set_listings)
+        self.listings_label = None
         #: sport -> its settings (the first listed league's lengths), in listed order.
         self.sports: dict = sport_settings(config.sport_settings_overrides)
 
@@ -135,6 +140,8 @@ class SportsView(SportsHeadersMixin, ContentView):
         scroll = self._scroll = QScrollArea(self)
         self._scroll_target: Optional[int] = None    # where a redraw must leave the list (_render)
         scroll.verticalScrollBar().rangeChanged.connect(self._restore_scroll)
+        # The user scrolling (wheel, drag, arrows) ends a redraw's hold: theirs wins.
+        scroll.verticalScrollBar().actionTriggered.connect(lambda _a: setattr(self, "_scroll_target", None))
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         # The centre panel never scrolls sideways: cards wrap, long names elide.
@@ -226,6 +233,12 @@ class SportsView(SportsHeadersMixin, ContentView):
     def on_activate(self) -> None:
         self.reload()
         self._tick.start()
+
+    def set_listings(self, when, *, failed: bool = False, refreshing: bool = False) -> None:
+        """How old the listings are (local time), or that a refresh runs / failed."""
+        self.listings_state = {"when": when, "failed": failed, "refreshing": refreshing}
+        if self.listings_label is not None and not sip.isdeleted(self.listings_label):
+            self.listings_label.setText(listings_text(**self.listings_state))
 
     def on_deactivate(self) -> None:
         self._tick.stop()
@@ -383,6 +396,9 @@ class SportsView(SportsHeadersMixin, ContentView):
             return
         now = self._clock()
         self._layout.addWidget(self._toolbar())
+        row, self.listings_label, self.listings_refresh = build_freshness_row(
+            listings_text(**self.listings_state), self.listingsRefreshRequested.emit)
+        self._layout.addWidget(row)
         if self._finding:
             looking = QLabel("Looking for new games…")
             _theme.style(looking, "TEXT_SM_MUTED")

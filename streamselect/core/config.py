@@ -635,6 +635,7 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     # The TEXT is deliberately not persisted (see WatchQueueSection) — only whether
     # the box is on screen.
     queue_filter_visible: bool = False
+    history_hidden_kinds: list = Field(default_factory=list, json_schema_extra=PROFILE)  # "live"/"movie"/"series" left out of History (owner, 2026-11-22)
 
     # Recommended view state
     preferences_attributes_expanded: bool = False  # collapsed by default

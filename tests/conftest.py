@@ -760,6 +760,7 @@ def sidebar_config(**over):
         # Section behaviour.
         "filter_adult_mode": "all",
         "queue_filter_visible": False,
+        "history_hidden_kinds": [],
         "sidebar_section_states": {},
     }
     base.update(over)

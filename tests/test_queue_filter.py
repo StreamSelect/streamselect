@@ -139,11 +139,11 @@ class TestTheHeaderToggle:
         """
         section._set_filter_visible(True, save=False)
         QApplication.processEvents()
-        with_box = section._content_height()
+        with_box = section._pinned_height() + section._content_height()
 
         section._set_filter_visible(False, save=False)
         QApplication.processEvents()
-        without_box = section._content_height()
+        without_box = section._pinned_height() + section._content_height()
 
         assert without_box < with_box, (
             f"hiding the filter freed no space: the section wants "
@@ -406,3 +406,47 @@ def _item_for(section, title: str):
         if _row_title(section, item) == title:
             return item
     raise AssertionError(f"no row rendered for {title!r}")
+
+
+def test_the_find_box_stays_in_view_when_the_scroll_bar_is_dragged(qapp):
+    """Owner, 2026-11-22: dragging the sidebar's scroll bar took "Find in queue…" out of
+    sight; it now sits above the scrolling rows, so it is on screen at any scroll."""
+    sec = WatchQueueSection(Config(), db=None)
+    try:
+        sec.resize(260, 240)
+        sec.show()
+        QApplication.processEvents()
+        sec._populate_rows([_entry(f"Title {i:02d}", days=i) for i in range(40)])
+        sec._set_filter_visible(True, save=False)
+        for _ in range(4):
+            QApplication.processEvents()
+        bar = sec.content_scroll.verticalScrollBar()
+        assert bar.maximum() > 0, "the rows must overflow for this to mean anything"
+        top_before = sec._filter.mapTo(sec, sec._filter.rect().topLeft()).y()
+        bar.setValue(bar.maximum())
+        QApplication.processEvents()
+        box = sec._filter
+        top = box.mapTo(sec, box.rect().topLeft()).y()
+        assert box.isVisible()
+        assert top == top_before
+        assert 0 <= top and top + box.height() <= sec.content_scroll.mapTo(sec, sec.content_scroll.rect().topLeft()).y()
+    finally:
+        destroy_widget(sec)
+
+
+def test_the_pinned_strip_goes_with_the_box_and_the_collapse(qapp):
+    sec = WatchQueueSection(Config(), db=None)
+    try:
+        sec.resize(260, 240)
+        sec.show()
+        sec._set_filter_visible(False, save=False)
+        QApplication.processEvents()
+        assert sec.pinned_area.isHidden(), "an empty strip must not leave a gap"
+        sec._set_filter_visible(True, save=False)
+        QApplication.processEvents()
+        assert sec.pinned_area.isVisible()
+        sec.set_collapsed(True, save=False)
+        QApplication.processEvents()
+        assert sec.pinned_area.isHidden(), "a collapsed section shows only its header"
+    finally:
+        destroy_widget(sec)

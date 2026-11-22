@@ -166,7 +166,7 @@ class _WatchCaptureMixin:
                             for i in range(1, min(pos + 1, len(queue)))
                         ]
                         if auto_ids:
-                            self._queue_end_detected.emit(auto_ids)
+                            self._queue_end_detected.emit(auto_ids, queue[0]["content_id"])
                 elif info and info.get("last_sample") and info.get("media_type") in ("movie", "episode"):
                     # PLAY-9: mpv exited (EOF or quit) between checkpoints for a
                     # movie or single (non-queued) episode — finalise the last

@@ -38,7 +38,51 @@ class _SportsViewMixin:
             tracker = self.game_tracker
             tracker.finding_started.connect(lambda: view.set_finding(True))
             tracker.games_updated.connect(lambda _counts: view.finished_finding())
+            # The listings line: its Refresh, and every refresh landing (whoever started it).
+            view.listingsRefreshRequested.connect(self._refresh_sports_listings)
+            queue = self.refresh_queue_manager
+            queue.refresh_finished.connect(self._note_sports_source_refreshed)
+            queue.all_refreshes_finished.connect(self._show_sports_listings_time)
         return view
+
+    def _show_sports_listings_time(self) -> None:
+        """Put the oldest active source's last live refresh on the listings line, and
+        say so if a refresh in the batch that just ended failed."""
+        failed = self.__dict__.pop("_sports_refresh_failed", False)
+        view = self.__dict__.get("sports_view")
+
+        def query(repos):
+            return [last for _id, _name, last in repos.providers.get_active_providers_live_refresh()]
+
+        def on_result(stamps) -> None:
+            known = [s for s in stamps or [] if s is not None]
+            if view is not None:
+                view.set_listings(min(known) if known else None, failed=failed)
+
+        self._run_query(query, on_result, on_error=lambda _exc: None)
+
+    def _note_sports_source_refreshed(self, _provider_id: str, success: bool, *_rest) -> None:
+        if not success:
+            self._sports_refresh_failed = True
+
+    def _refresh_sports_listings(self) -> None:
+        """The listings line's Refresh: a live-only refresh of every active source not
+        playing right now (the timer's lane, not Refresh All); the finder re-runs when
+        the batch ends."""
+        view = self.sports_view
+
+        def query(repos):
+            return repos.providers.get_active_providers_live_refresh()
+
+        def on_result(rows) -> None:
+            rows = rows or []
+            view.set_listings(view.listings_state.get("when"), refreshing=True)
+            self._enqueue_due_live_sources(rows, lambda _last: True)
+            queue = self.refresh_queue_manager
+            if not any(queue.is_queued_or_running(pid) for pid, _n, _l in rows):
+                self._show_sports_listings_time()     # nothing could run (all playing)
+
+        self._run_query(query, on_result, on_error=lambda _exc: None)
 
     def _offer_sports_tips(self) -> None:
         from streamselect.gui.sports_tips import on_rendered
@@ -105,6 +149,8 @@ class _SportsViewMixin:
         view.setVisible(True)
         self.stats_label.setText("Sports")
         view.on_activate()
+        if not view.listings_state.get("refreshing"):
+            self._show_sports_listings_time()
 
     def on_sports_view_toggle(self) -> None:
         if self.sports_chip.is_enabled():

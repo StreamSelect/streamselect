@@ -22,7 +22,7 @@ the season ends up with an unwatched hole in the middle of a watched run).
 from __future__ import annotations
 
 from loguru import logger
-from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QVBoxLayout
+from PyQt6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QLabel, QVBoxLayout
 
 from streamselect.core.repositories import RepositoryFactory
 from streamselect.gui.dialog_chrome import dialog_buttons
@@ -34,7 +34,7 @@ PROMPT_SETTING_LINK = "settings:Playback/Still here"
 class _QueueEndPromptMixin:
     """"Still watching?" prompt + the two answers' persistence paths."""
 
-    def _on_queue_end_detected(self, auto_episode_ids: list) -> None:
+    def _on_queue_end_detected(self, auto_episode_ids: list, first_episode_id: str = "") -> None:
         """Main-thread slot: show "Still here?" prompt after a queue-auto-advance run ends.
 
         Called when the ``_queue_end_detected`` signal fires (emitted from the
@@ -45,6 +45,9 @@ class _QueueEndPromptMixin:
             auto_episode_ids: Episode DB ids that were auto-advanced (played via
                 ``'queue'``). These are episodes at queue indices 1‥last_seen_pos.
                 Index 0 is already ``'manual'`` (the user explicitly started it).
+            first_episode_id: That index-0 episode. The question offers it too: when
+                the viewer fell asleep during it, it is not watched either (owner,
+                2026-11-22).
         """
         if not auto_episode_ids:
             return
@@ -69,6 +72,14 @@ class _QueueEndPromptMixin:
         msg.setWordWrap(True)
         layout.addWidget(msg)
 
+        first_too = None
+        if first_episode_id:
+            first_too = QCheckBox("I watched the first episode, too")
+            first_too.setChecked(True)
+            first_too.setToolTip("Untick if you did not watch the episode the run started "
+                                 "with either: it goes back to unwatched")
+            layout.addWidget(first_too)
+
         # The prompt's own off switch, one click away (Settings opens on that row).
         to_setting = QLabel(f'<a href="{PROMPT_SETTING_LINK}">Change whether this is asked</a>')
         to_setting.setToolTip("Open Settings at the option that turns this question on or off")
@@ -89,6 +100,25 @@ class _QueueEndPromptMixin:
             # Denied — the queue marked them watched while nobody was watching,
             # so take the mark back rather than merely greying it.
             self.executor.submit(self._bg_unmark_queue_episodes, auto_episode_ids)
+        if first_too is not None and not first_too.isChecked():
+            self.executor.submit(self._bg_unmark_first_episode, first_episode_id)
+
+    def _bg_unmark_first_episode(self, episode_id: str) -> None:
+        """Worker: the viewer did not watch the episode the run started with.
+
+        It was written complete when the playlist moved past it, so take that back.
+        Only a completed episode is touched; anything else has no mark to undo.
+        """
+        try:
+            with self.db.session_scope() as session:
+                repos = RepositoryFactory(session)
+                ep = repos.episodes.get_by_id(episode_id)
+                if ep is not None and ep.watch_completed:
+                    repos.episodes.mark_watched_bulk([episode_id], False)
+                    logger.info("Unmarked the run's first episode — the viewer did not watch it")
+        except Exception as exc:
+            logger.warning(f"Failed to unmark the run's first episode: {exc}")
+        self._episode_watch_state_changed.emit([episode_id])
 
     def _bg_promote_queue_episodes(self, episode_ids: list) -> None:
         """Worker: flip ``last_played_via`` to ``'manual'`` for confirmed episodes.

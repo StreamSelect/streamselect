@@ -196,7 +196,7 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
     # Queue-end detected from off-thread: list of episode ids that were auto-advanced
     # (last_played_via='queue'). Emitted only when >0 episodes were queue-watched so
     # the main thread can show the "Still here?" confirmation prompt.
-    _queue_end_detected = pyqtSignal(object)  # list[str] — auto-advanced episode ids
+    _queue_end_detected = pyqtSignal(object, str)  # auto-advanced episode ids, the first one's id
     # Episode watch state written OFF the main thread (the queue's auto-mark as the
     # playlist advances, and either answer to the "Still watching?" prompt).  Carries
     # the episode ids so the open series tree can re-read exactly those rows through

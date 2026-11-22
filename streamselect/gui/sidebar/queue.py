@@ -207,7 +207,7 @@ class WatchQueueSection(LazyRowMixin, BackgroundRefreshMixin, CollapsibleSection
         self._new_matches_btn.setToolTip("Open the new matches for your watch alerts")
         self._new_matches_btn.clicked.connect(self.newMatchesClicked.emit)
         self._new_matches_btn.hide()
-        self.content_layout.addWidget(self._new_matches_btn)
+        self.pin_above_scroll(self._new_matches_btn)
 
         # Find-in-queue box. Measured on a user's install: 612 entries, 597 of
         # them never watched, and NOTHING older than three months — so this is not
@@ -223,7 +223,7 @@ class WatchQueueSection(LazyRowMixin, BackgroundRefreshMixin, CollapsibleSection
         # clicking the header button off, so it also clears (never leaves an
         # invisible filter behind).
         self._filter.escaped.connect(self._hide_filter_box)
-        self.content_layout.addWidget(self._filter)
+        self.pin_above_scroll(self._filter)
         self._set_filter_visible(bool(self.config.queue_filter_visible), save=False)
 
         self._list = QListWidget()

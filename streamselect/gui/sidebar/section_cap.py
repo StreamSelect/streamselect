@@ -32,7 +32,22 @@ the design notes, "Sidebar vertical space".
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import QEvent, QObject, QTimer
+from PyQt6.QtWidgets import QVBoxLayout, QWidget
+
+
+class _PinnedWatcher(QObject):
+    """Re-decides whether the pinned strip shows when anything in it (or the rows'
+    scroll area, which collapsing hides) is shown or hidden."""
+
+    def __init__(self, section):
+        super().__init__(section)
+        self._section = section
+
+    def eventFilter(self, obj, event):  # noqa: N802 — Qt override
+        if event.type() in (QEvent.Type.ShowToParent, QEvent.Type.HideToParent):
+            self._section.sync_pinned_area()
+        return False
 
 
 class SectionContentCapMixin:
@@ -106,7 +121,7 @@ class SectionContentCapMixin:
             return self.minimumSizeHint().height()
 
         return max(self.min_expanded_height(),
-                   self.HEADER_H + self._content_height(),
+                   self.HEADER_H + self._pinned_height() + self._content_height(),
                    self.__dict__.get("_user_height") or 0)
 
     def note_user_height(self, height: int) -> None:
@@ -126,6 +141,38 @@ class SectionContentCapMixin:
         if height > self.min_expanded_height():
             self._user_height = int(height)
             self.setMaximumHeight(self.max_useful_height())
+
+    # ── a strip that does not scroll ──────────────────────────────────────
+    def pin_above_scroll(self, widget: QWidget) -> None:
+        """Put *widget* between the header and the scrolling rows, so it stays in view
+        however the rows are scrolled. Inside the rows, the Watch Queue's find box went
+        out of sight when the scroll bar was dragged (owner, 2026-11-22)."""
+        area = self.__dict__.get("pinned_area")
+        if area is None:
+            area = self.pinned_area = QWidget()
+            lay = QVBoxLayout(area)
+            lay.setContentsMargins(5, 5, 5, 0)
+            lay.setSpacing(4)
+            self.main_layout.insertWidget(self.main_layout.indexOf(self.content_scroll), area)
+            self._pinned_watcher = _PinnedWatcher(self)
+            self.content_scroll.installEventFilter(self._pinned_watcher)
+        area.layout().addWidget(widget)
+        widget.installEventFilter(self._pinned_watcher)
+        self.sync_pinned_area()
+
+    def sync_pinned_area(self) -> None:
+        """Show the strip only while the section is open and something in it shows."""
+        area = self.__dict__.get("pinned_area")
+        if area is None:
+            return
+        lay = area.layout()
+        shown = [lay.itemAt(i).widget() for i in range(lay.count())]
+        area.setVisible(not self.content_scroll.isHidden()
+                        and any(w is not None and not w.isHidden() for w in shown))
+
+    def _pinned_height(self) -> int:
+        area = self.__dict__.get("pinned_area")
+        return area.sizeHint().height() if area is not None and not area.isHidden() else 0
 
     def _apply_content_cap(self) -> None:
         """Stop the splitter handing this section more than it can fill.
