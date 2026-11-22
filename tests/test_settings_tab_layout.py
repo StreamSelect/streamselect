@@ -164,7 +164,7 @@ def test_settings_dialog_nav_and_stack_agree(qapp):
 
     expected = len(_SECTIONS)
     assert expected >= 6
-    assert dlg._nav.section_list.count() == expected, (
+    assert dlg._nav.count() == expected, (
         "a declared section is missing from the nav — zip dropped it"
     )
     assert dlg._nav.stack.count() == expected, (
@@ -190,8 +190,7 @@ def test_settings_dialog_tab_names(qapp):
     cfg = _FakeConfig()
     dlg = SettingsDialog(cfg, parent=None)
 
-    tab_titles = [dlg._nav.section_list.item(i).text()
-                  for i in range(dlg._nav.section_list.count())]
+    tab_titles = [dlg._nav.label(i) for i in range(dlg._nav.count())]
 
     declared = [label for _sid, label, _builder in _SECTIONS]
     assert tab_titles == declared, (
@@ -199,7 +198,7 @@ def test_settings_dialog_tab_names(qapp):
         f"was declared without a builder (zip truncated it), or the two are out of order"
     )
     assert len(tab_titles) >= 6
-    assert tab_titles[0] == "Playback"
+    assert "Playback" in tab_titles
     assert "Content" in tab_titles
 
     dlg.close()

@@ -79,8 +79,7 @@ def test_every_declared_section_renders_in_order(qapp, tmp_path):
     """
     dlg = SettingsDialog(_make_config(tmp_path), parent=None)
 
-    labels = [dlg._nav.section_list.item(i).text()
-              for i in range(dlg._nav.section_list.count())]
+    labels = [dlg._nav.label(i) for i in range(dlg._nav.count())]
     assert labels == [label for _sid, label, _builder in _SECTIONS]
     assert len(labels) >= 6
     assert dlg._nav.stack.count() == len(_SECTIONS)
@@ -95,9 +94,9 @@ def test_every_declared_section_renders_in_order(qapp, tmp_path):
 def test_selecting_section_switches_stack(qapp, tmp_path):
     dlg = SettingsDialog(_make_config(tmp_path), parent=None)
 
-    for row in range(len(_SECTIONS)):
-        dlg._nav.section_list.setCurrentRow(row)
-        assert dlg._nav.stack.currentIndex() == row
+    for index in range(len(_SECTIONS)):
+        dlg._nav.section_list.setCurrentRow(dlg._nav._section_rows[index])  # a click on the row
+        assert dlg._nav.stack.currentIndex() == index
 
     dlg.reject()
 
@@ -110,13 +109,13 @@ def test_select_section_by_label_tripwire_both_spellings(qapp, tmp_path):
     """Both shipped deep-link spellings must still select Interface."""
     dlg_lower = SettingsDialog(_make_config(tmp_path), parent=None)
     assert dlg_lower.select_section_by_label("interface") is True
-    assert dlg_lower._nav.section_list.currentRow() == _INTERFACE_ROW
+    assert dlg_lower._nav.current_row() == _INTERFACE_ROW
     assert dlg_lower._nav.stack.currentIndex() == _INTERFACE_ROW
     dlg_lower.reject()
 
     dlg_exact = SettingsDialog(_make_config(tmp_path), parent=None)
     assert dlg_exact.select_section_by_label("Interface") is True
-    assert dlg_exact._nav.section_list.currentRow() == _INTERFACE_ROW
+    assert dlg_exact._nav.current_row() == _INTERFACE_ROW
     assert dlg_exact._nav.stack.currentIndex() == _INTERFACE_ROW
     dlg_exact.reject()
 
@@ -166,7 +165,7 @@ def test_open_settings_tab_selects_interface_section(qapp, tmp_path, monkeypatch
     MainWindow.open_settings(host, tab="interface")
 
     dlg = captured["dlg"]
-    assert dlg._nav.section_list.currentRow() == _INTERFACE_ROW
+    assert dlg._nav.current_row() == _INTERFACE_ROW
     assert dlg._nav.stack.currentIndex() == _INTERFACE_ROW
     dlg.reject()
 
@@ -179,8 +178,8 @@ def test_help_text_changes_per_section(qapp, tmp_path):
     dlg = SettingsDialog(_make_config(tmp_path), parent=None)
 
     seen_texts = set()
-    for row in range(dlg._nav.section_list.count()):
-        dlg._nav.section_list.setCurrentRow(row)
+    for row in range(dlg._nav.count()):
+        dlg._nav.set_current_row(row)
         text = dlg._nav.help_panel.toPlainText()
         assert text, f"section row {row} ({_LABELS[row]}) has empty help text"
         seen_texts.add(text)
@@ -200,7 +199,7 @@ def test_dialog_size_and_section_persist_across_instances(qapp, tmp_path):
     dlg1 = SettingsDialog(config, parent=None)
     wide = dlg1.minimumWidth() + 50          # the minimum is measured from the pages
     dlg1.resize(wide, 640)
-    dlg1._nav.section_list.setCurrentRow(3)  # "Metadata & API Keys"
+    dlg1._nav.set_current_row(3)
     dlg1.reject()  # Cancel path — UI state (size/section) still must persist
 
     assert config.settings_dialog_width == wide
@@ -210,7 +209,7 @@ def test_dialog_size_and_section_persist_across_instances(qapp, tmp_path):
     dlg2 = SettingsDialog(config, parent=None)
     assert dlg2.width() == wide
     assert dlg2.height() == 640
-    assert dlg2._nav.section_list.currentRow() == 3
+    assert dlg2._nav.current_row() == 3
     assert dlg2._nav.stack.currentIndex() == 3
 
     dlg2.reject()

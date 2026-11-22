@@ -1,8 +1,8 @@
 """Settings dialog: three-panel layout — left-nav sections, center controls, right help."""
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QCheckBox, QComboBox, QFormLayout,
+    QAbstractSpinBox, QDialog, QVBoxLayout, QCheckBox, QComboBox, QFormLayout, QSizePolicy,
     QListWidgetItem, QWidget,
 )
 from loguru import logger
@@ -17,10 +17,12 @@ from streamselect.gui.time_display_settings import load_time_format, save_time_f
 from streamselect.gui.dialog_chrome import dialog_buttons
 from streamselect.gui.middle_click_actions import DEFAULT_MIDDLE_CLICK_ACTION
 from streamselect.gui.settings_dialog_tabs import SettingsTabsMixin
+from streamselect.gui.settings_metadata_tab import SettingsMetadataTabMixin
 from streamselect.gui.settings_downloads_tab import SettingsDownloadsTabMixin
 from streamselect.gui.settings_tray_tab import SettingsTrayTabMixin
 from streamselect.gui.settings_recording_tab import SettingsRecordingTabMixin
 from streamselect.gui.settings_sports_tab import SPORTS_HELP, SportsSettingsPage
+from streamselect.gui.settings_help import SettingsHelp
 from streamselect.gui.three_panel_section_nav import ThreePanelSectionNav
 
 _SIDEBAR_SECTION_LABELS: dict[str, str] = {
@@ -105,6 +107,23 @@ def _align_label_columns(page) -> None:
         label.setMinimumWidth(min(widest, label.maximumWidth()))
 
 
+def _fit_value_boxes(page) -> None:
+    """Size a page's lists and number boxes to their values; text fields still stretch.
+
+    Pages disagreed: some stretched every number box to the right edge (Signal checking,
+    Network) while others kept them small (Mark as watched), so "how wide is a value"
+    depended on which page you were on (owner, 2026-11-22: Q8 of the Settings redesign).
+    """
+    for form in page.findChildren(QFormLayout):
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+    for box in page.findChildren((QComboBox, QAbstractSpinBox)):
+        if isinstance(box, QComboBox):
+            box.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        policy = box.sizePolicy()
+        policy.setHorizontalPolicy(QSizePolicy.Policy.Fixed)
+        box.setSizePolicy(policy)
+
+
 def _load_channel_density(combo: QComboBox, config) -> None:
     """Select ``config.channel_list_density`` in ``combo`` (falls back to comfy).
 
@@ -177,7 +196,9 @@ def _save_theme_combo(combo: QComboBox, config) -> None:
 #: The floor; the dialog widens its minimum to whatever its widest page needs.
 SETTINGS_MIN_WIDTH = 900
 
-#: The dialog's sections, in order: (id, label, builder method name, help).
+#: The dialog's sections under their list headings, in order: (id, label, builder
+#: method name, help). Grouped by task, alphabetical within a group (owner,
+#: 2026-11-22: Q1 of the Settings redesign). ``SECTIONS`` is the flat view.
 #:
 #: ONE tuple, because this used to be three parallel structures — a
 #: ``_SECTIONS`` list of (id, label), a ``_SECTION_HELP`` dict keyed by id, and
@@ -189,65 +210,75 @@ SETTINGS_MIN_WIDTH = 900
 #:
 #: Help text: one short, plainly-written paragraph — what the section controls,
 #: plus the one thing worth knowing. Trivially editable.
-SECTIONS: tuple[tuple[str, str, str, str], ...] = (
-    ("playback", "Playback", "_build_playback_tab",
-     "Which player StreamSelect uses, how aggressively it buffers, and when a movie "
-     "or episode counts as \"watched\". If streams stutter or drop, the "
-     "Buffering profile here is the first thing to try. Auto-reconnect is always on."),
-    ("interaction", "Interaction", "_build_interaction_tab",
-     "What a double-click and a middle-click do on a channel row. These are "
-     "shortcuts, not required setup — right-click any movie for a one-time "
-     "override without changing either default."),
-    ("recording", "Recording", "_build_recording_tab",
-     "The default start/end padding a scheduled recording gets when you "
-     "record a programme from the guide — signed, so trimming a pregame hour "
-     "off the start is as valid as running over at the end. Stored per "
-     "recording; this is only the default a new one starts from."),
-    ("content", "Content", "_build_content_tab",
-     "What the library is allowed to show you. Adult content is hidden by "
-     "default; this is where that is changed. While it is hidden, a category "
-     "made up entirely of flagged channels will look empty — the channel list "
-     "says when that is why."),
-    ("recommendations", "Recommendations", "_build_recommendations_tab",
-     "Steering dials for the Recommendations engine: the movie/series mix and "
-     "how much weight genre, director, cast, and keywords carry. Every dial "
-     "ships at a sane default, so an untouched tab is fine."),
-    ("metadata", "Metadata & API Keys", "_build_metadata_tab",
-     "TMDb/OMDb API keys, how long fetched metadata is cached, and EPG guide "
-     "refresh/notification timing. A TMDb key unlocks posters, cast, and plot "
-     "details across your whole library."),
-    ("interface", "Interface", "_build_interface_tab",
-     "Search memory, how the channel list looks, source-refresh behavior "
-     "and update checks. Which sidebar sections show, and Watch Alerts, "
-     "now have pages of their own below."),
-    ("sidebar", "Sidebar", "_build_sidebar_tab",
-     "Which sections appear down the left, and in what order. Changes take "
-     "effect as soon as you click OK or Apply. Hiding a section does not "
-     "lose anything — it stops being built, and comes back exactly as it "
-     "was when you show it again."),
-    ("alerts", "Watch Alerts", "_build_alerts_tab",
-     "What the Watch Alerts section shows, and how often StreamSelect re-checks "
-     "your watch list for new episodes. That check costs one connection to "
-     "the source while it runs, so on an account limited to a single "
-     "connection it competes with playback — which is why it defaults to "
-     "once a day rather than hourly."),
-    ("sports", "Sports", "_build_sports_tab", SPORTS_HELP),
-    ("tray", "System Tray", "_build_tray_tab",
-     "Whether closing the window leaves StreamSelect running in the system tray "
-     "(the menu bar on macOS), and which alerts it then shows as system "
-     "notifications. While it idles there it only reads what is already stored, "
-     "so it never uses a connection to your sources."),
-    ("downloads", "Downloads", "_build_downloads_tab",
-     "Where saved VOD downloads land, and how they are organized: a "
-     "Movies/Series tree Plex, Jellyfin and Kodi read without configuration, "
-     "or one flat folder. Also the free-space floor — downloads stop before "
-     "they fill the disk, either right away or after finishing whatever is "
-     "already in flight."),
-    ("signal", "Signal checking", "_build_signal_tab",
-     "How StreamSelect decides an event stream is dead air rather than a picture, "
-     "and what it does with the ones that are. A check spends a provider "
-     "connection, so it never runs while you are watching something."),
+SECTION_GROUPS: tuple[tuple[str, tuple[tuple[str, str, str, str], ...]], ...] = (
+    ("Watching", (
+        ("downloads", "Downloads", "_build_downloads_tab",
+         "Where saved VOD downloads land, and how they are organized: a "
+         "Movies/Series tree Plex, Jellyfin and Kodi read without configuration, "
+         "or one flat folder. Also the free-space floor — downloads stop before "
+         "they fill the disk, either right away or after finishing whatever is "
+         "already in flight."),
+        ("interaction", "Interaction", "_build_interaction_tab",
+         "What a double-click and a middle-click do on a channel row. These are "
+         "shortcuts, not required setup — right-click any movie for a one-time "
+         "override without changing either default."),
+        ("playback", "Playback", "_build_playback_tab",
+         "Which player StreamSelect uses, how aggressively it buffers, and when a movie "
+         "or episode counts as \"watched\". If streams stutter or drop, the "
+         "Buffering profile here is the first thing to try. Auto-reconnect is always on."),
+        ("recording", "Recording", "_build_recording_tab",
+         "The default start/end padding a scheduled recording gets when you "
+         "record a programme from the guide — signed, so trimming a pregame hour "
+         "off the start is as valid as running over at the end. Stored per "
+         "recording; this is only the default a new one starts from."),
+    )),
+    ("Finding things", (
+        ("content", "Content", "_build_content_tab",
+         "What the library is allowed to show you. Adult content is hidden by "
+         "default; this is where that is changed. While it is hidden, a category "
+         "made up entirely of flagged channels will look empty — the channel list "
+         "says when that is why."),
+        ("recommendations", "Recommendations", "_build_recommendations_tab",
+         "Steering dials for the Recommendations engine: the movie/series mix and "
+         "how much weight genre, director, cast, and keywords carry. Every dial "
+         "ships at a sane default, so an untouched tab is fine."),
+        ("signal", "Signal checking", "_build_signal_tab",
+         "How StreamSelect decides an event stream is dead air rather than a picture, "
+         "and what it does with the ones that are. A check spends a provider "
+         "connection, so it never runs while you are watching something."),
+        ("sports", "Sports", "_build_sports_tab", SPORTS_HELP),
+    )),
+    ("Alerts", (
+        ("tray", "System Tray", "_build_tray_tab",
+         "Whether closing the window leaves StreamSelect running in the system tray "
+         "(the menu bar on macOS), and which alerts it then shows as system "
+         "notifications. While it idles there it only reads what is already stored, "
+         "so it never uses a connection to your sources."),
+        ("alerts", "Watch Alerts", "_build_alerts_tab",
+         "What the Watch Alerts section shows, and how often StreamSelect re-checks "
+         "your watch list for new episodes. That check costs one connection to "
+         "the source while it runs, so on an account limited to a single "
+         "connection it competes with playback — which is why it defaults to "
+         "once a day rather than hourly."),
+    )),
+    ("App & data", (
+        ("interface", "Interface", "_build_interface_tab",
+         "Search memory, how the channel list looks, source-refresh behavior "
+         "and update checks. Which sidebar sections show, and Watch Alerts, "
+         "have pages of their own."),
+        ("metadata", "Metadata & API Keys", "_build_metadata_tab",
+         "TMDb/OMDb API keys, how long fetched metadata is cached, and EPG guide "
+         "refresh/notification timing. A TMDb key unlocks posters, cast, and plot "
+         "details across your whole library."),
+        ("sidebar", "Sidebar", "_build_sidebar_tab",
+         "Which sections appear down the left, and in what order. Changes take "
+         "effect as soon as you click OK or Apply. Hiding a section does not "
+         "lose anything — it stops being built, and comes back exactly as it "
+         "was when you show it again."),
+    )),
 )
+SECTIONS: tuple[tuple[str, str, str, str], ...] = tuple(
+    section for _heading, sections in SECTION_GROUPS for section in sections)
 
 #: Kept as the ``(id, label, builder)`` triples and the help mapping the rest of
 #: the file — and the tests — already read. Derived, so they cannot drift from
@@ -272,7 +303,7 @@ def _dial_or_none(value: float, default: float):
     return None if abs(float(value) - float(default)) < 1e-9 else value
 
 
-class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecordingTabMixin,
+class SettingsDialog(SettingsTabsMixin, SettingsMetadataTabMixin, SettingsDownloadsTabMixin, SettingsRecordingTabMixin,
                      SettingsTrayTabMixin, QDialog):
     """Modal settings dialog: left-nav sections, center controls, right contextual help.
 
@@ -316,6 +347,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
         self.setWindowTitle("Settings")
         self.setMinimumWidth(SETTINGS_MIN_WIDTH)
         self.setModal(True)
+        self._pending_setting: tuple[int, str] | None = None
         self._setup_ui()
         self._provider_test_ready.connect(self._on_provider_test_ready)
         self._load_values()
@@ -325,17 +357,24 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
         layout = QVBoxLayout(self)
         layout.setSpacing(12)
 
-        self._nav = ThreePanelSectionNav(_SECTION_HELP)
+        self._nav = ThreePanelSectionNav()
+        self._help = SettingsHelp(self._nav, _SECTION_HELP, self)
         # A page that is not offered is still built: its controls are loaded and
         # saved like every other, so its settings survive untouched.
         self._unlisted_pages = []
-        for section_id, label, builder_name, _help in SECTIONS:
-            page = getattr(self, builder_name)()
-            _align_label_columns(page)
-            if section_id in _gates.CAPTURE_SETTINGS_PAGES and not _gates.capture_enabled():
-                self._unlisted_pages.append(page)
-                continue
-            self._nav.add_section(section_id, label, page)
+        for heading, sections in SECTION_GROUPS:
+            listed = [(sid, label, getattr(self, builder)()) for sid, label, builder, _help in sections]
+            for page in (page for _sid, _label, page in listed):
+                _align_label_columns(page)
+                _fit_value_boxes(page)
+            offered = []
+            for entry in listed:
+                hidden = entry[0] in _gates.CAPTURE_SETTINGS_PAGES and not _gates.capture_enabled()
+                (self._unlisted_pages if hidden else offered).append(entry[2] if hidden else entry)
+            if offered:
+                self._nav.add_heading(heading)
+            for section_id, label, page in offered:
+                self._nav.add_section(section_id, label, page)
         layout.addWidget(self._nav, 1)
 
         # Restore the last-selected section with signals blocked so it doesn't
@@ -358,7 +397,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
         widest = max((p.minimumSizeHint().width() for p in pages), default=0)
         scrollbar = self.style().pixelMetric(self.style().PixelMetric.PM_ScrollBarExtent)
         m = layout.contentsMargins()
-        need = (nav.section_list.width() + widest + scrollbar + nav.help_panel.width()
+        need = (nav.nav_column.sizeHint().width() + widest + scrollbar + nav.help_panel.width()
                 + m.left() + m.right() + 4)
         self.setMinimumWidth(max(SETTINGS_MIN_WIDTH, need))
 
@@ -394,6 +433,30 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
         QTabWidget → left-nav rework.
         """
         return self._nav.select_by_label(label_substring)
+
+    def select_setting(self, label_substring: str, setting: str) -> bool:
+        """Open at one setting: its section selected, its row scrolled to and tinted,
+        its explanation in the help column (the ``settings:<tab>/<setting>`` link).
+
+        *setting* is the control's object name or part of its name on the page. Before
+        the dialog is on screen the jump waits for it, since a row has no position yet.
+        """
+        want = label_substring.strip().lower()
+        index = next((i for i in range(self._nav.count()) if want in self._nav.label(i).lower()), -1)
+        if index < 0:
+            return False
+        if not self.isVisible():
+            self._nav.set_current_row(index)
+            self._pending_setting = (index, setting)
+            return any(setting.lower() in e.title.lower() or e.control.objectName() == setting
+                       for e in self._help.entries(index))
+        return self._help.select_setting(index, setting)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        pending, self._pending_setting = self._pending_setting, None
+        if pending is not None:
+            QTimer.singleShot(0, lambda: self._help.select_setting(*pending))
 
     def _restore_dialog_geometry(self) -> None:
         """Resize to the last-persisted size (or the shipped default)."""

@@ -509,7 +509,7 @@ class _MenuActionsMixin:
             duration_ms=12000,
         )
 
-    def open_settings(self, tab: str | None = None):
+    def open_settings(self, tab: str | None = None, setting: str | None = None):
         """Open settings dialog.
 
         Args:
@@ -517,6 +517,9 @@ class _MenuActionsMixin:
                 matched, the dialog opens with that tab selected — used by QA
                 deep-links (``settings:<tab>``).  Unmatched/None opens the first
                 tab as before (backward-compatible).
+            setting: Optional setting on that tab (its name, or part of it): the
+                dialog opens scrolled to that row, tinted, with its explanation
+                showing (``settings:<tab>/<setting>``).
         """
         from streamselect.gui.settings_dialog import SettingsDialog
         dialog = SettingsDialog(self.config, self, executor=self.executor)
@@ -527,7 +530,9 @@ class _MenuActionsMixin:
         # re-ran the whole 785k-row filter twice.
         dialog.settings_applied.connect(lambda: _settings_apply.run(self))
         dialog.check_updates_requested.connect(self._manual_update_check)
-        if tab:
+        if tab and setting:
+            dialog.select_setting(tab, setting)
+        elif tab:
             dialog.select_section_by_label(tab)
         dialog.exec()
         # NOTHING is re-run here. There used to be a hand-written tail repeating

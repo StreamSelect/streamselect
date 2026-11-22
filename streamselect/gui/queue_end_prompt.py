@@ -27,6 +27,9 @@ from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QLabel, QVBoxLayout
 from streamselect.core.repositories import RepositoryFactory
 from streamselect.gui.dialog_chrome import dialog_buttons
 
+#: Where the prompt's "Change whether this is asked" link opens Settings.
+PROMPT_SETTING_LINK = "settings:Playback/Still here"
+
 
 class _QueueEndPromptMixin:
     """"Still watching?" prompt + the two answers' persistence paths."""
@@ -65,6 +68,12 @@ class _QueueEndPromptMixin:
         )
         msg.setWordWrap(True)
         layout.addWidget(msg)
+
+        # The prompt's own off switch, one click away (Settings opens on that row).
+        to_setting = QLabel(f'<a href="{PROMPT_SETTING_LINK}">Change whether this is asked</a>')
+        to_setting.setToolTip("Open Settings at the option that turns this question on or off")
+        to_setting.linkActivated.connect(lambda link: self.navigate_to(link))
+        layout.addWidget(to_setting)
 
         # Ok/Cancel relabelled rather than Yes/No: same accept/reject slots,
         # and then the same row as every other dialog's.

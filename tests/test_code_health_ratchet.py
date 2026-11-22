@@ -196,7 +196,6 @@ _KNOWN_SLACK: dict[str, int] = {
     "streamselect/gui/global_filter_dialog.py": 3,
     "streamselect/gui/main_window.py": 98,
     "streamselect/gui/main_window_streaming.py": 11,
-    "streamselect/gui/settings_dialog_tabs.py": 1,
     "streamselect/gui/sidebar/base.py": 26,
     "streamselect/gui/theme.py": 4,
 }

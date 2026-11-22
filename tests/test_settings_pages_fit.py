@@ -45,7 +45,7 @@ def test_no_page_scrolls_sideways_at_the_minimum_width(dialog, qapp):
         _settle(qapp)
         area = dialog._nav.stack.currentWidget()
         assert isinstance(area, QScrollArea)
-        name = dialog._nav.section_list.item(row).text()
+        name = dialog._nav.label(row)
         assert area.widget().minimumSizeHint().width() <= area.viewport().width(), (
             f"{name}: page needs {area.widget().minimumSizeHint().width()} px, "
             f"column gives {area.viewport().width()}")
@@ -88,3 +88,7 @@ def test_the_section_list_shows_every_label_whole(dialog):
     for i in range(nav.count()):
         assert nav.visualItemRect(nav.item(i)).width() <= nav.viewport().width()
         assert nav.sizeHintForColumn(0) <= nav.viewport().width(), nav.item(i).text()
+    # Room for a find match count too ("Metadata & API Keys   4").
+    widest = max(nav.fontMetrics().horizontalAdvance(dialog._nav.label(i) + "   00")
+                 for i in range(dialog._nav.count()))
+    assert widest <= nav.viewport().width()

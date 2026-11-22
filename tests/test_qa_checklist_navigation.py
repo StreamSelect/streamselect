@@ -193,8 +193,8 @@ class _FakeHost(_NavMixin):
     def switch_to_list_view(self):
         self.calls.append("list")
 
-    def open_settings(self, tab=None):
-        self.calls.append(("settings", tab))
+    def open_settings(self, tab=None, setting=None):
+        self.calls.append(("settings", tab) if setting is None else ("settings", tab, setting))
 
     def show_channel_details_by_id(self, channel_id):
         self.shown.append(channel_id)
@@ -224,6 +224,13 @@ def test_navigate_to_settings_opens_tab():
     host = _FakeHost()
     assert host.navigate_to("settings:Interface") is True
     assert host.calls == [("settings", "Interface")]
+
+
+def test_navigate_to_settings_opens_one_setting():
+    """navigate_to('settings:Playback/Still here') opens Settings at that setting."""
+    host = _FakeHost()
+    assert host.navigate_to("settings:Playback/Still here") is True
+    assert host.calls == [("settings", "Playback", "Still here")]
 
 
 def test_navigate_to_a_channel_or_a_rule_opens_what_its_watch_alerts_row_opens():

@@ -21,7 +21,6 @@
     "streamselect/gui/main_window_favorites.py": 1093,
     "streamselect/gui/main_window_streaming.py": 1314,
     "streamselect/gui/qa_checklist_window.py": 2450,
-    "streamselect/gui/settings_dialog_tabs.py": 1107,
     "streamselect/gui/sidebar/base.py": 1419,
     "streamselect/gui/sidebar/queue.py": 1000,
     "streamselect/gui/theme.py": 2404

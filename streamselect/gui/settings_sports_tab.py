@@ -286,3 +286,16 @@ class SportsSettingsPage(QWidget):
         _icon_utils.set_button_icon(self.advanced_toggle, "collapse" if open_ else "expand")
         self.advanced_toggle.setToolTip("Collapse the advanced settings" if open_
                                         else "Expand the advanced settings")
+
+    def reveal_setting(self, widget: QWidget) -> None:
+        """Bring the row holding *widget* on screen: open Advanced, or pick a sport the
+        row applies to. Settings calls this before jumping to a row from Find or a link."""
+        for row in self.rows.values():
+            if row.box is widget or row.box.isAncestorOf(widget):
+                if row.spec.group == tuning.ADVANCED:
+                    self._set_advanced(True)
+                if not row.spec.settable_for(self._sport):
+                    sport = next((s for s in self._sports if row.spec.settable_for(s)), None)
+                    if sport is not None:
+                        self.select_sport(sport)
+                return

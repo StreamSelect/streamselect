@@ -418,7 +418,8 @@ class _NavMixin:
         - ``"view:<name>"``    — browse | list | discover | recipe | epg |
           preferences (see ``_NAV_VIEW_TARGETS``).
         - ``"settings:<tab>"`` — open the Settings dialog, optionally on a tab
-          whose label contains ``<tab>`` (case-insensitive).
+          whose label contains ``<tab>`` (case-insensitive);
+          ``"settings:<tab>/<setting>"`` opens it at that one setting.
         - ``"sample:<kind>"``  — find a representative channel (vod | live |
           partial | series) and open Browse + its details.
         - ``"channel:<id>"``   — that channel's details, as a click on its
@@ -443,7 +444,8 @@ class _NavMixin:
         if kind == "view":
             return self._navigate_to_view(arg)
         if kind == "settings":
-            self.open_settings(tab=arg or None)
+            tab, _, setting = (arg or "").partition("/")
+            self.open_settings(tab=tab or None, setting=setting or None)
             return True
         if kind == "sample":
             return self._navigate_to_sample(arg)

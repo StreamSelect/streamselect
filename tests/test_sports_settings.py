@@ -138,10 +138,10 @@ def test_advanced_starts_collapsed_and_opens(qapp, owned_widgets):
     assert page.rows["same_game"].editor.isVisible()
 
 
-def test_the_settings_dialog_has_a_sports_page_after_watch_alerts():
-    from streamselect.gui.settings_dialog import SECTIONS
-    ids = [s[0] for s in SECTIONS]
-    assert ids.index("sports") == ids.index("alerts") + 1
+def test_the_settings_dialog_has_a_sports_page_under_finding_things():
+    from streamselect.gui.settings_dialog import SECTION_GROUPS
+    groups = {heading: [s[0] for s in sections] for heading, sections in SECTION_GROUPS}
+    assert "sports" in groups["Finding things"]
 
 
 # ── the improved-defaults prompt ─────────────────────────────────────────

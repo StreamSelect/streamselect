@@ -4,19 +4,13 @@ etc. are the dialog's own attributes.
 """
 from __future__ import annotations
 
-import asyncio
-import html as _html
-from types import SimpleNamespace
-
-from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QWidget,
     QFormLayout, QComboBox, QCheckBox, QDoubleSpinBox, QSpinBox, QLineEdit,
     QPushButton, QLabel, QGroupBox, QListWidget,
 )
 
-from streamselect.core.epg_utils import EPG_INTERVAL_CHOICES, EPG_SCRUBBER_INCREMENTS
 from streamselect.core.media_mix import format_media_share
 from streamselect.core.preference_engine import RecScoringSettings
 from streamselect.gui.settings_text_size import add_text_size_row
@@ -66,9 +60,14 @@ class SettingsTabsMixin:
 
         self._player_mode_combo = QComboBox()
         self._player_mode_combo.addItems(["Single instance", "Multiple instances"])
+        self._player_mode_combo.setToolTip("Single instance plays everything in one player window, "
+            "replacing what is on. Multiple instances opens a new window for each play. Queues "
+            "and autoplay need a single instance.")
         player_form.addRow("Player mode:", self._player_mode_combo)
 
         self._autoplay_check = QCheckBox("Autoplay next episode when playing from a season")
+        self._autoplay_check.setToolTip("Playing an episode queues the rest of its season, so the "
+            "next one starts when it ends.")
         player_form.addRow(self._autoplay_check)
 
         self._prompt_after_autoplay_check = QCheckBox(
@@ -107,6 +106,8 @@ class SettingsTabsMixin:
         player_form.addRow("Mark as partially-watched after:", partial_threshold_row)
 
         self._close_player_check = QCheckBox("Close player when stream finishes")
+        self._close_player_check.setToolTip("Close the player window when a film or episode ends. "
+            "Off: the player stays open on the last frame.")
         player_form.addRow(self._close_player_check)
 
         add_player_rows(self, player_form)
@@ -151,6 +152,8 @@ class SettingsTabsMixin:
         self._mpv_args_input = QLineEdit()
         self._mpv_args_input.setClearButtonEnabled(True)
         self._mpv_args_input.setPlaceholderText("--cache=yes --demuxer-max-bytes=50M")
+        self._mpv_args_input.setToolTip("Extra flags for the mpv player, separated by spaces, "
+            "added after StreamSelect's own. For advanced tuning only.")
         hint = QLabel(
             "Space-separated flags passed directly to mpv. "
             "The Diagnose tool's “Apply tuning” writes its recommended cache flags here."
@@ -382,6 +385,8 @@ class SettingsTabsMixin:
 
         self._signal_streak_spin = QSpinBox()
         self._signal_streak_spin.setRange(1, 10)
+        self._signal_streak_spin.setSuffix(" checks")
+        self._signal_streak_spin.setSpecialValueText("1 check")
         self._signal_streak_spin.setToolTip(
             "How many checks in a row must find nothing before an event is\n"
             "hidden.\n"
@@ -566,267 +571,6 @@ class SettingsTabsMixin:
         self._rec_diversity_spin.setValue(defaults.people_diversity_decay)
         self._rec_impression_spin.setValue(int(round(defaults.impression_decay * 100)))
         self._rec_liked_cap_spin.setValue(defaults.liked_cap)
-
-    def _build_metadata_tab(self) -> QWidget:
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-        layout.setSpacing(16)
-        layout.setContentsMargins(12, 12, 12, 12)
-
-        meta_group = QGroupBox("Metadata Enrichment")
-        meta_form = QFormLayout(meta_group)
-        meta_form.setSpacing(8)
-
-        self._meta_enabled_check = QCheckBox("Enable metadata enrichment")
-        meta_form.addRow(self._meta_enabled_check)
-
-        self._meta_autofetch_check = QCheckBox("Auto-fetch on channel select")
-        meta_form.addRow(self._meta_autofetch_check)
-
-        self._cache_ttl_spin = QSpinBox()
-        self._cache_ttl_spin.setRange(1, 365)
-        self._cache_ttl_spin.setSuffix(" days")
-        meta_form.addRow("Cache TTL (fresh content):", self._cache_ttl_spin)
-
-        self._cache_old_ttl_spin = QSpinBox()
-        self._cache_old_ttl_spin.setRange(1, 365)
-        self._cache_old_ttl_spin.setSuffix(" days")
-        meta_form.addRow("Cache TTL (old content >2yr):", self._cache_old_ttl_spin)
-
-        layout.addWidget(meta_group)
-
-        tmdb_group = QGroupBox("TMDb")
-        tmdb_form = QFormLayout(tmdb_group)
-        tmdb_form.setSpacing(8)
-
-        tmdb_key_row = QHBoxLayout()
-        self._tmdb_key_input = QLineEdit()
-        self._tmdb_key_input.setClearButtonEnabled(True)
-        self._tmdb_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._tmdb_key_input.setPlaceholderText("your-tmdb-api-key")
-        tmdb_key_row.addWidget(self._tmdb_key_input, 1)
-        tmdb_link_btn = QPushButton("Get key →")
-        tmdb_link_btn.setFixedWidth(80)
-        _theme.style_fn(tmdb_link_btn, lambda: f"QPushButton {{ color: {_theme.COLOR_ACCENT_BLUE}; border: none; padding: 0; }}"
-            f" QPushButton:hover {{ color: {_theme.COLOR_ACCENT_BLUE_2}; }}")
-        tmdb_link_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl("https://www.themoviedb.org/settings/api"))
-        )
-        tmdb_key_row.addWidget(tmdb_link_btn)
-        self._tmdb_test_btn = QPushButton("Test")
-        self._tmdb_test_btn.setFixedWidth(50)
-        self._tmdb_test_btn.setEnabled(self._executor is not None)
-        self._tmdb_test_btn.setToolTip(
-            "Test this TMDb API key" if self._executor is not None
-            else "Test unavailable — no background executor for this dialog instance"
-        )
-        self._tmdb_test_btn.clicked.connect(self._on_test_tmdb_key)
-        tmdb_key_row.addWidget(self._tmdb_test_btn)
-        tmdb_form.addRow("API key:", tmdb_key_row)
-
-        self._tmdb_test_result = QLabel("")
-        _theme.style(self._tmdb_test_result, "URL_BADGE")
-        self._tmdb_test_result.hide()
-        tmdb_form.addRow(self._tmdb_test_result)
-
-        self._tmdb_lang_input = QLineEdit()
-        self._tmdb_lang_input.setClearButtonEnabled(True)
-        self._tmdb_lang_input.setPlaceholderText("en-US")
-        self._tmdb_lang_input.setMaxLength(10)
-        tmdb_form.addRow("Language:", self._tmdb_lang_input)
-
-        layout.addWidget(tmdb_group)
-
-        omdb_group = QGroupBox("OMDb")
-        omdb_form = QFormLayout(omdb_group)
-        omdb_form.setSpacing(8)
-
-        omdb_key_row = QHBoxLayout()
-        self._omdb_key_input = QLineEdit()
-        self._omdb_key_input.setClearButtonEnabled(True)
-        self._omdb_key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._omdb_key_input.setPlaceholderText("your-omdb-api-key")
-        omdb_key_row.addWidget(self._omdb_key_input, 1)
-        omdb_link_btn = QPushButton("Get key →")
-        omdb_link_btn.setFixedWidth(80)
-        _theme.style_fn(omdb_link_btn, lambda: f"QPushButton {{ color: {_theme.COLOR_ACCENT_BLUE}; border: none; padding: 0; }}"
-            f" QPushButton:hover {{ color: {_theme.COLOR_ACCENT_BLUE_2}; }}")
-        omdb_link_btn.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl("https://www.omdbapi.com/apikey.aspx"))
-        )
-        omdb_key_row.addWidget(omdb_link_btn)
-        self._omdb_test_btn = QPushButton("Test")
-        self._omdb_test_btn.setFixedWidth(50)
-        self._omdb_test_btn.setEnabled(self._executor is not None)
-        self._omdb_test_btn.setToolTip(
-            "Test this OMDb API key" if self._executor is not None
-            else "Test unavailable — no background executor for this dialog instance"
-        )
-        self._omdb_test_btn.clicked.connect(self._on_test_omdb_key)
-        omdb_key_row.addWidget(self._omdb_test_btn)
-        omdb_form.addRow("API key:", omdb_key_row)
-
-        self._omdb_test_result = QLabel("")
-        _theme.style(self._omdb_test_result, "URL_BADGE")
-        self._omdb_test_result.hide()
-        omdb_form.addRow(self._omdb_test_result)
-
-        layout.addWidget(omdb_group)
-
-        epg_group = QGroupBox("EPG")
-        epg_form = QFormLayout(epg_group)
-        epg_form.setSpacing(8)
-
-        self._epg_interval_combo = QComboBox()
-        for value, label in EPG_INTERVAL_CHOICES:
-            self._epg_interval_combo.addItem(label, value)
-        self._epg_interval_combo.setToolTip(
-            "Default EPG guide refresh frequency for all providers. "
-            "Individual providers can override this in their editor. "
-            "'Auto' (the default) self-tunes: it refreshes at half the guide depth, "
-            "clamped to 6 hours – 7 days, so there is always headroom. "
-            "'Only when data is stale' waits until the guide has fully expired before re-fetching."
-        )
-        epg_form.addRow("EPG refresh:", self._epg_interval_combo)
-
-        self._epg_hide_older_spin = QSpinBox()
-        self._epg_hide_older_spin.setRange(0, 168)  # 0 = no extra back-browse … 7 days
-        self._epg_hide_older_spin.setSuffix(" h")
-        self._epg_hide_older_spin.setToolTip(
-            "Browse opens at 'now' (currently-airing + upcoming) and its timeline\n"
-            "reaches back to the start of everything on right now. This setting lets\n"
-            "you scrub FURTHER back: drag the handle to browse up to this many hours\n"
-            "into the past. 0 (the default) keeps the timeline at the oldest show\n"
-            "currently airing — no further back."
-        )
-        epg_form.addRow("Allow browsing back:", self._epg_hide_older_spin)
-
-        self._epg_scrubber_increment_combo = QComboBox()
-        for _mins in EPG_SCRUBBER_INCREMENTS:
-            self._epg_scrubber_increment_combo.addItem(f"{_mins} minutes", _mins)
-        self._epg_scrubber_increment_combo.setToolTip(
-            "Granularity of the Browse timeline scrubber. Dragging the handle snaps to "
-            "this interval (and each scroll step of the handle is one interval)."
-        )
-        epg_form.addRow("Scrubber snap:", self._epg_scrubber_increment_combo)
-
-        self._epg_notify_minutes_spin = QSpinBox()
-        self._epg_notify_minutes_spin.setRange(5, 120)
-        self._epg_notify_minutes_spin.setSuffix(" min")
-        self._epg_notify_minutes_spin.setToolTip(
-            "How many minutes before a Watchlist programme starts StreamSelect shows a "
-            "notification toast."
-        )
-        epg_form.addRow("Notify before show:", self._epg_notify_minutes_spin)
-        self._epg_runout_spin = QSpinBox(minimum=10, maximum=360, suffix=" min")
-        self._epg_runout_spin.setToolTip("Fetch a new guide this long before its last listed "
-                                         "programme starts, so the guide never runs out first.")
-        epg_form.addRow("Refresh before it runs out:", self._epg_runout_spin)
-
-        self._epg_auto_refresh_check = QCheckBox("Auto-refresh guides on launch and interval")
-        self._epg_auto_refresh_check.setToolTip(
-            "When on, StreamSelect automatically fetches new EPG guide data on launch and "
-            "at each source's refresh interval. Turn off to only refresh EPG "
-            "manually (the Refresh button on the EPG screen still works)."
-        )
-        epg_form.addRow(self._epg_auto_refresh_check)
-
-        layout.addWidget(epg_group)
-
-        layout.addStretch()
-        return tab
-
-    # ── TMDb/OMDb "Test" buttons ────────────────────────────────────────────
-    # Off-UI-thread: the worker only emits `_provider_test_ready`; its slot alone
-    # touches the result badges. Tests the key CURRENTLY TYPED (test before save).
-
-    def _on_test_tmdb_key(self) -> None:
-        """Metadata tab: TMDb 'Test' button clicked."""
-        from streamselect.metadata_providers.tmdb import TMDbProvider
-        key = self._tmdb_key_input.text().strip()
-        language = self._tmdb_lang_input.text().strip() or "en-US"
-        provider = TMDbProvider(SimpleNamespace(
-            metadata_tmdb_api_key=key,
-            metadata_tmdb_language=language,
-            metadata_tmdb_include_adult=False,
-        ))
-        self._run_provider_test("tmdb", provider, self._tmdb_test_btn, self._tmdb_test_result)
-
-    def _on_test_omdb_key(self) -> None:
-        """Metadata tab: OMDb 'Test' button clicked."""
-        from streamselect.metadata_providers.omdb import OMDbProvider
-        key = self._omdb_key_input.text().strip()
-        provider = OMDbProvider(SimpleNamespace(metadata_omdb_api_key=key))
-        self._run_provider_test("omdb", provider, self._omdb_test_btn, self._omdb_test_result)
-
-    def _run_provider_test(self, provider_name: str, provider, button: QPushButton,
-                            label: QLabel) -> None:
-        """Kick off ``provider.test_connection()`` on the shared executor.
-
-        Args:
-            provider_name: ``"tmdb"``/``"omdb"`` — echoed back by the worker so
-                ``_on_provider_test_ready`` knows which widgets to update.
-            provider: A throwaway provider built from the typed (unsaved) key.
-            button: The "Test" button to disable while the probe is in flight.
-            label: The inline result-badge label to update.
-        """
-        if self._executor is None:
-            label.setText(f"{_icon_utils.role_html('notification_error')}&nbsp;Test unavailable — no executor")
-            _theme.style(label, "URL_BADGE_ERR")
-            label.show()
-            return
-        if not provider.is_enabled():
-            label.setText(f"{_icon_utils.role_html('notification_error')}&nbsp;Enter an API key first")
-            _theme.style(label, "URL_BADGE_ERR")
-            label.show()
-            return
-        button.setEnabled(False)
-        label.setText(f"{_icon_utils.role_html('loading')}&nbsp;Testing…")
-        _theme.style(label, "URL_BADGE_TESTING")
-        label.show()
-        self._executor.submit(self._provider_test_worker, provider_name, provider)
-
-    def _provider_test_worker(self, provider_name: str, provider) -> None:
-        """Runs OFF the main thread. Never touches widgets — emits the result only.
-
-        Args:
-            provider_name: ``"tmdb"`` or ``"omdb"``.
-            provider: The provider instance to probe.
-        """
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result = loop.run_until_complete(provider.test_connection())
-            finally:
-                loop.close()
-        except Exception as e:  # pragma: no cover - defensive; must never escape a worker thread
-            result = (False, f"Unexpected error: {e}")
-        self._provider_test_ready.emit(provider_name, result)
-
-    def _on_provider_test_ready(self, provider_name: str, result) -> None:
-        """MAIN THREAD ONLY: render a Test-button result (success/failure + icon).
-
-        Args:
-            provider_name: ``"tmdb"`` or ``"omdb"``.
-            result: ``(success, message)`` from ``test_connection()``.
-        """
-        if provider_name == "tmdb":
-            button, label = self._tmdb_test_btn, self._tmdb_test_result
-        elif provider_name == "omdb":
-            button, label = self._omdb_test_btn, self._omdb_test_result
-        else:
-            return
-        button.setEnabled(self._executor is not None)
-
-        success, message = result
-        if success:
-            label.setText(f"{_icon_utils.role_html('notification_success')}&nbsp;Connected")
-            _theme.style(label, "URL_BADGE_OK")
-        else:
-            label.setText(f"{_icon_utils.role_html('notification_error')}&nbsp;{_html.escape(message or 'Test failed', quote=False)}")
-            _theme.style(label, "URL_BADGE_ERR")
-        label.show()
 
     def _build_interface_tab(self) -> QWidget:
         """Build the Interface tab containing Search and Sidebar settings."""
@@ -1019,6 +763,9 @@ class SettingsTabsMixin:
         sidebar_layout.addWidget(hint)
 
         self._sidebar_list = QListWidget()
+        self._sidebar_list.setAccessibleName("Sections and their order")
+        self._sidebar_list.setToolTip("Tick a section to show it in the sidebar; drag it, or "
+                                      "use Move Up and Move Down, to change its place.")
         self._sidebar_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
         self._sidebar_list.setDefaultDropAction(Qt.DropAction.MoveAction)
         sidebar_layout.addWidget(self._sidebar_list)

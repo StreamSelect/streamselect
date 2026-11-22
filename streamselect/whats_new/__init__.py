@@ -27,7 +27,8 @@ from loguru import logger
 #                                  checklist renders a "Go ▸" button for.
 # ``target`` vocabulary (resolved by ``MainWindow.navigate_to`` — the single seam):
 #   - ``"view:<name>"``     browse | discover | recipe | epg | preferences
-#   - ``"settings:<tab>"``  open the Settings dialog (optionally on a named tab)
+#   - ``"settings:<tab>"``  open the Settings dialog (optionally on a named tab;
+#     ``"settings:<tab>/<setting>"`` opens it at one setting)
 #   - ``"sample:<kind>"``   vod | live | partial | series — the app finds a
 #                           representative channel and opens Browse + details on it.
 TestStep = Union[str, "tuple[str, str]"]
