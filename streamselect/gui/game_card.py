@@ -594,7 +594,9 @@ class GameCard(QFrame):
             _theme.style(started, "TEXT_SM_MUTED")
             top.addWidget(started)
         top.addStretch(1)
-        self.bell = AlertBell(game, alerts or [])
+        # Started: an alert for THIS game can never fire, so the bell offers the teams /
+        # rematch alerts and a click opens them, as a finished game's does (owner, 2026-11-14).
+        self.bell = AlertBell(game, alerts or [], over=live)
         if self.bell.covering and state == UPCOMING:
             on = QLabel("ALERT ON")            # words with the colour, never colour alone (B2)
             _theme.style(on, "GAME_LIVE_TAG")

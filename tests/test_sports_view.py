@@ -815,21 +815,45 @@ def test_an_alert_rule_matches_one_event_either_side_or_the_pair():
 
 def test_the_bell_sets_an_alert_for_this_event_and_lights(games_db, qapp, owned_widgets):
     from streamselect.core.games.alerts import load_alerts
-    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
-    card = _card(view, "Sabres")
-    assert not card.bell.covering
-    card.bell.click()
+    view = _view(games_db, qapp, owned_widgets, START - timedelta(hours=3))   # still to come
+
+    def row(team):
+        return next(r for r in view.rows if team in r.text())
+    assert not row("Sabres").bell.covering
+    row("Sabres").bell.click()
     _settle(qapp)
     with games_db.session_scope(commit=False) as s:
         [rule] = load_alerts(s)
     assert rule.event and rule.sides == ("Buffalo Sabres", "Chicago Blackhawks")
-    card = _card(view, "Sabres")
-    assert card.bell.covering and "Alert set" in card.bell.toolTip()
-    assert not _card(view, "Dallas").bell.covering, "only that event"
-    card.bell.click()                       # click again: off
+    assert row("Sabres").bell.covering and "Alert set" in row("Sabres").bell.toolTip()
+    assert not row("Dallas").bell.covering, "only that event"
+    row("Sabres").bell.click()              # click again: off
     _settle(qapp)
     with games_db.session_scope(commit=False) as s:
         assert load_alerts(s) == []
+
+
+def test_a_live_games_bell_offers_team_and_rematch_alerts_on_a_left_click(
+        games_db, qapp, owned_widgets, monkeypatch):
+    """Owner, 2026-11-14: a left click on a LIVE card's bell set an alert for a game that
+    had already started, which can never fire. It now opens the teams / rematch menu,
+    as a finished game's bell does, and sets nothing by itself."""
+    from PyQt6.QtWidgets import QMenu
+
+    from streamselect.core.games.alerts import load_alerts
+    view = _view(games_db, qapp, owned_widgets, LIVE_AT)
+    bell = _card(view, "Sabres").bell
+    labels = [a.text() for a in bell.build_menu().actions()]
+    assert labels and not any("this event" in t for t in labels), labels
+    assert any("every Buffalo Sabres event" in t for t in labels)
+    opened = []
+    monkeypatch.setattr(QMenu, "exec", lambda self, *a: opened.append(self))
+    bell.click()
+    _settle(qapp)
+    assert opened, "a left click opens the menu"
+    with games_db.session_scope(commit=False) as s:
+        assert load_alerts(s) == [], "no alert for a game already under way"
+    assert "teams' next events" in bell.toolTip()
 
 
 def test_a_team_alert_lights_every_event_of_that_team_and_says_alert_on_before_it_starts(
