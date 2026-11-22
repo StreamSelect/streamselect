@@ -1,10 +1,6 @@
-"""SettingsDialog's five section-content builders.
-
-Playback, Interaction, Recommendations, Metadata & API Keys, Interface — moved
-here **verbatim** from ``settings_dialog.py`` (which owns the three-panel shell
-plus ``_load_values``/``_save_values``) purely to keep both files under the
-1000-line ceiling. Mixed into ``SettingsDialog`` via multiple inheritance, so
-``self._player_mode_combo`` etc. resolve exactly as before.
+"""SettingsDialog's section-content builders, mixed into ``SettingsDialog`` (which owns
+the three-panel shell and ``_load_values``/``_save_values``), so ``self._player_mode_combo``
+etc. are the dialog's own attributes.
 """
 from __future__ import annotations
 
@@ -722,6 +718,10 @@ class SettingsTabsMixin:
             "notification toast."
         )
         epg_form.addRow("Notify before show:", self._epg_notify_minutes_spin)
+        self._epg_runout_spin = QSpinBox(minimum=10, maximum=360, suffix=" min")
+        self._epg_runout_spin.setToolTip("Fetch a new guide this long before its last listed "
+                                         "programme starts, so the guide never runs out first.")
+        epg_form.addRow("Refresh before it runs out:", self._epg_runout_spin)
 
         self._epg_auto_refresh_check = QCheckBox("Auto-refresh guides on launch and interval")
         self._epg_auto_refresh_check.setToolTip(

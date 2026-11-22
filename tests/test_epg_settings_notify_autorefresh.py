@@ -138,3 +138,21 @@ def test_both_epg_settings_round_trip_together(qapp, real_config):
     assert real_config.epg_notification_minutes_before == 30
     assert real_config.epg_auto_refresh is False
     dlg.close()
+
+
+def test_refresh_before_runout_has_a_settings_row_that_round_trips(qapp, real_config):
+    """``epg_refresh_before_runout_minutes`` shipped in 1.1.0 with no Settings row
+    (roadmap): it loads into the EPG group and saves back, and it is visible."""
+    from streamselect.gui.settings_dialog import SettingsDialog
+
+    real_config.epg_refresh_before_runout_minutes = 90
+    dlg = SettingsDialog(real_config, parent=None)
+    assert dlg._epg_runout_spin.value() == 90
+    dlg._epg_runout_spin.setValue(120)
+    dlg._save_values()
+    assert real_config.epg_refresh_before_runout_minutes == 120
+    dlg.select_section_by_label("Metadata")
+    dlg.show()
+    qapp.processEvents()
+    assert dlg._epg_runout_spin.isVisible()
+    dlg.close()

@@ -399,6 +399,11 @@ def test_browse_filter_changed_emits_signal(qapp):
     view.filterChanged.connect(emitted.append)
 
     view._search_box.setText("days")
+    import time                              # the box waits out a typing pause (300 ms)
+    end = time.time() + 1.0
+    while not emitted and time.time() < end:
+        qapp.processEvents()
+        time.sleep(0.02)
 
     assert emitted == ["days"], (
         f"filterChanged must emit the typed text; got {emitted!r}"

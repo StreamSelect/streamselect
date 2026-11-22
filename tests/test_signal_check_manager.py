@@ -263,3 +263,15 @@ def test_a_dispatched_preempt_reaches_each_listener_and_survives_a_raise():
 
     assert calls == [("first", "download:7"), ("third", "download:7")], (
         "a raising listener stopped the ones after it")
+
+
+def test_how_long_an_event_is_live_has_one_definition():
+    """The 4 h "an event is still on" window was defined twice more, beside the one
+    home made for it; a change to one copy would leave the guide's Events tab and the
+    signal check disagreeing (roadmap, owner 2026-11-18)."""
+    from streamselect.core import signal_check_manager
+    from streamselect.core.event_datetime import DEFAULT_EVENT_DURATION
+    from streamselect.gui import epg_events_mixin
+
+    assert signal_check_manager.LIVE_WINDOW is DEFAULT_EVENT_DURATION
+    assert epg_events_mixin.LIVE_EVENT_WINDOW is DEFAULT_EVENT_DURATION

@@ -1243,6 +1243,7 @@ def mock_settings_epg_widgets(dlg) -> None:
     dlg._epg_hide_older_spin = _stub("value", 0)
     dlg._epg_scrubber_increment_combo = _stub("currentData", 30)
     dlg._epg_notify_minutes_spin = _stub("value", 15)
+    dlg._epg_runout_spin = _stub("value", 60)
     dlg._epg_auto_refresh_check = _stub("isChecked", True)
 
 
@@ -1278,6 +1279,9 @@ def wire_settings_epg_widgets(dlg) -> None:
     dlg._epg_notify_minutes_spin = QSpinBox()
     dlg._epg_notify_minutes_spin.setRange(5, 120)
     dlg._epg_notify_minutes_spin.setValue(15)
+    dlg._epg_runout_spin = QSpinBox()
+    dlg._epg_runout_spin.setRange(10, 360)
+    dlg._epg_runout_spin.setValue(60)
     dlg._epg_auto_refresh_check = QCheckBox()
     dlg._epg_auto_refresh_check.setChecked(True)
 

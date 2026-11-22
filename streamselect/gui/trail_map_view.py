@@ -915,10 +915,10 @@ class TrailMapView(QWidget):
             self._image_cache.get_image_async(url)
 
     def _on_image_loaded(self, url: str, pix: QPixmap) -> None:
-        if not self.isVisible():
-            return
+        # Posters waiting on this image get it even while the map is hidden (returning
+        # early left them on their placeholder); only the enlarged-poster pop needs it shown.
         # A row-poster peek awaiting this image → pop the enlarged-poster overlay.
-        if url == self._pending_expand_url and pix and not pix.isNull():
+        if url == self._pending_expand_url and pix and not pix.isNull() and self.isVisible():
             self._pending_expand_url = None
             self.poster_expand_requested.emit(pix)
         if url == self._detail_poster_url and pix and not pix.isNull():

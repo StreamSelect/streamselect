@@ -104,7 +104,8 @@ class _BrowseView(QWidget):
         top.addWidget(self._title_lbl)
         top.addStretch()
 
-        self._search_box = ScopedFilterBox("Filter…", debounce_ms=0)
+        # Debounced: each change rebuilds the whole grid, and Recipe's "Show all" re-queries.
+        self._search_box = ScopedFilterBox("Filter…", debounce_ms=300)
         self._search_box.setFixedWidth(200)
         self._search_box.filterChanged.connect(self._apply_filter)
         top.addWidget(self._search_box)

@@ -774,3 +774,24 @@ class TestLightboxEntryPoint:
 # 8. What's New entry 176
 # ---------------------------------------------------------------------------
 
+
+
+def test_a_poster_loaded_while_the_map_is_hidden_still_reaches_its_thumbnail(qapp, tmp_path):
+    """Audit 2026-08-31: an image arriving while the trail map was hidden was dropped
+    before it reached the posters waiting for it, so they kept their placeholder."""
+    from PyQt6.QtCore import QSize
+    from PyQt6.QtGui import QPixmap
+    from PyQt6.QtWidgets import QLabel
+
+    db = _make_db(tmp_path / "t.db")
+    tm = _make_view(db, qapp)
+    label = QLabel("…", tm)
+    tm._poster_targets["http://img/x.jpg"] = [(label, QSize(40, 60))]
+    tm.hide()
+    pix = QPixmap(80, 120)
+    pix.fill()
+    tm._on_image_loaded("http://img/x.jpg", pix)
+    assert label.pixmap() is not None and not label.pixmap().isNull(), "the waiting poster got it"
+    assert label.text() == ""
+    from tests.conftest import destroy_widget
+    destroy_widget(tm._host_ref)

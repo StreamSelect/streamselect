@@ -293,3 +293,25 @@ def test_clear_button_clears_search_box_and_filter(qapp):
 
     assert view._search_box.text() == ""
     assert view.current_filter() == ""
+
+
+def test_typing_in_the_filter_rebuilds_once_after_a_pause(qapp):
+    """Audit 2026-08-31: the Browse filter rebuilt the whole grid (and Recipe's
+    "Show all" re-queried) on every keystroke; every other search box waits."""
+    import time
+
+    view = _make_browse(qapp)
+    view.load("Title", _cards("a", 30))
+    seen = []
+    view.filterChanged.connect(seen.append)
+    for ch in "titl":
+        view._search_box.setText(view._search_box.text() + ch)
+        qapp.processEvents()
+    assert seen == [], "no rebuild while the user is still typing"
+    end = time.time() + 1.0
+    while not seen and time.time() < end:
+        qapp.processEvents()
+        time.sleep(0.02)
+    assert seen == ["titl"], "one rebuild with the final text"
+    from tests.conftest import destroy_widget
+    destroy_widget(view)

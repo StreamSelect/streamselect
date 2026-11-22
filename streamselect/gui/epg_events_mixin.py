@@ -18,7 +18,7 @@ These are imported back into ``streamselect.gui.epg_view`` for backwards compati
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QFont
@@ -34,6 +34,7 @@ from PyQt6.QtWidgets import (
 )
 from loguru import logger
 
+from streamselect.core.event_datetime import DEFAULT_EVENT_DURATION
 from streamselect.core.time_display import clock_text
 from streamselect.core.epg_utils import (
     now_utc as _now_utc,
@@ -49,12 +50,11 @@ from streamselect.gui import theme as _theme
 # ---------------------------------------------------------------------------
 
 # Deliberate heuristic compromise (mirrors content_dedup.py): live-event feeds carry
-# no explicit stop time, so "on now" is approximated by a 4-hour look-back window.
-# Events that started within the window are grouped as on-now/upcoming; events whose
-# start_time is older than the window are filed under "Already passed". This is the
-# same trade-off called out in the project rules's Content Dedup section — a known heuristic
-# that is clearly documented rather than silently wrong.
-LIVE_EVENT_WINDOW = timedelta(hours=4)
+# no explicit stop time, so "on now" is approximated by a look-back window — the one
+# assumed event length (event_datetime.DEFAULT_EVENT_DURATION, 4 h), not a copy of it.
+# Events that started within the window are grouped as on-now/upcoming; older ones
+# are filed under "Already passed".
+LIVE_EVENT_WINDOW = DEFAULT_EVENT_DURATION
 
 
 def _classify_event(dto, now: datetime):

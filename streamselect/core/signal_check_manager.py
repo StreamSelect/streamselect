@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Optional
 from loguru import logger
 
 from streamselect.core.epg_utils import now_utc
+from streamselect.core.event_datetime import DEFAULT_EVENT_DURATION
 from streamselect.core.stream_probe import (FAILED_VERDICTS, LIVE, ProbeSettings,
                                       ffmpeg_available, probe_stream)
 
@@ -54,8 +55,9 @@ PROBE_PREEMPTS: tuple[str, ...] = ()
 #: How long a verdict stands before the channel is worth re-checking.
 RECHECK_AFTER = timedelta(minutes=30)
 
-#: How long after its start time an event is still "on" and worth probing.
-LIVE_WINDOW = timedelta(hours=4)
+#: How long after its start time an event is still "on" and worth probing: the one
+#: assumed event length, not a copy of it.
+LIVE_WINDOW = DEFAULT_EVENT_DURATION
 
 #: Idle poll. Slow on purpose — nothing here is urgent, and every wake-up is a
 #: chance to take a connection the user wants.
