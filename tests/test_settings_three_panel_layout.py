@@ -198,16 +198,17 @@ def test_dialog_size_and_section_persist_across_instances(qapp, tmp_path):
     config = _make_config(tmp_path)
 
     dlg1 = SettingsDialog(config, parent=None)
-    dlg1.resize(950, 640)
+    wide = dlg1.minimumWidth() + 50          # the minimum is measured from the pages
+    dlg1.resize(wide, 640)
     dlg1._nav.section_list.setCurrentRow(3)  # "Metadata & API Keys"
     dlg1.reject()  # Cancel path — UI state (size/section) still must persist
 
-    assert config.settings_dialog_width == 950
+    assert config.settings_dialog_width == wide
     assert config.settings_dialog_height == 640
     assert config.settings_dialog_section == 3
 
     dlg2 = SettingsDialog(config, parent=None)
-    assert dlg2.width() == 950
+    assert dlg2.width() == wide
     assert dlg2.height() == 640
     assert dlg2._nav.section_list.currentRow() == 3
     assert dlg2._nav.stack.currentIndex() == 3

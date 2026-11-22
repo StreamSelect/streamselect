@@ -264,7 +264,10 @@ def test_the_page_opens_on_all_sports_and_shows_each_setting_where_it_is_set(qap
     row = page.rows["listed_ahead"]
     assert row.value() == 24 and row.note.text() == "from All sports" and row.note.isVisible()
     assert not row.reset.isVisible(), "nothing of hockey's own to reset"
-    assert row.note.geometry().left() > row.editor.geometry().right(), "the note follows the value"
+    # The note sits under the value, aligned with it (side by side, a row was ~620 px:
+    # wider than the page has; owner, 2026-11-22).
+    note, editor = row.note.mapTo(page, row.note.rect().topLeft()), row.editor.mapTo(page, row.editor.rect().bottomLeft())
+    assert note.y() > editor.y() and abs(note.x() - editor.x()) <= 2, "the note sits under the value"
     page.edit("listed_ahead", 12)
     assert row.note.text() == "default 36 h ahead" and row.reset.isVisible(), "now hockey's own"
 

@@ -14,7 +14,8 @@ from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QListWidget, QListWidgetItem, QStackedWidget, QTextBrowser, QWidget,
+    QFrame, QHBoxLayout, QListWidget, QListWidgetItem, QScrollArea, QStackedWidget, QTextBrowser,
+    QWidget,
 )
 
 from streamselect.gui import theme as _theme
@@ -42,7 +43,9 @@ class ThreePanelSectionNav(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.section_list = QListWidget()
+        # Sized to its widest label in add_section (a fixed 160 cut "Recommendations").
         self.section_list.setFixedWidth(160)
+        self.section_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.section_list.setToolTip("Choose a settings section.")
         _theme.style_fn(self.section_list, lambda: "QListWidget { border: none; border-right: 1px solid "
             f"{_theme.COLOR_LINE}; background: transparent; font-size: {_theme.FONT_XL};"
@@ -72,13 +75,26 @@ class ThreePanelSectionNav(QWidget):
         self.section_list.currentRowChanged.connect(self._on_row_changed)
 
     def add_section(self, section_id: str, label: str, page: QWidget) -> None:
-        """Append a left-nav row labeled *label* and its center *page*."""
+        """Append a left-nav row labeled *label* and its center *page*.
+
+        The page scrolls inside its own frameless area. Placed bare in the stack,
+        a page wider than the centre column was squeezed below its minimum (labels
+        drawn under their fields, values cut off), and the tallest page's height
+        became the whole dialog's minimum (824 px; owner, 2026-11-22).
+        """
         item = QListWidgetItem(label)
         item.setData(Qt.ItemDataRole.UserRole, section_id)
         item.setToolTip(f"Show {label} settings")
         self.section_list.addItem(item)
-        self.stack.addWidget(page)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(page)
+        self.stack.addWidget(scroll)
         self._section_ids.append(section_id)
+        self.section_list.ensurePolished()
+        widest = self.section_list.sizeHintForColumn(0) + 2 * self.section_list.frameWidth() + 4
+        self.section_list.setFixedWidth(max(160, widest))
 
     def count(self) -> int:
         return self.section_list.count()

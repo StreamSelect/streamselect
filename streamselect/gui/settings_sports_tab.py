@@ -38,6 +38,10 @@ SPORTS_HELP = (
     "it, and stays as you set it when a default changes later.")
 
 
+#: The label column's widest: a longer label wraps rather than widening every row.
+_LABEL_MAX_W = 230
+
+
 class _Row:
     """One setting's controls: the value, a note ("default 2 h 45 min" / "set by you"), Reset."""
 
@@ -64,13 +68,24 @@ class _Row:
         # PyQt holds weakly; a lambda here held the page in a cycle past its dialog).
         for w in (self.editor, self.reset):
             w.setProperty("tuningKey", spec.key)
+        # The value on one line, its note and Reset on a second beneath it: side by side
+        # they made each row ~620 px, wider than the page has (owner, 2026-11-22).
         self.box = QWidget()
-        h = QHBoxLayout(self.box)
+        v = QVBoxLayout(self.box)
+        v.setContentsMargins(0, 0, 0, 0)
+        v.setSpacing(2)
+        line = QHBoxLayout()
+        line.addWidget(self.editor)
+        line.addStretch(1)
+        v.addLayout(line)
+        self.extra = QWidget()
+        h = QHBoxLayout(self.extra)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(8)
-        for w in (self.editor, self.note, self.reset):
-            h.addWidget(w)
+        h.addWidget(self.note)
+        h.addWidget(self.reset)
         h.addStretch(1)
+        v.addWidget(self.extra)
 
     def value(self) -> int:
         if isinstance(self.editor, QTimeEdit):
@@ -95,12 +110,14 @@ class _Row:
                                  if follows is not None else "")
             self.note.setVisible(follows is not None)
             self.reset.hide()
+            self.extra.setVisible(follows is not None)
             return
         self.note.setToolTip("")
         self.note.setText("set by you" if int(mine[0]) == default else f"default {self.spec.text(default)}")
         self.note.show()
         self.reset.setToolTip(f"Back to the default, {self.spec.text(default)}, and follow it from now on")
         self.reset.show()
+        self.extra.show()
 
 
 class SportsSettingsPage(QWidget):
@@ -128,9 +145,6 @@ class SportsSettingsPage(QWidget):
                                     "give it its own")
         self.sport_combo.currentIndexChanged.connect(self._on_sport)
         top.addWidget(self.sport_combo)
-        hint = QLabel("A sport's own value wins over All sports.")
-        _theme.style(hint, "TEXT_SM_MUTED")
-        top.addWidget(hint)
         top.addStretch(1)
         self.reset_all = QPushButton()
         _theme.style(self.reset_all, "RECIPE_CLEAR_BTN")
@@ -138,6 +152,10 @@ class SportsSettingsPage(QWidget):
         self.reset_all.clicked.connect(self._reset_sport)
         top.addWidget(self.reset_all)
         lay.addLayout(top)
+        hint = QLabel("A sport's own value wins over All sports.")
+        hint.setWordWrap(True)
+        _theme.style(hint, "TEXT_SM_MUTED")
+        lay.addWidget(hint)
 
         forms: dict[str, QFormLayout] = {}
         self._boxes: dict[str, QGroupBox] = {}
@@ -164,6 +182,7 @@ class SportsSettingsPage(QWidget):
             lay.addWidget(box)
             if group == tuning.ALERTS:
                 lead = QLabel("How early an alert notifies is on the Watch Alerts page.")
+                lead.setWordWrap(True)
                 _theme.style(lead, "TEXT_SM_MUTED")
                 self._alerts_form = form
         for spec in tuning.SPECS:
@@ -173,7 +192,10 @@ class SportsSettingsPage(QWidget):
             else:
                 row.editor.valueChanged.connect(self._on_edit)
             row.reset.clicked.connect(self._on_reset)
-            forms[spec.group].addRow(spec.label, row.box)
+            label = QLabel(spec.label)
+            label.setWordWrap(True)        # a long Advanced label must not set the column
+            label.setMaximumWidth(_LABEL_MAX_W)
+            forms[spec.group].addRow(label, row.box)
             self.rows[spec.key] = row
         self._alerts_form.addRow("", lead)
 

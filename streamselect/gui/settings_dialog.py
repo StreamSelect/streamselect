@@ -94,9 +94,15 @@ def _align_label_columns(page) -> None:
     ]
     if not labels:
         return
-    widest = max(label.sizeHint().width() for label in labels)
+    # A label that caps its own width (and wraps) caps the column too; its natural
+    # width is its text on one line (a wrapping label's size hint is already narrowed).
+    def natural(label) -> int:
+        if label.wordWrap():
+            return label.fontMetrics().horizontalAdvance(label.text()) + 2 * label.margin() + 2
+        return label.sizeHint().width()
+    widest = max(min(natural(label), label.maximumWidth()) for label in labels)
     for label in labels:
-        label.setMinimumWidth(widest)
+        label.setMinimumWidth(min(widest, label.maximumWidth()))
 
 
 def _load_channel_density(combo: QComboBox, config) -> None:
@@ -168,6 +174,9 @@ def _save_theme_combo(combo: QComboBox, config) -> None:
 # Left-nav sections, in display order — id + label, unchanged from the old
 # QTabWidget's five tab names/order so the ``settings:<tab>`` deep link and
 # shipped What's New entries keep matching. id is also the _SECTION_HELP key.
+#: The floor; the dialog widens its minimum to whatever its widest page needs.
+SETTINGS_MIN_WIDTH = 900
+
 #: The dialog's sections, in order: (id, label, builder method name, help).
 #:
 #: ONE tuple, because this used to be three parallel structures — a
@@ -305,7 +314,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
         self.config = config
         self._executor = executor
         self.setWindowTitle("Settings")
-        self.setMinimumWidth(900)
+        self.setMinimumWidth(SETTINGS_MIN_WIDTH)
         self.setModal(True)
         self._setup_ui()
         self._provider_test_ready.connect(self._on_provider_test_ready)
@@ -338,6 +347,20 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
         self._nav.sectionChanged.connect(self._on_section_changed)
 
         layout.addWidget(dialog_buttons(self, on_ok=self._accept, apply=self._apply))
+        self._fit_widest_page(layout)
+
+    def _fit_widest_page(self, layout) -> None:
+        """Minimum width = nav + the widest page + help, MEASURED: with the theme's
+        fonts a fixed 900 left Playback 18 px short and Sports far shorter, and a page
+        laid out below its minimum draws labels under their values (owner, 2026-11-22)."""
+        nav = self._nav
+        pages = [nav.stack.widget(i).widget() for i in range(nav.stack.count())]
+        widest = max((p.minimumSizeHint().width() for p in pages), default=0)
+        scrollbar = self.style().pixelMetric(self.style().PixelMetric.PM_ScrollBarExtent)
+        m = layout.contentsMargins()
+        need = (nav.section_list.width() + widest + scrollbar + nav.help_panel.width()
+                + m.left() + m.right() + 4)
+        self.setMinimumWidth(max(SETTINGS_MIN_WIDTH, need))
 
     def _on_section_changed(self, row: int) -> None:
         """Remember the section. Does NOT write config — ``done()`` does that.
@@ -374,7 +397,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
 
     def _restore_dialog_geometry(self) -> None:
         """Resize to the last-persisted size (or the shipped default)."""
-        width = getattr(self.config, "settings_dialog_width", 900)
+        width = getattr(self.config, "settings_dialog_width", SETTINGS_MIN_WIDTH)
         height = getattr(self.config, "settings_dialog_height", 600)
         self.resize(max(int(width), self.minimumWidth()), max(int(height), 1))
 
@@ -578,6 +601,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
         self._epg_notify_minutes_spin.setValue(
             getattr(c, "epg_notification_minutes_before", 15)
         )
+        self._epg_runout_spin.setValue(int(c.epg_refresh_before_runout_minutes))
         self._epg_auto_refresh_check.setChecked(
             getattr(c, "epg_auto_refresh", True)
         )
@@ -763,6 +787,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsDownloadsTabMixin, SettingsRecor
         if scrub_inc_val:
             c.epg_scrubber_increment_minutes = scrub_inc_val
         c.epg_notification_minutes_before = self._epg_notify_minutes_spin.value()
+        c.epg_refresh_before_runout_minutes = self._epg_runout_spin.value()
         c.epg_auto_refresh = self._epg_auto_refresh_check.isChecked()
 
         # Metadata
