@@ -583,6 +583,8 @@ class SettingsDialog(SettingsTabsMixin, SettingsMetadataTabMixin, SettingsDownlo
         self._audio_downmix_combo.setCurrentIndex(max(downmix_idx, 0))
         decoder_idx = self._video_decoder_combo.findData(getattr(c, "video_decoder", "auto"))
         self._video_decoder_combo.setCurrentIndex(max(decoder_idx, 0))
+        self._right_click_combo.setCurrentIndex(
+            max(self._right_click_combo.findData(c.player_right_click), 0))
         self._prebuffer_check.setChecked(getattr(c, "prebuffer_before_play", False))
         self._prebuffer_wait_spin.setValue(getattr(c, "prebuffer_wait_secs", 10))
         self._override_all_check.setChecked(getattr(c, "mpv_args_override_all", False))
@@ -774,6 +776,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsMetadataTabMixin, SettingsDownlo
         c.live_subtitles_off = self._live_subtitles_off_check.isChecked()
         c.audio_downmix = self._audio_downmix_combo.currentData()
         c.video_decoder = self._video_decoder_combo.currentData()
+        c.player_right_click = self._right_click_combo.currentData()
         c.prebuffer_before_play = self._prebuffer_check.isChecked()
         c.prebuffer_wait_secs = self._prebuffer_wait_spin.value()
         c.mpv_args_override_all = self._override_all_check.isChecked()

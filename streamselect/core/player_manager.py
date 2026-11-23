@@ -21,7 +21,7 @@ from streamselect.core.players.base import PlayerPlugin, QueueMode
 from streamselect.core.players.mpv import MPVPlayer
 from streamselect.core.players.mpv_args import (
     decoder_command, downmix_channels, normalize_active, normalize_command,
-    normalize_wanted, software_decoding_wanted,
+    normalize_wanted, right_click_action, right_click_command, software_decoding_wanted,
 )
 
 #: The instance key a finished download plays into when Split Streams wants it
@@ -43,6 +43,7 @@ class PlayerManager:
         """
         self.config = config
         self._software_decoding = software_decoding_wanted(config)
+        self._right_click = right_click_action(config)
         self.player: Optional[PlayerPlugin] = None
         # Instance key → provider_id of the content last played into it. Lets the
         # UI label each player window's health readout with its source (the key is
@@ -562,7 +563,7 @@ class PlayerManager:
         return self._resolve_instance_key(provider_id, force_split=force_new_window)
 
     def sync_player_settings(self) -> int:
-        """Make every open player window match the audio and decoder settings.
+        """Make every open player window match the audio, decoder and right-click settings.
 
         A launch flag never reaches a window that is already open, and windows are
         reused from one stream to the next. A window already in the right state is
@@ -582,6 +583,9 @@ class PlayerManager:
         software = software_decoding_wanted(self.config)
         decoder_moved = software != self._software_decoding
         self._software_decoding = software
+        right_click = right_click_action(self.config)     # same rule: only when the setting moved
+        right_click_moved = right_click != self._right_click
+        self._right_click = right_click
         changed = 0
         for key in self.active_keys():
             state = self.get_properties(["af", "audio-channels"], key=key)
@@ -592,6 +596,8 @@ class PlayerManager:
                 commands.append(["set_property", "audio-channels", channels])
             if decoder_moved:
                 commands.append(decoder_command(software))
+            if right_click_moved:
+                commands.append(right_click_command(right_click))
             changed += sum(self.send_command(cmd, key=key) for cmd in commands)
         return changed
 

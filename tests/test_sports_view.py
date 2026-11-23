@@ -776,6 +776,43 @@ def test_a_watch_of_that_channel_takes_a_report_back_and_a_sibling_slot_does_not
     assert arrange_feeds(one, prefs, {}, START + timedelta(hours=2)).playable[0].reported == (DIDNT_PLAY,)
 
 
+@pytest.mark.parametrize("seconds,minutes,taken_back", [
+    (120, 5, False),     # a 2-minute try does not take a report back (it used to: 1 minute did)
+    (360, 5, True),      # the default 5 minutes does
+    (360, 10, False),    # the setting moves the line
+    (None, 5, False),    # a play still running has not lasted yet
+])
+def test_only_watching_long_enough_takes_a_report_back(games_db, seconds, minutes, taken_back):
+    """Owner, 2026-11-13: one minute was too short to take back "No picture"; a setting,
+    default 5 min, kept apart from "counts as watched"."""
+    from dataclasses import replace
+
+    from streamselect.core.games.read import CHANNEL_REPORTS, DIDNT_PLAY, load_watch_history
+    from streamselect.core.playback_models import PlaybackEventDB
+    with games_db.session_scope() as s:
+        g = next(x for x in load_games(s, "hockey", set(), 1, 2) if x.team_a == "Buffalo Sabres")
+        feed = g.playable[0]
+        s.add(PlaybackEventDB(provider_id="p1", channel_id=feed.channel_id, title="t", outcome="started",
+                              started_at=START + timedelta(hours=1), seconds_watched=seconds))
+    settings = {"hockey": replace(HOCKEY, report_back_min=minutes)}
+    with games_db.session_scope() as s:
+        history = load_watch_history(s, settings)
+    prefs = {CHANNEL_REPORTS: {feed.channel_id: [{"kind": DIDNT_PLAY, "at": START.isoformat()}]}}
+    one = GameDTO(1, "hockey", "NHL", "A", "B", START, 2, False, 1, (feed,))
+    reported = arrange_feeds(one, prefs, history, START + timedelta(hours=2)).playable[0].reported
+    assert reported == (() if taken_back else (DIDNT_PLAY,))
+    if seconds and seconds >= HOCKEY.watched_after_s:
+        assert history[feed.collection_key][0] is not None, "it still counts as watching"
+
+
+def test_the_report_back_setting_is_on_the_sports_page_for_all_sports_only():
+    from streamselect.core.games import tuning
+    spec = tuning.BY_KEY["report_back"]
+    assert tuning.defaults()["report_back"] == 5
+    assert spec.settable_for(tuning.ALL) and not spec.settable_for("hockey")
+    assert spec.group == tuning.WATCHING and spec.tip
+
+
 def test_not_this_game_flags_the_card_but_does_not_dim_it(qapp, owned_widgets):
     """A channel that shows another game works; only "Nothing showing" on every channel dims."""
     from dataclasses import replace

@@ -90,6 +90,26 @@ def software_decoding_wanted(config) -> bool:
     return getattr(config, "video_decoder", "auto") == "software" and not _override_all(config)
 
 
+#: Settings value -> what a right click does in the player. "menu" is mpv 0.42's own
+#: default (its context menu), so it adds no launch flag; earlier mpv paused instead.
+_RIGHT_CLICK = {"menu": "script-binding select/context-menu", "pause": "cycle pause"}
+
+
+def right_click_action(config) -> str:
+    """The Right click setting; "menu" (mpv's own) while Override all is on."""
+    value = getattr(config, "player_right_click", "menu")
+    return "menu" if _override_all(config) or value not in _RIGHT_CLICK else value
+
+
+def right_click_command(action: str) -> list[str]:
+    """The IPC command that binds a running player's right click to *action*.
+
+    A ``keybind`` outranks mpv's built-in binding without touching the user's own
+    input.conf; the launch flag sends the same command (``--input-commands``).
+    """
+    return ["keybind", "MBTN_RIGHT", _RIGHT_CLICK[action]]
+
+
 def decoder_command(software: bool) -> list[str]:
     """The IPC command that switches a running player's decoder."""
     return ["set_property", "hwdec", "no" if software else "auto-safe"]
@@ -107,6 +127,10 @@ def player_setting_args(config) -> list[str]:
     channels = downmix_channels(config)
     if channels != _DOWNMIX_CHANNELS["auto"]:
         args.append(f"--audio-channels={channels}")
+    right_click = right_click_action(config)
+    if right_click != "menu":
+        _keybind, key, command = right_click_command(right_click)
+        args.append(f'--input-commands=keybind {key} "{command}"')
     return args
 
 

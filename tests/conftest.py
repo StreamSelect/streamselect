@@ -1592,6 +1592,8 @@ def mock_settings_playback_widgets(dlg) -> None:
     dlg._audio_downmix_combo.findData.return_value = 0
     dlg._video_decoder_combo = _stub("currentData", "auto")
     dlg._video_decoder_combo.findData.return_value = 0
+    dlg._right_click_combo = _stub("currentData", "menu")
+    dlg._right_click_combo.findData.return_value = 0
 
 
 def wire_style_menu_actions(host) -> None:
@@ -1690,6 +1692,9 @@ def wire_settings_playback_widgets(dlg) -> None:
     dlg._video_decoder_combo = QComboBox()
     dlg._video_decoder_combo.addItem("Automatic", userData="auto")
     dlg._video_decoder_combo.addItem("Software", userData="software")
+    dlg._right_click_combo = QComboBox()
+    dlg._right_click_combo.addItem("Opens the player's menu", userData="menu")
+    dlg._right_click_combo.addItem("Pauses and plays", userData="pause")
 
 
 def wire_settings_content_widgets(dlg) -> None:

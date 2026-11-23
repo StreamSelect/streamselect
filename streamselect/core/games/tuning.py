@@ -118,6 +118,10 @@ SPECS: tuple[Spec, ...] = (
     Spec("report_days", "A channel report counts for:", WATCHING, "days", 1, 365, " days",
          "How long \"Nothing showing\" or \"Not this game\" keeps a channel marked (longer "
          "for repeated reports)", "report_days"),
+    Spec("report_back", "Watching takes a report back after:", WATCHING, "min", 1, 60, " min",
+         "Watching a reported channel this long takes one report back. Kept apart from "
+         "\"counts as watched\": a black screen left running still counts", "report_back_min",
+         scope=ALL_ONLY),
     Spec("same_game", "Listings of one game start within:", ADVANCED, "min", 15, 240, " min",
          "Two listings of the same two teams this close together are one game", "same_game"),
     Spec("replay_within", "A replay airs within:", ADVANCED, "h", 12, 240, " h",

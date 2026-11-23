@@ -87,6 +87,8 @@ class SportSettings:
     most_watched_days: int = _D["most_watched_days"]
     #: A channel report counts this many days (times the number of reports).
     report_days: int = _D["report_days"]
+    #: Minutes of one play of a reported channel that take one report back.
+    report_back_min: int = _D["report_back_min"]
     #: A collection's zone-less time agrees with an anchor within this many minutes.
     clock_agree_min: int = _D["clock_agree_min"]
     #: Clock evidence older than this is forgotten.

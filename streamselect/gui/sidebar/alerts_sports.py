@@ -83,7 +83,6 @@ class SportsGroupMixin:
         if executor is None or self.db is None:
             return
         settings = sport_settings(getattr(self.config, "sport_settings_overrides", None))
-        watched_after = min((s.watched_after_s for s in settings.values()), default=60)
 
         def work():
             try:
@@ -95,7 +94,7 @@ class SportsGroupMixin:
                     games = [g for sp in settings for g in load_games(session, sp, hidden, 1, 2)]
                     waiting = waiting_events(games, alerts, now_utc(), settings,
                                              watched_game_ids(session, games, settings))
-                    return waiting, (load_watch_history(session, watched_after) if waiting else {})
+                    return waiting, (load_watch_history(session, settings) if waiting else {})
             except Exception as exc:  # noqa: BLE001 — any failure: keep the last rows
                 logger.warning("Watch Alerts Sports: could not read alerted events: {}", exc)
                 return None

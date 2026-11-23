@@ -56,7 +56,6 @@ class EventAlertNotifier(QObject):
         now = self._clock()
         settings = sport_settings(getattr(self._host.config, "sport_settings_overrides", None))
         sports = list(settings)
-        watched_after = min((s.watched_after_s for s in settings.values()), default=60)
 
         def query(repos):
             alerts = load_alerts(repos.session)
@@ -70,7 +69,7 @@ class EventAlertNotifier(QObject):
                 return [], [], {}
             hidden = set(ProviderRepository(repos.session).get_hidden_provider_ids())
             games = [g for sp in sports for g in load_games(repos.session, sp, hidden, 1, 2)]
-            return games, alerts, load_watch_history(repos.session, watched_after)
+            return games, alerts, load_watch_history(repos.session, settings)
         # A failed read or rule clean-up is logged; the next poll (30 s) tries again.
         self._host._run_query(query, self._on_data, commit=True,
                               on_error=lambda exc: logger.warning("Event alerts: check failed: {}", exc))

@@ -257,8 +257,7 @@ class SportsView(SportsHeadersMixin, ContentView):
         def query(repos):
             hidden = set(ProviderRepository(repos.session).get_hidden_provider_ids())
             games = [g for sp in self.sports for g in load_games(repos.session, sp, hidden, 1, top)]
-            watched_after = min((s.watched_after_s for s in self.sports.values()), default=60)
-            return (games, load_watch_history(repos.session, watched_after), load_alerts(repos.session),
+            return (games, load_watch_history(repos.session, self.sports), load_alerts(repos.session),
                     load_league_watch(repos.session))
         self._run_query(query, self._on_games, token_ref=self._token, on_error=self._on_error)
 

@@ -241,6 +241,7 @@ sport_defaults:
     watch_early: 15         # min before the start
     most_watched_days: 30   # days
     report_days: 30         # days
+    report_back: 5          # min of watching that takes one report back
     same_game: 90           # min
     replay_within: 72       # h
     stale_after: 48         # h

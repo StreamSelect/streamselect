@@ -12,7 +12,7 @@ import re
 import unicodedata
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Mapping, Optional
 
 from sqlalchemy import case, func, select
 
@@ -249,8 +249,8 @@ def report_text(reports: list[dict], game: GameDTO, last_watched: Optional[datet
     """The active report on one collection for one game, as its icon's tooltip; "" if none.
 
     ``reports``: the stored list for the channel, each ``{"kind", "at", "game"?, ...}``.
-    A real watch (``last_watched``, plays of a minute or more) after the latest
-    report cancels one report — a feed that came back earns its place back. A
+    A real watch (``last_watched``: a play of the channel lasting "Watching takes a
+    report back after") after the latest report cancels one report — a feed that came back earns its place back. A
     "not this game" report counts for its own game; "nothing showing" for every game.
     """
     active, n = active_reports(reports, game, last_watched, now, report_days)
@@ -318,19 +318,25 @@ def mark_finished(session, game: GameDTO, ended_at: datetime) -> None:
 
 def channel_history_key(channel_id: Optional[str]) -> str:
     """One channel's own entry in a ``WatchHistory`` (beside the collection entries):
-    a real watch of THIS channel takes back one of its reports."""
+    a real watch of THIS channel takes back one of its reports. Its time counts only
+    plays as long as ``report_back_min``."""
     return f"channel:{channel_id}"
 
 
-def load_watch_history(session, watched_after_s: int = _BASE.watched_after_s) -> WatchHistory:
+def load_watch_history(session, settings: Optional[Mapping[str, SportSettings]] = None) -> WatchHistory:
     """Plays that showed a picture, grouped by the played channel's source and collection,
     and per channel under ``channel_history_key``.
 
     The "last watched" time counts only plays of at least *watched_after_s* (Settings ▸
     Sports "A play counts as watched after"; still running counts); minutes and plays
-    count everything that showed a picture. The history spans sports, so a caller with
-    several passes the most lenient (smallest) value.
+    count everything that showed a picture. A channel's own entry dates the last play of
+    at least ``report_back_min`` (finished plays only: a play still running has not
+    lasted yet). The history spans sports, so each threshold is the most lenient
+    (smallest) of *settings* (sport -> ``SportSettings``; None: the defaults).
     """
+    chosen = list((settings or {}).values()) or [_BASE]
+    watched_after_s = min(s.watched_after_s for s in chosen)
+    report_back_s = 60 * min(s.report_back_min for s in chosen)
     watched = PlaybackEventDB.seconds_watched.is_(None) | (PlaybackEventDB.seconds_watched >= watched_after_s)
     rows = session.execute(
         select(ChannelDB.provider_id, ChannelDB.category,
@@ -345,7 +351,8 @@ def load_watch_history(session, watched_after_s: int = _BASE.watched_after_s) ->
     history = {f"{pid}|{cat or ''}": (last, int(secs), int(n)) for pid, cat, last, secs, n in rows}
     per_channel = session.execute(
         select(PlaybackEventDB.channel_id,
-               func.max(case((watched, PlaybackEventDB.started_at), else_=None)),
+               func.max(case((PlaybackEventDB.seconds_watched >= report_back_s,
+                              PlaybackEventDB.started_at), else_=None)),
                func.coalesce(func.sum(func.min(PlaybackEventDB.seconds_watched, _PLAY_CAP_S)), 0),
                func.count())
         .where(PlaybackEventDB.outcome.in_(("started", "dropped")))

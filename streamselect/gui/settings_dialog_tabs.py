@@ -20,7 +20,7 @@ from streamselect.gui import theme as _theme
 from streamselect.gui import theme_palettes
 from streamselect.gui.middle_click_actions import MIDDLE_CLICK_ACTIONS
 from streamselect.gui.settings_network_group import build_network_group
-from streamselect.gui.settings_player_rows import add_player_rows
+from streamselect.gui.settings_player_rows import RIGHT_CLICK_OPTIONS, RIGHT_CLICK_TIP, add_player_rows
 
 # Channel-list row densities — single source of truth. It lives HERE, and
 # settings_dialog re-exports it, because that import can only point one way.
@@ -178,7 +178,8 @@ class SettingsTabsMixin:
         return tab
 
     def _build_interaction_tab(self) -> QWidget:
-        """Build the Interaction tab — how clicks on a channel row play it.
+        """Build the Interaction tab — how clicks on a channel row play it, and what a
+        right click on the player window does.
 
         Double-click (``playback_resume_mode``) and middle-click
         (``middle_click_action``); the latter's combo is populated from the
@@ -222,6 +223,15 @@ class SettingsTabsMixin:
         click_form.addRow("Middle-click action:", self._middle_click_combo)
 
         layout.addWidget(click_group)
+
+        player_group = QGroupBox("Player window")
+        player_form = QFormLayout(player_group)
+        self._right_click_combo = QComboBox()
+        for value, label in RIGHT_CLICK_OPTIONS:
+            self._right_click_combo.addItem(label, userData=value)
+        self._right_click_combo.setToolTip(RIGHT_CLICK_TIP)
+        player_form.addRow("Right click:", self._right_click_combo)
+        layout.addWidget(player_group)
 
         layout.addStretch()
         return tab

@@ -726,7 +726,6 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     split_streams_by_source: bool = False  # one mpv window per source (keyed by provider_id) when True
     # MPV-specific settings
     mpv_extra_args: list = Field(default_factory=list)  # Additional args like ["--cache=yes", "--demuxer-max-bytes=50M"]
-    
     # Playback settings
     default_cache_size: str = "auto"  # "auto" or size like "50M", "100M"
     buffer_profile: str = "modest"  # "reconnect_only" | "modest" | "large" | "open_ended" — default buffer when default_cache_size is "auto"
@@ -736,6 +735,7 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     live_subtitles_off: bool = Field(default=False, json_schema_extra=PROFILE)  # live channels start with no subtitle track
     audio_downmix: str = Field(default="auto", json_schema_extra=PROFILE)  # "auto" | "stereo" | "mono"
     video_decoder: str = Field(default="auto", json_schema_extra=PROFILE)  # "auto" | "software"
+    player_right_click: str = Field(default="menu", json_schema_extra=PROFILE)  # "menu" | "pause"
     mpv_args_override_all: bool = False  # when True, _compose_extra_args returns ONLY mpv_extra_args (skips UA/reconnect/buffer/prebuffer)
     # Deep-cache ("Buffer without limit", VOD-only, ephemeral): per-play mode that
     # relaunches mpv with --stream-record into a scratch dir so the buffer can grow

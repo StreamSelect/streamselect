@@ -19,6 +19,10 @@ LIVE_SUBTITLES_TIP = ("Live channels start with no subtitles: live captions are 
                       "broadcast airs, so they lag and garble. Movies and series keep theirs. "
                       "Subtitles in the playback menu still turns them on for one window.\n"
                       "Applies from the next live channel you play.")
+RIGHT_CLICK_OPTIONS = (("menu", "Opens the player's menu"), ("pause", "Pauses and plays"))
+RIGHT_CLICK_TIP = ("What a right click on the player window does. Newer players open a menu "
+                   "of their own; older ones paused. Your own mpv key settings are left alone.\n"
+                   "Applies straight away, including to a player window that is already open.")
 DECODER_OPTIONS = (("auto", "Automatic"), ("software", "Software"))
 DECODER_TIP = ("Software can clear up colour faults and glitches caused by a hardware decoder, "
                "but uses more CPU. Switching skips the picture ahead to the next keyframe.")

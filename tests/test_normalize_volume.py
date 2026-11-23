@@ -26,6 +26,7 @@ class _Config:
     close_player_when_finished: bool = False
     prebuffer_before_play: bool = False
     prebuffer_wait_secs: int = 10
+    player_right_click: str = "menu"
 
 
 def _flags(args: list[str]) -> list[str]:
@@ -68,6 +69,8 @@ class _Player:
 
     def send_command(self, cmd, key=None):
         self.sent.append((key, cmd))
+        if cmd[0] == "keybind":
+            return True
         if cmd[:2] == ["set_property", "hwdec"]:
             self.hwdec[key] = [cmd[2]]
             return True
@@ -82,6 +85,7 @@ def _manager(config, windows) -> PlayerManager:
     manager = PlayerManager.__new__(PlayerManager)
     manager.config = config
     manager._software_decoding = False
+    manager._right_click = "menu"
     manager.player = _Player(windows)
     return manager
 
@@ -192,3 +196,58 @@ def test_the_rows_render_in_order_and_nothing_is_squeezed(qtbot):
     for control in (check, downmix, decoder):
         assert control.isVisible()
         assert control.width() >= control.sizeHint().width(), control
+
+
+# ── Right click (owner, 2026-11-18: mpv 0.42 made it open a menu; it used to pause) ──
+
+@pytest.mark.parametrize("compose", [
+    lambda p: p._compose_extra_args(),
+    lambda p: p._compose_open_ended_buffer_args(),
+    lambda p: p._compose_deep_cache_args("/tmp/x.ts"),
+])
+def test_right_click_pauses_in_every_new_window_only_when_chosen(compose):
+    def binds(config):
+        return [a for a in compose(MPVPlayer(config)) if a.startswith("--input-commands=")]
+    assert binds(_Config(player_right_click="pause")) == [
+        '--input-commands=keybind MBTN_RIGHT "cycle pause"']
+    assert binds(_Config()) == [], "mpv's own menu needs no flag (older mpv would refuse it)"
+    assert binds(_Config(player_right_click="pause", mpv_args_override_all=True)) == []
+
+
+def test_changing_right_click_rebinds_open_windows_once():
+    from streamselect.core.players.mpv_args import right_click_command
+    config = _Config()
+    manager = _manager(config, {"a": [], "b": []})
+    config.player_right_click = "pause"
+    assert manager.sync_player_settings() == 2
+    assert sorted(manager.player.sent) == [("a", right_click_command("pause")),
+                                           ("b", right_click_command("pause"))]
+    manager.player.sent.clear()
+    assert manager.sync_player_settings() == 0, "unchanged: open windows are left alone"
+    config.player_right_click = "menu"
+    manager.sync_player_settings()
+    assert ("a", ["keybind", "MBTN_RIGHT", "script-binding select/context-menu"]) in manager.player.sent
+    manager.player.sent.clear()
+    config.player_right_click, config.mpv_args_override_all = "pause", True
+    manager.sync_player_settings()
+    assert ("a", right_click_command("pause")) not in manager.player.sent, "Override all keeps mpv's own"
+
+
+def test_right_click_is_an_interaction_row_that_loads_and_saves(qtbot):
+    from streamselect.core.config import Config
+    from streamselect.gui.settings_dialog import SettingsDialog
+    from tests.conftest import destroy_widget
+
+    config = Config()
+    config.player_right_click = "pause"
+    dlg = SettingsDialog(config)
+    try:
+        combo = dlg._right_click_combo
+        assert combo.currentData() == "pause" and combo.toolTip()
+        page = dlg._nav.page(dlg._nav.index_of("interaction"))
+        assert combo.isVisibleTo(page), "on the Interaction page, beside the other clicks"
+        combo.setCurrentIndex(combo.findData("menu"))
+        dlg._save_values()
+        assert config.player_right_click == "menu"
+    finally:
+        destroy_widget(dlg)
