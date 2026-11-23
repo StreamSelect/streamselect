@@ -38,6 +38,7 @@ from typing import Any, Callable, TYPE_CHECKING
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
+from streamselect.core.history_buckets import history_min_seconds
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
 from streamselect.gui.trail_map_data import (
@@ -100,7 +101,8 @@ def _adult_mode(config) -> str:
 
 def _history_ids(repos, config) -> list[str]:
     return load_history_ids(
-        repos.session, limit=EXPLORE_SEED_LIMIT, adult_mode=_adult_mode(config)
+        repos.session, limit=EXPLORE_SEED_LIMIT, adult_mode=_adult_mode(config),
+        min_seconds=history_min_seconds(config),
     )
 
 

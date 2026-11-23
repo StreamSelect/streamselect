@@ -755,19 +755,23 @@ def build_history_dtos(
     repos: "RepositoryFactory",
     limit: int = 30,
     adult_mode: str = "all",
+    min_seconds: int = 0,
 ) -> list[HistoryDTO]:
     """Build HistoryDTOs with last-played episode code pre-populated for series.
 
+    A series row names its newest episode watched at least ``min_seconds`` (or
+    finished), never one skipped through or walked back.
     Must be called inside a session_scope() — performs multiple queries.
     """
-    channels = repos.channels.get_recent_history(limit=limit, adult_mode=adult_mode)
+    channels = repos.channels.get_recent_history(limit=limit, adult_mode=adult_mode,
+                                                 min_seconds=min_seconds)
     # Batch the series last-played lookup into one query (was N+1 — one query per row).
     series_keys = [
         (ch.source_id, ch.provider_id)
         for ch in channels
         if ch.media_type == MediaType.SERIES
     ]
-    played_map = repos.episodes.get_last_played_for_series(series_keys)
+    played_map = repos.episodes.get_last_played_for_series(series_keys, min_seconds)
     # Batch the "Play Next Episode" resume-target lookup alongside it (Wave 5) — same
     # keys, sibling helper (see EpisodeRepository.get_resume_targets_for_series).
     resume_map = repos.episodes.get_resume_targets_for_series(series_keys)

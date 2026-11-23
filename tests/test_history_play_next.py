@@ -207,16 +207,15 @@ class TestBuildHistoryDtosNextEpisode:
         assert dto.next_episode_id == ep_id
         assert dto.next_episode_code == "S02E05"
 
-    def test_series_with_no_episodes_has_no_next(self, db):
+    def test_series_with_no_episode_played_is_not_in_history(self, db):
+        """A show is listed for an episode watched, not for the show's own play
+        stamp: with no episode played there is nothing to list (owner, 2026-11-22)."""
         _seed_series(db, name="Unwatched Series", source_id="series_empty")
 
         with db.session_scope(commit=False) as session:
             dtos = build_history_dtos(RepositoryFactory(session), limit=10)
 
-        dto = next(d for d in dtos if d.name == "Unwatched Series")
-        assert dto.has_next is False
-        assert dto.next_episode_id is None
-        assert dto.next_episode_code is None
+        assert "Unwatched Series" not in {d.name for d in dtos}
 
     def test_non_series_row_never_gets_a_next_episode(self, db):
         from datetime import datetime

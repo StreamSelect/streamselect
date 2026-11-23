@@ -14,14 +14,50 @@ cohesion rather than arithmetic.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import List, Optional
 
 from loguru import logger
+from sqlalchemy import and_, or_, select
 
-from streamselect.core.database import ChannelDB
+from streamselect.core.database import ChannelDB, EpisodeDB
+from streamselect.core.models import MediaType
+
+
+def counts_in_history(model, min_seconds: int):
+    """Whether a played movie or episode row (``ChannelDB`` / ``EpisodeDB``) was
+    watched long enough for History: finished, or played at least ``min_seconds``
+    (Settings ▸ Sidebar "Show in History after"). A finished one has its resume
+    point cleared to 0, so ``watch_completed`` is what keeps it in."""
+    return and_(model.last_played.isnot(None),
+                or_(model.watch_completed.is_(True), model.watch_progress >= min_seconds))
 
 
 class _ChannelHistoryMixin:
     """Playback-history writes for ChannelRepository (uses self.session)."""
+
+    def get_recent_history(self, limit: int = 30, adult_mode: str = "all",
+                           force_adult_provider_ids: Optional[List[str]] = None,
+                           min_seconds: int = 0) -> List[ChannelDB]:
+        """Recently played channels, newest first: what History and Full History show.
+
+        A live (or unknown-kind) channel counts once played; a movie when
+        ``counts_in_history``; a series when one of its episodes does, so a show
+        whose episodes were all skipped through or walked back is not listed
+        (owner, 2026-11-22). Rows stay dated and ordered by ``ChannelDB.last_played``:
+        History's group headings purge by that column (``clear_history_in_range``),
+        and a heading must never list a row its purge cannot reach.
+        """
+        counted_episode = (select(EpisodeDB.id)
+                           .where(EpisodeDB.series_id == ChannelDB.source_id,
+                                  EpisodeDB.provider_id == ChannelDB.provider_id,
+                                  counts_in_history(EpisodeDB, min_seconds))
+                           .correlate(ChannelDB).exists())
+        q = self.session.query(ChannelDB).filter(ChannelDB.last_played.isnot(None), or_(
+            ChannelDB.media_type.notin_((MediaType.MOVIE, MediaType.SERIES)),
+            and_(ChannelDB.media_type == MediaType.SERIES, counted_episode),
+            and_(ChannelDB.media_type == MediaType.MOVIE, counts_in_history(ChannelDB, min_seconds))))
+        q = self._apply_adult_filter(q, adult_mode, force_adult_provider_ids)
+        return q.order_by(ChannelDB.last_played.desc()).limit(limit).all()
 
     def clear_history(self):
         """Clear all playback history"""

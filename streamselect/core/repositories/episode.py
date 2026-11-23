@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from loguru import logger
 
 from streamselect.core.database import EpisodeDB
+from streamselect.core.repositories.channel_history import counts_in_history
 from streamselect.core.repositories.dtos import EpisodeDTO
 
 
@@ -336,12 +337,13 @@ class EpisodeRepository:
         )
 
     def get_last_played_for_series(
-        self, keys: "List[tuple[str, str]]"
+        self, keys: "List[tuple[str, str]]", min_seconds: int = 0
     ) -> "Dict[tuple[str, str], tuple[str, str]]":
         """Batch the per-series last-played lookup into ONE query.
 
         For each ``(series_id, provider_id)`` key, returns ``(episode_id, code)``
-        for its most recently played episode. Replaces an N+1 of
+        for its most recently played episode that counts in History
+        (``counts_in_history``: finished, or played ``min_seconds``). Replaces an N+1 of
         ``get_last_played`` calls (one per history row). History can span
         providers, so the key is the pair, not just the series id. Ordering desc
         + first-seen-per-key reproduces ``get_last_played``'s single-row
@@ -362,7 +364,7 @@ class EpisodeRepository:
         rows = self.session.query(EpisodeDB).filter(
             EpisodeDB.series_id.in_(series_ids),
             EpisodeDB.provider_id.in_(provider_ids),
-            EpisodeDB.last_played.isnot(None),
+            counts_in_history(EpisodeDB, min_seconds),
         ).order_by(EpisodeDB.last_played.desc()).all()
         out: Dict[tuple[str, str], tuple[str, str]] = {}
         for ep in rows:
@@ -409,12 +411,15 @@ class EpisodeRepository:
         logger.info(f"Marked episode {episode.title} as {'watched' if watched else 'unwatched'}")
         return True
 
-    def mark_watched_bulk(self, episode_ids: "List[str]", watched: bool = True) -> int:
+    def mark_watched_bulk(self, episode_ids: "List[str]", watched: bool = True,
+                          forget_play: bool = False) -> int:
         """Mark multiple episodes as watched/unwatched atomically.
 
         Sets all watch fields coherently (same semantics as :meth:`mark_watched`,
         including ``last_played_via="manual"`` so manually-marked items render SOLID).
-        Commits once for the whole batch.
+        Commits once for the whole batch. ``forget_play`` (unwatching only) also
+        clears ``last_played``: the answer "I didn't watch them" means the episode
+        was never seen, so History must not list it (owner, 2026-11-22).
 
         Returns the number of episodes actually updated.
         """
@@ -440,6 +445,8 @@ class EpisodeRepository:
                 # for an unwatched episode (which has always been None), so the
                 # glyph changed the next time the tree was repopulated.
                 episode.last_played_via = None
+                if forget_play:
+                    episode.last_played = None
             episode.updated_at = datetime.now()
             updated += 1
         if updated:

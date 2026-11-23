@@ -271,7 +271,8 @@ SECTION_GROUPS: tuple[tuple[str, tuple[tuple[str, str, str, str], ...]], ...] = 
          "refresh/notification timing. A TMDb key unlocks posters, cast, and plot "
          "details across your whole library."),
         ("sidebar", "Sidebar", "_build_sidebar_tab",
-         "Which sections appear down the left, and in what order. Changes take "
+         "Which sections appear down the left, in what order, and how long something "
+         "must play before History lists it. Changes take "
          "effect as soon as you click OK or Apply. Hiding a section does not "
          "lose anything — it stops being built, and comes back exactly as it "
          "was when you show it again."),
@@ -718,6 +719,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsMetadataTabMixin, SettingsDownlo
         self._sidebar_density_combo.blockSignals(True)
         _load_sidebar_density(self._sidebar_density_combo, c)
         self._sidebar_density_combo.blockSignals(False)
+        self._history_min_spin.setValue(c.history_min_minutes)
         self._alerts_show_idle_check.setChecked(
             getattr(c, "alerts_show_idle_items", False)
         )
@@ -892,6 +894,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsMetadataTabMixin, SettingsDownlo
         # Channel List
         _save_channel_density(self._channel_density_combo, c)
         _save_sidebar_density(self._sidebar_density_combo, c)
+        c.history_min_minutes = self._history_min_spin.value()
         # The same key Manage Watch Alerts writes, so the two switches are one
         # setting seen from two places rather than two that can disagree.
         c.alerts_show_idle_items = self._alerts_show_idle_check.isChecked()

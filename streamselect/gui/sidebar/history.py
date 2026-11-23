@@ -7,7 +7,7 @@ from PyQt6.QtCore import Qt, QSize, pyqtSignal
 from streamselect.gui.row_activation import connect_row_activation
 
 from streamselect.core.repositories import RepositoryFactory
-from streamselect.core.history_buckets import BUCKETS, bucket_for
+from streamselect.core.history_buckets import BUCKETS, bucket_for, history_min_seconds
 from streamselect.gui.chip_row import (
     CHIP_LANG, CHIP_QUALITY, CHIP_YEAR, build_chip_row, media_icon_role,
     sidebar_meta_line,
@@ -203,7 +203,8 @@ class HistorySection(BackgroundRefreshMixin, CollapsibleSection):
         with self.db.session_scope() as session:
             repos = RepositoryFactory(session)
             return build_history_dtos(
-                repos, limit=HISTORY_ROW_LIMIT, adult_mode=adult_mode
+                repos, limit=HISTORY_ROW_LIMIT, adult_mode=adult_mode,
+                min_seconds=history_min_seconds(self.config),
             )
 
     def _populate_rows(self, dtos) -> None:

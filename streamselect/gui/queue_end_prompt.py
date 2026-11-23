@@ -114,7 +114,7 @@ class _QueueEndPromptMixin:
                 repos = RepositoryFactory(session)
                 ep = repos.episodes.get_by_id(episode_id)
                 if ep is not None and ep.watch_completed:
-                    repos.episodes.mark_watched_bulk([episode_id], False)
+                    repos.episodes.mark_watched_bulk([episode_id], False, forget_play=True)
                     logger.info("Unmarked the run's first episode — the viewer did not watch it")
         except Exception as exc:
             logger.warning(f"Failed to unmark the run's first episode: {exc}")
@@ -168,7 +168,7 @@ class _QueueEndPromptMixin:
                         to_clear.append(episode_id)
                     else:
                         skipped += 1
-                updated = repos.episodes.mark_watched_bulk(to_clear, False)
+                updated = repos.episodes.mark_watched_bulk(to_clear, False, forget_play=True)
                 logger.info(
                     f"Unmarked {updated}/{len(to_clear)} queue-watched episode(s) — "
                     "user answered No to the queue-end prompt"

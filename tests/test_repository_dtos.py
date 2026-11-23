@@ -369,8 +369,9 @@ def test_history_dto_episode_code_populated_for_series(session):
     assert series_dto.episode_code == "S02E05"
 
 
-def test_history_dto_episode_code_none_when_no_episode_played(session):
-    """HistoryDTO.episode_code must be None for series with no played episode."""
+def test_a_series_with_no_episode_played_is_not_listed(session):
+    """A show is listed for an episode watched; with none played it is not in
+    History at all (owner, 2026-11-22), so no row can name a missing episode."""
     from streamselect.core.models import MediaType
 
     _make_channel(session, name="Unwatched Series", media_type=MediaType.SERIES,
@@ -381,8 +382,7 @@ def test_history_dto_episode_code_none_when_no_episode_played(session):
     dtos = build_history_dtos(repos, limit=10)
     session.close()
 
-    dto = next(d for d in dtos if d.name == "Unwatched Series")
-    assert dto.episode_code is None
+    assert "Unwatched Series" not in {d.name for d in dtos}
 
 
 def test_history_dtos_batched_equals_per_row_and_one_query(session):
@@ -397,7 +397,10 @@ def test_history_dtos_batched_equals_per_row_and_one_query(session):
     by 2 per UNIQUE series (still O(series), never O(history rows) — see
     test_history_play_next.py's dedup test for that guarantee). With 3 series here,
     none manually engaged, each falls back to get_last_played_dto (get_last_engaged +
-    get_last_played = 2 queries), so total = 1 (code_map) + 3*2 (resume ladder) = 7.
+    get_last_played = 2 queries), so total was 1 (code_map) + 3*2 (resume ladder) = 7.
+    Since 2026-11-22 the History query itself reads episodes (a show is listed only
+    for an episode watched), and series_c, with none played, is not listed: 1 (the
+    History query) + 1 (code_map) + 2 series * 2 (resume ladder) = 6.
     """
     from streamselect.core.models import MediaType
 
@@ -442,6 +445,6 @@ def test_history_dtos_batched_equals_per_row_and_one_query(session):
     got = {d.name: d.episode_code for d in dtos}
     assert got["series_a"] == "S01E02"
     assert got["series_b"] == "S03E04"
-    assert got["series_c"] is None
-    assert got == expected           # byte-identical to the per-row reference
-    assert counter["n"] == 7         # see docstring: 1 (code_map) + 3 series * 2 (resume ladder)
+    assert "series_c" not in got     # no episode played: not in History (owner, 2026-11-22)
+    assert got == {k: v for k, v in expected.items() if v is not None}  # the per-row reference
+    assert counter["n"] == 6         # see docstring: 1 (History) + 1 (code_map) + 2 series * 2

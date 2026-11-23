@@ -798,15 +798,15 @@ class _SeriesMixin:
         playlist advances, and both answers to the "Still watching?" prompt —
         ends here rather than telling the tree what to display, so a write that
         happened off-thread while the tree was already on screen cannot leave a
-        stale glyph behind.
-
-        A no-op when the series tree was never built or holds none of these
-        episodes, so an off-thread writer can call it unconditionally.
+        stale glyph behind. History re-reads too: it lists only what was watched.
+        The tree part is a no-op when the tree was never built or holds none of
+        these episodes, so an off-thread writer can call it unconditionally.
 
         Args:
             episode_ids: Episode DB ids whose stored watch state to re-read.
         """
         self.details_pane.refresh_episode_state(episode_ids)   # D60: the pane too
+        self.load_history()
         if not episode_ids or "series_tree" not in self.__dict__:
             return
         wanted = set(episode_ids)

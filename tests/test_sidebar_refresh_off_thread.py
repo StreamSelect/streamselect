@@ -260,7 +260,8 @@ def test_history_bg_refresh_uses_build_history_dtos():
         HistoryDTO(id="c2", name="Action Movie", media_type="movie", episode_code=None),
     ]
 
-    def fake_build(repos, limit, adult_mode):
+    def fake_build(repos, limit, adult_mode, min_seconds):
+        assert min_seconds == 300, "History reads Settings ▸ Sidebar 'Show in History after'"
         return dtos
 
     # build_history_dtos is imported inside _bg_refresh from streamselect.core.repositories.dtos,

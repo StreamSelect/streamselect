@@ -158,3 +158,9 @@ def bucket_range(key: str, *, now: datetime | None = None
     if key == "month":
         return (now - timedelta(days=30), now - timedelta(days=7))
     return (None, now - timedelta(days=30))
+
+
+def history_min_seconds(config) -> int:
+    """Settings ▸ Sidebar "Show in History after", in seconds: the one reading of
+    it, for History and Full History (``ChannelRepository.get_recent_history``)."""
+    return 60 * max(0, int(config.history_min_minutes))

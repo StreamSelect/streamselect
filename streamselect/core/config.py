@@ -629,13 +629,12 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     #: carry its tag (PLAT-1). Titles, not rows — see core/platform_shelves.py.
     discover_platform_shelf_min_titles: int = 50
 
-    # Watch Queue view state — is the find-in-queue box revealed? Off by default:
-    # a permanently-visible filter costs a row of the sidebar's scarcest resource
-    # for a control most sessions never touch, so the 🔍 header button reveals it.
-    # The TEXT is deliberately not persisted (see WatchQueueSection) — only whether
-    # the box is on screen.
+    # Watch Queue view state — is the find-in-queue box revealed? Off by default: a
+    # permanently-visible filter costs a sidebar row most sessions never use, so the
+    # 🔍 header button reveals it. Only whether the box shows is saved, not the text.
     queue_filter_visible: bool = False
     history_hidden_kinds: list = Field(default_factory=list, json_schema_extra=PROFILE)  # "live"/"movie"/"series" left out of History (owner, 2026-11-22)
+    history_min_minutes: int = Field(default=5, json_schema_extra=PROFILE)  # an episode/movie played less than this stays out of History (owner, 2026-11-22)
 
     # Recommended view state
     preferences_attributes_expanded: bool = False  # collapsed by default

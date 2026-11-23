@@ -244,7 +244,7 @@ HISTORY_SEED_LIMIT = EXPLORE_SEED_LIMIT
 
 
 def load_history_ids(
-    session, limit: int = HISTORY_SEED_LIMIT, adult_mode: str = "all"
+    session, limit: int = HISTORY_SEED_LIMIT, adult_mode: str = "all", min_seconds: int = 0
 ) -> list[str]:
     """Return recently-played channel ids, most-recent first.
 
@@ -259,7 +259,8 @@ def load_history_ids(
     repos = RepositoryFactory(session)
     return [
         ch.id
-        for ch in repos.channels.get_recent_history(limit=limit, adult_mode=adult_mode)
+        for ch in repos.channels.get_recent_history(limit=limit, adult_mode=adult_mode,
+                                                    min_seconds=min_seconds)
     ]
 
 

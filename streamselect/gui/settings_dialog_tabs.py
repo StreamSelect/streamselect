@@ -793,6 +793,20 @@ class SettingsTabsMixin:
         sidebar_layout.addLayout(arrow_row)
 
         layout.addWidget(sidebar_group)
+
+        history_group = QGroupBox("History")
+        history_form = QFormLayout(history_group)
+        history_form.setSpacing(8)
+        self._history_min_spin = QSpinBox()
+        self._history_min_spin.setRange(0, 60)
+        self._history_min_spin.setSuffix(" min")
+        self._history_min_spin.setToolTip(
+            "An episode or movie played for less than this stays out of History, so\n"
+            "episodes you skipped through are not listed. Finished ones always count.\n"
+            "Live channels are listed once played. 0 lists everything you started."
+        )
+        history_form.addRow("Show in History after:", self._history_min_spin)
+        layout.addWidget(history_group)
         layout.addStretch()
         return tab
 

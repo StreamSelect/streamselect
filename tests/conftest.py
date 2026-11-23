@@ -761,6 +761,7 @@ def sidebar_config(**over):
         "filter_adult_mode": "all",
         "queue_filter_visible": False,
         "history_hidden_kinds": [],
+        "history_min_minutes": 5,
         "sidebar_section_states": {},
     }
     base.update(over)
@@ -1352,6 +1353,8 @@ def mock_settings_density_widget(dlg) -> None:
     dlg._channel_density_combo.currentData.return_value = "comfy"
     dlg._sidebar_density_combo = MagicMock()
     dlg._sidebar_density_combo.currentData.return_value = "compact"
+    dlg._history_min_spin = MagicMock()
+    dlg._history_min_spin.value.return_value = 5
     dlg._text_size_combo = MagicMock()
     dlg._text_size_combo.currentData.return_value = 1.0
     dlg._time_format_combo = MagicMock()
@@ -1534,6 +1537,8 @@ def wire_settings_density_widget(dlg) -> None:
     dlg._sidebar_density_combo = QComboBox()
     for label, value in _SIDEBAR_DENSITY_CHOICES:
         dlg._sidebar_density_combo.addItem(label, value)
+    dlg._history_min_spin = QSpinBox()
+    dlg._history_min_spin.setRange(0, 60)
     dlg._text_size_combo = QComboBox()
     for label, value in TEXT_SIZE_CHOICES:
         dlg._text_size_combo.addItem(label, value)
@@ -1795,8 +1800,8 @@ def wire_episode_state_refresh(host) -> list:
 
     Args:
         host: The skeleton host to wire. Gets a ``details_pane`` stub, and a
-            recording ``refresh_episode_watch_state`` only if it has none of its
-            own (a ``_FavoritesMixin``-only double).
+            recording ``refresh_episode_watch_state`` and a no-op ``load_history``
+            only if it has none of its own (a ``_FavoritesMixin``-only double).
 
     Returns:
         The list recording every id-list the pane was told about.
@@ -1810,6 +1815,10 @@ def wire_episode_state_refresh(host) -> list:
     host.details_pane = _PaneStub()
     if not callable(getattr(type(host), "refresh_episode_watch_state", None)):
         host.refresh_episode_watch_state = lambda ids: told.append(list(ids))
+    # That refresh re-reads History too (it lists only what was watched); the real
+    # load_history lives on MainWindow's history mixin, which these doubles lack.
+    if not callable(getattr(type(host), "load_history", None)):
+        host.load_history = lambda: None
     return told
 
 

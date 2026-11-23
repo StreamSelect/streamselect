@@ -1033,13 +1033,6 @@ class ChannelRepository(ChannelIngestionMixin, ChannelEnrichmentMixin,
         )
         return q.filter(~is_adult_expr) if adult_mode == "hide" else q.filter(is_adult_expr)
 
-    def get_recent_history(self, limit: int = 30, adult_mode: str = "all",
-                           force_adult_provider_ids: Optional[List[str]] = None) -> List[ChannelDB]:
-        """Get recently played channels."""
-        q = self.session.query(ChannelDB).filter(ChannelDB.last_played.isnot(None))
-        q = self._apply_adult_filter(q, adult_mode, force_adult_provider_ids)
-        return q.order_by(ChannelDB.last_played.desc()).limit(limit).all()
-    
     def mark_played(self, channel_id: str):
         """Mark channel as played - updates last_played and increments play_count"""
         channel = self.get_by_id(channel_id)

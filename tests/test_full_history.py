@@ -53,6 +53,7 @@ def _fake_config():
         preferred_version_provider_ids=[],
         preferred_version_quality=None,
         filter_adult_mode="all",
+        history_min_minutes=5,
     )
 
 
@@ -103,13 +104,13 @@ def _history_seed_db(path: Path):
         o = ChannelDB(id="o", source_id=str(uuid.uuid4()), provider_id="pa",
                       name="The Sea Beast", media_type="movie",
                       content_key="tmdb:1|movie", detected_region="EN",
-                      last_played=now, play_count=3)
+                      watch_progress=1800, last_played=now, play_count=3)
         o.metadata_id = "m-o"
         session.add(o)
         session.add(ChannelDB(id="s1", source_id=str(uuid.uuid4()), provider_id="pa",
                               name="The Sea Wolf Beast", media_type="movie",
                               content_key="tmdb:2|movie", is_favorite=True,
-                              watch_progress=90, last_played=now - timedelta(days=1),
+                              watch_progress=900, last_played=now - timedelta(days=1),
                               play_count=1))
         session.add(ChannelDB(id="s2", source_id=str(uuid.uuid4()), provider_id="pa",
                               name="Deep Beast Sea", media_type="movie",
@@ -120,7 +121,7 @@ def _history_seed_db(path: Path):
         # gated), yet must be gated OUT of the forward-looking similars drill.
         session.add(ChannelDB(id="sx", source_id=str(uuid.uuid4()), provider_id="pz",
                               name="Beast Below the Sea", media_type="movie",
-                              content_key="tmdb:4|movie",
+                              content_key="tmdb:4|movie", watch_progress=1800,
                               last_played=now - timedelta(days=3), play_count=1))
         # Never played → never in history.
         session.add(ChannelDB(id="n1", source_id=str(uuid.uuid4()), provider_id="pa",
@@ -159,7 +160,7 @@ class TestHistoryDataLayer:
         assert by_id["s2"].watch_count == 2
         assert all(by_id[i].last_watched for i in ("o", "s1", "s2", "sx"))
         # Watch state carried so badges + Play/Resume label work: s1 partial, s2 done.
-        assert by_id["s1"].watch_progress == 90 and by_id["s1"].watch_completed is False
+        assert by_id["s1"].watch_progress == 900 and by_id["s1"].watch_completed is False
         assert by_id["s2"].watch_completed is True
         # NOT provider-gated: the inactive-provider row is present in the seed.
         assert "sx" in by_id
