@@ -151,6 +151,7 @@ _MIDNIGHT_LEGACY: dict[str, TokenValue] = {
     'COLOR_ON_ACCENT': '#0d0d0d',
     'COLOR_OK': '#4CAF50',
     'COLOR_WARN': '#FFC107',
+    'COLOR_WARN_MUTED': '#8f6424',
     'COLOR_ERR': '#F44336',
     'COLOR_ERR_2': '#e05050',
     'COLOR_GOLD': 'gold',
@@ -356,6 +357,7 @@ _GRAPHITE_LEGACY: dict[str, TokenValue] = {
     'COLOR_ON_ACCENT': '#0f0f0f',   # 5.01:1 on #3c8fd5; white would be 1.93:1
     'COLOR_OK': '#5db060',
     'COLOR_WARN': '#f1bf27',
+    'COLOR_WARN_MUTED': '#8f6424',
     'COLOR_ERR': '#ea5c51',
     'COLOR_ERR_2': '#db6767',
     'COLOR_GOLD': 'gold',
@@ -628,6 +630,7 @@ _DAYLIGHT_LEGACY: dict[str, TokenValue] = {
     'COLOR_ON_ACCENT': '#ffffff',
     'COLOR_OK': '#2e7d32',
     'COLOR_WARN': '#96690a',
+    'COLOR_WARN_MUTED': '#ab6400',
     'COLOR_ERR': '#c62828',
     'COLOR_ERR_2': '#b3392b',
     'COLOR_GOLD': 'gold',

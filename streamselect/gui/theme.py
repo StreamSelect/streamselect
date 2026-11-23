@@ -30,8 +30,7 @@ the semantic-constant rebuild step exists. Switching the palette does not, by
 itself, repaint anything on screen; :func:`apply_theme` is what does that.
 
 QPalette floor: the style registry only reaches widgets styled through
-:func:`style`/:func:`style_fn` — a
-widget built with NO stylesheet at all (e.g. a bare ``QLabel``/``QStatusBar``)
+:func:`style`/:func:`style_fn` — a widget built with NO stylesheet at all (e.g. a bare ``QLabel``/``QStatusBar``)
 instead falls back to Qt's built-in default palette, which is light regardless
 of the active app theme. :func:`qt_palette` builds a ``QPalette`` from the
 CURRENTLY ACTIVE tokens; :func:`apply_theme` pushes it onto the whole
@@ -728,6 +727,7 @@ def _build_semantic_constants() -> dict[str, object]:
     # takes it rather than coining a same-sheet twin under its own name.
     TEXT_MD_ITALIC   = "color: " + COLOR_TEXT + "; font-size: " + FONT_MD + "; font-style: italic;"
     TEXT_SM_MUTED    = "color: " + COLOR_MUTED_2 + "; font-size: " + FONT_SM + ";"
+    GAME_REPORT_FLAG = "color: " + COLOR_WARN_MUTED + "; font-size: " + FONT_SM + ";"
     EXPAND_HINT      = "color: " + COLOR_MUTED_2 + "; font-size: " + FONT_XS + ";"
     INFO_LABEL       = "color: " + COLOR_TEXT + "; font-size: " + FONT_LG + "; padding-left: 4px; padding-top: 4px;"
 

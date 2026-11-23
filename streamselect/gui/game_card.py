@@ -67,7 +67,8 @@ def report_mark(feed: Optional[GameFeedDTO]) -> Optional[QLabel]:
     if feed is None or not (feed.report or feed.reported_before):
         return None
     mark = QLabel()
-    _theme.style(mark, "TEXT_SM_MUTED")
+    # Muted amber while a report counts, grey once it is only remembered (Q10).
+    _theme.style(mark, "GAME_REPORT_FLAG" if feed.report else "TEXT_SM_MUTED")
     _icon_utils.set_label_icon(mark, "reported", 12)
     mark.setToolTip(feed.report or reported_before_words(feed.reported_before)[1])
     return mark

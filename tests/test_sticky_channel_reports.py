@@ -189,3 +189,48 @@ def test_in_the_view_a_remembered_channel_sits_below_and_forget_reports_clears_i
     rows = _card(view, "Sabres").findChildren(ChannelRow)
     assert all(r.report_icon is None and r.reported_on is None for r in rows)
     assert rows[0].feed.channel_id == top.channel_id, "back at its usual place"
+
+
+def _ink_rgb(label):
+    """The most saturated pixel the flag painted, as (r, g, b)."""
+    img = label.grab().toImage()
+    best, sat = (0, 0, 0), -1
+    for y in range(img.height()):
+        for x in range(img.width()):
+            c = img.pixelColor(x, y)
+            s = max(c.red(), c.green(), c.blue()) - min(c.red(), c.green(), c.blue())
+            if s > sat and c.alpha() > 200:
+                best, sat = (c.red(), c.green(), c.blue()), s
+    return best
+
+
+def test_a_flag_that_counts_now_is_muted_amber_and_one_reported_before_is_grey(qapp, owned_widgets):
+    """Owner, 2026-11-23: the reported flag in a warning colour, "but muted, not too aggressive"."""
+    now = replace(_feed("a", "ONE"), report="Reported once in NHL games: nothing showing. Listed last.",
+                  reported=(DIDNT_PLAY,))
+    _h1, row_now = _row(qapp, owned_widgets, now)
+    _h2, row_before = _row(qapp, owned_widgets, replace(_feed("b", "TWO"), reported_before=LAPSED))
+    r, g, b = _ink_rgb(row_now.report_icon)
+    assert r > b + 40 and g > b + 20, f"amber, not grey: {(r, g, b)}"
+    r2, g2, b2 = _ink_rgb(row_before.report_icon)
+    assert max(r2, g2, b2) - min(r2, g2, b2) < 25, f"reported before stays grey: {(r2, g2, b2)}"
+
+
+def test_the_muted_amber_is_quieter_than_a_warning_and_still_visible_in_every_theme():
+    from streamselect.gui.theme_palettes import PALETTES
+
+    def lum(h):
+        h = h.lstrip("#")
+        f = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4  # noqa: E731
+        r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
+        return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+
+    def contrast(a, b):
+        x, y = sorted((lum(a), lum(b)), reverse=True)
+        return (x + 0.05) / (y + 0.05)
+
+    for name, p in PALETTES.items():
+        bg = p["COLOR_BG_SECTION"]
+        muted, warn = contrast(p["COLOR_WARN_MUTED"], bg), contrast(p["COLOR_WARN"], bg)
+        assert muted >= 2.7, f"{name}: the flag must stay visible ({muted:.2f}:1)"
+        assert muted < warn * 0.75, f"{name}: muted means clearly quieter than a warning"

@@ -260,7 +260,7 @@ class SettingsHelp(QObject):
             if not entry.control.isVisibleTo(page):
                 continue
             if entry.group and entry.group != group:
-                parts.append(f"<p style='color:{_theme.COLOR_MUTED}; font-size:{_theme.FONT_SM};"
+                parts.append(f"<p style='color:{_theme.COLOR_TEXT}; font-size:{_theme.FONT_SM};"
                              f" margin-top:12px'>{html.escape(entry.group.upper())}</p>")
             group = entry.group
             lit = i == active or self._matches(entry)
