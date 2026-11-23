@@ -204,36 +204,28 @@ def _ink_rgb(label):
     return best
 
 
-def test_a_flag_that_counts_now_is_muted_amber_and_one_reported_before_is_grey(qapp, owned_widgets):
-    """Owner, 2026-11-23: the reported flag in a warning colour, "but muted, not too aggressive"."""
+def test_a_row_reported_now_dims_slightly_with_a_grey_flag(qapp, owned_widgets):
+    """Owner, 2026-11-23: "dim it and keep the flag grey". A row only reported before
+    keeps full strength (its date says the rest)."""
+    from streamselect.gui.game_card import REPORTED_ROW_OPACITY
     now = replace(_feed("a", "ONE"), report="Reported once in NHL games: nothing showing. Listed last.",
                   reported=(DIDNT_PLAY,))
-    _h1, row_now = _row(qapp, owned_widgets, now)
-    _h2, row_before = _row(qapp, owned_widgets, replace(_feed("b", "TWO"), reported_before=LAPSED))
+    host_now, row_now = _row(qapp, owned_widgets, now)
+    host_before, row_before = _row(qapp, owned_widgets, replace(_feed("b", "TWO"), reported_before=LAPSED))
+    _host_plain, row_plain = _row(qapp, owned_widgets, _feed("c", "THREE"))
+    assert row_now.graphicsEffect() is not None and 0.5 <= REPORTED_ROW_OPACITY < 0.8, "dimmed, slightly"
+    assert row_before.graphicsEffect() is None and row_plain.graphicsEffect() is None
     r, g, b = _ink_rgb(row_now.report_icon)
-    assert r > b + 40 and g > b + 20, f"amber, not grey: {(r, g, b)}"
-    r2, g2, b2 = _ink_rgb(row_before.report_icon)
-    assert max(r2, g2, b2) - min(r2, g2, b2) < 25, f"reported before stays grey: {(r2, g2, b2)}"
+    assert max(r, g, b) - min(r, g, b) < 25, f"the flag is grey: {(r, g, b)}"
 
-
-def test_the_muted_amber_is_quieter_than_a_warning_and_still_visible_in_every_theme():
-    from streamselect.gui.theme_palettes import PALETTES
-
-    def lum(h):
-        h = h.lstrip("#")
-        f = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4  # noqa: E731
-        r, g, b = (int(h[i:i + 2], 16) / 255 for i in (0, 2, 4))
-        return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
-
-    def contrast(a, b):
-        x, y = sorted((lum(a), lum(b)), reverse=True)
-        return (x + 0.05) / (y + 0.05)
-
-    for name, p in PALETTES.items():
-        bg = p["COLOR_BG_SECTION"]
-        muted, warn = contrast(p["COLOR_WARN_MUTED"], bg), contrast(p["COLOR_WARN"], bg)
-        assert muted >= 2.7, f"{name}: the flag must stay visible ({muted:.2f}:1)"
-        assert muted < warn * 0.75, f"{name}: muted means clearly quieter than a warning"
+    def name_ink(host, row):
+        img = host.grab().toImage()
+        rect = row.name.geometry().translated(row.mapTo(host, QPoint(0, 0)))
+        lights = [img.pixelColor(x, y).lightness() for x in range(rect.left(), rect.right())
+                  for y in range(rect.top(), rect.bottom())]
+        return max(lights) - min(lights)         # text against its background
+    assert name_ink(host_now, row_now) < name_ink(host_before, row_before) * 0.85, (
+        "the name is painted dimmer")
 
 
 def test_an_upcoming_games_channels_line_up_under_its_title_flag_or_not(games_db, qapp, owned_widgets):
@@ -271,3 +263,6 @@ def test_an_upcoming_games_channels_line_up_under_its_title_flag_or_not(games_db
     assert len({x(r.name) for r in rows}) == 1, "a flag never shifts a channel's name"
     assert all(x(r) >= x(title) for r in rows), "the list starts under the game's title"
     assert x(rows[0].name) > x(title), "and its names sit a little inside it"
+    # The open game's title is bold (owner, 2026-11-23); the others are not.
+    other = next(r for r in view.rows if r.text() != matchup and r.property("alerted") != "true")
+    assert title.fontInfo().weight() > other.fontInfo().weight()

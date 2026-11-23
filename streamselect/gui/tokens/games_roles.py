@@ -56,6 +56,9 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
             f" color: {_('COLOR_TEXT')}; padding: 5px 8px; border-radius: {_('RADIUS_SM')};"
             f" font-size: {_('FONT_MD')}; }}"
             f"QPushButton:hover {{ background: {_('OVERLAY_ACCENT_35')}; color: {_('COLOR_TEXT_HI')}; }}"
+            # The game whose channel list is open: bold, so you can see which one it
+            # is (owner, 2026-11-23). An alerted game keeps its blue below.
+            f"QPushButton[open=\"true\"] {{ font-weight: bold; }}"
             # A game you have an alert on: the guide's watch-list look
             # (epg_widgets.apply_watchlist_highlight), on rows and cards (SV-Q51).
             f"QPushButton[alerted=\"true\"] {{ color: {_('COLOR_ACCENT_HOVER')}; font-weight: bold; }}"

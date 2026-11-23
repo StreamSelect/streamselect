@@ -47,6 +47,8 @@ from streamselect.gui.progress_paint import ProgressBar, elapsed_pct
 CARD_WIDTH = 280
 #: Width of a channel row's flag column: the 12 px flag and a little air.
 FLAG_COLUMN = 16
+#: A channel row whose report counts now: dimmed slightly, less than a card.
+REPORTED_ROW_OPACITY = 0.6
 #: A card whose channel the user reported, as the sidebar dims an unavailable row.
 REPORTED_OPACITY = 0.45
 
@@ -69,8 +71,7 @@ def report_mark(feed: Optional[GameFeedDTO]) -> Optional[QLabel]:
     if feed is None or not (feed.report or feed.reported_before):
         return None
     mark = QLabel()
-    # Muted amber while a report counts, grey once it is only remembered (Q10).
-    _theme.style(mark, "GAME_REPORT_FLAG" if feed.report else "TEXT_SM_MUTED")
+    _theme.style(mark, "TEXT_SM_MUTED")
     _icon_utils.set_label_icon(mark, "reported", 12)
     mark.setToolTip(feed.report or reported_before_words(feed.reported_before)[1])
     return mark
@@ -132,6 +133,12 @@ class ChannelRow(QWidget):
         # name out of line with the rest (owner, 2026-11-23).
         self.report_icon = report_mark(feed)
         _add_in_slot(row, self.report_icon, FLAG_COLUMN)
+        if feed.report:
+            # A report that counts now dims the row slightly, the grey flag saying why
+            # (owner, 2026-11-23); one only remembered keeps full strength and its date.
+            dim = QGraphicsOpacityEffect(self)
+            dim.setOpacity(REPORTED_ROW_OPACITY)
+            self.setGraphicsEffect(dim)
         _add_in_slot(row, language_chip(feed.language) if feed.language else None, slots.get("language", 0))
         if playing:
             mark = QLabel()

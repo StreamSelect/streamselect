@@ -727,7 +727,6 @@ def _build_semantic_constants() -> dict[str, object]:
     # takes it rather than coining a same-sheet twin under its own name.
     TEXT_MD_ITALIC   = "color: " + COLOR_TEXT + "; font-size: " + FONT_MD + "; font-style: italic;"
     TEXT_SM_MUTED    = "color: " + COLOR_MUTED_2 + "; font-size: " + FONT_SM + ";"
-    GAME_REPORT_FLAG = "color: " + COLOR_WARN_MUTED + "; font-size: " + FONT_SM + ";"
     EXPAND_HINT      = "color: " + COLOR_MUTED_2 + "; font-size: " + FONT_XS + ";"
     INFO_LABEL       = "color: " + COLOR_TEXT + "; font-size: " + FONT_LG + "; padding-left: 4px; padding-top: 4px;"
 

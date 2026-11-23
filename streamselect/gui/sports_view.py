@@ -777,6 +777,7 @@ class SportsView(SportsHeadersMixin, ContentView):
         if openable:
             row = QPushButton(g.matchup)
             row.setProperty("alerted", "true" if alerted else "false")
+            row.setProperty("open", "true" if is_open else "false")
             _theme.style(row, "GAME_FEED_ROW")
             row.setToolTip(f"{when} · " + ("Collapse its channel list" if is_open
                                            else "List every channel that will show this game"))

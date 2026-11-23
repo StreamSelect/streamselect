@@ -128,9 +128,6 @@
     "warn-fill": {
       "$value": "{warn.4}"
     },
-    "warn-muted": {
-      "$value": "{warn.11}"
-    },
     "err": {
       "$value": "{err.12}"
     },
