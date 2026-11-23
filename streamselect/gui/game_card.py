@@ -45,6 +45,8 @@ from streamselect.gui.progress_paint import ProgressBar, elapsed_pct
 
 #: Width of a closed card (SV-Q22: fixed for now, revisit after use).
 CARD_WIDTH = 280
+#: Width of a channel row's flag column: the 12 px flag and a little air.
+FLAG_COLUMN = 16
 #: A card whose channel the user reported, as the sidebar dims an unavailable row.
 REPORTED_OPACITY = 0.45
 
@@ -125,16 +127,17 @@ class ChannelRow(QWidget):
         row.setContentsMargins(4, 1, 2, 1)
         row.setSpacing(4)
         slots = slots or {}
+        # One small icon, no chip (owner, SV-Q39); the tooltip says what and how often.
+        # Its own column at the far left, held on every row, so a flag never pushes a
+        # name out of line with the rest (owner, 2026-11-23).
+        self.report_icon = report_mark(feed)
+        _add_in_slot(row, self.report_icon, FLAG_COLUMN)
         _add_in_slot(row, language_chip(feed.language) if feed.language else None, slots.get("language", 0))
         if playing:
             mark = QLabel()
             _theme.style(mark, "ALERT_NEW_MATCH_BADGE")
             _icon_utils.set_label_icon(mark, "play", 12)
             row.addWidget(mark)
-        # One small icon, no chip (owner, SV-Q39); the tooltip says what and how often.
-        self.report_icon = report_mark(feed)
-        if self.report_icon is not None:
-            row.addWidget(self.report_icon)
         self.name = QLabel(feed.title)
         _theme.style(self.name, "ALERT_NEW_MATCH_BADGE" if playing else
                      "TEXT_SM_MUTED" if hidden else "CHANNEL_NAME_LIVE")

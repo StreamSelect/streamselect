@@ -810,7 +810,11 @@ class SportsView(SportsHeadersMixin, ContentView):
         into.addWidget(line)
         self.rows.append(row)
         if is_open:
-            into.addWidget(self._channel_list(g))
+            # Under its game, starting where the game's title does: the channels read
+            # as that game's, not as more lines of the time group (owner, 2026-11-23).
+            lst = self._channel_list(g)
+            lst.layout().setContentsMargins(line.time.minimumWidth() + h.spacing(), 0, 0, 0)
+            into.addWidget(lst)
 
     # ── actions ────────────────────────────────────────────────────────────
 

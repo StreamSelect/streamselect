@@ -234,3 +234,40 @@ def test_the_muted_amber_is_quieter_than_a_warning_and_still_visible_in_every_th
         muted, warn = contrast(p["COLOR_WARN_MUTED"], bg), contrast(p["COLOR_WARN"], bg)
         assert muted >= 2.7, f"{name}: the flag must stay visible ({muted:.2f}:1)"
         assert muted < warn * 0.75, f"{name}: muted means clearly quieter than a warning"
+
+
+def test_an_upcoming_games_channels_line_up_under_its_title_flag_or_not(games_db, qapp, owned_widgets):
+    """Owner, 2026-11-23: a flag shifted one channel's name, and the list sat between
+    the time column and the game titles. Every row now holds a flag column, and the
+    list starts where its game's title does."""
+    from streamselect.core.config import Config
+    from streamselect.gui.game_card import ChannelRow
+    from streamselect.gui.sports_view import SportsView
+
+    def run_query(fn, on_result, *, token_ref=None, on_error=None, commit=False):
+        with games_db.session_scope(commit=commit) as s:
+            result = fn(RepositoryFactory(s))
+        on_result(result)
+
+    from streamselect.core.repositories import RepositoryFactory
+    cfg = Config()
+    view = owned_widgets.own(SportsView(games_db, cfg, run_query, clock=lambda: START - timedelta(hours=3)))
+    view.resize(1000, 900)
+    view.show()
+    view.on_activate()
+    matchup = view.rows[0].text()
+    view.rows[0].click()
+    _settle(qapp)
+    rows = view.findChildren(ChannelRow)
+    assert len(rows) >= 2
+    cfg.game_channel_prefs = {"hockey/NHL": {CHANNEL_REPORTS: {rows[0].feed.channel_id: [_dp(START)]}}}
+    view._render()
+    _settle(qapp)
+    rows = view.findChildren(ChannelRow)
+    title = next(r for r in view.rows if r.text() == matchup)
+    x = lambda w: w.mapTo(view, QPoint(0, 0)).x()  # noqa: E731
+    flagged = [r for r in rows if r.report_icon is not None]
+    assert flagged and len(flagged) < len(rows), "one flagged row among plain ones"
+    assert len({x(r.name) for r in rows}) == 1, "a flag never shifts a channel's name"
+    assert all(x(r) >= x(title) for r in rows), "the list starts under the game's title"
+    assert x(rows[0].name) > x(title), "and its names sit a little inside it"
