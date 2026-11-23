@@ -825,9 +825,14 @@ class _MenuActionsMixin:
         if kind == "channel":
             self.show_channel_details_by_id(content_id)
             return
+        self.show_episode_details_by_id(content_id)
+
+    def show_episode_details_by_id(self, episode_id: str) -> None:
+        """Show one episode in the details pane, over its series, as the series list
+        does — for surfaces that know only the episode (the playback menu, History)."""
         self._run_query(
-            lambda repos: (repos.stream_info.series_copy_of_episode(content_id),
-                           repos.episodes.get_episode_dto(content_id)),
+            lambda repos: (repos.stream_info.series_copy_of_episode(episode_id),
+                           repos.episodes.get_episode_dto(episode_id)),
             self._on_playing_episode_read,
             on_error=lambda e: logger.warning("Couldn't load the episode's details: {}", e))
 

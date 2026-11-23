@@ -45,6 +45,18 @@ class _HistoryMixin:
         self._show_channel_menu([channel_id], "history", gp.x(), gp.y(),
                                 entry_id=item.data(_ROLE_EPISODE_ID) or "")
 
+    def show_history_row_details(self, channel_id: str) -> None:
+        """Selecting a History row: one that names an episode shows THAT episode in the
+        details pane (owner, 2026-11-23: it showed the series to browse); any other
+        row shows its channel, as before."""
+        item = self.sidebar_sections["history"].history_list.currentItem()
+        episode_id = (item.data(_ROLE_EPISODE_ID) if item is not None
+                      and item.data(Qt.ItemDataRole.UserRole) == channel_id else "")
+        if episode_id:
+            self.show_episode_details_by_id(episode_id)
+        else:
+            self.show_channel_details_by_id(channel_id)
+
     def _with_history_episode(self, ctx):
         """Worker side of the menu: a History row's episode carries its saved position
         (``ChannelMenuContext.watch_progress``), so Resume / Play from Beginning apply."""

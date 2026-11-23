@@ -1008,7 +1008,7 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
         elif section_id == "history":
             section = HistorySection(self.config, self.db, self)
             section.historyItemClicked.connect(self.play_from_history_id)
-            section.itemSelected.connect(self.show_channel_details_by_id)
+            section.itemSelected.connect(self.show_history_row_details)
             section.clearHistoryClicked.connect(self.clear_history)
             section.clearOldHistoryClicked.connect(self.clear_history_older_than)
             section.clearHistoryGroupClicked.connect(self.clear_history_group)
