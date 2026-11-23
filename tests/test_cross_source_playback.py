@@ -243,6 +243,7 @@ def test_on_stream_ready_play_anyway_calls_player_manager():
         open_ended_buffer=False,
         deep_buffer=False,
         channel_id="ch-1",
+        live=False,          # no catalog row for ch-1 here, so not known to be live (96d535c)
     )
 
 

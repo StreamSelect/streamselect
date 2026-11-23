@@ -439,6 +439,7 @@ def test_play_checked_threads_real_provider_max_into_player_manager_play(db):
         open_ended_buffer=False,
         deep_buffer=False,
         channel_id="",
+        live=False,          # live channels can start with subtitles off (96d535c)
     )
 
 
