@@ -29,6 +29,49 @@ from streamselect.gui.dialog_chrome import dialog_buttons
 
 #: Where the prompt's "Change whether this is asked" link opens Settings.
 PROMPT_SETTING_LINK = "settings:Playback/Still here"
+#: The prompt's width: room for its question on a line or two. Without one the
+#: dialog took its wrapped label's guessed height and clipped the question's first
+#: line (owner, 2026-11-23).
+PROMPT_MIN_WIDTH = 380
+
+
+def build_queue_end_dialog(parent, count: int, ask_first: bool, navigate):
+    """The "Still watching?" dialog: the question, the first-episode tick when the
+    run had one, the link to its setting, Yes / No. Returns ``(dialog, tick or None)``."""
+    ep_label = "1 more episode" if count == 1 else f"{count} more episodes"
+    dlg = QDialog(parent)
+    dlg.setWindowTitle("Still watching?")
+    dlg.setModal(True)
+    dlg.setMinimumWidth(PROMPT_MIN_WIDTH)
+    layout = QVBoxLayout(dlg)
+    layout.setSpacing(12)
+    layout.setContentsMargins(16, 16, 16, 16)
+
+    msg = QLabel(f"The queue auto-advanced through {ep_label}.\n\nDid you watch them?")
+    msg.setWordWrap(True)
+    layout.addWidget(msg)
+
+    first_too = None
+    if ask_first:
+        first_too = QCheckBox("I watched the first episode, too")
+        first_too.setChecked(True)
+        first_too.setToolTip("Untick if you did not watch the episode the run started "
+                             "with either: it goes back to unwatched")
+        layout.addWidget(first_too)
+
+    # The prompt's own off switch, one click away (Settings opens on that row).
+    to_setting = QLabel(f'<a href="{PROMPT_SETTING_LINK}">Change whether this is asked</a>')
+    to_setting.setToolTip("Open Settings at the option that turns this question on or off")
+    to_setting.linkActivated.connect(navigate)
+    layout.addWidget(to_setting)
+
+    # Ok/Cancel relabelled rather than Yes/No: same accept/reject slots,
+    # and then the same row as every other dialog's.
+    btns = dialog_buttons(dlg, ok="Yes")
+    btns.button(QDialogButtonBox.StandardButton.Cancel).setText("No")
+    layout.addWidget(btns)
+    dlg.adjustSize()
+    return dlg, first_too
 
 
 class _QueueEndPromptMixin:
@@ -54,44 +97,8 @@ class _QueueEndPromptMixin:
         if not getattr(self.config, "prompt_after_autoplay", True):
             return
 
-        # Build a human-friendly label — show the episode count, not raw ids.
-        count = len(auto_episode_ids)
-        ep_label = "1 more episode" if count == 1 else f"{count} more episodes"
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle("Still watching?")
-        dlg.setModal(True)
-        layout = QVBoxLayout(dlg)
-        layout.setSpacing(12)
-        layout.setContentsMargins(16, 16, 16, 16)
-
-        msg = QLabel(
-            f"The queue auto-advanced through {ep_label}.\n\n"
-            "Did you watch them?"
-        )
-        msg.setWordWrap(True)
-        layout.addWidget(msg)
-
-        first_too = None
-        if first_episode_id:
-            first_too = QCheckBox("I watched the first episode, too")
-            first_too.setChecked(True)
-            first_too.setToolTip("Untick if you did not watch the episode the run started "
-                                 "with either: it goes back to unwatched")
-            layout.addWidget(first_too)
-
-        # The prompt's own off switch, one click away (Settings opens on that row).
-        to_setting = QLabel(f'<a href="{PROMPT_SETTING_LINK}">Change whether this is asked</a>')
-        to_setting.setToolTip("Open Settings at the option that turns this question on or off")
-        to_setting.linkActivated.connect(lambda link: self.navigate_to(link))
-        layout.addWidget(to_setting)
-
-        # Ok/Cancel relabelled rather than Yes/No: same accept/reject slots,
-        # and then the same row as every other dialog's.
-        btns = dialog_buttons(dlg, ok="Yes")
-        btns.button(QDialogButtonBox.StandardButton.Cancel).setText("No")
-        layout.addWidget(btns)
-
+        dlg, first_too = build_queue_end_dialog(
+            self, len(auto_episode_ids), bool(first_episode_id), lambda link: self.navigate_to(link))
         if dlg.exec() == QDialog.DialogCode.Accepted:
             # Confirmed — promote to 'manual' so they render solid and the
             # resume anchor advances past them.
