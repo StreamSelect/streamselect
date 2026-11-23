@@ -254,7 +254,33 @@ def test_answering_no_unmarks_the_auto_advanced_episodes(tmp_path):
             assert ep.is_watched is False
             assert ep.watch_percent == 0
             assert ep.last_played_via is None
+            assert ep.last_played is None, "an episode you did not watch stays in History"
     assert host.emitted == [["e1", "e2"]], "the tree was never told about the unmark"
+
+
+def test_unticking_the_first_episode_forgets_its_play_too(tmp_path):
+    """"I watched the first episode, too" unticked: that one leaves History as well."""
+    db = _make_db(tmp_path)
+    _add_episode(db, "e1", 1, watched=False)
+    with db.session_scope() as session:
+        RepositoryFactory(session).episodes.record_watch_progress("e1", 1.0, 1.0, 0.9, "manual")
+
+    _prompt_host(db)._bg_unmark_first_episode("e1")
+
+    with db.session_scope(commit=False) as session:
+        ep = RepositoryFactory(session).episodes.get_by_id("e1")
+        assert ep.watch_completed is False and ep.last_played is None
+
+
+def test_a_watch_change_re_reads_history(tmp_path):
+    """History lists only what was watched, so the one episode-state refresh path
+    re-reads it — answering No used to leave the walked-back show on screen."""
+    host = _SeriesHost(_make_db(tmp_path), None)
+    del host.series_tree                    # no series open: History still re-reads
+    reads = []
+    host.load_history = lambda: reads.append(1)
+    host.refresh_episode_watch_state(["e1"])
+    assert reads == [1]
 
 
 def test_answering_yes_promotes_and_still_refreshes(tmp_path):
