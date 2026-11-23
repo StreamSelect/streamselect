@@ -128,9 +128,10 @@ class ChannelRow(QWidget):
         row.setContentsMargins(4, 1, 2, 1)
         row.setSpacing(4)
         slots = slots or {}
-        # One small icon, no chip (owner, SV-Q39); the tooltip says what and how often.
-        # Its own column at the far left, held on every row, so a flag never pushes a
-        # name out of line with the rest (owner, 2026-11-23).
+        # Language, then the report flag, each in a column held on every row and in
+        # every game, so a name never moves with what its neighbours carry (owner,
+        # 2026-11-23). The flag: one small icon, no chip (SV-Q39), its tooltip says why.
+        _add_in_slot(row, language_chip(feed.language) if feed.language else None, slots.get("language", 0))
         self.report_icon = report_mark(feed)
         _add_in_slot(row, self.report_icon, FLAG_COLUMN)
         if feed.report:
@@ -139,7 +140,6 @@ class ChannelRow(QWidget):
             dim = QGraphicsOpacityEffect(self)
             dim.setOpacity(REPORTED_ROW_OPACITY)
             self.setGraphicsEffect(dim)
-        _add_in_slot(row, language_chip(feed.language) if feed.language else None, slots.get("language", 0))
         if playing:
             mark = QLabel()
             _theme.style(mark, "ALERT_NEW_MATCH_BADGE")
@@ -294,7 +294,8 @@ def fps_chip(fps: str) -> QWidget:
 
 def chip_slots(feeds) -> dict:
     """Column widths for a channel list: its widest chip of each kind (0 when no row
-    has one, so a list keeps no empty column)."""
+    has one, so a list keeps no empty column), except language, held at least a
+    two-letter chip wide in every list so names line up from game to game."""
     def width(make, values) -> int:
         out = 0
         for v in values:
@@ -305,7 +306,7 @@ def chip_slots(feeds) -> dict:
         return out
     feeds = list(feeds)
     return {
-        "language": width(language_chip, {f.language for f in feeds if f.language}),
+        "language": width(language_chip, {f.language for f in feeds if f.language} | {"EN"}),
         "region": width(lambda r: make_region_chip(r), {f.region for f in feeds if f.region}),
         "epg": width(lambda _v: guide_chip(), {True for f in feeds if f.from_guide}),
         "tier": width(lambda tv: quality_chip(*tv), {(f.tier, f.verified) for f in feeds if f.tier}),

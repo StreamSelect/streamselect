@@ -354,7 +354,6 @@
   "tests/test_episode_metadata_backfill.py::TestDetailsPaneRendersEpisodeOwnPlot::test_episode_without_plot_keeps_series_plot",
   "tests/test_episode_metadata_backfill.py::TestDetailsPaneRendersEpisodeOwnPlot::test_episode_without_rating_hides_rating_chip",
   "tests/test_episode_metadata_backfill.py::TestDetailsPaneRendersEpisodeOwnPlot::test_reverting_to_series_hides_episode_meta_row",
-  "tests/test_episode_resume.py::TestEpisodeResumeButtonRenderedState::test_resume_hidden_when_episode_completed",
   "tests/test_episode_resume.py::TestEpisodeResumeButtonRenderedState::test_resume_hidden_when_no_saved_progress",
   "tests/test_episode_resume.py::TestEpisodeResumeButtonRenderedState::test_resume_hides_again_on_return_to_series_root",
   "tests/test_episode_resume.py::TestEpisodeResumeButtonRenderedState::test_resume_visible_with_correct_formatted_position",

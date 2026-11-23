@@ -151,13 +151,20 @@ class TestEpisodeResumeButtonRenderedState:
 
         assert pane._action_bar.resume_button.isHidden()
 
-    def test_resume_hidden_when_episode_completed(self, qapp):
-        pane = _make_details_pane(qapp)
+    def test_a_finished_episode_being_rewatched_offers_resume(self, qapp, owned_widgets):
+        """Owner, 2026-11-23: a rewatch keeps the watched mark AND its position, so
+        a finished episode with a saved position resumes (it hid Resume before)."""
+        pane = owned_widgets.own(_make_details_pane(qapp))
         series = _fake_channel("series")
         ep = _episode_dto(watch_progress=450, watch_completed=True)
 
         pane.show_episode(ep, series)
 
+        assert not pane._action_bar.resume_button.isHidden()
+
+    def test_a_finished_episode_with_no_position_has_no_resume(self, qapp, owned_widgets):
+        pane = owned_widgets.own(_make_details_pane(qapp))
+        pane.show_episode(_episode_dto(watch_progress=0, watch_completed=True), _fake_channel("series"))
         assert pane._action_bar.resume_button.isHidden()
 
     def test_resume_hides_again_on_return_to_series_root(self, qapp):

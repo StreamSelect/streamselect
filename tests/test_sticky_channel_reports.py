@@ -266,3 +266,28 @@ def test_an_upcoming_games_channels_line_up_under_its_title_flag_or_not(games_db
     # The open game's title is bold (owner, 2026-11-23); the others are not.
     other = next(r for r in view.rows if r.text() != matchup and r.property("alerted") != "true")
     assert title.fontInfo().weight() > other.fontInfo().weight()
+
+
+def test_names_line_up_from_a_game_with_languages_to_one_without(qapp, owned_widgets):
+    """Owner, 2026-11-23: a game whose channels had a measured language put every
+    name further right than a game without. Language sits left of the flag, its
+    column held in every list."""
+    from streamselect.gui.game_card import ChannelList
+    host = owned_widgets.own(QWidget())
+    lay = QVBoxLayout(host)
+    with_lang = _game(replace(_feed("a", "ONE"), language="EN"), _feed("b", "TWO"))
+    without = GameDTO(2, "hockey", "NHL", "C", "D", START, 2, False, 1,
+                      (_feed("c", "THREE"), replace(_feed("d", "FOUR"), reported_before=LAPSED)))
+    lists = [ChannelList(g, preferred_key=None, playing_id=None, show_hidden=False) for g in (with_lang, without)]
+    for cl in lists:
+        lay.addWidget(cl)
+    host.resize(700, 200)
+    host.show()
+    qapp.processEvents()
+    x = lambda w: w.mapTo(host, QPoint(0, 0)).x()  # noqa: E731
+    names = {x(r.name) for cl in lists for r in cl.rows}
+    assert len(names) == 1, f"one starting place for every name: {names}"
+    lang_row = lists[0].rows[0]
+    chip = next(w for w in lang_row.findChildren(QWidget) if w.toolTip().startswith("Audio language"))
+    flagged = lists[1].rows[1]
+    assert x(chip) < x(flagged.report_icon) < x(flagged.name), "language, then the flag, then the name"

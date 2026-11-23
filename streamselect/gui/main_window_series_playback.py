@@ -150,6 +150,14 @@ class _SeriesPlaybackMixin:
                 self.status(f"Switched to the {data.get('label', 'other')} copy of this series")
                 self.drill_into_series(channel)
 
+    def _playing_episode_id(self, key) -> str | None:
+        """The episode a player window is playing, for the details pane's live timer:
+        a queue's current entry (as of the last progress save) or the one started.
+        Through ``_playing_content``, the one reader of what a window plays."""
+        info = self.__dict__.get("_watch_tracking", {}).get(key) or {}
+        content = self._playing_content(key, int(info.get("last_seen_pos", 0)) + 1)
+        return content[1] if content and content[0] == "episode" else None
+
     def play_episode_by_id(self, episode_id: str, start_seconds: int | None = None) -> None:
         """Resolve an episode_id to a PlayableEpisodeDTO and route through play_episode().
 

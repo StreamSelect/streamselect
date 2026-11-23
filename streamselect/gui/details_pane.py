@@ -211,12 +211,11 @@ class DetailsPaneWidget(QWidget):
         Called from the host's player-position poll (the same mpv poll that drives
         the nav-bar playback-health readout).  The green "currently playing"
         indicator + live elapsed timer appear on the Play button only while
-        ``channel_id`` matches the title currently shown in the pane.  Pass
-        ``channel_id=None`` (or a different id) when playback stops or moves to
-        another title to clear the indicator.
+        ``channel_id`` matches the title (or episode) shown in the pane; None, or
+        another id, clears it.
 
         Args:
-            channel_id: The channel id now playing, or None when nothing plays.
+            channel_id: The channel or EPISODE id now playing, or None when nothing plays.
             position_seconds: Current playback position in seconds.
         """
         self._playing_channel_id = channel_id
@@ -228,8 +227,9 @@ class DetailsPaneWidget(QWidget):
     def _apply_playing_indicator(self) -> None:
         """Show the playing indicator iff the shown channel is the one playing."""
         ch = self.current_channel
+        shown = getattr(self.current_episode if self._in_episode_mode else ch, "id", None)
         if (ch is not None and self._playing_channel_id is not None
-                and getattr(ch, "id", None) == self._playing_channel_id):
+                and shown == self._playing_channel_id):
             pos = self._playing_base_pos + (time.monotonic() - self._playing_base_ts)
             self._action_bar.set_playing_active(pos)
         else:
@@ -255,7 +255,8 @@ class DetailsPaneWidget(QWidget):
             self.episode_action_state_requested.emit(ep.id)
 
     def apply_episode_action_state(
-        self, episode_id: str, in_queue: bool, is_favorite: bool, watch_progress: int = 0, watch_completed: bool = False
+        self, episode_id: str, in_queue: bool, is_favorite: bool, watch_progress: int = 0,
+        watch_completed: bool = False, watch_percent: int = 0
     ) -> None:
         """Called from main_window when the async per-EPISODE action-state load
         completes (Slice 2B) — queue/favorite state for the episode shown in
@@ -269,7 +270,7 @@ class DetailsPaneWidget(QWidget):
         ):
             return  # stale response — user already moved on, or left episode mode
         self._action_bar.set_episode_queue_favorite(in_queue, is_favorite)
-        self._action_bar.set_resume(watch_progress > 0, watch_progress)
+        self._action_bar.set_resume(watch_progress > 0, watch_progress, watch_percent)
 
     def apply_channel_tags(self, channel_id: str, tags: list) -> None:
         """Called from main_window when the async tag load completes.
@@ -565,13 +566,12 @@ class DetailsPaneWidget(QWidget):
         # series-level action_state_requested fired by show_channel above).
         self.episode_action_state_requested.emit(episode.id)
 
-        # Resume button — from the EPISODE's own saved position, not the series'.
-        # MUST come after both show_channel() (above, which hides Resume via its
-        # movie-only gate) and enter_episode_mode() (which also hides it) — either
-        # would otherwise clobber this back to hidden.
+        # Resume button — from the EPISODE's own saved position (and how far in), not the
+        # series'. MUST come after show_channel() and enter_episode_mode(), which both
+        # hide it. A finished episode being rewatched has a position too (2026-11-23).
         _ep_progress = int(getattr(episode, "watch_progress", 0) or 0)
-        _ep_completed = bool(getattr(episode, "watch_completed", False))
-        self._action_bar.set_resume(_ep_progress > 0 and not _ep_completed, _ep_progress)
+        self._action_bar.set_resume(_ep_progress > 0, _ep_progress, int(getattr(episode, "watch_percent", 0) or 0))
+        self._apply_playing_indicator()     # the live timer, if this episode is the one playing
 
     # ------------------------------------------------------------------ #
     # Internal                                                             #

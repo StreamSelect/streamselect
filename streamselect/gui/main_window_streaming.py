@@ -1209,7 +1209,7 @@ class _StreamingMixin(_WatchCaptureMixin):
         # playing + its current position.  The pane lights its green Play indicator
         # only when this channel is the one currently shown.
         playing_map = self.__dict__.get("_playing_channels", {})
-        ch_id = playing_map.get(shown_key)
+        ch_id = playing_map.get(shown_key) or self._playing_episode_id(shown_key)
         pane = self.__dict__.get("details_pane")
         shown_ch = getattr(pane, "current_channel", None) if pane is not None else None
         shown_id = getattr(shown_ch, "id", None)

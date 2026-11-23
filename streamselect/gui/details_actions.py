@@ -3,13 +3,15 @@ import time
 from dataclasses import dataclass
 
 from PyQt6.QtWidgets import QWidget, QPushButton
-from PyQt6.QtCore import QSize, Qt, pyqtSignal, QTimer
+from PyQt6.QtCore import QEvent, QSize, Qt, pyqtSignal, QTimer
+from PyQt6.QtGui import QPainter
 
 from streamselect.core.models import MediaType
 
 from streamselect.gui import cursor_affordance as _cursor
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
+from streamselect.gui.progress_paint import paint_progress
 
 
 def _fmt_elapsed(total_seconds: float) -> str:
@@ -49,6 +51,39 @@ def resume_state(
     return (can_resume, progress)
 
 
+class _ResumeBar(QWidget):
+    """How far into the title the saved position is, along the bottom of the Resume
+    button, so you can tell a resume near the end (owner, 2026-11-23). The one
+    progress painter (``paint_progress``), with no "nearly over" colour."""
+
+    def __init__(self, button: QPushButton):
+        super().__init__(button)
+        self.pct = 0
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        button.installEventFilter(self)
+        self.hide()
+
+    def set_pct(self, pct: int) -> None:
+        self.pct = max(0, min(100, int(pct or 0)))
+        self.setVisible(self.pct > 0)
+        self._place()
+        self.update()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 (Qt API)
+        if event.type() == QEvent.Type.Resize:
+            self._place()
+        return False
+
+    def _place(self) -> None:
+        b = self.parentWidget()
+        self.setGeometry(10, b.height() - 7, max(0, b.width() - 20), 3)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 (Qt API)
+        painter = QPainter(self)
+        paint_progress(painter, self.rect(), self.pct, warn_at=None)
+        painter.end()
+
+
 @dataclass
 class ChannelActionState:
     """All per-channel DB state needed by the action bar. Loaded asynchronously."""
@@ -62,6 +97,7 @@ class ChannelActionState:
     media_type: str = ""
     watch_progress: int = 0
     watch_completed: bool = False
+    watch_percent: int = 0   # how far in, for the bar under Resume
 
 
 class _SteppedLabelButton(QPushButton):
@@ -259,6 +295,7 @@ class _ActionBar(QWidget):
         _theme.style(self.resume_button, "DETAIL_RESUME_BTN")
         self.resume_button.clicked.connect(self.resume_clicked)
         self.resume_button.hide()
+        self._resume_bar = _ResumeBar(self.resume_button)
 
         # --- Rail: infrequent icon-only actions --------------------------------
         self.favorite_button = self._mk("unfavorite", "Add to Favorites")
@@ -377,7 +414,7 @@ class _ActionBar(QWidget):
             # Resume is per-EPISODE in episode mode (apply_episode_action_state
             # owns it there); a late series-level fetch must not clobber it.
             self.set_resume(*resume_state(
-                state.media_type, state.watch_progress, state.watch_completed))
+                state.media_type, state.watch_progress, state.watch_completed), state.watch_percent)
         self._rating = state.rating
         self._suppressed = state.is_suppressed
         self._is_hidden = state.is_hidden
@@ -442,21 +479,24 @@ class _ActionBar(QWidget):
         self._has_new_match = has_unviewed_match
         self._sync_monitor_button()
 
-    def set_resume(self, can_resume: bool, position_s: int = 0) -> None:
-        """Show the dominant Resume button (with its M:SS label) only when there's
-        a saved position to resume from.
+    def set_resume(self, can_resume: bool, position_s: int = 0, percent: int = 0) -> None:
+        """Show the dominant Resume button (with its M:SS label, and a bar for how far
+        in ``percent`` is) only when there's a saved position to resume from.
 
         When ``can_resume`` is False the Resume button is hidden and the primary
         row collapses to a full-width Play (Qt skips the hidden item's stretch).
+        While the title shown is the one playing, the live timer replaces it.
         """
-        self.resume_button.setVisible(can_resume)
+        self.resume_button.setVisible(can_resume and not self._is_playing)
+        self._resume_bar.set_pct(percent if can_resume else 0)
         if can_resume != self._can_resume:
             self._can_resume = can_resume
             self._apply_primary_label()
         if can_resume and position_s > 0:
             minutes, secs = divmod(int(position_s), 60)
             self.resume_button.setText(f"Resume {minutes}:{secs:02d}")
-            self.resume_button.setToolTip(f"Resume from {minutes}:{secs:02d}")
+            self.resume_button.setToolTip(f"Resume from {minutes}:{secs:02d}"
+                                          + (f" · {self._resume_bar.pct}% in" if self._resume_bar.pct else ""))
         else:
             self.resume_button.setText("Resume")
             self.resume_button.setToolTip("Resume from where you left off")
@@ -485,6 +525,8 @@ class _ActionBar(QWidget):
 
     def _apply_primary_label(self) -> None:
         """Stamp the primary button's text + tooltip for the current ``_primary_mode``."""
+        if self._is_playing:
+            return          # the live timer owns the label while this title plays
         if self._primary_mode == "browse":
             self.play_button.setText("Browse")
             self._paint_primary_icon("browse")
@@ -597,12 +639,13 @@ class _ActionBar(QWidget):
         Args:
             position_seconds: The current playback position in seconds.
         """
-        if self._primary_mode != "play":
-            # A series-root (Browse) or episode-detail primary button is never the
-            # actively-playing movie/live title — don't paint the green indicator (or
-            # start the per-second tick) over its Browse / Play-Episode caption.
+        if self._primary_mode == "browse":
+            # A series root never plays itself — never paint the green indicator (or
+            # start the per-second tick) over its Browse caption. An episode does
+            # (owner, 2026-11-23: the timer should tick with mpv there too).
             return
         self._is_playing = True
+        self.resume_button.setVisible(False)   # you are watching it: the timer says where
         self._playing_base_pos = float(position_seconds or 0.0)
         self._playing_base_ts = time.monotonic()
         _theme.style(self.play_button, "DETAIL_PLAY_BTN_PLAYING")
@@ -623,9 +666,8 @@ class _ActionBar(QWidget):
         if self._playing_timer is not None:
             self._playing_timer.stop()
         _theme.style(self.play_button, "DETAIL_PLAY_BTN")
-        self.play_button.setText("Play")
-        self._paint_primary_icon("play")
-        self.play_button.setToolTip("Play from the beginning")
+        self._apply_primary_label()     # back to Play / Play Episode / Start over
+        self.resume_button.setVisible(self._can_resume)
 
     def _current_playing_position(self) -> float:
         """Interpolated playback position: last report + wall time since."""
