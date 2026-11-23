@@ -994,12 +994,9 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
             )
             # Subtle "checking…" hint on the Movies & Series header while a monitor
             # check (startup / recurring timer / post-refresh) is in flight.
-            self.series_monitor.checking_started.connect(
-                lambda: section.set_series_checking(True)
-            )
+            self.series_monitor.checking_started.connect(lambda: section.set_series_checking(True))
             self.series_monitor.checking_finished.connect(
-                lambda: section.set_series_checking(False)
-            )
+                lambda: section.set_series_checking(False))
             # Populate rules + series on startup; backfill any missing cleaned titles
             # first (bounded off-thread lookup), then render (rules are synchronous).
             QTimer.singleShot(0, self._backfill_series_display_titles)
@@ -1008,7 +1005,8 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
         elif section_id == "history":
             section = HistorySection(self.config, self.db, self)
             section.historyItemClicked.connect(self.play_from_history_id)
-            section.itemSelected.connect(self.show_history_row_details)
+            section.itemSelected.connect(self.show_channel_details_by_id)
+            section.episodeSelected.connect(self.show_episode_details_by_id)
             section.clearHistoryClicked.connect(self.clear_history)
             section.clearOldHistoryClicked.connect(self.clear_history_older_than)
             section.clearHistoryGroupClicked.connect(self.clear_history_group)

@@ -9,7 +9,7 @@ from streamselect.gui.row_activation import connect_row_activation
 from streamselect.core.repositories import RepositoryFactory
 from streamselect.core.history_buckets import BUCKETS, bucket_for, history_min_seconds
 from streamselect.gui.chip_row import (
-    CHIP_LANG, CHIP_QUALITY, CHIP_YEAR, build_chip_row, media_icon_role,
+    CHIP_LANG, CHIP_QUALITY, CHIP_YEAR, build_chip_row, chip_widget, media_icon_role,
     sidebar_meta_line,
 )
 from streamselect.gui.relative_time import humanize_ago
@@ -17,6 +17,7 @@ from streamselect.gui.sidebar.background_refresh import BackgroundRefreshMixin
 from streamselect.gui.sidebar.base import (
     GroupHeading, SectionAction, CollapsibleSection, make_seamless,
 )
+from streamselect.gui import cursor_affordance
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
@@ -79,6 +80,7 @@ class HistorySection(BackgroundRefreshMixin, CollapsibleSection):
     # grows a parallel play path.
     historyItemClicked = pyqtSignal(str, str)
     itemSelected       = pyqtSignal(str)   # channel_id (single-click)
+    episodeSelected    = pyqtSignal(str)   # episode_id: its S..E.. chip was clicked
     clearHistoryClicked = pyqtSignal()
     #: Age-scoped clear; carries the day threshold.
     clearOldHistoryClicked = pyqtSignal(int)
@@ -297,6 +299,9 @@ class HistorySection(BackgroundRefreshMixin, CollapsibleSection):
         # identifying fact — but the time no longer closes it, because the
         # heading above the row now says when.
         marker = dto.episode_code or dto.detected_year
+        # The episode chip opens THAT episode in the details pane; the rest of the
+        # row opens the series (owner, 2026-11-23).
+        episode_chip = self._episode_chip(item, dto) if dto.episode_id and dto.episode_code else None
         row = build_chip_row(
             title=title,
             icon_role=media_icon_role(dto.media_type),
@@ -304,7 +309,7 @@ class HistorySection(BackgroundRefreshMixin, CollapsibleSection):
             # two rows for the same film apart, so it has to sit where the eye
             # compares them rather than in the right rail.
             title_chips=((CHIP_QUALITY, dto.detected_quality),),
-            chips=((CHIP_YEAR, marker), (CHIP_LANG, dto.detected_prefix)),
+            chips=(episode_chip or (CHIP_YEAR, marker), (CHIP_LANG, dto.detected_prefix)),
             meta=sidebar_meta_line(marker, humanize_ago(dto.last_played)),
             density=self._row_density(),
             trailing_button=trailing_button,
@@ -380,6 +385,23 @@ class HistorySection(BackgroundRefreshMixin, CollapsibleSection):
         if channel_id:
             self.historyItemClicked.emit(channel_id,
                                          item.data(_ROLE_EPISODE_ID) or "")
+
+    def _episode_chip(self, item: QListWidgetItem, dto) -> QPushButton:
+        """The row's S..E.. chip as a button: clicking it selects the row and shows
+        that episode's details, where a click anywhere else shows the series."""
+        chip = chip_widget(CHIP_YEAR, dto.episode_code)
+        chip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        cursor_affordance.set_clickable(chip, True)
+        chip.setToolTip(f"Show {dto.episode_code} in the details pane")
+        chip.clicked.connect(lambda _=False: self._on_episode_chip(item, dto.episode_id))
+        return chip
+
+    def _on_episode_chip(self, item: QListWidgetItem, episode_id: str) -> None:
+        # Select the row without announcing it, so its series does not load first.
+        self.history_list.blockSignals(True)
+        self.history_list.setCurrentItem(item)
+        self.history_list.blockSignals(False)
+        self.episodeSelected.emit(episode_id)
 
     def on_history_item_selected(self, current, previous):
         if not current:

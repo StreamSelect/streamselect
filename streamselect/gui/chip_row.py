@@ -553,7 +553,7 @@ def build_chip_row(
     *,
     title: str,
     icon_role: str = "",
-    chips: Sequence[tuple[str, str]] = (),
+    chips: Sequence["tuple[str, str] | QWidget"] = (),
     tail: str = "",
     news_text: str = "",
     meta: str = "",
@@ -587,7 +587,10 @@ def build_chip_row(
             :func:`media_icon_role`. Empty draws no glyph.
         chips: ``[(CHIP_QUALITY, "4K"), (CHIP_YEAR, "1985"), (CHIP_LANG, "EN")]``
             — drawn right-aligned in the given order, COMPACT density only.
-            Each is skipped when its text is empty.
+            Each is skipped when its text is empty. An entry may instead be a
+            chip the caller built with :func:`chip_widget` and keeps (History's
+            clickable episode chip); one it made clickable keeps the row
+            clickable too, as ``trailing_button`` does.
         tail: Terse muted text pinned to the right edge ("2h", "329m"), after the
             chips. Compact density only — it is where History spends the slot the
             language chip would otherwise take.
@@ -702,9 +705,11 @@ def build_chip_row(
     if not comfortable:
         # The right-aligned cluster. Chips carry what distinguishes THIS
         # section's rows — see each section for which it spends them on.
-        for kind, text in chips:
-            if text:
-                layout.addWidget(chip_widget(kind, text))
+        for chip in chips:
+            if isinstance(chip, QWidget):
+                layout.addWidget(chip)
+            elif chip[1]:
+                layout.addWidget(chip_widget(*chip))
         # BEFORE the tail, not after it. The tail is a COLUMN — History is a
         # list ordered by time and the times read down the rail — and an
         # optional button on the outside of it pushes that column left on the
@@ -762,6 +767,8 @@ def build_chip_row(
     row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
     # The one row floor, for every sidebar section. See ROW_LEADING_PX.
     row.setMinimumHeight(row_min_height())
-    if trailing_button is None:
+    clickable_chip = any(isinstance(c, QWidget) and not c.testAttribute(
+        Qt.WidgetAttribute.WA_TransparentForMouseEvents) for c in chips)
+    if trailing_button is None and not clickable_chip:
         row.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
     return row
