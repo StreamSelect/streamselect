@@ -1586,7 +1586,7 @@ class _ChannelListMixin:
                 is_vod_watched=all_watched,
             )
 
-        self._ctx_data_ready.emit(ctx, gx, gy)
+        self._ctx_data_ready.emit(self._with_history_episode(ctx), gx, gy)
 
     def _on_ctx_data_ready(self, ctx, gx: int, gy: int) -> None:
         """Main-thread handler: finish context, build menu, exec it."""
@@ -1782,7 +1782,7 @@ class _ChannelListMixin:
         elif surface == "favorites" and fav_section is not None:
             handlers["clear_unavailable"] = fav_section.clearUnavailableClicked.emit
 
-        return handlers
+        return {**handlers, **self._history_episode_handlers(ctx)}
 
     def _copy_title_to_clipboard(self, title: str) -> None:
         """Put *title* on the system clipboard and confirm in the status bar.

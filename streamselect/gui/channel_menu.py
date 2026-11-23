@@ -71,7 +71,7 @@ class ChannelMenuContext:
     has_unavailable: bool = False     # favorites/queue Clear-Unavailable enablement
     channel_name: str = ""
     user_category: str | None = None
-    entry_id: str = ""                # retry surface: identifies the StreamRetryEntry
+    entry_id: str = ""                # retry: the StreamRetryEntry; history: the episode the row names
     channel_found: bool = True        # retry surface: False when lookup returned None
     watch_progress: int = 0           # saved resume position in seconds (0 = unwatched/completed)
     watch_completed: bool = False     # True when VOD has been watched to completion
@@ -230,14 +230,15 @@ def _resume_from_label(c: ChannelMenuContext) -> str:
 
 
 def _is_resumable_vod(c: ChannelMenuContext) -> bool:
-    """True when the item is a non-live VOD with saved, incomplete progress."""
+    """True when the item is a non-live VOD with a saved position (a finished one
+    being rewatched keeps its watched mark and has one too). A series has one only
+    as a History row, carrying the position of the episode it names."""
     return (
         c.is_single
         and c.channel_found
         and not c.is_hidden
-        and c.media_type in ("movie",)
+        and c.media_type in ("movie", "series")
         and c.watch_progress > 0
-        and not c.watch_completed
     )
 
 

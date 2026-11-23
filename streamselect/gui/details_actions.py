@@ -43,12 +43,9 @@ def resume_state(
         resume from.
     """
     progress = int(watch_progress or 0)
-    # Resume is available for movies with a saved, incomplete position.
-    can_resume = (
-        str(media_type) == str(MediaType.MOVIE) and
-        progress > 0 and
-        not bool(watch_completed)
-    )
+    # Resume is available for movies with a saved position — a finished one being
+    # rewatched keeps its watched mark and still has one (owner, 2026-11-23).
+    can_resume = str(media_type) == str(MediaType.MOVIE) and progress > 0
     return (can_resume, progress)
 
 
@@ -199,6 +196,7 @@ class _ActionBar(QWidget):
         # set by enter_episode_mode(), cleared by exit_episode_mode() so a later
         # Browse / Play caption never carries a stale code.
         self._episode_code: str = ""
+        self._can_resume = False     # Resume shown: the primary button says "Start over"
         # "Currently playing" indicator state (green outline + live elapsed timer on
         # the Play button while the shown title is the one actively playing).
         self._is_playing: bool = False
@@ -452,6 +450,9 @@ class _ActionBar(QWidget):
         row collapses to a full-width Play (Qt skips the hidden item's stretch).
         """
         self.resume_button.setVisible(can_resume)
+        if can_resume != self._can_resume:
+            self._can_resume = can_resume
+            self._apply_primary_label()
         if can_resume and position_s > 0:
             minutes, secs = divmod(int(position_s), 60)
             self.resume_button.setText(f"Resume {minutes}:{secs:02d}")
@@ -488,6 +489,14 @@ class _ActionBar(QWidget):
             self.play_button.setText("Browse")
             self._paint_primary_icon("browse")
             self.play_button.setToolTip("Browse seasons & episodes")
+        elif self._can_resume:
+            # Beside Resume, the other choice is starting over; the episode code
+            # made it overflow (owner, 2026-11-23).
+            code = self._episode_code if self._primary_mode == "episode" else ""
+            self.play_button.setText("Start over")
+            self._paint_primary_icon("play")
+            self.play_button.setToolTip(f"Play {code} from the beginning" if code
+                                        else "Play from the beginning")
         elif self._primary_mode == "episode":
             code = self._episode_code
             self.play_button.setText(f"Play Episode: {code}" if code else "Play Episode")
@@ -528,7 +537,7 @@ class _ActionBar(QWidget):
         """
         self._episode_code = episode_code
         self.set_primary_mode("episode")
-        self.resume_button.hide()
+        self.set_resume(False)
         self._in_queue = False
         self._sync_queue_button()
         self.queue_button.setVisible(True)
@@ -696,7 +705,7 @@ class _ActionBar(QWidget):
         self._current_epg_title = ""
         self.set_epg_link_blocked(False)
         self.monitor_button.setVisible(False)
-        self.resume_button.setVisible(False)
+        self.set_resume(False)
         self.trailer_button.setVisible(False)
         self.watchlist_button.setChecked(False)
         self.clear_playing()

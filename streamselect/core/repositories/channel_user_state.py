@@ -193,9 +193,9 @@ class ChannelUserStateMixin:
         ``last_played_via``. When ``position_s / duration_s >= threshold`` the item
         is marked ``watch_completed`` and the resume point is cleared so a finished
         movie never resurfaces in "continue watching" at 99%. On a partial watch
-        (below threshold), ``watch_completed`` is explicitly cleared so that
-        re-watching a previously-finished title un-completes it — this restores the
-        invariant ``watch_progress > 0 ⟺ not watch_completed``. ``play_count`` is
+        (below threshold) the resume point is saved; a title already finished STAYS
+        watched, so a rewatch you stop halfway keeps its mark and its place in History
+        and gains a resume point (owner, 2026-11-23). ``play_count`` is
         owned by ``mark_played`` (at play start) — this method never touches it, so
         progress capture can't double-count a play.
 
@@ -212,12 +212,14 @@ class ChannelUserStateMixin:
         )
         channel.last_played = datetime.now()
         channel.last_played_via = played_via
-        channel.watch_percent = 100 if completed else pct
         if completed:
             channel.watch_completed = True
+            channel.watch_percent = 100
             channel.watch_progress = 0
         else:
-            channel.watch_completed = False  # re-watching a finished title un-completes it
+            # A rewatch of a finished title keeps it watched (see docstring);
+            # the percentage is how far into this play you are.
+            channel.watch_percent = pct
             channel.watch_progress = max(0, int(position_s))
         channel.updated_at = datetime.now()
         self.session.commit()

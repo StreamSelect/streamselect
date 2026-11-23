@@ -18,6 +18,7 @@ from loguru import logger
 from PyQt6.QtCore import Qt
 
 from streamselect.core.repositories import RepositoryFactory
+from streamselect.gui.sidebar.history import _ROLE_EPISODE_ID
 
 
 class _HistoryMixin:
@@ -39,7 +40,31 @@ class _HistoryMixin:
             return
         channel_id = item.data(Qt.ItemDataRole.UserRole)
         gp = list_widget.mapToGlobal(position)
-        self._show_context_menu_for(channel_id, gp.x(), gp.y(), "history")
+        # The episode a show's row names rides along, so the menu plays THAT one
+        # (as a double-click does) and can offer its resume point.
+        self._show_channel_menu([channel_id], "history", gp.x(), gp.y(),
+                                entry_id=item.data(_ROLE_EPISODE_ID) or "")
+
+    def _with_history_episode(self, ctx):
+        """Worker side of the menu: a History row's episode carries its saved position
+        (``ChannelMenuContext.watch_progress``), so Resume / Play from Beginning apply."""
+        if ctx.surface == "history" and ctx.entry_id:
+            with self.db.session_scope(commit=False) as session:
+                ep = RepositoryFactory(session).episodes.get_by_id(ctx.entry_id)
+                ctx.watch_progress = int(ep.watch_progress or 0) if ep is not None else 0
+        return ctx
+
+    def _history_episode_handlers(self, ctx) -> dict:
+        """A History row naming an episode plays that episode from the menu, the
+        way a double-click does; Resume and Play from Beginning target it too."""
+        ep = ctx.entry_id if ctx.surface == "history" else ""
+        if not ep:
+            return {}
+        return {
+            "play": lambda: self.play_from_history_id(ctx.channel_id, ep),
+            "resume_from": lambda: self.play_episode_by_id(ep, start_seconds=ctx.watch_progress),
+            "play_from_beginning": lambda: self.play_episode_by_id(ep, start_seconds=0),
+        }
 
     def _confirm_and_clear_history(self, *, title: str, question: str,
                                    purge, describe, also: tuple[str, object] | None = None) -> None:

@@ -105,6 +105,8 @@ class PlayableEpisodeDTO:
     season_id: str
     episode_num: int
     season_num: int
+    #: Saved resume position, seconds (0 = none); a row play resumes from it.
+    watch_progress: int = 0
 
 
 # ---------------------------------------------------------------------------

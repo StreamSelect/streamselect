@@ -269,7 +269,7 @@ class DetailsPaneWidget(QWidget):
         ):
             return  # stale response — user already moved on, or left episode mode
         self._action_bar.set_episode_queue_favorite(in_queue, is_favorite)
-        self._action_bar.set_resume(watch_progress > 0 and not watch_completed, watch_progress)
+        self._action_bar.set_resume(watch_progress > 0, watch_progress)
 
     def apply_channel_tags(self, channel_id: str, tags: list) -> None:
         """Called from main_window when the async tag load completes.

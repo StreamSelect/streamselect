@@ -60,15 +60,10 @@ def test_crossing_threshold_marks_completed_and_clears_resume(db):
         s.close()
 
 
-def test_rewatch_after_completion_clears_completed_and_sets_progress(db):
-    """Partial re-watch after completion un-marks the title (restores the invariant).
-
-    The old behaviour made completion 'sticky' (one-way). That caused a resume bug:
-    finishing a movie (completed=True, progress=0) then re-watching partway would
-    write progress=N but leave completed=True, blocking resume on the next open.
-    New behaviour: a partial play always clears completed so progress > 0 implies
-    not completed — the invariant that makes resume work correctly.
-    """
+def test_rewatch_after_completion_stays_watched_and_sets_progress(db):
+    """A partial re-watch of a finished movie keeps it watched and saves where you
+    stopped (owner, 2026-11-23). Every resume check reads the position alone now, so
+    the old "sticky completion blocks resume" bug cannot return."""
     _seed_movie(db)
     s = db.get_session()
     try:
@@ -76,7 +71,7 @@ def test_rewatch_after_completion_clears_completed_and_sets_progress(db):
         repo.record_watch_progress("m1", 2900, 3000)            # finish it
         repo.record_watch_progress("m1", 300, 3000)             # rewatch, stop at 10%
         ch = repo.get_by_id("m1")
-        assert bool(ch.watch_completed) is False, "re-watch un-completes; completion is no longer sticky"
+        assert bool(ch.watch_completed) is True, "a rewatch keeps the watched mark"
         assert ch.watch_progress == 300, "resume point tracks the partial rewatch"
     finally:
         s.close()

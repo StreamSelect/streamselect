@@ -138,8 +138,9 @@ def test_channel_completion_sets_completed_clears_progress(db):
 # 2. Channel: partial re-watch after completion clears watch_completed
 # ---------------------------------------------------------------------------
 
-def test_channel_partial_rewatch_clears_completed(db):
-    """Partial progress after a completed title clears watch_completed (invariant restored)."""
+def test_channel_partial_rewatch_stays_watched(db):
+    """Partial progress after a completed title keeps it watched and saves the
+    position (owner, 2026-11-23)."""
     _seed_channel(db, "movie2", watch_completed=True, watch_progress=0)
 
     with db.session_scope() as session:
@@ -149,7 +150,7 @@ def test_channel_partial_rewatch_clears_completed(db):
         )
 
     state = _read_channel(db, "movie2")
-    assert state["watch_completed"] is False
+    assert state["watch_completed"] is True
     assert state["watch_progress"] == 1200
     assert 14 <= state["watch_percent"] <= 16  # 1200/8000 = 15%
 
@@ -159,8 +160,8 @@ def test_channel_partial_rewatch_clears_completed(db):
 # ---------------------------------------------------------------------------
 
 def test_channel_stuck_row_is_healed_by_partial_progress(db):
-    """The exact bug: after finishing once (completed=True, progress=0), a partial
-    re-watch must clear watch_completed and set watch_progress=3914."""
+    """The original bug: after finishing once, a partial re-watch must save
+    watch_progress=3914 so it resumes there. It now also stays watched."""
     _seed_channel(db, "movie3")
 
     dur = 8000.0
@@ -184,9 +185,7 @@ def test_channel_stuck_row_is_healed_by_partial_progress(db):
         )
 
     state = _read_channel(db, "movie3")
-    assert state["watch_completed"] is False, (
-        "watch_completed must be cleared when progress is saved after a prior completion"
-    )
+    assert state["watch_completed"] is True, "a rewatch keeps the watched mark"
     assert state["watch_progress"] == 3914
     pct = state["watch_percent"]
     assert 48 <= pct <= 50, f"Expected ~49%, got {pct}%"
@@ -219,8 +218,8 @@ def test_episode_completion_sets_watched_and_completed(db):
 # 5. Episode: partial re-watch after completion clears both flags
 # ---------------------------------------------------------------------------
 
-def test_episode_partial_rewatch_clears_both_flags(db):
-    """Partial progress after a completed episode clears is_watched and watch_completed."""
+def test_episode_partial_rewatch_stays_watched(db):
+    """Partial progress after a completed episode keeps it watched (owner, 2026-11-23)."""
     _seed_episode(db, "ep2", watch_completed=True, is_watched=True, watch_progress=0)
 
     with db.session_scope() as session:
@@ -230,8 +229,8 @@ def test_episode_partial_rewatch_clears_both_flags(db):
         )
 
     state = _read_episode(db, "ep2")
-    assert state["watch_completed"] is False, "watch_completed must be cleared on partial re-watch"
-    assert state["is_watched"] is False, "is_watched must be cleared on partial re-watch"
+    assert state["watch_completed"] is True, "a rewatch keeps the watched mark"
+    assert state["is_watched"] is True
     assert state["watch_progress"] == 800
     assert 28 <= state["watch_percent"] <= 32  # 800/2700 ~= 29.6%
 

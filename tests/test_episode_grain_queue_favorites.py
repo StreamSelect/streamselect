@@ -32,6 +32,8 @@ All DB tests use a real file-backed Database (tmp_path), never :memory:, per the
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import sqlite3
 import uuid
 from pathlib import Path
@@ -550,7 +552,8 @@ class TestPlayEpisodeById:
         host.status_bar = MagicMock()
         wire_status_method(host)   # STATUS-1: play_episode_by_id calls self.status(...)
         played = []
-        host.play_episode = lambda episode: played.append(episode)
+        host.play_episode = lambda episode, **kw: played.append(episode)
+        host.config = SimpleNamespace(playback_resume_mode="resume")
 
         host.play_episode_by_id(ep_id)
 

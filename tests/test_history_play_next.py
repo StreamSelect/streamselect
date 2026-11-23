@@ -24,6 +24,8 @@ All DB tests use a real file-backed ``Database`` (tmp_path), never
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import uuid
 from unittest.mock import MagicMock
 
@@ -408,7 +410,8 @@ class TestPlayNextRoutesThroughPlayEpisodeById:
         host.status_bar = MagicMock()
         wire_status_method(host)
         played = []
-        host.play_episode = lambda episode: played.append(episode)
+        host.play_episode = lambda episode, **kw: played.append(episode)
+        host.config = SimpleNamespace(playback_resume_mode="resume")
 
         host.play_episode_by_id(emitted[0])
 

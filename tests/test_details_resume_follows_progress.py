@@ -72,7 +72,7 @@ def test_resume_state_is_the_one_predicate():
     assert resume_state(MediaType.MOVIE, 234, False) == (True, 234)
     assert resume_state(MediaType.MOVIE, 0, False) == (False, 0)
     assert resume_state(MediaType.LIVE, 50, False) == (False, 50)
-    assert resume_state(MediaType.MOVIE, 100, True) == (False, 100)
+    assert resume_state(MediaType.MOVIE, 100, True) == (True, 100), "a finished film being rewatched resumes"
     assert resume_state(None, None, None) == (False, 0)
 
 

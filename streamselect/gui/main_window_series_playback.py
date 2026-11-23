@@ -33,6 +33,7 @@ from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QTreeWidgetItem
 from loguru import logger
 
+from streamselect.core.playback_resume import default_start_seconds
 from streamselect.core.repositories import RepositoryFactory
 from streamselect.core.repositories.dtos import EpisodeDTO
 from streamselect.gui import playback_start_watch as _startwatch
@@ -149,7 +150,7 @@ class _SeriesPlaybackMixin:
                 self.status(f"Switched to the {data.get('label', 'other')} copy of this series")
                 self.drill_into_series(channel)
 
-    def play_episode_by_id(self, episode_id: str) -> None:
+    def play_episode_by_id(self, episode_id: str, start_seconds: int | None = None) -> None:
         """Resolve an episode_id to a PlayableEpisodeDTO and route through play_episode().
 
         The single chokepoint for surfaces that only know an episode's DB id — the
@@ -163,7 +164,13 @@ class _SeriesPlaybackMixin:
         if episode is None:
             self.status("This episode is no longer available", ms=0, level="warn")
             return
-        self.play_episode(episode)
+        # Resume or start over as Settings ▸ Playback says, unless the caller chose
+        # (a menu's Resume / Play from Beginning); these rows always started at 0
+        # before (owner, 2026-11-23).
+        if start_seconds is None:
+            start_seconds = default_start_seconds(episode.watch_progress,
+                                                  self.config.playback_resume_mode)
+        self.play_episode(episode, start_seconds=start_seconds)
 
     def play_episode(self, episode, queue_season: bool | None = None, start_seconds: int = 0):
         """Play an episode and optionally queue subsequent episodes.

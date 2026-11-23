@@ -180,6 +180,7 @@ def _handler_host():
     host.config = MagicMock()
     host._copy_title_to_clipboard = lambda t: _ChannelListMixin._copy_title_to_clipboard(host, t)
     host._build_handlers = lambda ctx: _ChannelListMixin._build_handlers(host, ctx)
+    host._history_episode_handlers = lambda ctx: {}    # History's episode overrides
     return host
 
 

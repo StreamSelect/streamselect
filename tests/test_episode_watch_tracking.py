@@ -151,15 +151,10 @@ def test_episode_record_progress_partial_does_not_complete(db):
         assert ep.watch_progress == 300
 
 
-def test_episode_rewatch_after_completion_clears_completed(db):
-    """Partial re-watch after completion un-marks the episode (restores the invariant).
-
-    The old behaviour made completion 'sticky'. That caused a resume bug where
-    re-watching a finished episode would write watch_progress > 0 but leave
-    watch_completed=True, blocking resume. New behaviour: a partial play always
-    clears both is_watched and watch_completed so progress > 0 implies not
-    completed — consistent with ChannelRepository's behaviour.
-    """
+def test_episode_rewatch_after_completion_stays_watched_with_a_resume_point(db):
+    """A partial re-watch of a finished episode keeps it watched and saves where you
+    stopped (owner, 2026-11-23: starting it over had un-marked it and dropped it
+    from History). Resume reads the position alone, so it still resumes."""
     _seed_episode(db)
     with db.session_scope() as session:
         from streamselect.core.repositories import RepositoryFactory
@@ -167,8 +162,8 @@ def test_episode_rewatch_after_completion_clears_completed(db):
         repo.record_watch_progress("e1", 1450, 1500)   # complete
         repo.record_watch_progress("e1", 300, 1500)    # rewatch, stop early
         ep = repo.get_by_id("e1")
-        assert bool(ep.watch_completed) is False, "re-watch un-completes; completion is no longer sticky"
-        assert bool(ep.is_watched) is False, "is_watched must also be cleared on partial re-watch"
+        assert bool(ep.watch_completed) is True, "a rewatch keeps the watched mark"
+        assert bool(ep.is_watched) is True
         assert ep.watch_progress == 300, "resume point tracks the partial rewatch"
 
 

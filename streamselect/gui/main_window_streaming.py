@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import QApplication
 
 from streamselect.core import epg_utils as _epg
 from streamselect.core.channel_name_utils import parse_channel_name as _pcn
+from streamselect.core.playback_resume import default_start_seconds
 from streamselect.core.repositories import RepositoryFactory
 from streamselect.core.repositories.provider import persist_url_stats
 from streamselect.gui.stale_source_offer import read_last_refresh, stale_source_offer
@@ -260,8 +261,7 @@ class _StreamingMixin(_WatchCaptureMixin):
             start_seconds = start_override if not is_live else 0
         elif not is_live and watch_progress > 0:
             # VOD with a saved resume position: apply the user's default mode.
-            resume_mode = getattr(self.config, "playback_resume_mode", "resume")
-            start_seconds = watch_progress if resume_mode == "resume" else 0
+            start_seconds = default_start_seconds(watch_progress, self.config.playback_resume_mode)
         else:
             start_seconds = 0
 

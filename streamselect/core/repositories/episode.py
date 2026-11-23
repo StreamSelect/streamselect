@@ -119,6 +119,7 @@ class EpisodeRepository:
             season_id=ep.season_id,
             episode_num=ep.episode_num,
             season_num=ep.season_num,
+            watch_progress=int(ep.watch_progress or 0),
         )
 
     def get_favorites_dto(
@@ -227,8 +228,8 @@ class EpisodeRepository:
             # No manual play ever — fall back to old behaviour so history still works.
             return self.get_last_played_dto(series_id=series_id, provider_id=provider_id)
 
-        if not engaged.watch_completed:
-            # Resume inside the engaged episode.
+        if not engaged.watch_completed or (engaged.watch_progress or 0) > 0:
+            # Resume inside the engaged episode (also a finished one being rewatched).
             return PlayableEpisodeDTO(
                 id=engaged.id,
                 title=engaged.title,
@@ -487,9 +488,10 @@ class EpisodeRepository:
         sets ``watch_progress`` (resume seconds), ``last_played``, and
         ``last_played_via``; at ``>= threshold`` marks ``is_watched`` and
         ``watch_completed``, clearing the resume point. On a partial watch (below
-        threshold), both ``is_watched`` and ``watch_completed`` are explicitly
-        cleared so that re-watching a previously-finished episode un-completes it —
-        this restores the invariant ``watch_progress > 0 ⟺ not watch_completed``.
+        threshold) the resume point is saved; an episode already finished STAYS
+        watched — a rewatch you stop halfway keeps its watched mark and its place in
+        History, and gains a resume point (owner, 2026-11-23). Only "Mark unwatched"
+        or answering No to "Did you watch them?" takes the mark back.
         ``play_count`` is owned by ``mark_played``.
 
         Returns True if this call marked the episode watched.
@@ -505,14 +507,15 @@ class EpisodeRepository:
         )
         episode.last_played = datetime.now()
         episode.last_played_via = played_via
-        episode.watch_percent = 100 if completed else pct
         if completed:
             episode.is_watched = True
             episode.watch_completed = True
+            episode.watch_percent = 100
             episode.watch_progress = 0
         else:
-            episode.is_watched = False      # re-watching a finished episode un-completes it
-            episode.watch_completed = False  # mirrors the completed branch, inverted
+            # A rewatch of a finished episode keeps it watched (see docstring);
+            # the percentage is how far into this play you are.
+            episode.watch_percent = pct
             episode.watch_progress = max(0, int(position_s))
         episode.updated_at = datetime.now()
         self.session.commit()
