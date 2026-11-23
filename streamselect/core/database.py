@@ -64,10 +64,9 @@ class ChannelDB(Base):
     #: edited keeps an ancient timestamp and is indistinguishable from one that
     #: has vanished.
     #:
-    #: NULL means "never observed under this scheme" and is NEVER pruned. The backfill
-    #: stamps every existing row once, so a NULL afterwards can only be a row inserted
-    #: by something that bypassed the catalog upsert — deleting on an absence of evidence
-    #: is exactly the mistake an earlier change recorded about inferring a first launch from empty lists.
+    #: NULL means "never observed under this scheme" and is NEVER pruned: after the one
+    #: backfill a NULL is a row that bypassed the catalog upsert, and deleting on an
+    #: absence of evidence is the first-launch-from-empty-lists mistake.
     last_seen_at = Column(DateTime, index=True)
     is_adult = Column(Boolean, default=False)  # partial index, see __table_args__
     is_rec_suppressed = Column(Boolean, default=False)  # hidden from recommendations only — partial index, see __table_args__
@@ -77,6 +76,7 @@ class ChannelDB(Base):
     watch_progress = Column(Integer, default=0)        # resume position, seconds
     watch_completed = Column(Boolean, default=False)  # ever finished (≥ threshold) — partial index, see __table_args__
     watch_percent = Column(Integer, default=0)         # 0–100: % watched at last capture (graduated glyph)
+    furthest_position = Column(Integer, default=0)     # furthest point reached, seconds (History's measure)
     last_played_via = Column(String)                   # how it was played: manual | queue | alert
 
     raw_data = Column(JSON)
@@ -529,11 +529,9 @@ class EpisodeDB(Base):
     stream_url = Column(Text)  # Cached playback URL
     cover_url = Column(Text)  # Episode thumbnail for future use
 
-    # Episode-grain metadata lifted from raw_data at ingestion (Wave 4 — an earlier change).
-    # raw_data always carried this verbatim from the provider; these columns are
-    # the ONE place it's parsed out (compute-once-at-ingestion, the project rules) so
-    # render code never re-reads raw_data. All nullable, no masking defaults —
-    # NULL means "the provider didn't send it", not "unrated"/"no plot".
+    # Episode-grain metadata lifted from raw_data at ingestion: the ONE place it is
+    # parsed out (compute once at ingestion), so render code never re-reads raw_data.
+    # All nullable, no masking defaults: NULL means "the provider didn't send it".
     plot = Column(Text)        # Episode-specific overview/plot (falls back to the series plot in the UI)
     air_date = Column(String)  # Provider's ISO date verbatim, e.g. "1968-09-20" — never parsed to a date type
     rating = Column(Float)     # Episode rating (typically 0-10); junk source values coerce to None, never raise
@@ -544,6 +542,7 @@ class EpisodeDB(Base):
     watch_progress = Column(Integer, default=0)  # resume position, seconds
     watch_completed = Column(Boolean, default=False, index=True)  # sticky completion flag (mirrors ChannelDB)
     watch_percent = Column(Integer, default=0)   # 0–100: % watched at last capture (graduated glyph)
+    furthest_position = Column(Integer, default=0)  # furthest point reached, seconds (History's measure)
     last_played = Column(DateTime, index=True)
     play_count = Column(Integer, default=0)
     last_played_via = Column(String)             # how it was played: manual | queue | alert

@@ -146,6 +146,7 @@ class ChannelUserStateMixin:
             channel.watch_completed = False
             channel.watch_percent = 0
             channel.watch_progress = 0
+            channel.furthest_position = 0
         channel.updated_at = datetime.now()
         self.session.commit()
         logger.info(f"Marked channel {channel.name} as {'watched' if watched else 'unwatched'}")
@@ -172,6 +173,7 @@ class ChannelUserStateMixin:
                 channel.watch_completed = False
                 channel.watch_percent = 0
                 channel.watch_progress = 0
+                channel.furthest_position = 0
             channel.updated_at = datetime.now()
             updated += 1
         if updated:
@@ -212,6 +214,7 @@ class ChannelUserStateMixin:
         )
         channel.last_played = datetime.now()
         channel.last_played_via = played_via
+        channel.furthest_position = max(int(channel.furthest_position or 0), int(position_s))
         if completed:
             channel.watch_completed = True
             channel.watch_percent = 100

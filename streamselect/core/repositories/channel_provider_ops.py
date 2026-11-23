@@ -331,6 +331,7 @@ class ChannelProviderOpsMixin:
         live.watch_progress = merged_watch_progress
         live.watch_percent = merged_watch_percent
         live.watch_completed = merged_watch_completed
+        live.furthest_position = max(int(live.furthest_position or 0), int(orphan.furthest_position or 0))
         live.updated_at = now
 
         orphan.is_favorite = False
@@ -339,6 +340,7 @@ class ChannelProviderOpsMixin:
         orphan.watch_progress = 0
         orphan.watch_completed = False
         orphan.watch_percent = 0
+        orphan.furthest_position = 0
         orphan.last_played_via = None
         orphan.updated_at = now
 

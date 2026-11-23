@@ -26,10 +26,12 @@ from streamselect.core.models import MediaType
 def counts_in_history(model, min_seconds: int):
     """Whether a played movie or episode row (``ChannelDB`` / ``EpisodeDB``) was
     watched long enough for History: finished, or played at least ``min_seconds``
-    (Settings ▸ Sidebar "Show in History after"). A finished one has its resume
-    point cleared to 0, so ``watch_completed`` is what keeps it in."""
+    (Settings ▸ Sidebar "Show in History after"), judged by the FURTHEST point a play
+    reached, so jumping back to rewatch the opening keeps it (owner, 2026-11-23). A
+    finished one has its resume point cleared to 0, so ``watch_completed`` keeps it."""
     return and_(model.last_played.isnot(None),
-                or_(model.watch_completed.is_(True), model.watch_progress >= min_seconds))
+                or_(model.watch_completed.is_(True), model.watch_progress >= min_seconds,
+                    model.furthest_position >= min_seconds))
 
 
 class _ChannelHistoryMixin:

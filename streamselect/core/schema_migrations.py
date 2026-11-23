@@ -55,6 +55,10 @@ COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("episodes",     "watch_completed",            "INTEGER DEFAULT 0"),
     ("channels",     "watch_percent",              "INTEGER DEFAULT 0"),
     ("episodes",     "watch_percent",              "INTEGER DEFAULT 0"),
+    # The furthest point a play reached: jumping back to rewatch the opening no
+    # longer drops an episode from History (owner, 2026-11-23).
+    ("channels",     "furthest_position",          "INTEGER DEFAULT 0"),
+    ("episodes",     "furthest_position",          "INTEGER DEFAULT 0"),
     ("channels",     "tag_fingerprint",            "TEXT"),
     ("channels",     "content_key",                "TEXT"),
     ("channels",     "detected_audio",             "TEXT"),

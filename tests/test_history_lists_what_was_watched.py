@@ -198,3 +198,42 @@ def test_the_setting_is_on_the_sidebar_page_and_saves(qtbot, monkeypatch):
     spin.setValue(12)
     dlg._save_values()
     assert cfg.history_min_minutes == 12
+
+
+class TestTheFurthestPointCounts:
+    """Owner, 2026-11-23: watched minutes into S04E02, jumped back to the opening,
+    stopped at 0:55 — and History left it out, judging by where the play ended."""
+
+    def test_jumping_back_keeps_the_furthest_point_and_the_resume_point(self, db):
+        from streamselect.core.database import EpisodeDB
+        from streamselect.core.repositories import RepositoryFactory
+
+        _channel(db, "The Show", "series", source_id="s1")
+        ep = _episode(db, "s1", 2, ago_min=1)
+        with db.session_scope() as session:
+            repo = RepositoryFactory(session).episodes
+            for pos in (60, 300, 540, 20, 55):       # watched to 9:00, back to the start
+                repo.record_watch_progress(ep, pos, 2640)
+        with db.session_scope() as session:
+            row = session.get(EpisodeDB, ep)
+            assert (row.watch_progress, row.furthest_position) == (55, 540)
+        assert "The Show" in _history(db), "nine minutes in counts, wherever it stopped"
+
+    def test_a_movie_too(self, db):
+        from streamselect.core.repositories import RepositoryFactory
+        cid = _channel(db, "A Movie", "movie")
+        with db.session_scope() as session:
+            repo = RepositoryFactory(session).channels
+            repo.record_watch_progress(cid, 900, 6000)
+            repo.record_watch_progress(cid, 40, 6000)
+        assert "A Movie" in _history(db)
+
+    def test_marking_it_unwatched_forgets_the_furthest_point(self, db):
+        from streamselect.core.repositories import RepositoryFactory
+        _channel(db, "The Show", "series", source_id="s1")
+        ep = _episode(db, "s1", 2, ago_min=1)
+        with db.session_scope() as session:
+            RepositoryFactory(session).episodes.record_watch_progress(ep, 540, 2640)
+        with db.session_scope() as session:
+            RepositoryFactory(session).episodes.mark_watched_bulk([ep], False)
+        assert "The Show" not in _history(db)

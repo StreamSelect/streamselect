@@ -407,6 +407,7 @@ class EpisodeRepository:
             episode.watch_completed = False
             episode.watch_percent = 0
             episode.watch_progress = 0
+            episode.furthest_position = 0
         episode.updated_at = datetime.now()
         self.session.commit()
         logger.info(f"Marked episode {episode.title} as {'watched' if watched else 'unwatched'}")
@@ -441,6 +442,7 @@ class EpisodeRepository:
                 episode.watch_completed = False
                 episode.watch_percent = 0
                 episode.watch_progress = 0
+                episode.furthest_position = 0
                 # Provenance goes with the watch: leaving a stale "manual"/"queue"
                 # here made the row disagree with the DTO the series tree builds
                 # for an unwatched episode (which has always been None), so the
@@ -507,6 +509,7 @@ class EpisodeRepository:
         )
         episode.last_played = datetime.now()
         episode.last_played_via = played_via
+        episode.furthest_position = max(int(episode.furthest_position or 0), int(position_s))
         if completed:
             episode.is_watched = True
             episode.watch_completed = True

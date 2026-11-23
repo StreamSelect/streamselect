@@ -42,9 +42,9 @@ SCOPE_ALL = "all"            # expired, switched off, or removed
 REMOVED_SOURCE = "a removed source"
 #: The watch-history columns that move with an item (``ChannelDB``).
 HISTORY_FIELDS = ("last_played", "play_count", "watch_progress", "watch_percent",
-                  "watch_completed", "last_played_via")
+                  "watch_completed", "last_played_via", "furthest_position")
 _CLEARED = {"last_played": None, "play_count": 0, "watch_progress": 0, "watch_percent": 0,
-            "watch_completed": False, "last_played_via": None}
+            "watch_completed": False, "last_played_via": None, "furthest_position": 0}
 _QUEUE_FIELDS = ("channel_id", "channel_name", "media_type", "source_id")
 
 
