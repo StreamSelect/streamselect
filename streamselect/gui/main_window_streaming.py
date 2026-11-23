@@ -851,14 +851,9 @@ class _StreamingMixin(_WatchCaptureMixin):
     def _provider_max_connections(self, provider_id: str) -> int:
         """Resolve a provider's stream capacity for the connection accountant.
 
-        Trivial single-row PK lookup — safe to run inline per the async-DB-
-        reads rule (the design notes). Falls
-        back to 1 (the ``ProviderDB.max_connections`` column default) on any
-        lookup failure so a missing/errored provider never silently grants
-        unlimited connections.
-
-        This is the ONE helper every play-launch call site uses to fetch
-        ``provider_max_connections`` — never re-query it per call site.
+        A single-row PK lookup, safe inline. Falls back to 1 (the column default)
+        on any failure, so an errored provider never grants unlimited connections.
+        The ONE helper every play-launch call site uses for it.
 
         Args:
             provider_id: The provider whose ``max_connections`` to fetch.
@@ -874,6 +869,16 @@ class _StreamingMixin(_WatchCaptureMixin):
         except Exception as e:
             logger.debug(f"provider-max-connections lookup failed for {provider_id}: {e}")
         return 1
+
+    def _channel_is_live(self, channel_id: str) -> bool:
+        """Whether *channel_id* is a live channel (a PK lookup, inline like the one above)."""
+        try:
+            with self.db.session_scope(commit=False) as session:
+                channel = RepositoryFactory(session).channels.get_by_id(channel_id) if channel_id else None
+                return channel is not None and channel.media_type == "live"
+        except Exception as e:
+            logger.debug(f"live lookup failed for {channel_id}: {e}")
+            return False
 
     def _provider_display_name(self, provider_id: str) -> str:
         """Return a provider's display name for the capacity-warning toast (trivial PK read)."""
@@ -905,14 +910,8 @@ class _StreamingMixin(_WatchCaptureMixin):
         site), pre-flights the connection accountant via
         ``PlayerManager.check_capacity``, and either plays immediately or
         shows a "connection limit reached" warning with a "Play anyway
-        (replace oldest)" escape hatch instead of silently failing — this is
-        the only place today that path is reachable (force_new_window opening
-        a second window for a provider already playing in the shared window,
-        or ``player_mode == "multiple-instances"``; see
-        ``connection_accountant.py`` module docstring).
-
-        Same bool return contract as ``player_manager.play()`` — a drop-in
-        replacement at every call site.
+        (replace oldest)" escape hatch instead of silently failing (see
+        ``connection_accountant.py``). Same bool return as ``player_manager.play()``.
         """
         max_conn = self._provider_max_connections(provider_id) if provider_id else 1
         preview = self.player_manager.check_capacity(
@@ -934,6 +933,7 @@ class _StreamingMixin(_WatchCaptureMixin):
             open_ended_buffer=open_ended_buffer,
             deep_buffer=deep_buffer,
             channel_id=channel_id,
+            live=self._channel_is_live(channel_id),
         )
 
     def play_trailer(self, url: str, title: str) -> None:
@@ -1031,7 +1031,7 @@ class _StreamingMixin(_WatchCaptureMixin):
                 provider_id=_pid,
                 provider_max_connections=self._provider_max_connections(_pid),
                 force_new_window=_fnw, start_seconds=_ss, open_ended_buffer=_oeb,
-                deep_buffer=_deep, channel_id=_cid,
+                deep_buffer=_deep, channel_id=_cid, live=self._channel_is_live(_cid),
             )
 
         plural = "s" if preview.capacity != 1 else ""

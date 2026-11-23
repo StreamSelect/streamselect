@@ -477,21 +477,21 @@ class MPVPlayer(PlayerPlugin):
         open_ended_buffer: bool = False,
         deep_buffer: bool = False,
         channel_id: str = "",
+        live: bool = False,
     ) -> bool:
         """Play *url* in the instance identified by *instance_key*.
 
         In single-instance mode:
         - If the instance for *instance_key* is not running, launch it.
-        - Send ``loadfile … replace`` over its IPC socket, with a per-file
-          ``start=`` option when *start_seconds* > 0 so mpv begins at the
-          saved resume position (no seek-after-load race).
-        - Fall back to a new standalone process if IPC fails.
+        - Send ``loadfile … replace`` over its IPC socket, with this stream's
+          per-file options (``_file_options``: resume point, subtitles off).
+        - Fall back to a new standalone process if that fails, with the same
+          options and buffer mode.
 
-        When *open_ended_buffer* is True, a standalone process is always
-        launched with the open-ended disk-backed cache args (see
-        ``_open_ended_buffer_args``), regardless of ``single_instance`` mode.
-        This is a per-play variant — the normal ``play_media`` path and the
-        configured buffer profile are unchanged.
+        When *open_ended_buffer* is True, the window for *instance_key* is
+        relaunched with the open-ended disk-backed cache args (buffer settings
+        cannot change over IPC). A per-play variant: the configured buffer
+        profile is unchanged.
 
         When *deep_buffer* is True ("Buffer without limit", VOD-only), mpv is
         launched with the same open-ended disk-backed cache flags PLUS
@@ -525,6 +525,8 @@ class MPVPlayer(PlayerPlugin):
                 deep-cache recording deterministically (``<channel_id>.ts``) so
                 a later slice can find it for save/keep/promotion. Ignored
                 unless *deep_buffer* is True.
+            live: A live channel. With ``live_subtitles_off`` set, it starts with
+                no subtitle track (live captions are typed as it airs, and lag).
 
         Returns:
             True if the stream was handed off to mpv, False on failure.
@@ -534,12 +536,14 @@ class MPVPlayer(PlayerPlugin):
         logger.info(f"  Mode: {'single-instance' if self.single_instance else 'new-instance'}")
         if start_seconds:
             logger.info(f"  Resume: {start_seconds}s")
-        if open_ended_buffer:
-            logger.info("  Open-ended buffer mode: disk-backed 2GiB / 3600s readahead")
+        subtitles_off = live and self.config.live_subtitles_off
+        # What this one stream needs, whichever way it ends up being started. Every
+        # launch below takes exactly this, so no route can drop part of it.
+        launch: dict = {"start_seconds": start_seconds, "subtitles_off": subtitles_off}
+        launch_args: list[str] | None = None   # None: the window's usual args will do
 
-        # Deep-cache ("Buffer without limit", VOD-only) — same baked-in-at-launch
-        # constraint as open-ended buffer, plus a pre-flight (cap sweep / disk-space
-        # refusal) and a --stream-record file to manage.  Checked first so a caller
+        # Deep-cache ("Buffer without limit", VOD-only): a pre-flight (cap sweep /
+        # disk-space refusal) and a --stream-record file. Checked first so a caller
         # that (incorrectly) sets both flags gets deep-cache behavior.
         if deep_buffer:
             ok, message = self._deep_cache_preflight()
@@ -548,157 +552,76 @@ class MPVPlayer(PlayerPlugin):
                 logger.warning(f"Deep buffer refused for {title!r}: {message}")
                 return False
             self.last_deep_cache_message = ""
-
             size = getattr(self.config, "default_cache_size", "auto")
             if size and size != "auto":
-                # default_cache_size normally bypasses the profile system entirely
-                # (see _compose_extra_args) — deep mode is an explicit one-off user
-                # action asking for the largest possible buffer, so it intentionally
-                # overrides that power-user setting rather than being silently
-                # capped by it. Must be logged per the deep-cache design note.
+                # Deep mode is an explicit one-off request for the largest buffer, so it
+                # overrides default_cache_size rather than being capped by it (logged
+                # per the deep-cache design note).
                 logger.info(
                     f"Deep buffer: bypassing explicit default_cache_size={size!r} — "
                     "deep mode always uses the full open-ended disk-backed cache."
                 )
             record_path = str(self._deep_cache_record_path(channel_id))
             logger.info(f"  Deep-cache buffer mode: recording to {record_path}")
+            launch.update(deep_buffer=True, record_path=record_path)
+            launch_args = self._compose_deep_cache_args(record_path)
+        elif open_ended_buffer:
+            logger.info("  Open-ended buffer mode: disk-backed 2GiB / 3600s readahead")
+            launch.update(open_ended_buffer=True)
+            launch_args = self._compose_open_ended_buffer_args()
 
-            if self.single_instance:
-                if not self._relaunch_instance(
-                    instance_key,
-                    self._compose_deep_cache_args(record_path),
-                    record_path=record_path,
-                ):
-                    logger.warning(
-                        f"Could not relaunch instance [{instance_key}] with deep-cache args, "
-                        "falling back to standalone process"
-                    )
-                    return self._launch_new_instance(
-                        url, title, start_seconds=start_seconds,
-                        deep_buffer=True, record_path=record_path,
-                    )
+        if not self.single_instance:
+            # Multiple-instances mode: every play is a new window. NOTE: standalone
+            # launches aren't tracked in _instances, so a deep-cache file here relies
+            # on the startup sweep for cleanup.
+            return self._launch_new_instance(url, title, **launch)
 
-                if start_seconds > 0:
-                    per_file_opts = f"start={start_seconds}"
-                    command = {"command": ["loadfile", url, "replace", 0, per_file_opts],
-                               "request_id": 1}
-                else:
-                    command = {"command": ["loadfile", url, "replace"], "request_id": 1}
-
-                if self._send_ipc_command(command, instance_key):
-                    title_command = {
-                        "command": ["set_property", "force-media-title", title],
-                        "request_id": 2,
-                    }
-                    self._send_ipc_command(title_command, instance_key)
-                    self._last_key = instance_key
-                    logger.info(
-                        f"Sent to mpv instance [{instance_key}] (deep-cache buffer): {title}"
-                    )
-                    return True
-                else:
-                    logger.warning(
-                        f"IPC command failed after deep-cache relaunch [{instance_key}], "
-                        "falling back to standalone process"
-                    )
-                    return self._launch_new_instance(
-                        url, title, start_seconds=start_seconds,
-                        deep_buffer=True, record_path=record_path,
-                    )
-
-            # multiple-instances mode — no IPC; spawn a plain standalone process. NOTE: standalone
-            # (multi-instance) launches aren't tracked in _instances at all (pre-existing gap, same
-            # as open-ended buffer), so this file relies on the startup sweep for cleanup rather
-            # than a symmetric stop()/cleanup() purge.
-            return self._launch_new_instance(
-                url, title, start_seconds=start_seconds,
-                deep_buffer=True, record_path=record_path,
-            )
-
-        # Open-ended buffer requires baking the large cache args in at process start — mpv's cache
-        # settings cannot be patched via IPC loadfile per-file options. In single-instance mode:
-        # relaunch the SAME key's instance with the open-ended args, then send ``loadfile`` over
-        # IPC exactly as a normal play does.  This keeps the window in the same mpv instance slot
-        # so the playback-health readout (which polls by key) continues to work, and avoids
-        # spawning a separate orphan window. In multiple-instances mode (no IPC/keying): fall
-        # through to the standalone-process path below (same as before).
-        if open_ended_buffer and self.single_instance:
-            if not self._relaunch_instance(instance_key, self._compose_open_ended_buffer_args()):
-                logger.warning(
-                    f"Could not relaunch instance [{instance_key}] with open-ended buffer args, "
-                    "falling back to standalone process"
-                )
-                return self._launch_new_instance(url, title, start_seconds=start_seconds,
-                                                 open_ended_buffer=True)
-
-            # IPC is now ready on the relaunched instance — load the URL.
-            if start_seconds > 0:
-                per_file_opts = f"start={start_seconds}"
-                command = {"command": ["loadfile", url, "replace", 0, per_file_opts],
-                           "request_id": 1}
-            else:
-                command = {"command": ["loadfile", url, "replace"], "request_id": 1}
-
-            if self._send_ipc_command(command, instance_key):
-                title_command = {
-                    "command": ["set_property", "force-media-title", title],
-                    "request_id": 2,
-                }
-                self._send_ipc_command(title_command, instance_key)
-                self._last_key = instance_key
-                logger.info(
-                    f"Sent to mpv instance [{instance_key}] (open-ended buffer): {title}"
-                )
-                return True
-            else:
-                logger.warning(
-                    f"IPC command failed after open-ended relaunch [{instance_key}], "
-                    "falling back to standalone process"
-                )
-                return self._launch_new_instance(url, title, start_seconds=start_seconds,
-                                                 open_ended_buffer=True)
-
-        if open_ended_buffer:
-            # multiple-instances mode — no IPC; spawn a plain standalone process.
-            return self._launch_new_instance(url, title, start_seconds=start_seconds,
-                                             open_ended_buffer=True)
-
-        if self.single_instance:
-            if not self._ensure_instance_running(instance_key):
-                logger.warning(
-                    f"Could not start instance [{instance_key}], falling back to new instance"
-                )
-                return self._launch_new_instance(url, title)
-
-            # Per-file options string: "start=<N>" starts at a saved position
-            # without a post-load seek race.  The 4th argument to loadfile is
-            # the per-file options count (0 = none), but mpv IPC uses a
-            # positional string argument for per-file opts (mpv docs: the 4th
-            # element is the options string as a comma-separated key=value list).
-            if start_seconds > 0:
-                per_file_opts = f"start={start_seconds}"
-                command = {"command": ["loadfile", url, "replace", 0, per_file_opts], "request_id": 1}
-            else:
-                command = {"command": ["loadfile", url, "replace"], "request_id": 1}
-
-            if self._send_ipc_command(command, instance_key):
-                title_command = {
-                    "command": ["set_property", "force-media-title", title],
-                    "request_id": 2,
-                }
-                self._send_ipc_command(title_command, instance_key)
-
-                self._last_key = instance_key
-                logger.info(f"Sent to mpv instance [{instance_key}]: {title}")
-                return True
-            else:
-                logger.warning(
-                    f"IPC command failed [{instance_key}], falling back to new instance"
-                )
-                return self._launch_new_instance(url, title)
+        # Buffer settings are baked in at process start and cannot be patched over
+        # IPC, so a buffer mode relaunches THIS key's window with its args (keeping
+        # the slot the health readout polls); a normal play reuses the window.
+        if launch_args is not None:
+            ready = self._relaunch_instance(
+                instance_key, launch_args, record_path=launch.get("record_path", ""))
         else:
-            # Multiple-instances mode: every play = new window.
-            return self._launch_new_instance(url, title)
+            ready = self._ensure_instance_running(instance_key)
+        if ready and self._load_into(instance_key, url, title, **launch):
+            return True
+        logger.warning(f"Could not play in instance [{instance_key}], "
+                       "falling back to a standalone process")
+        return self._launch_new_instance(url, title, **launch)
+
+    @staticmethod
+    def _file_options(start_seconds: int = 0, subtitles_off: bool = False) -> dict[str, str]:
+        """The options that belong to one stream rather than to the window.
+
+        The one list both launch routes read: ``loadfile``'s per-file options
+        string and a standalone process's command line.
+        """
+        options: dict[str, str] = {}
+        if start_seconds > 0:
+            options["start"] = str(start_seconds)   # begin at the resume point, no seek race
+        if subtitles_off:
+            options["sid"] = "no"
+        return options
+
+    def _load_into(self, key: str, url: str, title: str, *, start_seconds: int = 0,
+                   subtitles_off: bool = False, **_launch_only) -> bool:
+        """Load *url* into the running window *key* over IPC and title it.
+
+        ``loadfile <url> replace <index> <options>``: mpv takes the per-file
+        options as one comma-separated ``key=value`` string after the index.
+        """
+        options = self._file_options(start_seconds, subtitles_off)
+        command = ["loadfile", url, "replace"]
+        if options:
+            command += [0, ",".join(f"{k}={v}" for k, v in options.items())]
+        if not self._send_ipc_command({"command": command, "request_id": 1}, key):
+            return False
+        self._send_ipc_command(
+            {"command": ["set_property", "force-media-title", title], "request_id": 2}, key)
+        self._last_key = key
+        logger.info(f"Sent to mpv instance [{key}]: {title}")
+        return True
 
     def queue(
         self,
@@ -769,6 +692,7 @@ class MPVPlayer(PlayerPlugin):
         open_ended_buffer: bool = False,
         deep_buffer: bool = False,
         record_path: str = "",
+        subtitles_off: bool = False,
     ) -> bool:
         """Launch a standalone (no-IPC) mpv process for *url*.
 
@@ -786,6 +710,7 @@ class MPVPlayer(PlayerPlugin):
                 + start-paused); wins over ``open_ended_buffer`` if both are set.
             record_path: The ``--stream-record`` target path — required (and
                 only used) when ``deep_buffer`` is True.
+            subtitles_off: Start with no subtitle track (``--sid=no``).
 
         Returns:
             True if the process was spawned successfully.
@@ -800,8 +725,8 @@ class MPVPlayer(PlayerPlugin):
 
             cmd = ([_resolve_mpv_binary(), f"--force-media-title={title}",
                     "--msg-level=all=warn,cplayer=info"] + extra_args)
-            if start_seconds > 0:
-                cmd.append(f"--start={start_seconds}")
+            cmd += [f"--{k}={v}" for k, v in
+                    self._file_options(start_seconds, subtitles_off).items()]
             cmd.append(url)
 
             logger.info(f"Launching new mpv instance: {' '.join(cmd[:3])}...")

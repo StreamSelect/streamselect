@@ -724,7 +724,6 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     close_player_when_finished: bool = True  # Close player when stream finishes (mpv --keep-open=no)
     max_player_instances: int = 1  # Max player instances (0 = use provider's max_connections, -1 = unlimited)
     split_streams_by_source: bool = False  # one mpv window per source (keyed by provider_id) when True
-    
     # MPV-specific settings
     mpv_extra_args: list = Field(default_factory=list)  # Additional args like ["--cache=yes", "--demuxer-max-bytes=50M"]
     
@@ -734,6 +733,7 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     prebuffer_before_play: bool = False  # pause at startup until the cache pre-fills (mpv --cache-pause-initial)
     prebuffer_wait_secs: int = 10        # seconds of cache to buffer before unpausing (--cache-pause-wait)
     normalize_volume: bool = Field(default=False, json_schema_extra=PROFILE)  # lift quiet voices, even out loudness
+    live_subtitles_off: bool = Field(default=False, json_schema_extra=PROFILE)  # live channels start with no subtitle track
     audio_downmix: str = Field(default="auto", json_schema_extra=PROFILE)  # "auto" | "stereo" | "mono"
     video_decoder: str = Field(default="auto", json_schema_extra=PROFILE)  # "auto" | "software"
     mpv_args_override_all: bool = False  # when True, _compose_extra_args returns ONLY mpv_extra_args (skips UA/reconnect/buffer/prebuffer)

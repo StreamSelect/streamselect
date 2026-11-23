@@ -578,6 +578,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsMetadataTabMixin, SettingsDownlo
 
         self._mpv_args_input.setText(" ".join(c.mpv_extra_args))
         self._normalize_volume_check.setChecked(getattr(c, "normalize_volume", False))
+        self._live_subtitles_off_check.setChecked(c.live_subtitles_off)
         downmix_idx = self._audio_downmix_combo.findData(getattr(c, "audio_downmix", "auto"))
         self._audio_downmix_combo.setCurrentIndex(max(downmix_idx, 0))
         decoder_idx = self._video_decoder_combo.findData(getattr(c, "video_decoder", "auto"))
@@ -770,6 +771,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsMetadataTabMixin, SettingsDownlo
         raw_args = self._mpv_args_input.text().strip()
         c.mpv_extra_args = raw_args.split() if raw_args else []
         c.normalize_volume = self._normalize_volume_check.isChecked()
+        c.live_subtitles_off = self._live_subtitles_off_check.isChecked()
         c.audio_downmix = self._audio_downmix_combo.currentData()
         c.video_decoder = self._video_decoder_combo.currentData()
         c.prebuffer_before_play = self._prebuffer_check.isChecked()

@@ -243,6 +243,7 @@ class PlayerManager:
         open_ended_buffer: bool = False,
         deep_buffer: bool = False,
         channel_id: str = "",
+        live: bool = False,
     ) -> bool:
         """Play a URL, enforcing the provider's connection limit.
 
@@ -277,6 +278,7 @@ class PlayerManager:
             channel_id: The channel/episode id being played — threaded through
                 to name the deep-cache recording deterministically. Ignored
                 unless ``deep_buffer`` is True.
+            live: A live channel (``live_subtitles_off`` applies to it).
 
         Returns:
             True if successful, False otherwise (including when the
@@ -318,7 +320,7 @@ class PlayerManager:
         result = self.player.play(
             url, title, instance_key=key, start_seconds=start_seconds,
             open_ended_buffer=open_ended_buffer,
-            deep_buffer=deep_buffer, channel_id=channel_id,
+            deep_buffer=deep_buffer, channel_id=channel_id, live=live,
         )
 
         if result:

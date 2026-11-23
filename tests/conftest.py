@@ -1587,6 +1587,7 @@ def mock_settings_playback_widgets(dlg) -> None:
     dlg._recheck_failed_on_refresh_check = _stub("isChecked", True)
     dlg._stream_retry_checks_check = _stub("isChecked", False)
     dlg._normalize_volume_check = _stub("isChecked", False)
+    dlg._live_subtitles_off_check = _stub("isChecked", False)
     dlg._audio_downmix_combo = _stub("currentData", "auto")
     dlg._audio_downmix_combo.findData.return_value = 0
     dlg._video_decoder_combo = _stub("currentData", "auto")
@@ -1681,6 +1682,7 @@ def wire_settings_playback_widgets(dlg) -> None:
     dlg._recheck_failed_on_refresh_check.setChecked(True)
     dlg._stream_retry_checks_check = QCheckBox()
     dlg._normalize_volume_check = QCheckBox()
+    dlg._live_subtitles_off_check = QCheckBox()
     dlg._audio_downmix_combo = QComboBox()
     dlg._audio_downmix_combo.addItem("Off", userData="auto")
     dlg._audio_downmix_combo.addItem("To stereo", userData="stereo")

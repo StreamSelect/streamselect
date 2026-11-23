@@ -15,7 +15,8 @@ from PyQt6.QtWidgets import QMenu
 from streamselect.core.players.live_playback import LivePlayback, LiveTrack
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui.settings_player_rows import (
-    DECODER_OPTIONS, DECODER_TIP, DOWNMIX_OPTIONS, DOWNMIX_TIP, NORMALIZE_LABEL, NORMALIZE_TIP,
+    DECODER_OPTIONS, DECODER_TIP, DOWNMIX_OPTIONS, DOWNMIX_TIP, LIVE_SUBTITLES_LABEL,
+    LIVE_SUBTITLES_TIP, NORMALIZE_LABEL, NORMALIZE_TIP,
 )
 
 _OVERRIDE_TIP = "Off while Override all is on in Settings → Playback"
@@ -178,6 +179,14 @@ def build_playback_menu(host: Any, live: LivePlayback | None = None) -> QMenu:
                       enabled)
     _add_setting_menu(host, menu, "Video decoder", "video_decoder", DECODER_OPTIONS, DECODER_TIP,
                       enabled)
+    # Not an mpv argument (a per-stream option), so Override all does not switch it off.
+    live_subs = QAction(LIVE_SUBTITLES_LABEL, menu, checkable=True)
+    live_subs.setChecked(host.config.live_subtitles_off)
+    live_subs.setToolTip(LIVE_SUBTITLES_TIP)
+    live_subs.triggered.connect(lambda checked: _change(
+        host, "live_subtitles_off", checked,
+        f"{LIVE_SUBTITLES_LABEL}: {'on' if checked else 'off'} (from the next live channel)"))
+    menu.addAction(live_subs)
     menu.addSeparator()
 
     # This click used to cycle windows; it has to stay reachable.

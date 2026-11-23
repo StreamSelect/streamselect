@@ -164,7 +164,7 @@ def test_play_open_ended_buffer_relaunch_uses_same_key_shared():
     p = _player()
     relaunch_key: str | None = None
 
-    def capture_relaunch(key, extra_args):
+    def capture_relaunch(key, extra_args, record_path=""):
         nonlocal relaunch_key
         relaunch_key = key
         return True
@@ -185,7 +185,7 @@ def test_play_open_ended_buffer_relaunch_uses_same_key_provider():
     p = _player()
     relaunch_key: str | None = None
 
-    def capture_relaunch(key, extra_args):
+    def capture_relaunch(key, extra_args, record_path=""):
         nonlocal relaunch_key
         relaunch_key = key
         return True
@@ -205,7 +205,7 @@ def test_play_open_ended_buffer_relaunch_passes_open_ended_args():
     p = _player(buffer_profile="modest")
     relaunch_args: list[str] | None = None
 
-    def capture_relaunch(key, extra_args):
+    def capture_relaunch(key, extra_args, record_path=""):
         nonlocal relaunch_args
         relaunch_args = extra_args
         return True

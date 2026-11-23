@@ -14,6 +14,11 @@ NORMALIZE_TIP = ("Lifts quiet voices without making explosions louder, "
 DOWNMIX_OPTIONS = (("auto", "Off"), ("stereo", "To stereo"), ("mono", "To mono"))
 DOWNMIX_TIP = ("Mixes 5.1 and other surround audio down to two channels or one. "
                "Off keeps the stream's own channels.")
+LIVE_SUBTITLES_LABEL = "Subtitles off on live channels"
+LIVE_SUBTITLES_TIP = ("Live channels start with no subtitles: live captions are typed as the "
+                      "broadcast airs, so they lag and garble. Movies and series keep theirs. "
+                      "Subtitles in the playback menu still turns them on for one window.\n"
+                      "Applies from the next live channel you play.")
 DECODER_OPTIONS = (("auto", "Automatic"), ("software", "Software"))
 DECODER_TIP = ("Software can clear up colour faults and glitches caused by a hardware decoder, "
                "but uses more CPU. Switching skips the picture ahead to the next keyframe.")
@@ -37,6 +42,10 @@ def add_player_rows(dlg, form: QFormLayout) -> None:
         dlg._video_decoder_combo.addItem(label, userData=value)
     dlg._video_decoder_combo.setToolTip(DECODER_TIP + live)
     form.addRow("Video decoder:", dlg._video_decoder_combo)
+
+    dlg._live_subtitles_off_check = QCheckBox(LIVE_SUBTITLES_LABEL)
+    dlg._live_subtitles_off_check.setToolTip(LIVE_SUBTITLES_TIP)
+    form.addRow(dlg._live_subtitles_off_check)
 
     dlg._buffer_combo = QComboBox()
     dlg._buffer_combo.addItem("Reconnect only (no extra buffer)", userData="reconnect_only")

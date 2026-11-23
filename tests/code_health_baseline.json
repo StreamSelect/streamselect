@@ -5,7 +5,7 @@
     "streamselect/core/config.py": 1981,
     "streamselect/core/database.py": 1345,
     "streamselect/core/filter_utils.py": 1237,
-    "streamselect/core/players/mpv.py": 1275,
+    "streamselect/core/players/mpv.py": 1200,
     "streamselect/core/provider_loader.py": 1305,
     "streamselect/core/repositories/channel.py": 1711,
     "streamselect/core/repositories/channel_ingestion.py": 1317,

@@ -23,7 +23,8 @@ def host(monkeypatch, qtbot):
     widget = QWidget()
     qtbot.addWidget(widget)
     widget.config = SimpleNamespace(normalize_volume=False, audio_downmix="auto",
-                                    video_decoder="auto", mpv_args_override_all=False)
+                                    video_decoder="auto", mpv_args_override_all=False,
+                                    live_subtitles_off=False)
     widget.player_manager = MagicMock()
     widget.player_manager.active_keys.return_value = ["a"]
     widget._apply_player_settings = MagicMock()
