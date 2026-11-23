@@ -149,12 +149,17 @@ def test_clicking_a_name_in_the_column_scrolls_the_page_to_it(dialog, qapp):
 # ── Q7: open at one setting ──────────────────────────────────────────────
 
 def _assert_opened_at_still_here(dialog, qapp):
-    index = _index(dialog, "Playback")
+    index = _index(dialog, "Sidebar")
     assert dialog._nav.current_row() == index
     check = dialog._prompt_after_autoplay_check
     area = dialog._nav.stack.widget(index)
     assert area.viewport().rect().contains(_rect_in(check, area.viewport()))
-    assert _top_of_column(dialog).startswith('Ask "Still here?"')
+    # In view in the help column (the History group closes the Sidebar page, so the
+    # column cannot scroll its entry all the way to the top).
+    panel = dialog._nav.help_panel
+    found = panel.document().find("Ask how many episodes you watched")
+    assert not found.isNull()
+    assert panel.viewport().rect().contains(panel.cursorRect(found).center())
     (tint,) = _tints(dialog, index)
     assert tint.geometry().contains(_rect_in(check, dialog._nav.page(index)))
 
@@ -176,7 +181,7 @@ def test_a_link_given_before_the_dialog_shows_lands_once_it_does(qapp):
 
     dlg = SettingsDialog(Config())
     try:
-        assert dlg.select_setting("Playback", "Still here") is True
+        assert dlg.select_setting("Sidebar", "Ask how many episodes") is True
         dlg.resize(dlg.minimumWidth(), 360)        # short, so the row needs scrolling into view
         dlg.show()
         _settle(qapp, 10)

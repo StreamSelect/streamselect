@@ -4,11 +4,13 @@ When a queued auto-advance run ends, the off-thread checkpoint tick emits
 ``_queue_end_detected`` with the ids of every episode the playlist advanced
 PAST — those were already written 100%-complete by ``_bg_finalise_episode``
 while the queue was still running.  This mixin owns the main-thread prompt that
-asks whether the user actually watched them, and both answers' write paths.
+asks how many the user actually watched — None · First only · All — and the
+answers' write paths. It is asked only when ``asks_now`` says so (by default for a
+run started between 21:00 and 05:00, Settings ▸ Playback).
 
-Both answers write, and both refresh
---------------------------------------
-The prompt asks "Did you watch them?", so **No must undo the auto-mark** — it
+Every answer writes, and every one refreshes
+--------------------------------------------
+"None" and "First only" **must undo the auto-mark** — "No" once
 used to only downgrade ``last_played_via`` to ``'queue'`` (a greyer glyph) and
 leave the episodes flagged watched, which is the opposite of the answer given.
 Every write here ends by emitting ``_episode_watch_state_changed`` so the open
@@ -21,94 +23,133 @@ the season ends up with an unwatched hole in the middle of a watched run).
 
 from __future__ import annotations
 
+from datetime import datetime, time
+
 from loguru import logger
-from PyQt6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QLabel, QVBoxLayout
+from PyQt6.QtWidgets import QDialog, QLabel, QVBoxLayout
 
 from streamselect.core.repositories import RepositoryFactory
-from streamselect.gui.dialog_chrome import dialog_buttons
+from streamselect.gui.dialog_chrome import action_button, dialog_buttons
 
-#: Where the prompt's "Change whether this is asked" link opens Settings.
-PROMPT_SETTING_LINK = "settings:Playback/Still here"
+#: Where the prompt's link opens Settings: the row that says when it is asked.
+PROMPT_SETTING_LINK = "settings:Sidebar/Ask how many episodes"
 #: The prompt's width: room for its question on a line or two. Without one the
 #: dialog took its wrapped label's guessed height and clipped the question's first
 #: line (owner, 2026-11-23).
 PROMPT_MIN_WIDTH = 380
+#: The three answers (owner, 2026-11-23: three buttons, not a question and a tick).
+#: Closing the dialog answers nothing: the run stays as the queue marked it.
+NONE, FIRST_ONLY, ALL = "none", "first", "all"
 
 
-def build_queue_end_dialog(parent, count: int, ask_first: bool, navigate):
-    """The "Still watching?" dialog: the question, the first-episode tick when the
-    run had one, the link to its setting, Yes / No. Returns ``(dialog, tick or None)``."""
-    ep_label = "1 more episode" if count == 1 else f"{count} more episodes"
-    dlg = QDialog(parent)
-    dlg.setWindowTitle("Still watching?")
-    dlg.setModal(True)
-    dlg.setMinimumWidth(PROMPT_MIN_WIDTH)
-    layout = QVBoxLayout(dlg)
-    layout.setSpacing(12)
-    layout.setContentsMargins(16, 16, 16, 16)
+def _hhmm(text: str) -> time:
+    hours, minutes = text.strip().split(":")
+    return time(int(hours), int(minutes))
 
-    msg = QLabel(f"The queue auto-advanced through {ep_label}.\n\nDid you watch them?")
-    msg.setWordWrap(True)
-    layout.addWidget(msg)
 
-    first_too = None
-    if ask_first:
-        first_too = QCheckBox("I watched the first episode, too")
-        first_too.setChecked(True)
-        first_too.setToolTip("Untick if you did not watch the episode the run started "
-                             "with either: it goes back to unwatched")
-        layout.addWidget(first_too)
+def asks_now(config, started: datetime) -> bool:
+    """Whether a run that started at ``started`` gets the question: asking is on,
+    and either it asks at any hour or the run began inside the hours set (which may
+    wrap past midnight, as the default 21:00-05:00 does). A garbled setting asks."""
+    if not config.prompt_after_autoplay:
+        return False
+    if not config.autoplay_prompt_night_only:
+        return True
+    try:
+        start, end = (_hhmm(t) for t in config.autoplay_prompt_hours.split("-"))
+    except (ValueError, AttributeError):
+        return True
+    t = started.time()
+    return (start <= t or t < end) if start > end else (start <= t < end)
 
-    # The prompt's own off switch, one click away (Settings opens on that row).
-    to_setting = QLabel(f'<a href="{PROMPT_SETTING_LINK}">Change whether this is asked</a>')
-    to_setting.setToolTip("Open Settings at the option that turns this question on or off")
-    to_setting.linkActivated.connect(navigate)
-    layout.addWidget(to_setting)
 
-    # Ok/Cancel relabelled rather than Yes/No: same accept/reject slots,
-    # and then the same row as every other dialog's.
-    btns = dialog_buttons(dlg, ok="Yes")
-    btns.button(QDialogButtonBox.StandardButton.Cancel).setText("No")
-    layout.addWidget(btns)
-    dlg.adjustSize()
-    return dlg, first_too
+class QueueEndDialog(QDialog):
+    """The "Still watching?" dialog: how many of the run you watched, answered by
+    None · First only · All (Enter = All), and a link to when it is asked. The
+    answer is :attr:`choice` (``None`` when closed without one). Its answers are
+    methods, not lambdas: a lambda holding the dialog would keep it alive."""
+
+    def __init__(self, parent, count: int, navigate):
+        super().__init__(parent)
+        self.choice = None
+        ep_label = "1 more episode" if count == 1 else f"{count} more episodes"
+        self.setWindowTitle("Still watching?")
+        self.setModal(True)
+        self.setMinimumWidth(PROMPT_MIN_WIDTH)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(16, 16, 16, 16)
+
+        msg = QLabel(f"The queue played {ep_label} after the one you started.\n\nHow many did you watch?")
+        msg.setWordWrap(True)
+        layout.addWidget(msg)
+
+        to_setting = QLabel(f'<a href="{PROMPT_SETTING_LINK}">Change when this is asked</a>')
+        to_setting.setToolTip("Open Settings at the option that says when this question is asked")
+        to_setting.linkActivated.connect(navigate)
+        layout.addWidget(to_setting)
+
+        # Added in reading order, least to most watched; All is the default (Enter), as Yes was.
+        btns = dialog_buttons(self, ok=None, cancel=False, extra=(
+            ("None", self._none), ("First only", self._first_only), ("All", self._all)))
+        action_button(btns, "All").setDefault(True)
+        btns.setToolTip("None: the first episode and the rest go back to unwatched · First only: "
+                        "keep the first, the rest go back · All: keep them all")
+        layout.addWidget(btns)
+        self.adjustSize()
+
+    def _answer(self, choice: str) -> None:
+        self.choice = choice
+        self.accept()
+
+    def _none(self) -> None:
+        self._answer(NONE)
+
+    def _first_only(self) -> None:
+        self._answer(FIRST_ONLY)
+
+    def _all(self) -> None:
+        self._answer(ALL)
+
+
+def build_queue_end_dialog(parent, count: int, navigate) -> QueueEndDialog:
+    """The "Still watching?" dialog for a run that played on ``count`` episodes."""
+    return QueueEndDialog(parent, count, navigate)
 
 
 class _QueueEndPromptMixin:
-    """"Still watching?" prompt + the two answers' persistence paths."""
+    """"Still watching?" prompt + the answers' persistence paths."""
 
     def _on_queue_end_detected(self, auto_episode_ids: list, first_episode_id: str = "") -> None:
-        """Main-thread slot: show "Still here?" prompt after a queue-auto-advance run ends.
+        """Main-thread slot: ask how many of a queue run were watched.
 
         Called when the ``_queue_end_detected`` signal fires (emitted from the
         off-thread checkpoint tick after a queued player window closes with
-        ``last_seen_pos > 0``).
+        ``last_seen_pos > 0``, when ``asks_now`` says so).
 
         Args:
             auto_episode_ids: Episode DB ids that were auto-advanced (played via
                 ``'queue'``). These are episodes at queue indices 1‥last_seen_pos.
                 Index 0 is already ``'manual'`` (the user explicitly started it).
-            first_episode_id: That index-0 episode. The question offers it too: when
-                the viewer fell asleep during it, it is not watched either (owner,
-                2026-11-22).
+            first_episode_id: That index-0 episode; "None" takes it back too (the
+                viewer fell asleep during it, owner 2026-11-22).
         """
         if not auto_episode_ids:
             return
         if not getattr(self.config, "prompt_after_autoplay", True):
             return
 
-        dlg, first_too = build_queue_end_dialog(
-            self, len(auto_episode_ids), bool(first_episode_id), lambda link: self.navigate_to(link))
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            # Confirmed — promote to 'manual' so they render solid and the
-            # resume anchor advances past them.
+        dlg = build_queue_end_dialog(self, len(auto_episode_ids), lambda link: self.navigate_to(link))
+        dlg.exec()
+        choice = dlg.choice
+        if choice == ALL:
+            # Promote to 'manual' so they render solid and the resume anchor advances.
             self.executor.submit(self._bg_promote_queue_episodes, auto_episode_ids)
-        else:
-            # Denied — the queue marked them watched while nobody was watching,
-            # so take the mark back rather than merely greying it.
+        elif choice in (FIRST_ONLY, NONE):
+            # The queue marked them watched while nobody was watching: take it back.
             self.executor.submit(self._bg_unmark_queue_episodes, auto_episode_ids)
-        if first_too is not None and not first_too.isChecked():
-            self.executor.submit(self._bg_unmark_first_episode, first_episode_id)
+            if choice == NONE and first_episode_id:
+                self.executor.submit(self._bg_unmark_first_episode, first_episode_id)
 
     def _bg_unmark_first_episode(self, episode_id: str) -> None:
         """Worker: the viewer did not watch the episode the run started with.

@@ -25,6 +25,7 @@ Covered:
 from __future__ import annotations
 
 from types import SimpleNamespace
+import pytest
 from unittest.mock import MagicMock
 
 from streamselect.core.database import EpisodeDB
@@ -67,7 +68,8 @@ def _streaming_host(db):
     wire_episode_watch_signal(host)
     host.db = db
     host.executor = SimpleNamespace(submit=lambda fn, *a, **k: fn(*a, **k))
-    host.config = SimpleNamespace(watch_complete_threshold=0.9, prompt_after_autoplay=True)
+    host.config = SimpleNamespace(watch_complete_threshold=0.9, prompt_after_autoplay=True,
+                                  autoplay_prompt_night_only=False, autoplay_prompt_hours="21:00-05:00")
     host.player_manager = MagicMock()
     host._watch_tracking = {}
     return host
@@ -271,39 +273,26 @@ def test_not_watching_the_first_episode_takes_back_its_mark(db):
     assert _episode_fields(db, "e9")["watch_progress"] == 900
 
 
-def _answer_prompt(monkeypatch, *, accept: bool, untick_first: bool):
-    from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog
-    from streamselect.gui.queue_end_prompt import _QueueEndPromptMixin
 
-    QApplication.instance() or QApplication([])
-    host = _QueueEndPromptMixin.__new__(_QueueEndPromptMixin)
-    host.config = MagicMock(prompt_after_autoplay=True)
-    host.executor = MagicMock()
-    host.navigate_to = MagicMock()
-    init = QDialog.__init__
-    monkeypatch.setattr(QDialog, "__init__", lambda self, _parent=None: init(self))
-    seen = {}
+@pytest.mark.parametrize("hour, asked", [(14, False), (23, True)])
+def test_the_question_waits_for_a_run_started_in_its_hours(db, hour, asked):
+    """Owner, 2026-11-23: ask only for a run started when you might fall asleep
+    (default 9 PM to 5 AM); an afternoon run is left as the queue marked it."""
+    from datetime import datetime
+    _seed_episode(db, "e1", 1)
+    _seed_episode(db, "e2", 2)
+    host = _streaming_host(db)
+    host.config.autoplay_prompt_night_only = True
+    host._watch_tracking["k"] = {
+        "media_type": "episode", "played_via": "manual", "last_seen_pos": 1,
+        "queue": [{"content_id": "e1"}, {"content_id": "e2"}],
+        "started_at": datetime(2026, 11, 23, hour, 0),
+    }
+    host.player_manager.active_keys.return_value = []
+    host.player_manager.last_exit_reason.return_value = "End of file"
+    host._watch_checkpoint_timer = MagicMock()
+    host._queue_end_detected = MagicMock()
 
-    def _exec(dlg):
-        (box,) = dlg.findChildren(QCheckBox)
-        seen["text"], seen["checked"] = box.text(), box.isChecked()
-        if untick_first:
-            box.setChecked(False)
-        return QDialog.DialogCode.Accepted if accept else QDialog.DialogCode.Rejected
+    host._watch_checkpoint_tick()
 
-    monkeypatch.setattr(QDialog, "exec", _exec)
-    host._on_queue_end_detected(["e2", "e3"], "e1")
-    return host, seen
-
-
-def test_the_question_offers_the_first_episode_ticked(monkeypatch):
-    host, seen = _answer_prompt(monkeypatch, accept=True, untick_first=False)
-    assert seen == {"text": "I watched the first episode, too", "checked": True}
-    host.executor.submit.assert_called_once_with(host._bg_promote_queue_episodes, ["e2", "e3"])
-
-
-def test_unticking_the_first_episode_unmarks_it_whatever_the_answer(monkeypatch):
-    for accept in (True, False):
-        host, _ = _answer_prompt(monkeypatch, accept=accept, untick_first=True)
-        calls = [c.args for c in host.executor.submit.call_args_list]
-        assert (host._bg_unmark_first_episode, "e1") in calls
+    assert host._queue_end_detected.emit.called is asked

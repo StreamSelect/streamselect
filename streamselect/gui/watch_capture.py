@@ -50,10 +50,13 @@ alone.
 
 from __future__ import annotations
 
+from datetime import datetime
+
 from loguru import logger
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from streamselect.core.repositories import RepositoryFactory
+from streamselect.gui.queue_end_prompt import asks_now
 
 
 def _entry_media_type(entry: dict, info: dict) -> str:
@@ -160,7 +163,7 @@ class _WatchCaptureMixin:
                     # queue-end signal so the main thread can show "Still here?".
                     # Episodes at indices 1..pos (inclusive) were auto-advanced;
                     # index 0 is the user-started episode (last_played_via="manual").
-                    if pos > 0 and getattr(self.config, "prompt_after_autoplay", True):
+                    if pos > 0 and asks_now(self.config, info.get("started_at") or datetime.now()):
                         auto_ids = [
                             queue[i]["content_id"]
                             for i in range(1, min(pos + 1, len(queue)))

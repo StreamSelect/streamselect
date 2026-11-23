@@ -141,6 +141,20 @@ def _save_channel_density(combo: QComboBox, config) -> None:
     config.channel_list_density = combo.currentData() or "comfy"
 
 
+def _load_ask_hours(dlg, config) -> None:
+    """Settings ▸ Playback's "only between" hours for "Ask how many episodes you
+    watched" (``Config.autoplay_prompt_hours``, "HH:MM-HH:MM"); a garbled value
+    shows the default 21:00-05:00."""
+    from PyQt6.QtCore import QTime
+    start, end = (QTime.fromString(t.strip(), "HH:mm") for t in
+                  ((config.autoplay_prompt_hours or "").split("-") + ["", ""])[:2])
+    dlg._autoplay_when_combo.setCurrentIndex(
+        dlg._autoplay_when_combo.findData(bool(config.autoplay_prompt_night_only)))
+    dlg._autoplay_from_time.setTime(start if start.isValid() else QTime(21, 0))
+    dlg._autoplay_until_time.setTime(end if end.isValid() else QTime(5, 0))
+    dlg._sync_ask_row()
+
+
 def _load_sidebar_density(combo: QComboBox, config) -> None:
     """Select ``config.sidebar_row_density`` in ``combo`` (falls back to compact).
 
@@ -550,6 +564,7 @@ class SettingsDialog(SettingsTabsMixin, SettingsMetadataTabMixin, SettingsDownlo
             getattr(c, "prompt_after_autoplay", True)
         )
         self._prompt_after_autoplay_check.blockSignals(False)
+        _load_ask_hours(self, c)
         self._watch_threshold_spin.setValue(
             int(round(getattr(c, "watch_complete_threshold", 0.9) * 100))
         )
@@ -756,6 +771,9 @@ class SettingsDialog(SettingsTabsMixin, SettingsMetadataTabMixin, SettingsDownlo
         )
         c.autoplay_season_episodes = self._autoplay_check.isChecked()
         c.prompt_after_autoplay = self._prompt_after_autoplay_check.isChecked()
+        c.autoplay_prompt_night_only = bool(self._autoplay_when_combo.currentData())
+        c.autoplay_prompt_hours = (f"{self._autoplay_from_time.time().toString('HH:mm')}-"
+                                   f"{self._autoplay_until_time.time().toString('HH:mm')}")
         c.watch_complete_threshold = self._watch_threshold_spin.value() / 100.0
         c.watch_partial_threshold = self._watch_partial_spin.value() / 100.0
         c.close_player_when_finished = self._close_player_check.isChecked()

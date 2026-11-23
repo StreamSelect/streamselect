@@ -8,7 +8,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QWidget,
     QFormLayout, QComboBox, QCheckBox, QDoubleSpinBox, QSpinBox, QLineEdit,
-    QPushButton, QLabel, QGroupBox, QListWidget,
+    QPushButton, QLabel, QGroupBox, QListWidget, QTimeEdit,
 )
 
 from streamselect.core.media_mix import format_media_share
@@ -48,6 +48,15 @@ _PLATFORM_NAME_STYLE_CHOICES: tuple[tuple[str, str], ...] = (
 class SettingsTabsMixin:
     """The five ``_build_*_tab()`` section builders + their direct UI callbacks."""
 
+    def _sync_ask_row(self, *_args) -> None:
+        """"Ask how many episodes you watched": the when-choice and the hours follow it,
+        and the hours only matter for "only between"."""
+        on = self._prompt_after_autoplay_check.isChecked()
+        self._autoplay_when_combo.setEnabled(on)
+        night = bool(self._autoplay_when_combo.currentData())
+        for edit in (self._autoplay_from_time, self._autoplay_until_time):
+            edit.setEnabled(on and night)
+
     def _build_playback_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -70,15 +79,6 @@ class SettingsTabsMixin:
             "next one starts when it ends.")
         player_form.addRow(self._autoplay_check)
 
-        self._prompt_after_autoplay_check = QCheckBox(
-            "Ask \"Still here?\" after auto-advancing through episodes"
-        )
-        self._prompt_after_autoplay_check.setToolTip(
-            "After the queue auto-advances through one or more episodes and the player\n"
-            "closes, ask whether you actually watched them. Confirming promotes them from\n"
-            "gray (auto-watched) to solid (fully engaged) and advances your resume point."
-        )
-        player_form.addRow(self._prompt_after_autoplay_check)
 
         threshold_row = QHBoxLayout()
         self._watch_threshold_spin = QSpinBox()
@@ -806,6 +806,34 @@ class SettingsTabsMixin:
             "Live channels are listed once played. 0 lists everything you started."
         )
         history_form.addRow("Show in History after:", self._history_min_spin)
+        # After the queue plays on: ask how many you watched, and when (its own row:
+        # every page's controls share one left edge). Here, beside what History counts.
+        self._prompt_after_autoplay_check = QCheckBox("Ask how many episodes you watched")
+        self._prompt_after_autoplay_check.setToolTip(
+            "When the queue has played on through episodes and the player closes, ask\n"
+            "how many you watched: None, First only or All. The ones you did not watch\n"
+            "go back to unwatched and leave History.")
+        self._autoplay_when_combo = QComboBox()
+        self._autoplay_when_combo.addItem("at any time", userData=False)
+        self._autoplay_when_combo.addItem("only between", userData=True)
+        self._autoplay_when_combo.setToolTip(
+            "Ask only when the run started between these hours (when you might have\n"
+            "fallen asleep), or whatever the time.")
+        self._autoplay_from_time, self._autoplay_until_time = QTimeEdit(), QTimeEdit()
+        for edit, tip in ((self._autoplay_from_time, "From this time…"),
+                          (self._autoplay_until_time, "…until this time (it may be after midnight)")):
+            edit.setDisplayFormat("h:mm AP")
+            edit.setToolTip(tip)
+        when_row = QHBoxLayout()
+        when_row.setContentsMargins(0, 0, 0, 0)
+        for w in (self._autoplay_when_combo, self._autoplay_from_time, QLabel("–"),
+                  self._autoplay_until_time):
+            when_row.addWidget(w)
+        when_row.addStretch()
+        self._prompt_after_autoplay_check.toggled.connect(self._sync_ask_row)
+        self._autoplay_when_combo.currentIndexChanged.connect(self._sync_ask_row)
+        history_form.addRow(self._prompt_after_autoplay_check)
+        history_form.addRow("Ask when:", when_row)
         layout.addWidget(history_group)
         layout.addStretch()
         return tab

@@ -780,18 +780,18 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     network_timeout: int = 30  # seconds
     reconnect_attempts: int = 3
     # ── URL ranking tunables (Provider.ordered_urls(), core/models.py) ───────
-    # A provider's alternate host URLs are ranked on recency-weighted health +
-    # latency, not a lifetime success/failure ratio (a chronically slow-but-
-    # working host could sit at the top forever otherwise). These three knobs
-    # are the ONLY place these numbers live — never hardcode them elsewhere.
+    # A provider's alternate host URLs are ranked on recency-weighted health + latency, not
+    # a lifetime success ratio (a slow-but-working host could stay on top forever otherwise).
+    # These three knobs are the ONLY place these numbers live — never hardcode them elsewhere.
     url_health_decay: float = 0.85  # EWMA decay per recent_attempts step, newest-first (0-1)
     url_cooldown_minutes: int = 10  # demote a URL whose most-recent attempt failed within this window
     url_recent_attempts_kept: int = 20  # cap on ProviderURL.recent_attempts persisted per URL
     autoplay_season_episodes: bool = True  # Auto-queue subsequent episodes when playing from season
-    # After a queued auto-advance run ends, ask "Still here? Did you watch them all?"
-    # so the user can promote queue-watched episodes to fully-engaged (solid icon, advance resume anchor).
-    # Configurable in Settings → Playback.
+    # After the queue plays on through episodes, ask how many you watched (Settings → Playback),
+    # by default only for a run started between those hours (owner, 2026-11-23: falling asleep).
     prompt_after_autoplay: bool = True
+    autoplay_prompt_night_only: bool = Field(default=True, json_schema_extra=PROFILE)
+    autoplay_prompt_hours: str = Field(default="21:00-05:00", json_schema_extra=PROFILE)  # "HH:MM-HH:MM", may wrap midnight
     # Watch-completion: fraction of a VOD item's duration that counts as "completed"
     # (e.g. 0.9 = 90%). Configurable in Settings → Playback.
     watch_complete_threshold: float = 0.9

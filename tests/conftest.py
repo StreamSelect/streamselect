@@ -1598,6 +1598,12 @@ def mock_settings_playback_widgets(dlg) -> None:
     dlg._video_decoder_combo = _stub("currentData", "auto")
     dlg._video_decoder_combo.findData.return_value = 0
     dlg._right_click_combo = _stub("currentData", "menu")
+    # "Ask how many episodes you watched … only between [from] – [until]".
+    from PyQt6.QtCore import QTime
+    dlg._autoplay_when_combo = _stub("currentData", True)
+    dlg._autoplay_from_time = _stub("time", QTime(21, 0))
+    dlg._autoplay_until_time = _stub("time", QTime(5, 0))
+    dlg._sync_ask_row = lambda: None
     dlg._right_click_combo.findData.return_value = 0
 
 
@@ -1700,6 +1706,13 @@ def wire_settings_playback_widgets(dlg) -> None:
     dlg._right_click_combo = QComboBox()
     dlg._right_click_combo.addItem("Opens the player's menu", userData="menu")
     dlg._right_click_combo.addItem("Pauses and plays", userData="pause")
+    # "Ask how many episodes you watched … only between [from] – [until]".
+    from PyQt6.QtWidgets import QTimeEdit
+    dlg._autoplay_when_combo = QComboBox()
+    dlg._autoplay_when_combo.addItem("at any time", userData=False)
+    dlg._autoplay_when_combo.addItem("only between", userData=True)
+    dlg._autoplay_from_time, dlg._autoplay_until_time = QTimeEdit(), QTimeEdit()
+    dlg._sync_ask_row = lambda: None
 
 
 def wire_settings_content_widgets(dlg) -> None:

@@ -289,79 +289,40 @@ def test_tick_no_emit_for_non_episode_tracking():
 # 10. _on_queue_end_detected Yes → submits _bg_promote_queue_episodes
 # ---------------------------------------------------------------------------
 
-def _patch_dialog(accepted: bool):
-    """Return a context-manager stack that makes the QDialog a no-op mock.
-
-    We need to preserve the real QDialog.DialogCode enum so the method's
-    ``result == QDialog.DialogCode.Accepted`` comparison works correctly.  We
-    achieve this by patching only the Qt widget-construction calls while letting
-    the real ``QDialog`` class — and thus ``QDialog.DialogCode.Accepted`` — be
-    imported from the real module at call time.
-    """
-    from contextlib import ExitStack
-    from PyQt6.QtWidgets import QDialog
-
-    # exec() return value must match the *real* enum for the comparison to fire.
-    exec_return = QDialog.DialogCode.Accepted if accepted else QDialog.DialogCode.Rejected
-
-    stack = ExitStack()
-    mock_dlg_class = MagicMock()
-    mock_dlg_instance = MagicMock()
-    mock_dlg_instance.exec.return_value = exec_return
-    # Preserve the real enum on the mock class so ``QDialog.DialogCode.Accepted``
-    # still resolves to the real value inside _on_queue_end_detected.
-    mock_dlg_class.return_value = mock_dlg_instance
-    mock_dlg_class.DialogCode = QDialog.DialogCode
-
-    stack.enter_context(
-        patch("streamselect.gui.queue_end_prompt.QDialog", mock_dlg_class)
-    )
-    stack.enter_context(patch("streamselect.gui.queue_end_prompt.QVBoxLayout"))
-    stack.enter_context(patch("streamselect.gui.queue_end_prompt.QLabel"))
-    stack.enter_context(patch("streamselect.gui.queue_end_prompt.QDialogButtonBox"))
-    # The Yes/No row now comes from dialog_chrome.dialog_buttons, which builds a
-    # REAL QDialogButtonBox on the (mocked) dialog — stub the builder too.
-    stack.enter_context(patch("streamselect.gui.queue_end_prompt.dialog_buttons"))
-    return stack
+def _answer(choice):
+    """Stand the real dialog down: ``build_queue_end_dialog`` returns one that
+    answers ``choice`` (None = closed without an answer)."""
+    fake = MagicMock()
+    fake.choice = choice
+    return patch("streamselect.gui.queue_end_prompt.build_queue_end_dialog", return_value=fake)
 
 
-def test_on_queue_end_yes_submits_promote():
-    """_on_queue_end_detected: when user clicks Yes, submits promote worker with correct ids."""
+@pytest.mark.parametrize("choice, wanted", [
+    ("all", ["promote"]),
+    ("first", ["unmark_run"]),
+    ("none", ["unmark_run", "unmark_first"]),
+    (None, []),
+])
+def test_each_answer_writes_what_it_says(choice, wanted):
+    """None · First only · All (owner, 2026-11-23). All keeps the run (promotes it);
+    First only takes back the episodes the queue played on to; None takes back
+    those and the first; closing the dialog changes nothing."""
     from streamselect.gui.queue_end_prompt import _QueueEndPromptMixin
 
     host = _QueueEndPromptMixin.__new__(_QueueEndPromptMixin)
     host.config = MagicMock(prompt_after_autoplay=True)
     host.executor = MagicMock()
-
-    auto_ids = ["ep2", "ep3"]
-    with _patch_dialog(accepted=True):
-        host._on_queue_end_detected(auto_ids)
-
-    host.executor.submit.assert_called_once_with(
-        host._bg_promote_queue_episodes, auto_ids
-    )
-
-
-def test_on_queue_end_no_submits_unmark():
-    """_on_queue_end_detected: No unmarks them — it must not leave them watched.
-
-    The prompt asks "Did you watch them?", so No has to undo the auto-mark the
-    queue already wrote. It used only to downgrade last_played_via to 'queue'
-    (a greyer glyph on a still-watched episode), which is the answer inverted.
-    """
-    from streamselect.gui.queue_end_prompt import _QueueEndPromptMixin
-
-    host = _QueueEndPromptMixin.__new__(_QueueEndPromptMixin)
-    host.config = MagicMock(prompt_after_autoplay=True)
-    host.executor = MagicMock()
-
-    auto_ids = ["ep2", "ep3"]
-    with _patch_dialog(accepted=False):
-        host._on_queue_end_detected(auto_ids)
-
-    host.executor.submit.assert_called_once_with(
-        host._bg_unmark_queue_episodes, auto_ids
-    )
+    names = {host._bg_promote_queue_episodes: "promote", host._bg_unmark_queue_episodes: "unmark_run",
+             host._bg_unmark_first_episode: "unmark_first"}
+    with _answer(choice):
+        host._on_queue_end_detected(["ep2", "ep3"], "ep1")
+    got = [names[c.args[0]] for c in host.executor.submit.call_args_list]
+    assert got == wanted
+    args = {names[c.args[0]]: c.args[1] for c in host.executor.submit.call_args_list}
+    if "unmark_run" in args or "promote" in args:
+        assert args.get("unmark_run", args.get("promote")) == ["ep2", "ep3"]
+    if "unmark_first" in args:
+        assert args["unmark_first"] == "ep1"
 
 
 def test_on_queue_end_skips_when_prompt_disabled():

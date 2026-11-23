@@ -28,6 +28,7 @@ two methods that moved (``_play_all_items``, ``_play_all_selected_episodes``);
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import QTreeWidgetItem
@@ -508,6 +509,7 @@ class _SeriesPlaybackMixin:
                         "played_via": "manual",
                         "queue": _pa_queue,
                         "last_seen_pos": 0,
+                        "started_at": datetime.now(),
                     }
                 else:
                     self._watch_tracking[_pa_key] = {
@@ -676,6 +678,7 @@ class _SeriesPlaybackMixin:
                 "played_via": "manual",     # for the started episode (playlist index 0)
                 "queue": _queue,
                 "last_seen_pos": 0,         # mpv playlist-pos last finalized through
+                "started_at": datetime.now(),   # when to ask how many were watched (asks_now)
             }
         else:
             # Single episode: flat dict.
