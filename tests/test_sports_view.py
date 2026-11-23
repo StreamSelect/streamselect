@@ -620,7 +620,7 @@ def test_reporting_a_channel_puts_it_last_with_its_flag_and_clear_brings_it_back
     texts = [a.text() for a in menu.actions()]
     assert "Nothing showing" in texts and "Not this game" in texts
     assert "Report this channel" not in texts and "Didn't play" not in texts, "the old wording is back"
-    clear = next(a for a in menu.actions() if a.text() == "Clear bad reports")
+    clear = next(a for a in menu.actions() if a.text() == "Forget reports")
     assert not clear.isEnabled(), "nothing to clear yet"
     next(a for a in menu.actions() if a.text() == "Nothing showing").trigger()
     _settle(qapp)
@@ -630,7 +630,7 @@ def test_reporting_a_channel_puts_it_last_with_its_flag_and_clear_brings_it_back
     assert last.report_icon is not None and last.report_icon.isVisibleTo(view)
     assert "nothing showing" in last.report_icon.toolTip()
     assert all(r.report_icon is None for r in rows if r is not last), "no clutter on other rows"
-    clear = next(a for a in last.build_context_menu("NHL").actions() if a.text() == "Clear bad reports")
+    clear = next(a for a in last.build_context_menu("NHL").actions() if a.text() == "Forget reports")
     assert clear.isEnabled()
     clear.trigger()
     _settle(qapp)

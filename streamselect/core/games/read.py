@@ -18,6 +18,7 @@ from sqlalchemy import case, func, select
 
 from streamselect.core.category_headings import split_head
 from streamselect.core.database import ChannelDB
+from streamselect.core.epg_utils import to_local
 from streamselect.core.event_datetime import DEFAULT_EVENT_DURATION, event_is_on_now
 from streamselect.core.games.finder import SportSettings
 from streamselect.core.games.models import GameDB, GameEndDB, GameFeedDB
@@ -28,6 +29,7 @@ from streamselect.core.region_codes import (
 )
 from streamselect.core.repositories.stream_info import StreamInfoRepository
 from streamselect.core.stream_info import measured_quality, summarize
+from streamselect.core.time_display import short_date_text
 
 UPCOMING, ON_NOW, ENDING, OVER = "upcoming", "on_now", "ending", "over"
 
@@ -51,6 +53,9 @@ class GameFeedDTO:
     #: The report kinds active on it for this game (DIDNT_PLAY / WRONG_CONTENT): what
     #: the right-click menus tick.
     reported: tuple = ()
+    #: When its last "nothing showing" report was made, if that report no longer
+    #: counts but is remembered (Sticky Channel Reports, owner 2026-11-22); else None.
+    reported_before: Optional[datetime] = None
     #: ``quality`` was measured by the app itself (played or probed), not read
     #: off the name: the chip carries the measured mark (PLAYED-3).
     verified: bool = False
@@ -244,6 +249,29 @@ def active_reports(reports: list[dict], game: GameDTO, last_watched: Optional[da
     return tuple(sorted({r.get("kind") for r in relevant})), n
 
 
+def reported_before(reports: list[dict], last_watched: Optional[datetime]) -> Optional[datetime]:
+    """When a channel was last reported "nothing showing", kept after its reports stop
+    counting (Sticky Channel Reports Q1-Q4, owner 2026-11-22), or None.
+
+    Only "nothing showing" is remembered: "not this game" was about one game (Q3). A
+    real watch after the latest report forgets it (Q4); so does "Forget reports".
+    The caller asks only when no report counts now (``active_reports``).
+    """
+    times = [datetime.fromisoformat(r["at"]) for r in reports if r.get("kind") == DIDNT_PLAY]
+    if not times:
+        return None
+    latest = max(times)
+    return None if last_watched is not None and last_watched > latest else latest
+
+
+def reported_before_words(when: datetime) -> tuple[str, str]:
+    """A channel reported before, in words: its row's date label and its tooltip."""
+    day = short_date_text(to_local(when))
+    return (f"reported {day}",
+            f"Reported before (nothing showing), last on {day}. No longer counts, so it is "
+            "listed below channels never reported. Right-click to report it again.")
+
+
 def report_text(reports: list[dict], game: GameDTO, last_watched: Optional[datetime],
                 now: datetime, report_days: int = _BASE.report_days) -> str:
     """The active report on one collection for one game, as its icon's tooltip; "" if none.
@@ -284,15 +312,19 @@ def arrange_feeds(game: GameDTO, prefs: dict, history: WatchHistory,
         def reported(f: GameFeedDTO) -> GameFeedDTO:
             mine, watched = reports.get(f.channel_id, []), history.get(channel_history_key(f.channel_id), (None,))[0]
             days = (settings or _BASE).report_days
-            return replace(f, report=report_text(mine, game, watched, now, days),
-                           reported=active_reports(mine, game, watched, now, days)[0])
+            text = report_text(mine, game, watched, now, days)
+            return replace(f, report=text, reported=active_reports(mine, game, watched, now, days)[0],
+                           reported_before=None if text else reported_before(mine, watched))
         keep = [reported(f) if f.channel_id in reports else f for f in keep]
 
     def key(f: GameFeedDTO):
         _last, secs, plays = history.get(f.collection_key, (None, 0, 0))
-        # A reported channel goes last whatever else it has going for it (SV-Q39).
-        return (bool(f.report), f.collection_key != preferred, f.collection_key != last, -secs, -plays,
-                _FEED_RANK.get(f.time_from, 2))
+        # A reported channel goes last whatever else it has going for it (SV-Q39); one
+        # reported before goes below every channel never reported, unless it is your
+        # PREFERRED one (Sticky Channel Reports Q1, Q7).
+        not_preferred = f.collection_key != preferred
+        return (bool(f.report), not_preferred and f.reported_before is not None, not_preferred,
+                f.collection_key != last, -secs, -plays, _FEED_RANK.get(f.time_from, 2))
     return replace(game, feeds=tuple(sorted(keep, key=key)), hidden=tuple(gone))
 
 

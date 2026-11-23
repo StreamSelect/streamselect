@@ -33,7 +33,7 @@ from streamselect.core.epg_utils import fmt_time
 from streamselect.core.quality_vocab import quality_tooltip
 from streamselect.core.stream_info import _rate as rate_text
 from streamselect.core.games.read import (
-    DIDNT_PLAY, ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, GameFeedDTO,
+    DIDNT_PLAY, ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, GameFeedDTO, reported_before_words,
 )
 from streamselect.gui import cursor_affordance, icons
 from streamselect.gui import icon_utils as _icon_utils
@@ -58,6 +58,19 @@ def _keep_space(*widgets: QWidget) -> None:
         sp = w.sizePolicy()
         sp.setRetainSizeWhenHidden(True)
         w.setSizePolicy(sp)
+
+
+def report_mark(feed: Optional[GameFeedDTO]) -> Optional[QLabel]:
+    """The flag on a reported channel (SV-Q39), or on one reported before (Sticky
+    Channel Reports Q2, Q8), its tooltip saying which; None when neither. One mark
+    for a channel row and a card."""
+    if feed is None or not (feed.report or feed.reported_before):
+        return None
+    mark = QLabel()
+    _theme.style(mark, "TEXT_SM_MUTED")
+    _icon_utils.set_label_icon(mark, "reported", 12)
+    mark.setToolTip(feed.report or reported_before_words(feed.reported_before)[1])
+    return mark
 
 
 def add_report_actions(menu: QMenu, feed: GameFeedDTO, report) -> None:
@@ -117,18 +130,22 @@ class ChannelRow(QWidget):
             _theme.style(mark, "ALERT_NEW_MATCH_BADGE")
             _icon_utils.set_label_icon(mark, "play", 12)
             row.addWidget(mark)
-        self.report_icon = None
-        if feed.report:
-            # One small icon, no chip (owner, SV-Q39); the tooltip says what and how often.
-            self.report_icon = QLabel()
-            _theme.style(self.report_icon, "TEXT_SM_MUTED")
-            _icon_utils.set_label_icon(self.report_icon, "reported", 12)
-            self.report_icon.setToolTip(feed.report)
+        # One small icon, no chip (owner, SV-Q39); the tooltip says what and how often.
+        self.report_icon = report_mark(feed)
+        if self.report_icon is not None:
             row.addWidget(self.report_icon)
         self.name = QLabel(feed.title)
         _theme.style(self.name, "ALERT_NEW_MATCH_BADGE" if playing else
                      "TEXT_SM_MUTED" if hidden else "CHANNEL_NAME_LIVE")
         row.addWidget(self.name)
+        self.reported_on = None
+        if feed.reported_before and not feed.report:
+            # The date is what tells "reported before" from "reported now" (Q2, B).
+            label, tip = reported_before_words(feed.reported_before)
+            self.reported_on = QLabel(f"· {label}")
+            _theme.style(self.reported_on, "TEXT_SM_MUTED")
+            self.reported_on.setToolTip(tip)
+            row.addWidget(self.reported_on)
         for word in feed.codecs:                 # HEVC / RAW right after the title (owner)
             row.addWidget(quality_chip(word))
         if feed.detail:
@@ -185,10 +202,14 @@ class ChannelRow(QWidget):
             lambda: self.prefer.emit(None if self._preferred else self.feed))
         self._add_hide_actions(menu.addMenu(f"Hide from {league} games"), league)
         menu.addSeparator()
+        if self.feed.reported_before and not self.feed.report:
+            day = reported_before_words(self.feed.reported_before)[0].removeprefix("reported ")
+            menu.addAction(f"Reported before: nothing showing, last on {day}").setEnabled(False)
         add_report_actions(menu, self.feed, lambda kind, on: (
             self.reportRequested if on else self.unreportRequested).emit(self.feed, kind))
-        clear = menu.addAction("Clear bad reports")
-        clear.setEnabled(bool(self.feed.report))
+        # Forgets the memory too, so it stays enabled while the channel is remembered (Q6).
+        clear = menu.addAction("Forget reports")
+        clear.setEnabled(bool(self.feed.report or self.feed.reported_before))
         clear.triggered.connect(lambda: self.clearReportsRequested.emit(self.feed))
         return menu
 
@@ -676,12 +697,8 @@ class GameCard(QFrame):
         # The channel the card plays is reported (reported channels sort last, so every
         # other one is too): the flag says so. The card dims only when every channel
         # showed nothing showing — "Not this game" means a channel that works (owner, 2026-11-13).
-        self.report_icon = None
-        if self.top_feed is not None and self.top_feed.report:
-            self.report_icon = QLabel()
-            _theme.style(self.report_icon, "TEXT_SM_MUTED")
-            _icon_utils.set_label_icon(self.report_icon, "reported", 12)
-            self.report_icon.setToolTip(self.top_feed.report)
+        self.report_icon = report_mark(self.top_feed)
+        if self.report_icon is not None:
             pl.addWidget(self.report_icon)
         if game.playable and all(DIDNT_PLAY in f.reported for f in game.playable):
             dim = QGraphicsOpacityEffect(self)
