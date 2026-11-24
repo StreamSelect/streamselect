@@ -141,16 +141,58 @@ def _could_name_a_game(session, settings: SportSettings):
         select(ChannelDB.category).where(ChannelDB.media_type == "live").distinct())
         if c and league.search(norm(c))]
 
-    def like(word):
-        escaped = word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        return ChannelDB.name.like(f"%{escaped}%", escape="\\")
-
     return or_(
         ChannelDB.category.in_(categories),
         ChannelDB.name.op("GLOB")(NOT_PLAIN_GLOB),
         *(ChannelDB.name.like(p) for p in MATCHUP_LIKE_PATTERNS),
-        *(like(w) for w in words),
+        *(_name_like(w) for w in words),
     )
+
+
+def _name_like(word: str):
+    """A channel name containing *word* (LIKE, so a substring the finder narrows again)."""
+    escaped = word.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return ChannelDB.name.like(f"%{escaped}%", escape="\\")
+
+
+def _guide_in_window(settings: SportSettings, now: datetime):
+    """Guide programmes in the league's window naming one of its words."""
+    return (EpgProgramDB.start_time.between(now - max(settings.window_back, settings.replay_within),
+                                            now + settings.window_ahead),
+            or_(*(EpgProgramDB.title.ilike(f"%{w}%") for w in settings.words)))
+
+
+def _leagues_named(session, leagues, now: datetime, plays) -> set[str]:
+    """The leagues some listing, guide programme or recent play names.
+
+    A game needs a listing that names its league (the finder's seed), so a league
+    nobody names finds nothing, and its run (every matchup-shaped listing read and
+    normalised, ~0.9 s on 20,000 listings) is skipped. Thirty-odd basketball
+    leagues run each refresh; most name nothing most of the year (2026-11-23).
+    One read for all leagues: the channels and guide titles holding any league's
+    word, matched per league like the finder. Over-inclusive by design: hidden
+    sources count, the widest window is used, and a name LIKE cannot judge
+    (beyond plain ASCII) is read too.
+    """
+    if not leagues:
+        return set()
+    live = ChannelDB.media_type == "live"
+    words = sorted({w for settings in leagues for w in settings.words})
+    texts = [c for (c,) in session.execute(select(ChannelDB.category).where(live).distinct()) if c]
+    texts += session.execute(select(ChannelDB.name).where(
+        live, or_(ChannelDB.name.op("GLOB")(NOT_PLAIN_GLOB), *(_name_like(w) for w in words)))).scalars()
+    back = max(max(st.window_back, st.replay_within) for st in leagues)
+    ahead = max(st.window_ahead for st in leagues)
+    texts += session.execute(select(EpgProgramDB.title).where(
+        EpgProgramDB.start_time.between(now - back, now + ahead),
+        or_(*(EpgProgramDB.title.ilike(f"%{w}%") for w in words)))).scalars()
+    texts = [norm(t) for t in texts if t] + [norm(p.title) for p in plays]
+    named = set()
+    for st in leagues:
+        league = league_matcher(st.words)
+        if not all(w.isascii() and w.isprintable() for w in st.words) or any(map(league.search, texts)):
+            named.add(_finder_key(st))
+    return named
 
 
 def _read_listings(session, settings: SportSettings, now: datetime, hidden: set[str]) -> list[ListingIn]:
@@ -168,9 +210,7 @@ def _read_listings(session, settings: SportSettings, now: datetime, hidden: set[
                EpgProgramDB.channel_name, EpgProgramDB.title, EpgProgramDB.start_time)
         # Back as far as the replay rule looks (as much as the guide keeps): the
         # original of a rerun is then found even on a league's first run (finder).
-        .where(EpgProgramDB.start_time.between(now - max(settings.window_back, settings.replay_within),
-                                               now + settings.window_ahead))
-        .where(or_(*(EpgProgramDB.title.ilike(f"%{w}%") for w in settings.words)))).all()
+        .where(*_guide_in_window(settings, now))).all()
     listings += [ListingIn(GUIDE, cname or epg_id or "", title or "", cdb, start)
                  for pid, cdb, epg_id, cname, title, start in guide if pid not in hidden]
     return listings
@@ -195,9 +235,15 @@ def refresh_games(db: Database, now: datetime | None = None,
                       for c in _learn_clocks(_memory_from_json(row.memory).clock_samples).values())
         leagues = enabled_leagues(overrides)
         plays = _recent_plays(session, now, max((s.most_watched_days for s in leagues), default=0))
+        named = _leagues_named(session, leagues, now, plays)
+        stored = {f"{sport}/{league}" for sport, league in
+                  session.execute(select(GameDB.sport, GameDB.league).distinct())}
     for settings in leagues:
         t0 = time.monotonic()
         key = _finder_key(settings)
+        if key not in named and key not in stored:
+            counts[key] = 0         # nothing names it and nothing of it is stored: no change
+            continue
         with db.session_scope(commit=False) as session:
             hidden = set(ProviderRepository(session).get_hidden_provider_ids())
             listings = _read_listings(session, settings, now, hidden)

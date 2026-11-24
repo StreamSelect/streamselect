@@ -314,3 +314,86 @@ game_finder_leagues:
     # yet through the test above.
     NBA:
       - NBA
+    # TRIAL (owner, 2026-11-23: "add all known basketball leagues"). The key is the
+    # league's short name, as the Sports view shows it and preferences are kept
+    # under; the words are its other names. Measured on one snapshot (Monday
+    # 2026-11-23, real finder, read-only): NCAAB 17 confirmed / 1 less certain;
+    # EuroLeague 0/7; EuroCup, ACB, LNB a game or two; the rest named by no listing
+    # that day (off season, or no source carries them). None is through the test above.
+    # No bare word that names another sport: not "BBL" (cricket's Big Bash),
+    # "PBA" (bowling), "Betclic" (Portugal's football league), "BSL", or "NCAA
+    # Women" / "College Basketball" ("NCAA Women's Volleyball", "Women's College
+    # Basketball" is the women's league).
+    NCAAB:
+      - NCAAB
+      - NCAAM
+      - NCAA Basketball
+      - NCAA Men's Basketball
+      - NCAA Men`s Basketball
+      - Men's College Basketball
+    NCAAW:
+      - NCAAW
+      - NCAA Women's Basketball
+      - NCAA Women`s Basketball
+      - Women's College Basketball
+      - Women`s College Basketball
+    WNBA:
+      - WNBA
+    G League:
+      - G League
+      - G-League
+    EuroLeague:
+      - EuroLeague
+    EuroCup:
+      - EuroCup
+    BCL:
+      - Basketball Champions League
+    FIBA:
+      - FIBA
+      - EuroBasket
+      - AmeriCup
+      - AfroBasket
+    ACB:
+      - ACB
+      - Liga ACB
+      - Liga Endesa
+    LBA:
+      - LBA
+      - Lega Basket
+    BBL:
+      - Basketball Bundesliga
+      - easyCredit BBL
+    LNB:
+      - Betclic Elite
+      - LNB Pro A
+    GBL:
+      - Greek Basket League
+      - Stoiximan Basket League
+    BSL:
+      - Basketbol Super Ligi
+      - Turkish Basketball Super League
+    VTB:
+      - VTB United League
+      - VTB League
+    ABA:
+      - ABA League
+      - ABA Liga
+    NBL:
+      - NBL
+    CBA:
+      - CBA
+    B.League:
+      - B.League
+      - B League
+    KBL:
+      - KBL
+    PBA:
+      - Philippine Basketball Association
+    LNBP:
+      - LNBP
+    NBB:
+      - NBB
+    BAL:
+      - Basketball Africa League
+    BIG3:
+      - BIG3

@@ -472,3 +472,39 @@ def test_the_guide_is_read_back_as_far_as_the_replay_rule_looks(db):
     with db.session_scope(commit=False) as s:
         names = [li.name for li in _read_listings(s, NHL, NOW, set()) if li.source == GUIDE]
     assert "NHL: Boston Bruins - Montreal Canadiens" in names, "30 h back: inside the 72 h replay look-back"
+
+
+def test_a_league_nothing_names_is_not_run_and_one_with_stored_games_still_is(db):
+    """Thirty-odd basketball leagues (owner, 2026-11-23: "add all known"); most name
+    nothing most of the year, and each run reads every matchup-shaped listing. A
+    league no listing, guide title or recent play names is skipped — unless it has
+    games stored, which its run must clear. Skipping changes no stored game."""
+    from unittest import mock
+
+    from streamselect.core.games import store
+    from streamselect.core.playback_models import PlaybackEventDB
+    _seed_db(db)
+    with db.session_scope() as s:
+        s.add(GameDB(sport="basketball", league="KBL", team_a="A", team_b="B", start_utc=START,
+                     level=1, replay=False, collections=1, found_at=NOW))
+        s.add(PlaybackEventDB(provider_id="p1", channel_id="x", title="LNBP: Halcones vs Soles",
+                              started_at=NOW - timedelta(days=1), outcome="started", seconds_watched=600))
+    ran = []
+    real = store.find_games
+
+    def spy(listings, settings, *a, **k):
+        ran.append(settings.league)
+        return real(listings, settings, *a, **k)
+
+    with mock.patch.object(store, "find_games", spy):
+        counts = store.refresh_games(db, NOW)
+    assert "NHL" in ran, "named by its listings"
+    assert "KBL" in ran, "stored games: its run clears them"
+    assert "LNBP" in ran, "named by a recent play"
+    assert "B.League" not in ran and counts["basketball/B.League"] == 0, "named by nothing"
+    with db.session_scope(commit=False) as s:
+        assert not s.query(GameDB).filter(GameDB.league == "KBL").count(), "cleared, as a run would"
+    ran.clear()
+    with mock.patch.object(store, "find_games", spy):
+        store.refresh_games(db, NOW)
+    assert "KBL" not in ran, "nothing names it and nothing is stored any more"
