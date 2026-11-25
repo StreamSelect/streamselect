@@ -401,9 +401,16 @@ def test_split_off_socket_path_unchanged():
 # 7. send_command — thin wrapper over MPVPlayer._send_ipc_command
 # ---------------------------------------------------------------------------
 
+def _running(player, *keys):
+    from streamselect.core.players.mpv import _Inst
+    for key in keys:
+        player._instances[key] = _Inst(process=_fake_process(), socket_path=player._socket_path_for(key))
+
+
 def test_mpv_send_command_resolves_last_key_and_delivers(monkeypatch):
     """MPVPlayer.send_command targets _last_key and delivers via _send_ipc_command."""
     player = _make_player()
+    _running(player, "p1")
     delivered = []
     monkeypatch.setattr(
         MPVPlayer, "_send_ipc_command",
@@ -419,6 +426,7 @@ def test_mpv_send_command_resolves_last_key_and_delivers(monkeypatch):
 
 def test_mpv_send_command_explicit_key_overrides_last_key(monkeypatch):
     player = _make_player()
+    _running(player, "p1", "p2")
     delivered = []
     monkeypatch.setattr(
         MPVPlayer, "_send_ipc_command",
@@ -429,6 +437,20 @@ def test_mpv_send_command_explicit_key_overrides_last_key(monkeypatch):
     player.send_command(["cycle", "pause"], key="p2")
 
     assert delivered[0][1] == "p2"
+
+
+def test_mpv_send_command_to_a_closed_window_sends_nothing(monkeypatch):
+    """Space after the player closed (2026-11-25): its socket file is still there,
+    nothing listens, and the send logged "Connection refused" as an ERROR. A closed
+    window answers False ("Nothing is playing") without trying."""
+    player = _make_player()
+    _running(player, "p1")
+    player._instances["p1"].process.poll.return_value = 0      # mpv has exited
+    player._last_key = "p1"
+    tried = []
+    monkeypatch.setattr(MPVPlayer, "_send_ipc_command", lambda self, cmd, key: tried.append(key) or True)
+    assert player.send_command(["cycle", "pause"]) is False
+    assert tried == []
 
 
 def test_mpv_send_command_no_resolvable_key_returns_false():
