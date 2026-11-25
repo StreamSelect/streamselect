@@ -274,11 +274,12 @@ def test_not_watching_the_first_episode_takes_back_its_mark(db):
 
 
 
-@pytest.mark.parametrize("hour, asked", [(14, False), (23, True)])
+@pytest.mark.parametrize("hour, asked", [(14, False), (20, True), (23, True)])
 def test_the_question_waits_for_a_run_in_its_hours(db, hour, asked, monkeypatch):
     """Owner, 2026-11-23: ask only for a run when you might fall asleep (default
     9 PM to 5 AM); an afternoon run is left as the queue marked it. The player
-    closes at the run's start hour plus one, which the trigger passes as its end."""
+    closes an hour after the run started, which the trigger passes as its end: a
+    run started at 8 PM is asked about (owner, 2026-11-25)."""
     from datetime import datetime, timedelta
 
     from streamselect.gui import watch_capture

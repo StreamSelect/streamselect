@@ -66,13 +66,10 @@ def asks_now(config, started: datetime, ended: datetime | None = None) -> bool:
         return True
     ended = max(ended or started, started)
 
-    def inside(when: datetime) -> bool:
-        t = when.time()
-        return (start <= t or t < end) if start > end else (start <= t < end)
-
-    if inside(started) or inside(ended):
+    t = started.time()
+    if (start <= t or t < end) if start > end else (start <= t < end):
         return True
-    # Neither end inside, yet they overlap: then the hours begin during the run.
+    # Begun outside the hours: they overlap only if the hours begin during the run.
     opens = datetime.combine(started.date(), start)
     return (opens if opens >= started else opens + timedelta(days=1)) <= ended
 
