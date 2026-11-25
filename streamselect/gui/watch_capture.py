@@ -163,7 +163,8 @@ class _WatchCaptureMixin:
                     # queue-end signal so the main thread can show "Still here?".
                     # Episodes at indices 1..pos (inclusive) were auto-advanced;
                     # index 0 is the user-started episode (last_played_via="manual").
-                    if pos > 0 and asks_now(self.config, info.get("started_at") or datetime.now()):
+                    now = datetime.now()
+                    if pos > 0 and asks_now(self.config, info.get("started_at") or now, now):
                         auto_ids = [
                             queue[i]["content_id"]
                             for i in range(1, min(pos + 1, len(queue)))

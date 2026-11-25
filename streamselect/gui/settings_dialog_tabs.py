@@ -817,7 +817,7 @@ class SettingsTabsMixin:
         self._autoplay_when_combo.addItem("at any time", userData=False)
         self._autoplay_when_combo.addItem("only between", userData=True)
         self._autoplay_when_combo.setToolTip(
-            "Ask only when the run started between these hours (when you might have\n"
+            "Ask only when the queue played during these hours (when you might have\n"
             "fallen asleep), or whatever the time.")
         self._autoplay_from_time, self._autoplay_until_time = QTimeEdit(), QTimeEdit()
         for edit, tip in ((self._autoplay_from_time, "From this time…"),

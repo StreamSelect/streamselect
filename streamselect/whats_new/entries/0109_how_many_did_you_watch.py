@@ -10,12 +10,15 @@ ENTRY = WhatsNewEntry(
         "asks \"How many did you watch?\" with three buttons: None, First only, All. None puts "
         "the first episode and the rest back to unwatched; First only keeps the first; All "
         "keeps them all (Enter picks All). Closing the window leaves them as they were.",
-        "By default it only asks for a run started between 9 PM and 5 AM, when you might "
-        "have fallen asleep. Change the hours, or ask at any time, in Settings → Sidebar → "
+        "By default it only asks when the queue played at some point between 9 PM and 5 AM, "
+        "when you might have fallen asleep — a run started at 7 PM that carried on past 9 "
+        "counts. Change the hours, or ask at any time, in Settings → Sidebar → "
         "History (\"Ask how many episodes you watched\" and \"Ask when\").",
         "The question is no longer cut off at the top.",
     ),
     test_steps=(
+        "Before 9 PM, play an episode with the rest of the season queued and let the queue "
+        "carry on past 9 PM, then close the player: \"How many did you watch?\" appears.",
         "After 9 PM, play an episode with the rest of the season queued, let it move on to the "
         "next, and close the player: \"How many did you watch?\" appears, in full, with None · "
         "First only · All.",

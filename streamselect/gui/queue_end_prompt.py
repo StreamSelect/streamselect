@@ -6,7 +6,7 @@ PAST — those were already written 100%-complete by ``_bg_finalise_episode``
 while the queue was still running.  This mixin owns the main-thread prompt that
 asks how many the user actually watched — None · First only · All — and the
 answers' write paths. It is asked only when ``asks_now`` says so (by default for a
-run started between 21:00 and 05:00, Settings ▸ Playback).
+run that reaches 21:00-05:00, Settings ▸ Sidebar ▸ History).
 
 Every answer writes, and every one refreshes
 --------------------------------------------
@@ -23,7 +23,7 @@ the season ends up with an unwatched hole in the middle of a watched run).
 
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 
 from loguru import logger
 from PyQt6.QtWidgets import QDialog, QLabel, QVBoxLayout
@@ -47,10 +47,15 @@ def _hhmm(text: str) -> time:
     return time(int(hours), int(minutes))
 
 
-def asks_now(config, started: datetime) -> bool:
-    """Whether a run that started at ``started`` gets the question: asking is on,
-    and either it asks at any hour or the run began inside the hours set (which may
-    wrap past midnight, as the default 21:00-05:00 does). A garbled setting asks."""
+def asks_now(config, started: datetime, ended: datetime | None = None) -> bool:
+    """Whether a run from ``started`` to ``ended`` gets the question: asking is on,
+    and either it asks at any hour or some part of the run fell inside the hours set
+    (which may wrap past midnight, as the default 21:00-05:00 does). A garbled
+    setting asks.
+
+    Any part, not the start: a run started at 7:14 PM that the queue carried on to
+    11 PM is the one you fell asleep in, and asking only by its start never asked
+    (owner, 2026-11-25)."""
     if not config.prompt_after_autoplay:
         return False
     if not config.autoplay_prompt_night_only:
@@ -59,8 +64,17 @@ def asks_now(config, started: datetime) -> bool:
         start, end = (_hhmm(t) for t in config.autoplay_prompt_hours.split("-"))
     except (ValueError, AttributeError):
         return True
-    t = started.time()
-    return (start <= t or t < end) if start > end else (start <= t < end)
+    ended = max(ended or started, started)
+
+    def inside(when: datetime) -> bool:
+        t = when.time()
+        return (start <= t or t < end) if start > end else (start <= t < end)
+
+    if inside(started) or inside(ended):
+        return True
+    # Neither end inside, yet they overlap: then the hours begin during the run.
+    opens = datetime.combine(started.date(), start)
+    return (opens if opens >= started else opens + timedelta(days=1)) <= ended
 
 
 class QueueEndDialog(QDialog):

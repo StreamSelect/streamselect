@@ -788,7 +788,7 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     url_recent_attempts_kept: int = 20  # cap on ProviderURL.recent_attempts persisted per URL
     autoplay_season_episodes: bool = True  # Auto-queue subsequent episodes when playing from season
     # After the queue plays on through episodes, ask how many you watched (Settings → Playback),
-    # by default only for a run started between those hours (owner, 2026-11-23: falling asleep).
+    # by default only for a run that played into those hours (owner, 2026-11-23/25: falling asleep).
     prompt_after_autoplay: bool = True
     autoplay_prompt_night_only: bool = Field(default=True, json_schema_extra=PROFILE)
     autoplay_prompt_hours: str = Field(default="21:00-05:00", json_schema_extra=PROFILE)  # "HH:MM-HH:MM", may wrap midnight

@@ -82,6 +82,26 @@ def test_by_default_it_asks_only_for_a_run_started_at_night(hh, mm, asked):
     assert asks_now(_cfg(), datetime(2026, 11, 23, hh, mm)) is asked
 
 
+@pytest.mark.parametrize("start, end, asked", [
+    ((19, 14), (23, 6), True),     # owner, 2026-11-25: started at 7:14 PM, the queue ran to 11 PM
+    ((13, 0), (15, 0), False),     # an afternoon run
+    ((4, 0), (6, 30), True),       # began inside, ended after 5 AM
+    ((6, 0), (20, 59), False),     # all day, stopped before the hours
+    ((20, 0), (20, 30), False),
+])
+def test_it_asks_when_any_part_of_the_run_was_in_the_hours(start, end, asked):
+    day = datetime(2026, 11, 24)
+    started, ended = day.replace(hour=start[0], minute=start[1]), day.replace(hour=end[0], minute=end[1])
+    assert asks_now(_cfg(), started, ended) is asked
+
+
+def test_a_run_across_midnight_that_missed_none_of_it_still_counts():
+    """Neither end inside a 23:00-01:00 window, yet the run went right through it."""
+    cfg = _cfg(autoplay_prompt_hours="23:00-01:00")
+    assert asks_now(cfg, datetime(2026, 11, 24, 22, 0), datetime(2026, 11, 25, 2, 0))
+    assert not asks_now(cfg, datetime(2026, 11, 25, 2, 0), datetime(2026, 11, 25, 22, 0))
+
+
 def test_a_window_inside_one_day_works_too():
     cfg = _cfg(autoplay_prompt_hours="13:00-17:00")
     assert asks_now(cfg, datetime(2026, 11, 23, 14, 0))

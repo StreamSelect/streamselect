@@ -275,10 +275,19 @@ def test_not_watching_the_first_episode_takes_back_its_mark(db):
 
 
 @pytest.mark.parametrize("hour, asked", [(14, False), (23, True)])
-def test_the_question_waits_for_a_run_started_in_its_hours(db, hour, asked):
-    """Owner, 2026-11-23: ask only for a run started when you might fall asleep
-    (default 9 PM to 5 AM); an afternoon run is left as the queue marked it."""
-    from datetime import datetime
+def test_the_question_waits_for_a_run_in_its_hours(db, hour, asked, monkeypatch):
+    """Owner, 2026-11-23: ask only for a run when you might fall asleep (default
+    9 PM to 5 AM); an afternoon run is left as the queue marked it. The player
+    closes at the run's start hour plus one, which the trigger passes as its end."""
+    from datetime import datetime, timedelta
+
+    from streamselect.gui import watch_capture
+
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 11, 23, hour, 0) + timedelta(hours=1)
+    monkeypatch.setattr(watch_capture, "datetime", _Clock)
     _seed_episode(db, "e1", 1)
     _seed_episode(db, "e2", 2)
     host = _streaming_host(db)
