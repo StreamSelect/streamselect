@@ -462,9 +462,6 @@ class MPVPlayer(PlayerPlugin):
             resolved, its window is closed, or delivery failed.
         """
         resolved = self._resolve_key(key)
-        # A closed window leaves its socket file behind: Space after the player
-        # closed logged "Connection refused" as an ERROR (2026-11-25). Nothing is
-        # playing is an answer, not a failure — the same check stop() makes.
         if resolved is None or not self.is_running(resolved):
             return False
         return self._send_ipc_command({"command": cmd, "request_id": 1}, resolved)
