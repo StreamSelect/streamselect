@@ -202,6 +202,18 @@ def best_feed(game: GameDTO) -> Optional[GameFeedDTO]:
     return feeds[0] if feeds else None
 
 
+def watched_game(games, channel_id: Optional[str], now: datetime) -> Optional[GameDTO]:
+    """The game a playing channel is showing: of the games it carries, the one that
+    started last by ``now`` (else the next to start). One channel often carries games
+    back to back, and only the latest is on it (owner, 2026-11-25: two ABA cards both
+    said WATCHING)."""
+    mine = [g for g in games if channel_id and any(f.channel_id == channel_id for f in g.playable)]
+    started = [g for g in mine if g.start_utc <= now]
+    if started:
+        return max(started, key=lambda g: g.start_utc)
+    return min(mine, key=lambda g: g.start_utc, default=None)
+
+
 #: collection key -> (last WATCHED play or None, seconds watched, plays) from the play log.
 WatchHistory = dict[str, tuple[Optional[datetime], int, int]]
 

@@ -1988,3 +1988,23 @@ def test_scrolling_during_a_redraws_hold_is_not_undone(games_db, qapp, owned_wid
     bar.triggerAction(QAbstractSlider.SliderAction.SliderToMaximum)   # the user, mid-hold
     QTest.qWait(RESTORE_SCROLL_MS + 50)
     assert bar.value() == bar.maximum(), "the hold ended by putting the list back"
+
+
+def test_one_channel_carrying_two_games_says_watching_only_on_the_one_on_now(
+        qapp, owned_widgets, db):
+    """Owner, 2026-11-25: the guide put two ABA games on one channel back to back,
+    and with that channel playing both cards said WATCHING. Only the later one is
+    on it now; the earlier card keeps its play line without the word."""
+    feed = (GameFeedDTO("ch", "ARENA 1", "SI| COLL", True, "guide", "p1", "SI| COLL", "SI"),)
+    early = GameDTO(1, "hockey", "NHL", "Early Home", "Early Away", LIVE_AT - timedelta(minutes=115),
+                    1, False, 1, feed)
+    late = GameDTO(2, "hockey", "NHL", "Late Home", "Late Away", LIVE_AT - timedelta(minutes=5),
+                   1, False, 1, feed)
+    view = _view(db, qapp, owned_widgets, LIVE_AT)
+    view._playing = "ch"
+    view._on_games(([early, late], {}, [], {}))
+    _settle(qapp)
+    watching = {c.game.team_a for c in view.cards
+                if any(lbl.text() == "WATCHING" for lbl in c.play_line.findChildren(QLabel))}
+    assert watching == {"Late Home"}, watching
+    assert not _card(view, "Early").watching

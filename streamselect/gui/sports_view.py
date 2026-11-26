@@ -34,7 +34,7 @@ from streamselect.core.epg_utils import browse_day_separator_label, fmt_time, no
 from streamselect.core.games.read import (
     CHANNEL_REPORTS, ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, arrange_feeds, best_feed, game_key, game_state,
     can_mark_not_finished, load_games, load_watch_history, mark_finished,
-    mark_not_finished,
+    mark_not_finished, watched_game,
 )
 from streamselect.core.games.alerts import add_alert, alerts_for, load_alerts, remove_alerts, rule_for
 from streamselect.core.games.store import load_league_watch, sport_settings
@@ -123,6 +123,7 @@ class SportsView(SportsHeadersMixin, ContentView):
         self._open: Optional[tuple] = None
         self._show_hidden: set[tuple] = set()
         self._playing: Optional[str] = None
+        self._watched: Optional[tuple] = None      # the game the playing channel is showing
         self._loaded = False
         self._stale = False         # a finder run finished while off screen
         self._finding = False
@@ -394,6 +395,8 @@ class SportsView(SportsHeadersMixin, ContentView):
             self._message("No sport is set up yet", "")
             return
         now = self._clock()
+        watched = watched_game(games, self._playing, now)
+        self._watched = _game_key(watched) if watched else None
         self._layout.addWidget(self._toolbar())
         row, self.listings_label, self.listings_refresh = build_freshness_row(
             listings_text(**self.listings_state), self.listingsRefreshRequested.emit)
@@ -706,7 +709,7 @@ class SportsView(SportsHeadersMixin, ContentView):
               meta: str = "") -> GameCard:
         channels = self._channel_list(g) if expanded else None
         card = GameCard(g, state, now, self.sports[g.sport].usual_length, expanded=expanded,
-                        playing_id=self._playing, channels=channels,
+                        playing_id=self._playing if _game_key(g) == self._watched else None, channels=channels,
                         alerts=alerts_for(g, self._alerts), meta=meta,
                         league_logo=self._league_logo(g.league_logo))
         card.bell.toggled_rule.connect(self._set_alert)
