@@ -34,9 +34,9 @@ from datetime import datetime
 from typing import Callable
 from urllib.parse import urlparse
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
-    QBoxLayout, QFrame, QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
+    QBoxLayout, QGridLayout, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
 
 from streamselect.core.epg_utils import to_local_naive
@@ -46,13 +46,15 @@ from streamselect.core.repositories.dtos import (
     TitleOverlapDTO, ViewingDTO,
 )
 from streamselect.core.time_display import short_date_text
-from streamselect.gui import cursor_affordance, icons
+from streamselect.gui import cursor_affordance
+from streamselect.gui.analytics_parts import (
+    AnalyticsCard, FigureTile, LinkLabel, short_bar, stat_grid, text_label,
+)
 from streamselect.gui.attempt_ticks import AttemptTicks
 from streamselect.gui import theme as _theme
 from streamselect.gui.connection_wait import minutes_text
 from streamselect.gui.chip_row import MiddleElideLabel
 from streamselect.gui.hour_strip import HourStrip, struggle_span
-from streamselect.gui.progress_paint import ProgressBar
 from streamselect.gui.tool_view import clear_layout, show_loading, show_panel_error
 
 #: (media_type, plural noun) in the order every section lists them.
@@ -95,13 +97,11 @@ REGIONS_TWO_FROM = 560
 MEDIA_SINGULAR = {"movie": "film", "series": "series", "live": "live"}
 _ONE = {"movie": "film", "live": "live channel"}       # MEDIA's nouns for a count of one
 
-#: A short bar: long enough to compare, too short to be a page-wide empty track.
-BAR_PX = 56
 #: Shared puts three bars on a row, so they are shorter still (fits 400 px).
 SHARED_BAR_PX = 40
 
 
-def source_state_label(name: str, is_active: bool, is_expired: bool) -> str:
+def source_statetext_label(name: str, is_active: bool, is_expired: bool) -> str:
     """A source's name with its state, so a greyed row also SAYS why (color never alone)."""
     if is_expired:
         return f"{name} (expired)"
@@ -128,143 +128,6 @@ def redundancy_hint(overlap: TitleOverlapDTO, provider_id: str) -> str | None:
             "one of the two is probably redundant.")
 
 
-def _label(text: str, role: str) -> QLabel:
-    label = QLabel(text)
-    _theme.style(label, role)
-    return label
-
-
-class _Section(QFrame):
-    """A card: a heading with a right-aligned subtitle over a body that loads on its own."""
-
-    def __init__(self, title: str, parent=None) -> None:
-        super().__init__(parent)
-        self.setObjectName("analyticsCard")
-        _theme.style(self, "ANALYTICS_CARD")
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(14, 10, 14, 12)
-        outer.setSpacing(6)
-        head = QHBoxLayout()
-        self.title = QLabel(title)
-        self.title.setWordWrap(True)
-        _theme.style(self.title, "SECTION_TITLE_SM")
-        head.addWidget(self.title, 1)
-        self.subtitle = QLabel("")
-        self.subtitle.setWordWrap(True)          # a long subtitle must not set a narrow editor's floor
-        self.subtitle.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
-        _theme.style(self.subtitle, "META_HINT")
-        head.addWidget(self.subtitle)
-        outer.addLayout(head)
-        self.body = QVBoxLayout()
-        self.body.setSpacing(4)
-        outer.addLayout(self.body)
-
-    def text(self, html_text: str, role: str = "SECTION_HINT") -> QLabel:
-        label = QLabel(html_text)
-        label.setWordWrap(True)
-        _theme.style(label, role)
-        self.body.addWidget(label)
-        return label
-
-    def grid(self) -> QGridLayout:
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(4)
-        self.body.addLayout(grid)
-        return grid
-
-    def show_all(self, hidden: list[QWidget], total: int) -> None:
-        """Hide *hidden* behind a "Show all (N)" toggle that expands in place."""
-        if not hidden:
-            return
-        for widget in hidden:
-            widget.setVisible(False)
-        more = f"{icons.show_all_icon} Show all ({total:,})"
-        button = QPushButton(more)
-        button.setToolTip(f"Show all {total:,} — {len(hidden):,} more rows")
-        _theme.style(button, "LINK_BTN_SM")
-        cursor_affordance.set_clickable(button)
-
-        def toggle() -> None:
-            opening = button.text() == more
-            for widget in hidden:
-                widget.setVisible(opening)
-            button.setText("Show fewer" if opening else more)
-
-        button.clicked.connect(toggle)
-        row = QHBoxLayout()
-        row.addWidget(button)
-        row.addStretch(1)
-        self.body.addLayout(row)
-
-
-class _Tile(QFrame):
-    """One headline figure over its caption; hidden until its query answers."""
-
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent)
-        self.setObjectName("analyticsCard")
-        _theme.style(self, "ANALYTICS_CARD")
-        box = QVBoxLayout(self)
-        box.setContentsMargins(14, 8, 16, 10)
-        box.setSpacing(0)
-        self.figure = _label("", "STAT_FIGURE")
-        box.addWidget(self.figure)
-        self.caption = _label("", "META_HINT")
-        self.caption.setWordWrap(True)
-        box.addWidget(self.caption)
-        box.addStretch(1)
-        self.hide()
-
-    def set(self, figure: str, caption: str, *, warn: bool = False) -> None:
-        self.figure.setText(figure)
-        _theme.style(self.figure, "STAT_FIGURE_WARN" if warn else "STAT_FIGURE")
-        self.caption.setText(caption)
-        self.show()
-
-
-#: Stat blocks per row on a card. Three keep each block wide enough for a
-#: one-line caption at the editor's narrowest two-column width.
-STATS_ACROSS = 3
-
-
-def _stats(section: _Section, stats) -> None:
-    """(figure, caption, detail) blocks in an even grid: the number first, what it
-    counts under it, and any breakdown below that — Playback and What you watch."""
-    grid = QGridLayout()
-    grid.setHorizontalSpacing(18)
-    grid.setVerticalSpacing(12)
-    for col in range(STATS_ACROSS):
-        grid.setColumnStretch(col, 1)
-    for i, (figure, caption, *detail) in enumerate(stats):
-        block = QVBoxLayout()
-        block.setSpacing(0)
-        block.addWidget(_label(figure, "STAT_FIGURE_MD"))
-        for text in (caption, *(d for d in detail if d)):
-            line = _label(text, "META_HINT")
-            line.setWordWrap(True)               # a long caption wraps rather than widen the card
-            block.addWidget(line)
-        block.addStretch(1)
-        grid.addLayout(block, *divmod(i, STATS_ACROSS))
-    section.body.addLayout(grid)
-
-
-class _LinkLabel(MiddleElideLabel):
-    """A middle-eliding label that is clicked like a link (region names, Q18)."""
-
-    clicked = pyqtSignal()
-
-    def __init__(self, text: str, tooltip: str) -> None:
-        super().__init__(text, color_token="COLOR_LINK")
-        self.setToolTip(tooltip)
-        cursor_affordance.set_clickable(self)
-
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 — Qt override
-        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
-            self.clicked.emit()
-        super().mouseReleaseEvent(event)
-
-
 def _last_worked_text(when: datetime | None) -> str:
     """"today" / "20 Oct" / "never", under a "Last worked" heading (Q22). *when*
     is local-naive, as the URL history records it."""
@@ -273,10 +136,6 @@ def _last_worked_text(when: datetime | None) -> str:
     if when.date() == datetime.now().date():
         return "today"
     return short_date_text(when)
-
-
-def _bar(fraction: float | None, width: int = BAR_PX) -> ProgressBar:
-    return ProgressBar((fraction or 0.0) * 100.0, width=width, height=6, warn_at=None)
 
 
 class SourceAnalyticsTab(QWidget):
@@ -314,7 +173,7 @@ class SourceAnalyticsTab(QWidget):
         self._tiles_grid = QGridLayout(self._tiles_box)
         self._tiles_grid.setContentsMargins(0, 0, 0, 0)
         self._tiles_grid.setSpacing(10)
-        self._tiles = {k: _Tile() for k in ("only", "movie", "series", "live", "guide", "days", "started", "limit")}
+        self._tiles = {k: FigureTile() for k in ("only", "movie", "series", "live", "guide", "days", "started", "limit")}
         self._place_tiles(TILES_ACROSS_NARROW)
         self._browse = QPushButton("Browse them")
         self._browse.setToolTip("List the titles only this source carries")
@@ -328,13 +187,13 @@ class SourceAnalyticsTab(QWidget):
         self._browse_ids: tuple[str, frozenset[str]] | None = None
         layout.addWidget(self._tiles_box)
 
-        self._viewing = _Section("What you watch here")
-        self._shared = _Section("Shared with your other sources")
-        self._addresses = _Section("Server addresses")
-        self._playback = _Section("Playback")
-        self._connections = _Section("Connections")
-        self._catalogue = _Section("Titles by region")
-        self._prefixes = _Section("Unrecognized prefixes")
+        self._viewing = AnalyticsCard("What you watch here")
+        self._shared = AnalyticsCard("Shared with your other sources")
+        self._addresses = AnalyticsCard("Server addresses")
+        self._playback = AnalyticsCard("Playback")
+        self._connections = AnalyticsCard("Connections")
+        self._catalogue = AnalyticsCard("Titles by region")
+        self._prefixes = AnalyticsCard("Unrecognized prefixes")
 
         self._columns = QBoxLayout(QBoxLayout.Direction.TopToBottom)
         self._columns.setSpacing(12)
@@ -424,7 +283,7 @@ class SourceAnalyticsTab(QWidget):
                         token_ref=self._tokens["prefixes"],
                         on_error=lambda e: show_panel_error(self._prefixes.body, e))
 
-    def _sections(self) -> tuple[_Section, ...]:
+    def _sections(self) -> tuple[AnalyticsCard, ...]:
         """Reading order: left column (what it carries), right column (how it
         behaves), then the full-width cards (Q2)."""
         return (self._viewing, self._shared, self._playback, self._connections, self._addresses,
@@ -478,11 +337,11 @@ class SourceAnalyticsTab(QWidget):
         grid = self._shared.grid()
         shown = [m for m, _ in MEDIA if totals[m]]
         for col, media in enumerate(shown, start=1):
-            grid.addWidget(_label(MEDIA_HEADING[media], "META_HINT"), 0, col)
+            grid.addWidget(text_label(MEDIA_HEADING[media], "META_HINT"), 0, col)
         grid.setColumnStretch(0, 1)
         for row, other in enumerate(others, start=1):
             muted = other.is_expired or not other.is_active
-            name = QLabel(source_state_label(other.name, other.is_active, other.is_expired))
+            name = QLabel(source_statetext_label(other.name, other.is_active, other.is_expired))
             name.setWordWrap(True)
             _theme.style(name, "LABEL_MUTED" if muted else "SECTION_HINT")
             grid.addWidget(name, row, 0)
@@ -494,8 +353,8 @@ class SourceAnalyticsTab(QWidget):
                 box = QHBoxLayout(cell)
                 box.setContentsMargins(0, 0, 0, 0)
                 box.setSpacing(6)
-                box.addWidget(_label(f"{both / total:.0%}", "LABEL_MUTED" if muted else "FIELD_LABEL"))
-                box.addWidget(_bar(both / total, SHARED_BAR_PX))
+                box.addWidget(text_label(f"{both / total:.0%}", "LABEL_MUTED" if muted else "FIELD_LABEL"))
+                box.addWidget(short_bar(both / total, SHARED_BAR_PX))
                 grid.addWidget(cell, row, col)
         hint = redundancy_hint(overlap, pid)
         if hint:
@@ -542,10 +401,10 @@ class SourceAnalyticsTab(QWidget):
             row, group = divmod(i, across)
             name = REGION_FULL_NAMES.get(code, code)
             label = name if name == code else f"{name} ({code})"
-            link = _LinkLabel(label, f"Browse the {n:,} titles in {name} on this source")
+            link = LinkLabel(label, f"Browse the {n:,} titles in {name} on this source")
             link.clicked.connect(lambda c=code, lbl=name: self._browse_region(c, lbl))
-            cells = (link, _bar(n / mix.total), _label(f"{n / mix.total:.0%}", "FIELD_LABEL"),
-                     _label(f"{n:,}", "META_HINT"))
+            cells = (link, short_bar(n / mix.total), text_label(f"{n / mix.total:.0%}", "FIELD_LABEL"),
+                     text_label(f"{n:,}", "META_HINT"))
             for j, widget in enumerate(cells):
                 grid.addWidget(widget, row, group * (per + 1) + j)
             if row >= REGION_ROWS:
@@ -603,7 +462,7 @@ class SourceAnalyticsTab(QWidget):
                           f"across {viewing.episode_series:,} series"))
         if viewing.favourites:
             stats.append((f"{viewing.favourites:,}", "favourites"))
-        _stats(self._viewing, stats)
+        stat_grid(self._viewing, stats)
         if viewing.only_here:
             only = self._viewing.text(
                 f"<b>{viewing.only_here:,}</b> of the {viewing.titles:,} titles you've watched "
@@ -612,20 +471,20 @@ class SourceAnalyticsTab(QWidget):
             only.setObjectName("onlyHereVerdict")
         if viewing.top:
             since = viewing.watched_since
-            self._viewing.body.addWidget(_label(
+            self._viewing.body.addWidget(text_label(
                 f"Most played since {short_date_text(to_local_naive(since))}" if since
                 else "Most played", "LABEL_MUTED"))
             grid = self._viewing.grid()
             grid.setColumnStretch(5, 1)       # the row hugs its title; slack goes last
             hidden: list[QWidget] = []
             for row, (title, media, plays, when, key, seconds) in enumerate(viewing.top):
-                link = _LinkLabel(title, f"Show {title} in Search")
+                link = LinkLabel(title, f"Show {title} in Search")
                 link.clicked.connect(lambda k=key, t=title: self._browse_title(k, t))
-                cells = (link, _label(MEDIA_SINGULAR.get(media, media), "META_HINT"),
-                         _label(f"{plays:,} plays" if plays != 1 else "1 play", "FIELD_LABEL"),
-                         _label(f"{seconds / 3600:.1f} h" if seconds >= 360 else
+                cells = (link, text_label(MEDIA_SINGULAR.get(media, media), "META_HINT"),
+                         text_label(f"{plays:,} plays" if plays != 1 else "1 play", "FIELD_LABEL"),
+                         text_label(f"{seconds / 3600:.1f} h" if seconds >= 360 else
                                 f"{max(1, round(seconds / 60))} min" if seconds else "", "META_HINT"),
-                         _label(short_date_text(to_local_naive(when)), "META_HINT"))
+                         text_label(short_date_text(to_local_naive(when)), "META_HINT"))
                 for col, widget in enumerate(cells):
                     grid.addWidget(widget, row, col)
                 if row >= TOP_ROWS:
@@ -644,7 +503,7 @@ class SourceAnalyticsTab(QWidget):
                                    warn=summary.started / summary.attempts < 0.8)
         self._playback.subtitle.setText(f"since {short_date_text(summary.since)}" if summary.since else "")
         ttp = summary.median_time_to_picture_ms
-        _stats(self._playback, (
+        stat_grid(self._playback, (
             (f"{summary.never_started:,}", "never loaded"),
             (f"{summary.refused:,}", "refused", "all connections in use"),
             (f"{summary.dropped:,}", "dropped while playing"),
@@ -678,7 +537,7 @@ class SourceAnalyticsTab(QWidget):
                                    "connections are in use, StreamSelect waits for one, starts the "
                                    "title, and records how long it took.", "META_HINT")
             return
-        _stats(self._connections, (
+        stat_grid(self._connections, (
             (minutes_text(conns.median_seconds), "typical wait for a connection"),
             (minutes_text(conns.longest_seconds), "longest wait"),
             (f"{conns.waits:,}", "waits recorded"),
@@ -698,7 +557,7 @@ class SourceAnalyticsTab(QWidget):
         grid = self._addresses.grid()
         grid.setColumnStretch(5, 1)
         for col, heading in ((1, "Last 20"), (3, "Speed"), (4, "Last worked")):
-            grid.addWidget(_label(heading, "META_HINT"), 0, col)
+            grid.addWidget(text_label(heading, "META_HINT"), 0, col)
         keep = max(worked, 3)                         # best first: the ones that worked
         hidden: list[QWidget] = []
         for row, a in enumerate(addresses, start=1):
@@ -706,13 +565,13 @@ class SourceAnalyticsTab(QWidget):
             host.setToolTip(a.url + ("\nIn use — StreamSelect tries this address first" if a.in_use else ""))
             if a.tried:
                 share = a.worked / a.tried
-                cells = (host, AttemptTicks(a.history), _label(f"{share:.0%}", "FIELD_LABEL"),
-                         _label(f"{a.median_latency_ms / 1000:.1f} s" if a.median_latency_ms else "—",
+                cells = (host, AttemptTicks(a.history), text_label(f"{share:.0%}", "FIELD_LABEL"),
+                         text_label(f"{a.median_latency_ms / 1000:.1f} s" if a.median_latency_ms else "—",
                                 "META_HINT"),
-                         _label(_last_worked_text(a.last_worked), "META_HINT"))
+                         text_label(_last_worked_text(a.last_worked), "META_HINT"))
             else:
-                cells = (host, AttemptTicks(()), _label("—", "LABEL_MUTED"), _label("", "META_HINT"),
-                         _label("untested", "META_HINT"))
+                cells = (host, AttemptTicks(()), text_label("—", "LABEL_MUTED"), text_label("", "META_HINT"),
+                         text_label("untested", "META_HINT"))
             for col, widget in enumerate(cells):
                 grid.addWidget(widget, row, col)
             if row > keep and not a.in_use:
@@ -739,15 +598,15 @@ class SourceAnalyticsTab(QWidget):
         for media, stats in groups.items():
             column = QVBoxLayout()
             column.setSpacing(4)
-            column.addWidget(_label(f"{nouns.get(media, 'other').capitalize()} · {len(stats):,}",
+            column.addWidget(text_label(f"{nouns.get(media, 'other').capitalize()} · {len(stats):,}",
                                     "LABEL_MUTED"))
             grid = QGridLayout()
             grid.setHorizontalSpacing(10)
             grid.setVerticalSpacing(4)
             grid.setColumnStretch(2, 1)
             for row, stat in enumerate(stats):
-                code = _label(stat.prefix, "FIELD_LABEL")
-                count = _label(f"{stat.count:,}", "META_HINT")
+                code = text_label(stat.prefix, "FIELD_LABEL")
+                count = text_label(f"{stat.count:,}", "META_HINT")
                 sample = MiddleElideLabel(stat.sample_names[0] if stat.sample_names else "",
                                           color_token="COLOR_MUTED_2")
                 sample.setToolTip("\n".join(stat.sample_names))
