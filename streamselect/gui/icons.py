@@ -676,15 +676,16 @@ VECTOR_KEYS: dict[str, str] = {
     "sport_swimming": "mdi6.swim",
     "sport_track": "mdi6.run-fast",
     # The many multi-sport networks — Fox Sports 1, Sky Sports News, beIN.
-    # "General", not "Unclassified": a rack carries many sports, so having no
-    # single sport_type is correct rather than a classification failure.
+    # Keyed by the stored kind "network" (sports_catalog.NETWORK; it was keyed
+    # "general", a value nothing ever stored). Not "Unclassified": a rack
+    # carries many sports, so having no single sport is correct.
     #
     # A stadium, NOT the whistle: the whistle is the nav chip for the whole
     # Sports view, and the registry guard is right that two roles rendering the
     # same glyph are indistinguishable to the user — the view chip and the
     # General facet would have been pixel-identical. A venue that hosts many
     # sports is also the better shape for "carries several of these".
-    "sport_general": "mdi6.stadium-variant",
+    "sport_network": "mdi6.stadium-variant",
     # "show only this group" in a filter group row (was the ◎ glyph).
     "filter_only": "mdi6.filter-check-outline",
     # ── Every remaining role (icon plan: one icon set, mdi6) ──
