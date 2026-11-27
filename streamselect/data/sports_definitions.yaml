@@ -19,6 +19,8 @@
 #         words:           the league's names. They tag a channel already in Sports
 #                          and name the league's sport; they put a channel in Sports
 #                          only with  gates: true.
+#         capitals: true   an all-capitals word ("AHL") counts only where a listing
+#                          writes it in capitals: "Ahl" is a word in Arabic titles.
 #         shared: true     the name is used by more than one sport or country
 #                          ("Premier League"): it names the sport only when nothing
 #                          else on the listing does, as a guess.
@@ -63,6 +65,7 @@ sports:
       # disagree stays less certain.
       AHL:
         words: [AHL, American Hockey League]
+        capitals: true
         finder: trial
       # TRIAL (owner, 2026-11-17): listings state date and zone; each game is in
       # one collection, so its games are less certain until a second lists them.

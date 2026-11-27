@@ -25,8 +25,8 @@ from typing import Optional
 
 from streamselect.core.event_datetime import zone_label_to_utc
 from streamselect.core.games.listing_text import (
-    HOME_SECOND, StatedTime, candidate_days, find_date, find_time, league_matcher, matchups,
-    matchups_with_separator, norm,
+    HOME_SECOND, StatedTime, candidate_days, find_date, find_time, acronyms_of, league_matcher, matchups,
+    matchups_with_separator, names_league, norm,
 )
 from streamselect.core.games import tuning
 from streamselect.core.games.teams import Side, TeamBook, team_display
@@ -95,6 +95,8 @@ class SportSettings:
     clock_keep: timedelta = _D["clock_keep"]
     #: (a team's former name, its name now): the league's ``renamed:`` in the one list.
     renamed: tuple[tuple[str, str], ...] = ()
+    #: The league's ``capitals: true``: its all-capitals words count only in capitals.
+    capitals: bool = False
 
 
 @dataclass(frozen=True)
@@ -402,8 +404,11 @@ def _place_times(work: list[_L], anchors, clocks, now: datetime) -> None:
             continue
         h, m, zone = L.time
         clock = clocks.get((L.src.source, L.src.collection))
-        if zone and not L.date:
-            cands = [u for d in candidate_days(now, h, m) if (u := zone_label_to_utc(d, zone))]
+        if zone:
+            # A stated zone is read with the stated date when there is one: "Fri 27 Nov
+            # 17:55 CET" was never placed at all (only dateless zones were read).
+            days = [L.date.replace(hour=h, minute=m)] if L.date else candidate_days(now, h, m)
+            cands = [u for d in days if (u := zone_label_to_utc(d, zone))]
             how = "zone"
         elif clock and clock.learned:
             off = timedelta(minutes=clock.offset_min)
@@ -434,11 +439,13 @@ def _mark_stale(work: list[_L], memory: Memory, now: datetime, stale_after: time
     return first_seen
 
 
-def _split(listings: list[ListingIn], league: re.Pattern[str]) -> tuple[list[ListingIn], list[ListingIn]]:
+def _split(listings: list[ListingIn], league: re.Pattern[str],
+           acronyms: frozenset[str] = frozenset()) -> tuple[list[ListingIn], list[ListingIn]]:
     """(listings naming the league in their name or collection: the seed, the rest)."""
     seeded, others = [], []
     for li in listings:
-        hit = league.search(norm(li.name)) or (li.source != GUIDE and league.search(norm(li.collection)))
+        hit = (names_league(li.name, league, acronyms)
+               or (li.source != GUIDE and names_league(li.collection, league, acronyms)))
         (seeded if hit else others).append(li)
     return seeded, others
 
@@ -450,7 +457,7 @@ def learn_teams(listings: list[ListingIn], settings: SportSettings) -> TeamBook:
     book's teams (``sport_teams``), so one run builds it once and passes it in.
     """
     league = league_matcher(settings.words)
-    seeded, _ = _split(listings, league)
+    seeded, _ = _split(listings, league, acronyms_of(settings.words) if settings.capitals else frozenset())
     return TeamBook((norm(li.name) for li in seeded if li.source != GUIDE),
                     (norm(li.name) for li in seeded if li.source == GUIDE), league, settings.renamed)
 
@@ -480,7 +487,7 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
     """
     memory = memory or Memory()
     league = league_matcher(settings.words)
-    seeded, others = _split(listings, league)
+    seeded, others = _split(listings, league, acronyms_of(settings.words) if settings.capitals else frozenset())
     book = book if book is not None else learn_teams(listings, settings)
     seeded = [ListingIn(**{**li.__dict__, "seeded": True}) for li in seeded]
     # Past the seed: only channels whose BOTH sides are exactly known teams.

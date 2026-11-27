@@ -73,6 +73,9 @@ class League:
     finder: str = FINDER_OFF
     #: (a team's former name, its name now), from the list's ``renamed:``.
     renamed: tuple[tuple[str, str], ...] = ()
+    #: An all-capitals word ("AHL") names the league only where a listing writes it
+    #: in capitals, from the list's ``capitals: true``.
+    capitals: bool = False
 
 
 @dataclass(frozen=True)
@@ -179,7 +182,7 @@ def _parse(data: dict) -> Catalog:
             if any(not old.strip() or not new.strip() for old, new in renamed):
                 raise ValueError(f"sports.{key}.leagues.{name}: renamed needs a former and a current name")
             leagues.append(League(key, str(name), _strs(lb.get("words")), bool(lb.get("gates")),
-                                  bool(lb.get("shared")), finder, renamed))
+                                  bool(lb.get("shared")), finder, renamed, bool(lb.get("capitals"))))
         sports.append(Sport(str(key), str(body.get("name") or key), words, tuple(leagues)))
         for w in words:
             by_word.setdefault(w, []).append(_Entry(order, key, None))

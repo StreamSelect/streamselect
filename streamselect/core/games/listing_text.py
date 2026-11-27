@@ -95,6 +95,9 @@ def norm(text: Optional[str]) -> str:
     text = text or ""
     if text.isascii():
         return text.upper()
+    # An en or em dash joins two sides as a hyphen does: one guide writes every
+    # game "Hokej na ledu – NHL: Carolina – Seattle" (measured 2026-11-27).
+    text = text.replace("\u2013", "-").replace("\u2014", "-")
     folded = "".join(c for c in unicodedata.normalize("NFKD", text)
                      if not unicodedata.combining(c))
     return unicodedata.normalize("NFKC", folded).upper()
@@ -180,6 +183,22 @@ def find_time(u: str) -> Optional[StatedTime]:
         return None
     zoned = [t for t in found if t.zone]
     return (zoned or found)[0]
+
+
+def names_league(text: Optional[str], league: re.Pattern[str], acronyms: frozenset[str]) -> bool:
+    """Whether *text* names the league. An acronym league word (all capitals in
+    the list, "AHL") counts only where the text writes it in capitals: a guide's
+    "So'al Ahl Al Thekr" is an Arabic title, not the AHL (measured 2026-11-27)."""
+    for m in league.finditer(norm(text)):
+        if m.group() not in acronyms or re.search(rf"(?<![A-Za-z0-9]){re.escape(m.group())}(?![A-Za-z0-9])",
+                                                    text or ""):
+            return True
+    return False
+
+
+def acronyms_of(words) -> frozenset[str]:
+    """The league words written all in capitals, without spaces ("AHL", "NHL")."""
+    return frozenset(w for w in words if w.isupper() and " " not in w)
 
 
 def segments(u: str) -> list[str]:

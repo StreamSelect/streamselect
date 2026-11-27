@@ -47,7 +47,8 @@ def enabled_leagues(overrides: Optional[Mapping] = None) -> tuple[SportSettings,
     never reads Config itself)."""
     per_sport = {lg.sport: tuning.settings_kwargs(tuning.values(lg.sport, overrides))
                  for lg in _league_words()}
-    return tuple(SportSettings(lg.sport, lg.name, lg.words, **per_sport[lg.sport], renamed=lg.renamed)
+    return tuple(SportSettings(lg.sport, lg.name, lg.words, **per_sport[lg.sport], renamed=lg.renamed,
+                                capitals=lg.capitals)
                  for lg in _league_words())
 
 
