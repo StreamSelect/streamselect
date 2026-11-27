@@ -85,6 +85,10 @@ SPORT_ROLE = Qt.ItemDataRole.UserRole + 29
 #: the window.
 EVENT_WINDOW_ROLE = Qt.ItemDataRole.UserRole + 35
 LEAGUE_ROLE = Qt.ItemDataRole.UserRole + 30
+#: The game an event slot carries now (``core/games/carried.CarriedGame``) or
+#: None. Its own role, not folded into SPORT_ROLE: the stored kind stays what
+#: the row says it is, and only the cell shows the game's sport.
+CARRIED_GAME_ROLE = Qt.ItemDataRole.UserRole + 36
 
 #: Normalised media kind — "live" / "movie" / "series" / "" — read straight off
 #: the stored ``media_type``. The V3 row treats kind as STRUCTURAL (it picks the

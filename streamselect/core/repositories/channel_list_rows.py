@@ -13,6 +13,9 @@ lines with one job.
 
 from __future__ import annotations
 
+from streamselect.core import sports_catalog
+from streamselect.core.epg_utils import now_utc
+from streamselect.core.games.carried import carried_games
 from streamselect.core.repositories import search_ranking
 
 def rows_to_dtos(repos, rows: list, search_query: str | None) -> list:
@@ -41,6 +44,12 @@ def rows_to_dtos(repos, rows: list, search_query: str | None) -> list:
     # term itself is the honest heading — see canonical_person, and the 182-vs-8
     # measurement behind it.
     from_name = search_ranking.canonical_person(term, persons) if term else None
+    # A sports row with no sport of its own (an event slot, a many-sports network,
+    # an unidentified matchup) shows the sport of the game the finder placed on it
+    # now (One Sports List slice 3): one query for the page, never stored.
+    carried = carried_games(repos.session, [c.id for c in rows
+                                            if sports_catalog.is_kind(getattr(c, "sport_type", None))],
+                            now_utc())
 
     def _person(ch, section):
         # Only ever in Cast & Crew. A TITLES row matched on its own title, and
@@ -73,6 +82,7 @@ def rows_to_dtos(repos, rows: list, search_query: str | None) -> list:
             match_tier=(search_ranking.tier_for_row(
                 c.detected_title or c.name, person, section, term)
                 if term else 0),
+            carried_game=carried.get(c.id),
         )
 
     return [_dto(c) for c in rows]

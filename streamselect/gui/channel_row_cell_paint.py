@@ -61,6 +61,7 @@ from streamselect.gui.channel_row_cells import (
 )
 from streamselect.core.epg_utils import now_utc as _now_utc
 from streamselect.gui.channel_list_roles import (
+    CARRIED_GAME_ROLE,
     CATEGORY_ROLE,
     COLLECTION_ROLE,
     EVENT_WINDOW_ROLE,
@@ -191,8 +192,10 @@ class RowCellPaintMixin:
                 index.data(GENRES_ROLE), index.data(GENRE_ROLE) or ""
             ),
             CHIP_SLOT_STATE: one(_state_cell(index.data(EVENT_WINDOW_ROLE), _now_utc())),
-            CHIP_SLOT_SPORT: one(_sport_cell(index.data(SPORT_ROLE) or "")),
-            CHIP_SLOT_LEAGUE: one(_league_cell(index.data(LEAGUE_ROLE) or "")),
+            CHIP_SLOT_SPORT: one(_sport_cell(index.data(SPORT_ROLE) or "",
+                                             index.data(CARRIED_GAME_ROLE), _now_utc())),
+            CHIP_SLOT_LEAGUE: one(_league_cell(index.data(LEAGUE_ROLE) or "",
+                                               index.data(CARRIED_GAME_ROLE))),
             CHIP_SLOT_COLLECTION: one(_category_cell(
                 index.data(COLLECTION_ROLE) or "", platform_code,
                 filter_category=index.data(CATEGORY_ROLE) or "",

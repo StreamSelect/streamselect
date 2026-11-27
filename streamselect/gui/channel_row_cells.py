@@ -24,7 +24,9 @@ from streamselect.core import sports_catalog
 from streamselect.core.channel_name_utils import collection_display
 from streamselect.core.quality_vocab import quality_display
 from streamselect.core.region_codes import PLATFORM_CODES, platform_display
+from streamselect.core.epg_utils import to_local
 from streamselect.core.event_datetime import event_is_on_now
+from streamselect.core.time_display import clock_text
 from streamselect.gui import theme as _theme
 from streamselect.gui.badge_utils import _quality_outline_colors
 
@@ -317,7 +319,7 @@ def _state_cell(window, now) -> Optional[_Cell]:
                      "now be showing something else")
 
 
-def _sport_cell(sport: str) -> Optional[_Cell]:
+def _sport_cell(sport: str, carried=None, now=None) -> Optional[_Cell]:
     """Sport — TIER 2, NEUTRAL text, for the same reason collection is neutral.
 
     The palette publishes one hue per facet and guarantees no two share one, so
@@ -328,7 +330,19 @@ def _sport_cell(sport: str) -> Optional[_Cell]:
 
     The stored value is a key (``american_football``, or a kind such as
     ``network``); the one sports list names it (``sports_catalog.sport_label``).
+    A row stored as a kind (event slot, many sports, unknown) that carries a
+    game (*carried*, ``core/games/carried.py``) reads as that game's sport, and
+    the tooltip says where it came from (owner, 2026-11-27: the cell reads like
+    any other row, the tooltip says why).
     """
+    if carried is not None and sports_catalog.is_kind(sport):
+        label = sports_catalog.sport_label(carried.sport)
+        when = ("on now" if now is None or carried.start_utc <= now
+                else f"at {clock_text(to_local(carried.start_utc))}")
+        return _Cell(label, False, _theme.COLOR_ROW_META,
+                     tip=f"Sport: {label}, from the game this channel carries {when}: "
+                         f"{carried.title} ({carried.league}). The channel itself is "
+                         f"listed as {sports_catalog.sport_label(sport)}.")
     if not sport:
         return None
     label = sports_catalog.sport_label(str(sport))
@@ -337,12 +351,16 @@ def _sport_cell(sport: str) -> Optional[_Cell]:
     return _Cell(label, False, _theme.COLOR_ROW_META, tip=f"Sport: {label}")
 
 
-def _league_cell(league: str) -> Optional[_Cell]:
+def _league_cell(league: str, carried=None) -> Optional[_Cell]:
     """League — TIER 2, NEUTRAL text. See :func:`_sport_cell`.
 
     Painted as stored: a league name is an acronym or a proper noun ("NFL",
-    "Premier League"), so title-casing it would damage it.
+    "Premier League"), so title-casing it would damage it. A row with no
+    league of its own that carries a game shows the game's league.
     """
+    if not league and carried is not None:
+        return _Cell(carried.league, False, _theme.COLOR_ROW_META,
+                     tip=f"League: {carried.league}, from {carried.title}")
     if not league:
         return None
     label = str(league).strip()

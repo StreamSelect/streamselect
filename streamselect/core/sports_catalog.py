@@ -50,6 +50,11 @@ FINDER_LISTED, FINDER_TRIAL, FINDER_OFF = "listed", "trial", "off"
 _KIND_LABELS = {NETWORK: "Many sports", SLOT: "Event slot", UNKNOWN: "Unknown"}
 
 
+def is_kind(sport_type: Optional[str]) -> bool:
+    """Whether a stored ``sport_type`` is a kind (network, slot, unknown), not a sport."""
+    return sport_type in _KIND_LABELS
+
+
 @dataclass(frozen=True)
 class League:
     """One league of one sport."""

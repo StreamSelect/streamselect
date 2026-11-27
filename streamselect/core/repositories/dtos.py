@@ -218,6 +218,8 @@ class ChannelListDTO:
     #: rather than wrong — Q13: show it only when a parsed time corroborates it.
     event_start_time: "datetime | None" = None
     event_stop_time: "datetime | None" = None
+    #: An event slot's game now (core/games/carried.py), read per page, never stored.
+    carried_game: "object | None" = None
 
     @property
     def section(self) -> str:
@@ -234,7 +236,8 @@ class ChannelListDTO:
     def from_orm(cls, ch, *, user_rating: int = 0, reliability_state: str = "ok",
                  section_key: str | None = None,
                  match_person: str | None = None,
-                 match_tier: int = 0) -> "ChannelListDTO":
+                 match_tier: int = 0,
+                 carried_game: "object | None" = None) -> "ChannelListDTO":
         """Build a ChannelListDTO from a ChannelDB row (call inside a session).
 
         Args:
@@ -283,6 +286,7 @@ class ChannelListDTO:
             league_name=getattr(ch, "league_name", None),
             event_start_time=getattr(ch, "event_start_time", None),
             event_stop_time=getattr(ch, "event_stop_time", None),
+            carried_game=carried_game,
         )
 
 

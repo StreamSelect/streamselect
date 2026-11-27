@@ -66,6 +66,7 @@ __all__ = [
 ]
 from streamselect.gui import icons as _icons
 from streamselect.gui import theme as _theme
+from streamselect.gui.channel_list_roles import CARRIED_GAME_ROLE
 
 def _watched_dim_brush() -> QBrush:
     """Brush for fully-watched non-live rows — built fresh each call so a live
@@ -322,6 +323,8 @@ class ChannelListModel(ChannelListGroupingMixin, QAbstractListModel):
             return getattr(channel, "sport_type", None) or ""
         if role == LEAGUE_ROLE:
             return getattr(channel, "league_name", None) or ""
+        if role == CARRIED_GAME_ROLE:
+            return getattr(channel, "carried_game", None)
         if role == EVENT_WINDOW_ROLE:
             # A pair, or None when this row is not a dated fixture — which is
             # ~96% of them. Returning None rather than (None, None) means the
