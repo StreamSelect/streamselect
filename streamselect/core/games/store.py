@@ -8,6 +8,7 @@ thread (the caller's executor); the finder itself never touches the database.
 
 from __future__ import annotations
 
+import re
 import time
 from datetime import datetime, timedelta
 from typing import Mapping, Optional
@@ -24,7 +25,7 @@ from streamselect.core.games.finder import (
     GUIDE, ListingIn, Memory, PlayIn, SportSettings, _learn_clocks, find_games, learn_teams,
 )
 from streamselect.core.games.listing_text import (
-    MATCHUP_LIKE_PATTERNS, NOT_PLAIN_GLOB, NOT_TEAM_WORDS, league_matcher, norm,
+    MATCHUP_LIKE_PATTERNS, NOT_PLAIN_GLOB, clean_side, league_matcher, norm,
 )
 from streamselect.core.games.models import GameDB, GameFeedDB, GameFinderMemoryDB, SportTeamDB
 from streamselect.core.games.teams import team_display
@@ -213,7 +214,7 @@ def _read_listings(session, settings: SportSettings, now: datetime, hidden: set[
 
 
 def _keep_teams(session, key: str, names: list[str], games, now: datetime,
-                former: frozenset[str] = frozenset()) -> None:
+                former: frozenset[str] = frozenset(), league: Optional[re.Pattern[str]] = None) -> None:
     """Add this run's team book to ``sport_teams``; a team the run did not see is
     kept with its last-seen time (owner, 2026-11-27). A game's two sides are in
     the book by construction; they are added anyway, so a confirmed team is
@@ -222,9 +223,12 @@ def _keep_teams(session, key: str, names: list[str], games, now: datetime,
     in_game = {t for g in games if g.level <= 2 for t in (g.team_a, g.team_b)}
     stored = {r.name: r for r in session.execute(
         select(SportTeamDB).where(SportTeamDB.league_key == key)).scalars()}
-    # A former name, and a misreading kept before its word was listed as never a
-    # team's ("Herrar New York Knicks"), are not teams of their own.
-    for name in [n for n in stored if n in former or NOT_TEAM_WORDS & set(norm(n).split())]:
+    # A former name is not a team of its own, and neither is a stored name the
+    # side reader no longer reads as itself: a misreading kept before the reader
+    # learned better ("Herrar New York Knicks", "Mit Sky Sport", "Ta M").
+    def misread(name: str) -> bool:
+        return league is not None and clean_side(norm(name), league) != tuple(norm(name).split())
+    for name in [n for n in stored if n in former or misread(n)]:
         session.delete(stored.pop(name))
     for name in sorted(set(names) | in_game):
         row = stored.get(name)
@@ -287,7 +291,8 @@ def refresh_games(db: Database, now: datetime | None = None,
                 session.add(row)
             session.merge(GameFinderMemoryDB(finder=key, memory=_memory_to_json(memory), updated_at=now))
             _keep_teams(session, key, [team_display(t) for t in book.teams], games, now,
-                        frozenset(team_display(tuple(norm(old).split())) for old, _ in settings.renamed))
+                        frozenset(team_display(tuple(norm(old).split())) for old, _ in settings.renamed),
+                        league_matcher(settings.words))
         counts[key] = sum(g.level == 1 for g in games)
         logger.info("Games {}: {} found ({} at level 1) from {:,} listings, {} clocks learned, {:.1f}s",
                     key, len(games), counts[key], len(listings),

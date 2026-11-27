@@ -161,3 +161,34 @@ def test_a_stored_misreading_goes_and_a_real_team_stays(db):
     teams = _teams(db)
     assert "Matchday" not in teams and "Herrar Buffalo Sabres" not in teams
     assert teams["Buffalo Sabres"].last_in_game == NOW
+
+
+def test_a_broadcaster_or_a_credit_is_never_a_side():
+    from streamselect.core.games.listing_text import clean_side, league_matcher, matchups, norm
+
+    fiba = league_matcher(["FIBA"])
+    title = "M1 Group - Sports to the World呈獻：FIBA 3x3 世界巡迴賽 — 香港大師賽 2026[直播][粵]"
+    assert matchups(norm(title), fiba) == []
+    assert clean_side("MIT SKY SPORT", fiba) is None
+    assert clean_side("SPORT RECIFE", fiba) == ("SPORT", "RECIFE"), "SPORT alone is a club's word"
+
+
+def test_an_ampersand_between_letters_is_part_of_the_name():
+    from streamselect.core.games.listing_text import league_matcher, matchups, norm
+    from streamselect.core.games.teams import team_display
+
+    ncaa = league_matcher(["NCAA"])
+    (a, b), = matchups(norm("NCAA Men`s Basketball: MARQ vs. TA&M • Players Era 16"), ncaa)
+    assert (a, b) == (("MARQ",), ("TA&M",))
+    (_, east), = matchups(norm("NCAAM: Rice vs E Texas A&M @ Nov 27 3:00 PM"), ncaa)
+    assert team_display(east) == "E Texas A&M", "AM is not stripped as a clock word here"
+    assert matchups(norm("NCAA: Tom & Jerry vs Rice"), ncaa)[0][0] == ("TOM", "JERRY")
+
+
+def test_a_stored_name_the_reader_no_longer_reads_as_itself_goes(db):
+    _seed_db(db)
+    with db.session_scope() as s:
+        s.add(SportTeamDB(league_key="hockey/NHL", name="Mit Sky Sport", first_seen=NOW, last_seen=NOW,
+                          last_in_game=NOW))
+    refresh_games(db, NOW)
+    assert "Mit Sky Sport" not in _teams(db)

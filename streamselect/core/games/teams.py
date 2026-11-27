@@ -152,5 +152,5 @@ class TeamBook:
 
 
 def team_display(team: Side) -> str:
-    """"BUFFALO SABRES" -> "Buffalo Sabres"."""
-    return " ".join(w.capitalize() for w in team)
+    """"BUFFALO SABRES" -> "Buffalo Sabres", "TEXAS A&M" -> "Texas A&M"."""
+    return " ".join("&".join(p.capitalize() for p in w.split("&")) for w in team)

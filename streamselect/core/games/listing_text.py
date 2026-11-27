@@ -64,6 +64,11 @@ _CLOCK_IN_SIDE_RE = re.compile(r"\d{1,2}(:\d{2}){1,2}\s*(AM|PM)?|\d{1,2}\s*(AM|P
 NOT_TEAM_WORDS = frozenset({"HERRAR", "DAMER", "HERREN", "DAMEN", "MATCHDAY", "PREGAME",
                             "POSTGAME", "COUNTDOWN", "PRESS", "CONFERENCE", "BASKETBALL"})
 _STRIP_WORDS = set(MONTH_WORD) | set(WEEKDAY_WORD) | {"AM", "PM"} | set(ZONE_LABELS) | NOT_TEAM_WORDS
+#: A side holding one of these runs of words is a broadcaster or a credit, never a
+#: team: "… - MIT SKY SPORT" (German "with Sky Sport"), "M1 Group - Sports to the
+#: World presents: FIBA 3x3 …" (a guide title). "SPORT" alone is a club's word
+#: ("Sport Recife", Benfica's "Sport Lisboa"), so only "SKY SPORT" is listed.
+NOT_A_TEAM: tuple[tuple[str, ...], ...] = (("SPORTS",), ("SKY", "SPORT"))
 #: A number that is part of a team's name: digits then 3+ letters ("76ERS", "49ERS"),
 #: never an ordinal ("18TH"), a quality mark ("4K", "1080P") or a frame rate ("60FPS").
 _NAME_NUMBER_RE = re.compile(r"\d+(?!FPS$)[A-Z]{3,}")
@@ -187,7 +192,10 @@ def clean_side(part: str, league: re.Pattern[str]) -> Optional[Side]:
     """The words of one side, without clock times, league words, dates and zone labels."""
     p = _CLOCK_IN_SIDE_RE.sub(" ", part)
     p = league.sub(" ", p)
-    p = re.sub(r"[^A-Z0-9 ]", " ", p.replace(".", ""))
+    # "&" joining letters is part of the name ("TEXAS A&M", ESPN's "TA&M"): split
+    # there, it read "TA M", and the "AM" of "TEXAS A M" went as a clock word.
+    p = re.sub(r"[^A-Z0-9 &]", " ", p.replace(".", ""))
+    p = re.sub(r"(?<![A-Z])&|&(?![A-Z])", " ", p)
     # A number is kept only as part of a name ("76ERS", "49ERS"); bare numbers,
     # ordinals ("18TH") and quality marks ("4K", "1080P") go.
     p = " ".join(w if _NAME_NUMBER_RE.fullmatch(w) else re.sub(r"[0-9]", " ", w) for w in p.split())
@@ -203,6 +211,8 @@ def clean_side(part: str, league: re.Pattern[str]) -> Optional[Side]:
             words.append(w)
         prev_single = len(w) == 1
     side = tuple(dict.fromkeys(words))
+    if any(side[i:i + len(run)] == run for run in NOT_A_TEAM for i in range(len(side))):
+        return None
     return side if any(len(w) >= 2 for w in side) else None
 
 
