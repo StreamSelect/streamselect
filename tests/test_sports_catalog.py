@@ -171,3 +171,15 @@ def test_cyclocross_and_the_uci_are_cycling():
     tag = sc.classify("AU (STAN 02) | Women`s Elite: Ostrava  UCI Cyclocross World Cup 2026/27 (2026-11-28 04:05:50)")
     assert (tag.sport_type, tag.league_name) == ("cycling", "UCI")
     assert sc.classify("flobikes: 2026 USA BMX Race of Champions (Main)").sport_type == "cycling"
+
+
+def test_grand_prix_is_racing_only_when_nothing_else_names_the_sport():
+    gp = sc.classify("CA (SN+ 025) | Tissot Sprint _ Grand Prix of Valencia (2026-11-28 08:30:00)")
+    assert (gp.sport_type, gp.league_name) == ("racing", "MotoGP")
+    guess = sc.classify("Next | Qatar Grand Prix, Practice 1 | all | 27-11-2026 | DE: SOCCER PPV 4")
+    assert (guess.sport_type, guess.sport_from) == ("racing", sc.FROM_LEAGUE_GUESS)
+    skate = sc.classify("End | Eiskunstlauf: Grand Prix: Kurzprogramm Frauen | all | DE: SOCCER PPV 9")
+    assert skate.sport_type == "figure_skating", "a skating word beats the Grand Prix guess"
+    assert not sc.is_sports("NL| Grand Prix Radio"), "Grand Prix alone never makes a channel Sports"
+    assert sc.classify("NEXT | FORMEL 1 QATARS GRAND PRIX | Fri 27 Nov").league_name == "Formula 1"
+    assert sc.is_sports("Live | Formel 1 Kvalifikation 2026 | DK: VIAPLAY PPV 59")

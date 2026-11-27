@@ -299,16 +299,26 @@ sports:
     name: Racing
     words: [f1*, formula*, floracing]
     leagues:
+      # "Formel 1": Danish, German and Swedish listings (owner, 2026-11-27: the DK
+      # PPV qualifying feeds were not Sports at all). Gates, so they are.
       Formula 1:
-        words: [Formula 1, Formula One, Formule 1, F1]
+        words: [Formula 1, Formula One, Formule 1, Formel 1, F1]
+        gates: true
       NASCAR:
         words: [NASCAR]
+      # "Tissot Sprint": MotoGP's own name for its Saturday sprint race.
       MotoGP:
-        words: [MotoGP]
+        words: [MotoGP, Tissot Sprint, Moto2, Moto3]
       IndyCar:
         words: [IndyCar]
       Rally:
         words: [Rally]
+      # Shared and a guess: figure skating, darts, snooker and judo have Grand
+      # Prix events too, so it names racing only when nothing else names a sport,
+      # and never makes a channel Sports on its own (owner, 2026-11-27).
+      Grand Prix:
+        words: [Grand Prix]
+        shared: true
   cricket:
     name: Cricket
     words: [cricket]
@@ -386,7 +396,15 @@ sports:
   # PPV "Short Program" rows that only a SOCCER PPV slot name had called soccer.
   figure_skating:
     name: Figure skating
-    words: [figure skating, free skate, free dance, short program, ice dance, pairs skating]
+    # German, Spanish and French too: 14 of the "Grand Prix" PPV rows were ISU
+    # Grand Prix skating in those languages (owner, 2026-11-27).
+    words: [figure skating, free skate, free dance, short program, ice dance, pairs skating,
+            eiskunstlauf, kurzprogramm, patinaje artístico, patinaje artistico, programa corto,
+            patinage artistique, programme court, danse sur glace]
+    leagues:
+      ISU Grand Prix:
+        words: [ISU Grand Prix, NHK Trophy]
+        gates: true
   # BV-Q11: 6 event rows. Not the bare "GS" ("Women's GS: Killington"): a sport word
   # also decides what counts as Sports, and two letters are too loose for that.
   skiing:

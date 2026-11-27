@@ -223,7 +223,9 @@ if TYPE_CHECKING:                                    # pragma: no cover
 #: Sports ("SKY SPORTS UHD [EVENT]": 59 rows had no sport or kind).
 #: v17: figure skating and skiing are sports (Library Breakdown BV-Q11).
 #: v18: cyclocross, flobikes and the UCI are cycling (owner, 2026-11-27).
-CURRENT_VERSION = 18
+#: v19: "Formel 1", Tissot Sprint / Moto2 / Moto3, "Grand Prix" as a racing guess,
+#: and figure skating in German, Spanish and French (owner, 2026-11-27).
+CURRENT_VERSION = 19
 
 #: Fields the classifier owns end-to-end. Cleared before each recompute so a row
 #: that stops matching loses its stale label instead of keeping it.
