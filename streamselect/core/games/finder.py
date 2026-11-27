@@ -432,9 +432,31 @@ def _mark_stale(work: list[_L], memory: Memory, now: datetime, stale_after: time
     return first_seen
 
 
+def _split(listings: list[ListingIn], league: re.Pattern[str]) -> tuple[list[ListingIn], list[ListingIn]]:
+    """(listings naming the league in their name or collection: the seed, the rest)."""
+    seeded, others = [], []
+    for li in listings:
+        hit = league.search(norm(li.name)) or (li.source != GUIDE and league.search(norm(li.collection)))
+        (seeded if hit else others).append(li)
+    return seeded, others
+
+
+def learn_teams(listings: list[ListingIn], settings: SportSettings) -> TeamBook:
+    """The league's team book, learned from its seed listings and guide titles.
+
+    :func:`find_games` reads its games against this book; the store keeps the
+    book's teams (``sport_teams``), so one run builds it once and passes it in.
+    """
+    league = league_matcher(settings.words)
+    seeded, _ = _split(listings, league)
+    return TeamBook((norm(li.name) for li in seeded if li.source != GUIDE),
+                    (norm(li.name) for li in seeded if li.source == GUIDE), league)
+
+
 def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime,
                memory: Optional[Memory] = None,
-               known: tuple[Clock, ...] = (), plays=()) -> tuple[list[Game], Memory, list[Clock]]:
+               known: tuple[Clock, ...] = (), plays=(),
+               book: Optional[TeamBook] = None) -> tuple[list[Game], Memory, list[Clock]]:
     """Find one sport's games among *listings*.
 
     Args:
@@ -448,18 +470,16 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
         plays: recent plays (:class:`PlayIn`); those that were this league join
             ``memory.watched`` (:func:`credit_plays`), which drops days past
             ``settings.most_watched_days``.
+        book: the team book :func:`learn_teams` built from these same
+            listings; learned here when not given.
 
     Returns:
         (games in the window and outside it, the memory for the next run, learned clocks)
     """
     memory = memory or Memory()
     league = league_matcher(settings.words)
-    seeded, others = [], []
-    for li in listings:
-        hit = league.search(norm(li.name)) or (li.source != GUIDE and league.search(norm(li.collection)))
-        (seeded if hit else others).append(li)
-    book = TeamBook((norm(li.name) for li in seeded if li.source != GUIDE),
-                    (norm(li.name) for li in seeded if li.source == GUIDE), league)
+    seeded, others = _split(listings, league)
+    book = book if book is not None else learn_teams(listings, settings)
     seeded = [ListingIn(**{**li.__dict__, "seeded": True}) for li in seeded]
     # Past the seed: only channels whose BOTH sides are exactly known teams.
     widened = []

@@ -20,12 +20,13 @@ from streamselect.core.epg_utils import now_utc, to_local
 from streamselect.core.event_datetime import DEFAULT_EVENT_DURATION
 from streamselect.core.games import tuning
 from streamselect.core.games.finder import (
-    GUIDE, ListingIn, Memory, PlayIn, SportSettings, _learn_clocks, find_games,
+    GUIDE, ListingIn, Memory, PlayIn, SportSettings, _learn_clocks, find_games, learn_teams,
 )
 from streamselect.core.games.listing_text import (
     MATCHUP_LIKE_PATTERNS, NOT_PLAIN_GLOB, league_matcher, norm,
 )
-from streamselect.core.games.models import GameDB, GameFeedDB, GameFinderMemoryDB
+from streamselect.core.games.models import GameDB, GameFeedDB, GameFinderMemoryDB, SportTeamDB
+from streamselect.core.games.teams import team_display
 from streamselect.core.playback_models import PlaybackEventDB
 from streamselect.core.repositories.provider import ProviderRepository
 from streamselect.core import sports_catalog
@@ -210,6 +211,25 @@ def _read_listings(session, settings: SportSettings, now: datetime, hidden: set[
     return listings
 
 
+def _keep_teams(session, key: str, names: list[str], games, now: datetime) -> None:
+    """Add this run's team book to ``sport_teams``; a team the run did not see is
+    kept with its last-seen time (owner, 2026-11-27). A game's two sides are in
+    the book by construction; they are added anyway, so a confirmed team is
+    never missing from the table."""
+    in_game = {t for g in games if g.level <= 2 for t in (g.team_a, g.team_b)}
+    stored = {r.name: r for r in session.execute(
+        select(SportTeamDB).where(SportTeamDB.league_key == key)).scalars()}
+    for name in sorted(set(names) | in_game):
+        row = stored.get(name)
+        if row is None:
+            row = SportTeamDB(league_key=key, name=name, first_seen=now, last_seen=now, runs_seen=0)
+            session.add(row)
+        row.last_seen = now
+        row.runs_seen = (row.runs_seen or 0) + 1
+        if name in in_game:
+            row.last_in_game = now
+
+
 def refresh_games(db: Database, now: datetime | None = None,
                   overrides: Optional[Mapping] = None) -> dict[str, int]:
     """Find every enabled league's games and replace them in the database.
@@ -243,7 +263,8 @@ def refresh_games(db: Database, now: datetime | None = None,
             listings = _read_listings(session, settings, now, hidden)
             row = session.get(GameFinderMemoryDB, key)
             memory = _memory_from_json(row.memory if row else None)
-        games, memory, clocks = find_games(listings, settings, now, memory, known, plays)
+        book = learn_teams(listings, settings)
+        games, memory, clocks = find_games(listings, settings, now, memory, known, plays, book)
         with db.session_scope(background=True) as session:
             old = select(GameDB.id).where(GameDB.sport == settings.sport, GameDB.league == settings.league)
             session.execute(delete(GameFeedDB).where(GameFeedDB.game_id.in_(old)))
@@ -258,6 +279,7 @@ def refresh_games(db: Database, now: datetime | None = None,
                                         start_utc=f.start_utc, counts=f.counts) for f in g.feeds]
                 session.add(row)
             session.merge(GameFinderMemoryDB(finder=key, memory=_memory_to_json(memory), updated_at=now))
+            _keep_teams(session, key, [team_display(t) for t in book.teams], games, now)
         counts[key] = sum(g.level == 1 for g in games)
         logger.info("Games {}: {} found ({} at level 1) from {:,} listings, {} clocks learned, {:.1f}s",
                     key, len(games), counts[key], len(listings),

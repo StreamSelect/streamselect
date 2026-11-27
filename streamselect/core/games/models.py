@@ -82,3 +82,24 @@ class GameEndDB(Base):
     team_b     = Column(String, primary_key=True)
     start_utc  = Column(DateTime, primary_key=True)
     ended_at   = Column(DateTime, nullable=False)    # UTC, when the user marked it
+
+
+class SportTeamDB(Base):
+    """One team of one league, as the finder's team book learned it.
+
+    Kept across runs (owner, 2026-11-27: a team that leaves the listings stays,
+    with when it was last seen): the read-only Sport ▸ League ▸ Teams view and
+    the catch-all read these rows. ``last_in_game`` is the confidence label: a
+    team that was a side of a stored game is confirmed; a name only the
+    listings gave ("Liga", "Tbd" on some feeds) is a low-confidence guess,
+    kept and labelled rather than dropped.
+    """
+    __tablename__ = "sport_teams"
+
+    league_key   = Column(String, primary_key=True)    # "hockey/NHL"
+    name         = Column(String, primary_key=True)    # display name, "Calgary Flames"
+    first_seen   = Column(DateTime, nullable=False)    # UTC: the first run that learned it
+    last_seen    = Column(DateTime, nullable=False)    # UTC: the latest run that learned it
+    runs_seen    = Column(Integer, nullable=False, default=1)
+    #: UTC: the latest run in which it was a side of a stored game; None if never.
+    last_in_game = Column(DateTime)
