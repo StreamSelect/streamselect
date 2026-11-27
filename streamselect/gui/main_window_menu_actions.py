@@ -124,6 +124,15 @@ class _MenuActionsMixin:
         )
         missing_tmdb_action.triggered.connect(self.enter_missing_tmdb_mode)
         tools_menu.addAction(missing_tmdb_action)
+        breakdown_action = QAction(
+            _icon_utils.role_icon("library_breakdown"), "Library &Breakdown", self
+        )
+        breakdown_action.setToolTip(
+            "See how your channels were sorted into sports, leagues and teams, "
+            "and what couldn't be sorted"
+        )
+        breakdown_action.triggered.connect(self.enter_library_breakdown_mode)
+        tools_menu.addAction(breakdown_action)
         reconnect_action = QAction(
             _icon_utils.role_icon("reconnect"), "Reconnect Engaged Content", self
         )

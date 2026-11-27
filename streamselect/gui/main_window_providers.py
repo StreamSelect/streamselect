@@ -218,6 +218,34 @@ class _ProviderMixin:
         self.missing_tmdb_view.on_deactivate()
         self.switch_to_list_view()
 
+    def enter_library_breakdown_mode(self):
+        """Switch the centre panel to Tools ▸ Library breakdown (design "Library Breakdown").
+
+        Built on first open, not in ``__init__``: most sessions never open it,
+        and ``CONTENT_VIEW_ATTRS`` already treats an absent view as hidden.
+        """
+        view = self.__dict__.get("library_breakdown_view")
+        if view is None:
+            from streamselect.gui.library_breakdown_view import LibraryBreakdownView
+            view = self.library_breakdown_view = LibraryBreakdownView(self)
+            view.done.connect(self.exit_library_breakdown_mode)
+            # A clicked count opens its channels as a strict context filter, the
+            # same chokepoint the Analytics tab's "Browse them" uses.
+            view.browse_requested.connect(
+                lambda label, ids: self._activate_context_filter(label, _details_id_filter=set(ids)))
+            view.setVisible(False)
+            self._list_layout.addWidget(view)
+        self._hide_all_content_views()
+        view.setVisible(True)
+        view.on_activate()
+        self.stats_label.setText("Library breakdown")
+        self._deactivate_view_chips()
+
+    def exit_library_breakdown_mode(self):
+        """Return to the normal channel list view."""
+        self.library_breakdown_view.on_deactivate()
+        self.switch_to_list_view()
+
     def enter_reconnect_engaged_mode(self):
         """Switch center panel to the Reconnect Engaged Content view.
 

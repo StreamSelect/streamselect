@@ -39,6 +39,7 @@ CONTENT_VIEW_ATTRS: tuple[str, ...] = (
     "reconnect_engaged_view",
     "metadata_enrichment_view",
     "sources_manager_view",
+    "library_breakdown_view",
 )
 
 

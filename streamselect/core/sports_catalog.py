@@ -45,10 +45,15 @@ FROM_LEAGUE = "league"              # a league's name
 FROM_LEAGUE_GUESS = "league_guess"  # a shared league name, nothing else naming the sport
 FROM_LABEL = "label"                # only the slot's own name ("SOCCER PPV 80"): a guess
 FROM_TEAMS = "teams"                # both sides are confirmed teams of one league (games/identify.py)
+#: How each ``sport_from`` reads (Library breakdown, "Decided by").
+FROM_WORDS = {FROM_WORD: "its name", FROM_LEAGUE: "a league", FROM_LEAGUE_GUESS: "a shared league (guess)",
+              FROM_LABEL: "slot name (guess)", FROM_TEAMS: "its teams"}
 
 FINDER_LISTED, FINDER_TRIAL, FINDER_OFF = "listed", "trial", "off"
 
 _KIND_LABELS = {NETWORK: "Many sports", SLOT: "Event slot", UNKNOWN: "Unknown"}
+#: The stored kinds, in the order they are listed.
+KINDS = tuple(_KIND_LABELS)
 
 
 def is_kind(sport_type: Optional[str]) -> bool:

@@ -34,7 +34,7 @@ from streamselect.core.games.teams import match
 _VIEWS = ("sports", "ppv", "live_event")
 
 
-class _League:
+class LeagueTeams:
     """One league's confirmed teams, indexed by word for a quick candidate list."""
 
     def __init__(self, key: str, names: list[str], words: tuple[str, ...]):
@@ -56,27 +56,34 @@ class _League:
         return exact[0] if len(exact) == 1 else None
 
 
-def _leagues(session) -> list[_League]:
+def load_leagues(session) -> list[LeagueTeams]:
+    """Every league with confirmed teams, from ``sport_teams``."""
     confirmed: dict[str, list[str]] = defaultdict(list)
     for key, name in session.execute(select(SportTeamDB.league_key, SportTeamDB.name)
                                      .where(SportTeamDB.last_in_game.is_not(None))):
         confirmed[key].append(name)
     words = {f"{lg.sport}/{lg.name}": lg.words for s in sports_catalog.sports() for lg in s.leagues}
-    return [_League(key, names, words.get(key, ())) for key, names in confirmed.items()]
+    return [LeagueTeams(key, names, words.get(key, ())) for key, names in confirmed.items()]
 
 
-def league_of(name: str, leagues: list[_League]) -> Optional[_League]:
-    """The one league whose confirmed teams are both sides of *name*'s matchup."""
+def fitting_leagues(name: str, leagues: list[LeagueTeams]) -> Optional[list[LeagueTeams]]:
+    """The leagues whose confirmed teams are both sides of *name*'s matchup, or
+    None when the name states no matchup."""
     a, b = parse_fixture_opponents(name or "")
     if a is None or b is None:
         return None
-    fits = [lg for lg in leagues if (ta := lg.team(a)) and (tb := lg.team(b)) and ta != tb]
+    return [lg for lg in leagues if (ta := lg.team(a)) and (tb := lg.team(b)) and ta != tb]
+
+
+def league_of(name: str, leagues: list[LeagueTeams]) -> Optional[LeagueTeams]:
+    """The one league whose confirmed teams are both sides of *name*'s matchup."""
+    fits = fitting_leagues(name, leagues) or []
     return fits[0] if len(fits) == 1 else None
 
 
 def identify_by_teams(session) -> int:
     """Tag the unknown sports rows two confirmed teams name. Returns how many."""
-    leagues = _leagues(session)
+    leagues = load_leagues(session)
     if not leagues:
         return 0
     rows = session.execute(select(ChannelDB).where(

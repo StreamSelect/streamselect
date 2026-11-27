@@ -756,6 +756,8 @@ VECTOR_KEYS: dict[str, str] = {
     "info": "mdi6.information-outline",
     "tips": "mdi6.lightbulb-on-outline",
     "missing_data": "mdi6.database-off-outline",
+    # Tools ▸ Library breakdown: how the library is sorted into groups.
+    "library_breakdown": "mdi6.file-tree-outline",
     "reconnect": "mdi6.power-plug-outline",
     "log_viewer": "mdi6.text-box-outline",
     "clear_log": "mdi6.delete-sweep-outline",
