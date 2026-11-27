@@ -44,6 +44,7 @@ FROM_WORD = "word"                  # a word that says the sport
 FROM_LEAGUE = "league"              # a league's name
 FROM_LEAGUE_GUESS = "league_guess"  # a shared league name, nothing else naming the sport
 FROM_LABEL = "label"                # only the slot's own name ("SOCCER PPV 80"): a guess
+FROM_TEAMS = "teams"                # both sides are confirmed teams of one league (games/identify.py)
 
 FINDER_LISTED, FINDER_TRIAL, FINDER_OFF = "listed", "trial", "off"
 

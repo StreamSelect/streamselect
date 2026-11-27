@@ -55,3 +55,40 @@ def test_handing_the_finder_its_book_finds_the_same_games():
     given, _, _ = find_games(listings, NHL, NOW, book=learn_teams(listings, NHL))
     assert [(g.title, g.start_utc, g.level) for g in given] == \
         [(g.title, g.start_utc, g.level) for g in alone]
+
+
+def _unknown(s, cid, name):
+    s.add(ChannelDB(id=cid, source_id=cid, provider_id="p1", name=name, media_type="live",
+                    special_view="sports", sport_type="unknown"))
+
+
+def test_a_game_nothing_identified_is_named_by_two_confirmed_teams_of_one_league(db):
+    from streamselect.core.games.identify import identify_by_teams
+
+    with db.session_scope() as s:
+        for league, name, confirmed in (
+                ("hockey/NHL", "Toronto Maple Leafs", True), ("hockey/NHL", "Boston Bruins", True),
+                ("basketball/NBA", "Toronto Raptors", True), ("basketball/NBA", "Boston Celtics", True),
+                ("basketball/NBA", "Liga", False), ("basketball/NBA", "Miami Heat", True)):
+            s.add(SportTeamDB(league_key=league, name=name, first_seen=NOW, last_seen=NOW,
+                              last_in_game=NOW if confirmed else None))
+        _unknown(s, "u1", "NEXT | TORONTO MAPLE LEAFS VS. BOSTON BRUINS | Fri 27 Nov 12:30 EST (US)")
+        _unknown(s, "u2", "CA (SN+ 006) | Toronto @ Boston (2026-11-27 13:00:05)")    # NHL or NBA
+        _unknown(s, "u3", "NEXT | LIGA VS. MIAMI HEAT | Fri 27 Nov")                    # Liga unconfirmed
+    with db.session_scope() as s:
+        assert identify_by_teams(s) == 1
+    with db.session_scope(commit=False) as s:
+        got = {c.id: (c.sport_type, c.league_name, c.sport_from) for c in s.query(ChannelDB).all()}
+    assert got["u1"] == ("hockey", "NHL", "teams")
+    assert got["u2"][0] == "unknown", "two leagues fit: left for the catch-all"
+    assert got["u3"][0] == "unknown", "a name only the listings gave never identifies"
+
+
+def test_each_finder_run_names_the_games_its_teams_now_explain(db):
+    _seed_db(db)
+    with db.session_scope() as s:
+        _unknown(s, "u9", "NEXT | WINNIPEG JETS - DALLAS STARS | Thu 12 Nov | 8K EXCLUSIVE")
+    refresh_games(db, NOW)
+    with db.session_scope(commit=False) as s:
+        row = s.get(ChannelDB, "u9")
+        assert (row.sport_type, row.league_name, row.sport_from) == ("hockey", "NHL", "teams")

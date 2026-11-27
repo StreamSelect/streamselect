@@ -19,6 +19,7 @@ from streamselect.core.database import Database, ChannelDB, EpgProgramDB
 from streamselect.core.epg_utils import now_utc, to_local
 from streamselect.core.event_datetime import DEFAULT_EVENT_DURATION
 from streamselect.core.games import tuning
+from streamselect.core.games.identify import identify_by_teams
 from streamselect.core.games.finder import (
     GUIDE, ListingIn, Memory, PlayIn, SportSettings, _learn_clocks, find_games, learn_teams,
 )
@@ -289,4 +290,8 @@ def refresh_games(db: Database, now: datetime | None = None,
                                                           for f in g.feeds) for g in games):
                 logger.info("Games {}: {} has no clock of its own; borrowed {:+d} min from {}",
                             key, c.collection, c.offset_min, c.borrowed_from)
+    # The team book just grew: games nothing identified may now be named by their
+    # teams (Library Breakdown BV-Q10).
+    with db.session_scope(background=True) as session:
+        identify_by_teams(session)
     return counts
