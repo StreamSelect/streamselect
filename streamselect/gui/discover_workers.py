@@ -143,7 +143,8 @@ def fetch_cards_for_key(
         cat_name = shelf_key[len(_USER_CAT_PREFIX):]
         return get_by_user_category(session, cat_name, limit=limit, **sk, **fk, **af, **ek)
     if shelf_key.startswith(_COLLECTION_PREFIX):
-        return get_by_collection(session, shelf_key[len(_COLLECTION_PREFIX):], limit=limit, **sk, **fk, **af, **ek)
+        return get_by_collection(session, shelf_key[len(_COLLECTION_PREFIX):], limit=limit, **sk, **fk, **af, **ek,
+                                 include_live=config.discover_show_live_collections)
     if shelf_key.startswith(_RECIPE_PREFIX):
         return _cards_for_saved_recipe(
             session, config, shelf_key[len(_RECIPE_PREFIX):], limit,
@@ -462,13 +463,15 @@ def normalize_shelf_config(config: Config) -> None:
 
 class _ShelfData:
     __slots__ = ("title", "shelf_key", "cards", "is_featured_actor",
-                 "is_user_category", "header_only")
+                 "is_user_category", "header_only", "chips")
 
     def __init__(self, title: str, shelf_key: str, cards: list[ContentCard],
                  is_featured_actor: bool = False,
                  is_user_category: bool = False,
-                 header_only: bool = False) -> None:
+                 header_only: bool = False, chips: tuple[str, ...] = ()) -> None:
         self.title = title
+        #: Region codes shown after the title (a collection shelf's regions, Plan 1).
+        self.chips = chips
         self.shelf_key = shelf_key
         self.cards = cards
         self.is_featured_actor = is_featured_actor
@@ -916,12 +919,13 @@ class _LoaderWorker(QObject):
             # e.g. "Apple+ Kids", "Hindu Subs" — no hard cap beyond the
             # min-member floor applied inside get_all_collections().
             collections = get_all_collections(
-                session, min_count=MIN_COLLECTION_SHELF_MEMBERS, **fk, **af, **ek
+                session, min_count=MIN_COLLECTION_SHELF_MEMBERS, **fk, **af, **ek,
+                include_live=bool(self._config.discover_show_live_collections),
             )
-            for collection in collections:
+            for shelf in collections:
                 if self._cancelled:
                     return
-                key = f"collection:{collection}"
+                collection, key = shelf.title, f"collection:{shelf.key}"
                 if key in hidden:
                     continue
                 zone = _zone(key)
@@ -930,9 +934,9 @@ class _LoaderWorker(QObject):
                         session, self._config, key, 30,
                         sk=sk, fk=fk, af=af, ek=ek,
                     )
-                    emit(_ShelfData(collection, key, cards))
+                    emit(_ShelfData(collection, key, cards, chips=shelf.regions))
                 else:
-                    emit(_ShelfData(collection, key, [], header_only=True))
+                    emit(_ShelfData(collection, key, [], header_only=True, chips=shelf.regions))
 
         except Exception:
             logger.exception("DiscoverView loader error")

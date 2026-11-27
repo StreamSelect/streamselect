@@ -222,11 +222,10 @@ class ChannelDB(Base):
     # Category-marker cleanup (user-reported gap): provider category strings often
     # carry a leading pipe-delimited marker that duplicates channel-name language
     # info (e.g. "|EN| ANIME", "|AR-SUB| AMAZON PRIME", "|DE| FILME 1990-2023").
-    # Computed once at ingestion via channel_name_utils.parse_category_marker() in
-    # the same update_detected_prefixes() pass that computes the other detected_*
-    # fields; the raw ``category`` column is NEVER modified (keeps provenance).
-    #   detected_collection: the CLEAN category, marker stripped and whitespace
-    #     collapsed ("ANIME"). NULL when the channel has no category.
+    # Computed once at ingestion (category_headings.read_category) in update_detected_prefixes();
+    # the raw ``category`` column is NEVER modified (keeps provenance).
+    #   detected_collection: the CLEAN category, marker / "UK|" head / leading country
+    #     stripped ("ANIME"). NULL when no category. _group: its shelf key (Plan 2).
     #   detected_collection_language: a plain-code marker ("EN") that DISAGREES with
     #     the channel's own detected_prefix — kept as its own "other language" chip
     #     value rather than silently dropped. NULL when the marker was adopted
@@ -240,6 +239,7 @@ class ChannelDB(Base):
     detected_collection_language = Column(String, nullable=True)
     detected_collection_subdub   = Column(String, nullable=True)
     detected_collection_quality  = Column(String, nullable=True)
+    detected_collection_group    = Column(String, index=True, nullable=True)
     detected_exclusion_code = Column(String, nullable=True)  # region_codes.exclusion_code(prefix)
     # Provider-appended trailing credits lifted from the channel name at
     # ingestion, e.g. "NICOLAS CAGE" from

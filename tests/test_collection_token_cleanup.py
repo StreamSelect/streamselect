@@ -422,6 +422,7 @@ class TestTrailingQualityRunIsPeeledAndKept:
         plain = _add_channel(file_db, name="Some Channel", category="NETFLIX")
         _run_ingestion(file_db)
         ch = _get(file_db, sport)
-        assert ch.detected_collection == "NORWAY SPORT"
+        # The leading country is the region, not part of the name (Plan 1, reparse v26).
+        assert (ch.detected_collection, ch.detected_collection_group) == ("SPORT", "SPORT")
         assert ch.detected_collection_quality == "HD HEVC"
         assert _get(file_db, plain).detected_collection_quality is None

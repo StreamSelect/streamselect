@@ -12,11 +12,11 @@ raw_data directly via SQLAlchemy text() to avoid pulling 300K+ rows into Python.
 from __future__ import annotations
 
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from typing import NamedTuple
 
-from sqlalchemy import literal_column, text
+from sqlalchemy import func, literal_column, text
 from loguru import logger
 
 from streamselect.core import channel_visibility
@@ -902,50 +902,51 @@ def get_by_user_category(session, category: str, limit: int = 30,
 MIN_COLLECTION_SHELF_MEMBERS = 2
 
 
+class CollectionShelf(NamedTuple):
+    """One collection shelf: its key (``detected_collection_group``), the label it shows
+    (its categories' most common), and up to three regions, most channels first."""
+    key: str
+    title: str
+    regions: tuple[str, ...]
+
+
 def get_all_collections(session, min_count: int = MIN_COLLECTION_SHELF_MEMBERS,
                         excluded_prefixes=None, excluded_categories=None, include_uncategorized: bool = True,
                         excluded_content_types=None,
                         excluded_keywords=None,
                         adult_mode: str = "all", force_adult_provider_ids: list[str] | None = None,
                         excluded_provider_ids: list[str] | None = None, dead_signal_streak_floor: int | None = None,
-                        ) -> list[str]:
-    """Return ``detected_collection`` names with >= min_count member channels.
+                        include_live: bool = False) -> list[CollectionShelf]:
+    """Collection shelves with >= *min_count* member channels, largest first, then by title.
 
-    Mirrors ``get_all_genres``'s shape and scoping parameters, but reads the
-    ingestion-computed ``ChannelDB.detected_collection`` column — a single
-    clean category label (e.g. "Apple+ Kids", "Hindu Subs") with its leading
-    bracket marker and any redundant quality/media-type/multi-sub tokens
-    already stripped by ``update_detected_prefixes()``
-    (``core/repositories/channel.py``, an earlier change). Never re-parses ``channel.name``
-    or ``channel.category`` at query time (the project rules "compute once at
-    ingestion, read everywhere else").
-
-    Applies the same global-exclusion / adult / provider-scoping chokepoints
-    as every other shelf query — a hidden-provider channel must never be
-    counted toward a collection's member total (the project rules "disabled/expired
-    sources are an absolute gate").
-
-    Ordered deterministically — member count descending, then name ascending
-    — so repeated Discover loads never reshuffle equal-count shelves (unlike
-    ``Counter.most_common()``'s unspecified tie order).
+    Reads the ingestion-computed ``detected_collection`` (the provider category with
+    its marker, "UK|" head or leading country taken off) and its shelf key
+    ``detected_collection_group`` (near-identical spellings share one: design
+    "Tidying Discover's Categories", Plans 1-2); never re-parses a name or category.
+    Films and series only unless *include_live* (the "Show live categories" switch:
+    1,118 of 1,857 categories were live TV packages). Same visibility chokepoints as
+    every shelf: a hidden source's channel is never counted.
     """
     from streamselect.core.database import ChannelDB
-    q = (
-        session.query(ChannelDB.detected_collection)
-        .filter(
-            ChannelDB.is_hidden == False,  # noqa: E712
-            ChannelDB.detected_collection.isnot(None),
-        )
-    )
+    from streamselect.core.platform_shelves import PLATFORM_SHELF_MEDIA_TYPES
+    group = func.coalesce(ChannelDB.detected_collection_group, ChannelDB.detected_collection)
+    q = (session.query(group, ChannelDB.detected_collection, ChannelDB.detected_region)
+         .filter(ChannelDB.is_hidden == False, ChannelDB.detected_collection.isnot(None)))  # noqa: E712
+    if not include_live:
+        q = q.filter(ChannelDB.media_type.in_(PLATFORM_SHELF_MEDIA_TYPES))
     q = _apply_prefix_filter(q, excluded_prefixes, include_uncategorized, excluded_content_types, excluded_keywords, excluded_categories)
     q = _apply_adult_filter(q, adult_mode, force_adult_provider_ids)
     q = _apply_provider_exclusion(q, excluded_provider_ids, dead_signal_streak_floor)
-    counter: Counter = Counter()
-    for (collection,) in q.yield_per(5000):
-        counter[collection] += 1
-    eligible = [(name, cnt) for name, cnt in counter.items() if cnt >= min_count]
-    eligible.sort(key=lambda t: (-t[1], t[0]))
-    return [name for name, _cnt in eligible]
+    labels: dict[str, Counter] = defaultdict(Counter)
+    regions: dict[str, Counter] = defaultdict(Counter)
+    for key, label, region in q.yield_per(5000):
+        labels[key][label] += 1
+        if region:
+            regions[key][region] += 1
+    shelves = [(sum(c.values()), CollectionShelf(k, min(c, key=lambda lb: (-c[lb], lb)),
+                                                  tuple(r for r, _ in regions[k].most_common(3))))
+               for k, c in labels.items() if sum(c.values()) >= min_count]
+    return [s for _n, s in sorted(shelves, key=lambda t: (-t[0], t[1].title))]
 
 
 def get_by_collection(session, collection: str, limit: int = 30, fav_ids=None,
@@ -955,31 +956,24 @@ def get_by_collection(session, collection: str, limit: int = 30, fav_ids=None,
                       excluded_keywords=None,
                       adult_mode: str = "all", force_adult_provider_ids: list[str] | None = None,
                       excluded_provider_ids: list[str] | None = None, dead_signal_streak_floor: int | None = None,
-                      ) -> list[ContentCard]:
-    """Content whose ingestion-computed collection label matches *collection*.
+                      include_live: bool = False) -> list[ContentCard]:
+    """Content of the collection shelf whose key is *collection* (``CollectionShelf.key``).
 
-    *collection* is the exact string returned by ``get_all_collections`` — the
-    stored ``ChannelDB.detected_collection`` value. Matched by plain equality
-    against that stored column, never a re-parse of ``channel.category`` or
-    ``channel.name`` (the project rules "compute once at ingestion, read everywhere
-    else"; contrast with ``get_by_genre``'s ``json_each`` membership match,
-    which exists only because ``detected_genres`` is a multi-value list —
-    ``detected_collection`` is a single string, so equality is the correct
-    match, not a different shape).
+    Matched by equality on the stored ``detected_collection_group`` (the label when a
+    row predates it), never a re-parse of ``channel.category`` or ``channel.name``.
+    Films and series only unless *include_live*, as :func:`get_all_collections`.
 
     Same scoping chokepoints as every other shelf query (prefix/content-type/
     keyword exclusion, adult filter, hidden-provider exclusion) and the same
     cross-source ``content_key`` dedup as the genre/decade/actor shelves.
     """
     from streamselect.core.database import ChannelDB, MetadataDB
-    q = (
-        session.query(ChannelDB, MetadataDB)
-        .outerjoin(MetadataDB, ChannelDB.metadata_id == MetadataDB.id)
-        .filter(
-            ChannelDB.detected_collection == collection,
-            ChannelDB.is_hidden == False,  # noqa: E712
-        )
-    )
+    from streamselect.core.platform_shelves import PLATFORM_SHELF_MEDIA_TYPES
+    group = func.coalesce(ChannelDB.detected_collection_group, ChannelDB.detected_collection)
+    q = (session.query(ChannelDB, MetadataDB).outerjoin(MetadataDB, ChannelDB.metadata_id == MetadataDB.id)
+         .filter(group == collection, ChannelDB.is_hidden == False))  # noqa: E712
+    if not include_live:
+        q = q.filter(ChannelDB.media_type.in_(PLATFORM_SHELF_MEDIA_TYPES))
     q = _apply_prefix_filter(q, excluded_prefixes, include_uncategorized, excluded_content_types, excluded_keywords, excluded_categories)
     q = _apply_adult_filter(q, adult_mode, force_adult_provider_ids)
     q = _apply_provider_exclusion(q, excluded_provider_ids, dead_signal_streak_floor)

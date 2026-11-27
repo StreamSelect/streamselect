@@ -60,7 +60,7 @@ class ShelfTarget:
     category: str = ""
 
 
-def resolve_shelf_target(*, search: str = "", category: str = "", collection: str = "",
+def resolve_shelf_target(*, search: str = "", category: str = "", collection: str = "", collection_key: str = "",
                          genre: str = "", person: str = "", tag=None,
                          tag_includes=None, tag_excludes=None) -> "ShelfTarget | None":
     """Decide how the results on screen become a shelf.
@@ -68,6 +68,8 @@ def resolve_shelf_target(*, search: str = "", category: str = "", collection: st
     Args:
         search: The search box's words.
         category: The collection chip's exact provider category.
+        collection_key: That category's shelf key (``detected_collection_group``);
+            the shelf is keyed on it and titled by ``collection``.
         collection: That category's cleaned name, which is what its shelf is
             keyed by. The shelf can hold more than the chip: a few cleaned names
             cover several categories (user accepted this).
@@ -88,7 +90,7 @@ def resolve_shelf_target(*, search: str = "", category: str = "", collection: st
 
     if not search and not includes and not excludes:
         if category and collection:
-            return ShelfTarget(collection, key=f"{_COLLECTION_PREFIX}{collection}")
+            return ShelfTarget(collection, key=f"{_COLLECTION_PREFIX}{collection_key or collection}")
         if chip and chip[0] in _SHELF_PREFIX_BY_FACET:
             value = chip[1]
             # A decade tag reads "1990s"; its shelf key is the bare year.
@@ -316,14 +318,16 @@ class _SearchPostersMixin:
         """Read Search's state on the main thread and resolve it."""
         state = self.current_filter_state or self.filter_panel.get_filter_state()
         category = self._details_category_filter or ""
-        collection = ""
+        collection = collection_key = ""
         if category:
-            collection = next((c.detected_collection or "" for _r, kind, c
-                               in self.channel_model.display_rows() if kind == "channel"), "")
+            first = next((c for _r, kind, c in self.channel_model.display_rows() if kind == "channel"), None)
+            collection = (first.detected_collection or "") if first else ""
+            collection_key = (first.detected_collection_group or collection) if first else ""
         return resolve_shelf_target(
             search=self.search_input.text(),
             category=category,
             collection=collection,
+            collection_key=collection_key,
             genre=self._details_genre_filter or "",
             person=self._details_person_filter or "",
             tag=self._details_tag_filter,

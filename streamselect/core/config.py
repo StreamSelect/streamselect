@@ -625,9 +625,9 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     discover_collapse_to_top: bool = True  # re-collapsed shelves jump to top of collapsed zone
     search_view_posters: bool = Field(default=False, json_schema_extra=PROFILE)  # Search as a poster grid
     discover_zoom: float = 1.0             # content card zoom factor (0.6–1.8); persisted
-    #: A platform earns its own Discover shelf once this many DISTINCT TITLES
-    #: carry its tag (PLAT-1). Titles, not rows — see core/platform_shelves.py.
+    #: A platform earns its own Discover shelf once this many DISTINCT TITLES carry its tag (PLAT-1, platform_shelves.py).
     discover_platform_shelf_min_titles: int = 50
+    discover_show_live_collections: bool = Field(default=False, json_schema_extra=PROFILE)  # live TV packages as collection shelves too
 
     # Watch Queue view state — is the find-in-queue box revealed? Off by default: a
     # permanently-visible filter costs a sidebar row most sessions never use, so the

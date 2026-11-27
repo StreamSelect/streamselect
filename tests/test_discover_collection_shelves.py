@@ -112,7 +112,7 @@ def test_multi_member_collections_produce_shelves_excluding_hidden_provider(coll
 
     session = collection_db.get_session()
     try:
-        collections = get_all_collections(session, excluded_provider_ids=excl_ids)
+        collections = [c.key for c in get_all_collections(session, excluded_provider_ids=excl_ids)]
     finally:
         session.close()
 
@@ -128,7 +128,7 @@ def test_single_member_collection_is_absent(collection_db):
     excl_ids = _hidden_provider_ids(collection_db)
     session = collection_db.get_session()
     try:
-        collections = get_all_collections(session, excluded_provider_ids=excl_ids)
+        collections = [c.key for c in get_all_collections(session, excluded_provider_ids=excl_ids)]
     finally:
         session.close()
 
@@ -141,7 +141,7 @@ def test_null_collection_never_forms_a_shelf(collection_db):
     excl_ids = _hidden_provider_ids(collection_db)
     session = collection_db.get_session()
     try:
-        collections = get_all_collections(session, excluded_provider_ids=excl_ids)
+        collections = [c.key for c in get_all_collections(session, excluded_provider_ids=excl_ids)]
     finally:
         session.close()
 
@@ -157,7 +157,7 @@ def test_hidden_provider_only_collection_never_appears(collection_db):
     excl_ids = _hidden_provider_ids(collection_db)
     session = collection_db.get_session()
     try:
-        collections = get_all_collections(session, excluded_provider_ids=excl_ids)
+        collections = [c.key for c in get_all_collections(session, excluded_provider_ids=excl_ids)]
     finally:
         session.close()
 
@@ -176,7 +176,7 @@ def test_hidden_provider_content_not_counted_toward_shared_collection(collection
     excl_ids = _hidden_provider_ids(collection_db)
     session = collection_db.get_session()
     try:
-        scoped_collections = get_all_collections(session, excluded_provider_ids=excl_ids)
+        scoped_collections = [c.key for c in get_all_collections(session, excluded_provider_ids=excl_ids)]
         assert scoped_collections == ["Apple+ Kids", "Hindu Subs"]
 
         # Confirm the raw (unscoped) count really is 8 — i.e. the fixture does
@@ -192,7 +192,7 @@ def test_hidden_provider_content_not_counted_toward_shared_collection(collection
         # And when excluded_provider_ids is NOT passed, the unscoped call
         # would rank hidden-provider-inflated collections above Hindu Subs —
         # demonstrating the parameter is load-bearing, not decorative.
-        unscoped_collections = get_all_collections(session, excluded_provider_ids=None)
+        unscoped_collections = [c.key for c in get_all_collections(session, excluded_provider_ids=None)]
         assert unscoped_collections[0] == "Apple+ Kids"
     finally:
         session.close()
@@ -204,8 +204,8 @@ def test_ordering_is_deterministic_across_repeated_calls(collection_db):
     excl_ids = _hidden_provider_ids(collection_db)
     session = collection_db.get_session()
     try:
-        first = get_all_collections(session, excluded_provider_ids=excl_ids)
-        second = get_all_collections(session, excluded_provider_ids=excl_ids)
+        first = [c.key for c in get_all_collections(session, excluded_provider_ids=excl_ids)]
+        second = [c.key for c in get_all_collections(session, excluded_provider_ids=excl_ids)]
     finally:
         session.close()
 

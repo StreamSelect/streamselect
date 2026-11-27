@@ -114,3 +114,58 @@ def headings_by_provider(session, provider_id: str | None = None) -> dict[str, f
     for pid, category in query.all():
         by_provider[pid].append(category)
     return {pid: detect_headings(cats) for pid, cats in by_provider.items()}
+
+
+# ── A collection's label (design "Tidying Discover's Categories", Plans 1-2) ──
+
+def read_category(category: str | None, headings: frozenset[str] = frozenset()):
+    """``(clean label, marker)`` for a provider category: the leading ``|EN|``
+    marker :func:`~streamselect.core.channel_name_utils.parse_category_marker`
+    reads, and also the two shapes it did not (Plan 1, owner 2026-11-27):
+
+    * ``"UK| MAX PPV VIP"`` — a head without a leading pipe. A country, language
+      or platform code becomes the marker (so it fills the prefix, or shows as
+      the collection's own region chip, exactly as ``"|UK| …"`` always did); a
+      source's continent heading (``AM``, ``ASIA``, ``ARAB``, ``EU``) or a
+      multi-track word (``MULTI``) is only taken off the label, never read as a
+      country (``AM`` is not Armenia). Any other head stays (``BEE| …``).
+    * ``"DENMARK DISNEY+ PPV"`` — a country's name first.
+
+    The provider's ``category`` itself is never changed.
+    """
+    from streamselect.core.channel_name_utils import (
+        _MULTI_TRACK_TOKENS, CategoryMarker, parse_category_marker,
+    )
+    from streamselect.core.region_codes import ISO_639_1_LANGUAGE_NAMES, PLATFORM_CODES
+
+    clean, marker = parse_category_marker(category or "")
+    if marker is not None or not clean:
+        return clean, marker
+    head, rest = split_head(clean)
+    if head and rest:
+        if head in headings or head in _MULTI_TRACK_TOKENS:
+            return rest, None
+        code = normalize_region_code(head)
+        if code in REGION_FULL_NAMES or head in PLATFORM_CODES or head.lower() in ISO_639_1_LANGUAGE_NAMES:
+            return rest, CategoryMarker(code=code, kind="language")
+        return clean, None
+    country = leading_country(clean)
+    if country and country[1].strip():
+        return country[1].strip(), CategoryMarker(code=country[0], kind="language")
+    return clean, None
+
+
+def collection_group_key(label: str | None) -> str | None:
+    """The key labels that are the same collection share (Plan 2): case, accents,
+    punctuation and a word's plural folded, so "HORROR / THRILLER",
+    "HORROR/THRILLERS" and "Horror Thriller" are one shelf, and "COMEDIA",
+    "COMEDIAS" and "COMÉDIA" another. Only near-identical spellings join."""
+    import re
+    import unicodedata
+
+    if not label:
+        return None
+    s = "".join(c for c in unicodedata.normalize("NFKD", label) if not unicodedata.combining(c))
+    words = re.sub(r"[^\w+&]+", " ", unicodedata.normalize("NFKC", s).upper()).split()
+    words = [w[:-1] if len(w) > 4 and w.endswith("S") and not w.endswith("SS") else w for w in words]
+    return " ".join(words) or None

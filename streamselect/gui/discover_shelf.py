@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html as _html
+import weakref
 
 from typing import TYPE_CHECKING
 
@@ -16,7 +17,11 @@ from streamselect.core.discovery_engine import ContentCard
 from streamselect.gui.chunked_construction import ChunkHandle, build_chunked
 from streamselect.gui.discover_card import _ContentCard, card_metrics
 from streamselect.gui.discover_workers import _RECIPE_PREFIX
+from streamselect.core.region_codes import REGION_FULL_NAMES
 from streamselect.gui import cursor_affordance
+from streamselect.gui import deferred_config_save as _deferred_save
+from streamselect.gui.badge_utils import make_region_chip
+from streamselect.gui.chips import ToggleChip
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
 
@@ -58,8 +63,10 @@ class _Shelf(QWidget):
     def __init__(self, title: str, shelf_key: str,
                  cards: list[ContentCard], image_cache: "ImageCache",
                  config: Config, pinned: bool = False, collapsed: bool = False,
-                 parent=None) -> None:
+                 parent=None, *, chips: tuple[str, ...] = ()) -> None:
         super().__init__(parent)
+        #: Region codes after the title: a collection shelf's regions (Plan 1).
+        self.chips = tuple(chips)
         self._shelf_key = shelf_key
         # Kept so DiscoverView's shelf filter can match on what the user SEES,
         # not on the internal key ("collection:Apple+ Kids" vs "Apple+ Kids").
@@ -101,6 +108,10 @@ class _Shelf(QWidget):
         self._title_lbl = QLabel(f"<b>{title}</b>")
         _theme.style_fn(self._title_lbl, lambda: f"font-size: {_theme.FONT_XL};")
         header.addWidget(self._title_lbl)
+        self.region_chips = [make_region_chip(code) for code in self.chips]
+        for chip in self.region_chips:
+            chip.setToolTip(f"Region: {REGION_FULL_NAMES.get(chip.text(), chip.text())}")
+            header.addWidget(chip)
         header.addStretch()
 
         btn_ss = (
@@ -571,3 +582,35 @@ class _Shelf(QWidget):
             w.doubleClicked.connect(on_double_clicked)
             w.contextMenuRequested.connect(on_context_menu)
             w.middleClicked.connect(on_middle_click)
+
+
+# ── "More Categories" row (design "Tidying Discover's Categories", Plan 1) ──
+# Discover is the films-and-series surface, so a provider's live TV packages
+# ("UK| MAX PPV VIP", 60% of all categories) are not collection shelves by
+# default, but one click brings them back and the choice is remembered
+# (Config.discover_show_live_collections; owner, 2026-11-27).
+
+def more_categories_row(view) -> QWidget:
+    """The view's ``_more_btn`` with the switch beside it; the row shows and hides with
+    the button (``DiscoverView._update_more_btn`` toggles the button's visibility)."""
+    row = QWidget()
+    h = QHBoxLayout(row)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(8)
+    h.addWidget(view._more_btn, 1)
+    chip = view.live_categories_chip = ToggleChip(
+        "Live categories", enabled=bool(view._config.discover_show_live_collections))
+    chip.setToolTip("Also list live TV packages (sports, news, PPV slots) as categories here")
+
+    ref = weakref.ref(view)       # a strong capture would keep the view alive through the connection
+
+    def toggled(on: bool) -> None:
+        v = ref()
+        if v is not None:
+            v._config.discover_show_live_collections = bool(on)
+            _deferred_save.save_soon(v)
+            v.reload()
+
+    chip.toggled_changed.connect(toggled)
+    h.addWidget(chip)
+    return row

@@ -191,6 +191,7 @@ class ChannelListDTO:
     # collection/secondary-language/subtitle-marker chips
     # (channel_list_delegate.py).
     detected_collection: str | None = None
+    detected_collection_group: str | None = None     # its Discover shelf key (Plan 2)
     detected_collection_language: str | None = None
     detected_collection_subdub: str | None = None
     # Canonical genre (ChannelDB.detected_genre — the first raw_data["genre"]
@@ -276,6 +277,7 @@ class ChannelListDTO:
             content_key=getattr(ch, "content_key", None),
             variant_count=int(getattr(ch, "_variant_count", 1) or 1),
             detected_collection=ch.detected_collection,
+            detected_collection_group=getattr(ch, "detected_collection_group", None),
             detected_collection_language=ch.detected_collection_language,
             detected_collection_subdub=ch.detected_collection_subdub,
             detected_genre=getattr(ch, "detected_genre", None),

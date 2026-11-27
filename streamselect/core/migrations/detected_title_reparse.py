@@ -182,7 +182,12 @@ from streamselect.core.migrations.detected_fields_reparse import DetectedFieldsR
 #   25  Names are NFC-normalized before parsing, so a decomposed "Bölüm" lifts as the
 #       episode marker (181 rows) and a decomposed accent no longer splits a title's
 #       key; a trailing "[1980]" is the year (27 rows, "MOTO GP Assen 500cc [1980]").
-CURRENT_VERSION: int = 25
+#   26  Collection labels lose a "UK|" head (no leading pipe), a source's continent
+#       folder ("AM|", "ASIA |") and a leading country name ("DENMARK DISNEY+ PPV"):
+#       1,034 of 1,868 labels carried one; detected_collection_group (new column) is
+#       the Discover shelf key near-identical spellings share (design "Tidying
+#       Discover's Categories", Plans 1-2).
+CURRENT_VERSION: int = 26
 
 
 class DetectedTitleReparseTask(DetectedFieldsReparseBase):

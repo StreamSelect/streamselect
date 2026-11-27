@@ -44,7 +44,7 @@ from streamselect.core.database import Database
 from streamselect.core.discovery_engine import ContentCard
 from streamselect.gui.discover_browse import _BrowseView
 from streamselect.gui.discover_card import card_zoom_slider
-from streamselect.gui.discover_shelf import _Shelf
+from streamselect.gui.discover_shelf import _Shelf, more_categories_row
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui.discover_workers import (
     _LoaderWorker, _RECIPE_PREFIX, _SeeAllWorker, _ShelfCardsWorker,
@@ -214,7 +214,7 @@ class DiscoverView(QWidget):
         self._more_btn.clicked.connect(self._toggle_more_categories)
         self._more_btn.setVisible(False)
         self._more_expanded = self._config.discover_more_expanded
-        self._shelves_layout.addWidget(self._more_btn)
+        self._shelves_layout.addWidget(more_categories_row(self))
 
         self._collapsed_zone = QWidget()
         self._collapsed_layout = QVBoxLayout(self._collapsed_zone)
@@ -789,7 +789,7 @@ class DiscoverView(QWidget):
         shelf = _Shelf(
             data.title, data.shelf_key, data.cards,
             self._image_cache, self._config,
-            pinned=(zone == _ZONE_PINNED),
+            pinned=(zone == _ZONE_PINNED), chips=data.chips,
             collapsed=collapsed,
         )
         shelf.seeAllRequested.connect(self._on_see_all)

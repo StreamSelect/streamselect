@@ -44,7 +44,6 @@ from sqlalchemy import func, or_, update
 from streamselect.core.channel_name_utils import (
     _COMPOUND_PREFIX_RE,
     _PAREN_PREFIX_RE,
-    parse_category_marker,
     parse_channel_name,
     strip_collection_noise_tokens,
 )
@@ -52,7 +51,7 @@ from streamselect.core.content_labels import (
     AI_VOICEOVER_VALUE, AGE_RATING_PREFIXES, detect_ai_provenance, is_restricted,
 )
 from streamselect.core.quality_vocab import QUALITY_TOKENS
-from streamselect.core.category_headings import headings_by_provider
+from streamselect.core.category_headings import collection_group_key, headings_by_provider, read_category
 from streamselect.core.collection_quality import collection_quality_text
 from streamselect.core.region_codes import (
     AUDIO_LANG_WORD_MAP,
@@ -452,8 +451,7 @@ class ChannelIngestionMixin:
 
             # ── Category marker (user report: a "|EN| ANIME" leading marker duplicates
             # the name's language/subtitle info and crowds the title). Strips it into
-            # the clean detected_collection and routes the token by kind (see
-            # parse_category_marker), never guessing beyond a plain language code or a
+            # the clean detected_collection, routing the token by kind (read_category), never guessing beyond a plain language code or a
             # SUB/DUB compound: a plain code fills detected_prefix ONLY when empty (the
             # detected_region fill-empty-only pattern above), else survives as
             # detected_collection_language unless it repeats the prefix; "CODE-SUB"/
@@ -467,7 +465,7 @@ class ChannelIngestionMixin:
             _marker_sub_lang: str | None = None
             _marker_dub_lang: str | None = None
             if channel.category:
-                clean_category, category_marker = parse_category_marker(channel.category)
+                clean_category, category_marker = read_category(channel.category, headings.get(channel.provider_id, frozenset()))
                 new_collection = clean_category or None
                 # Strip tokens another chip/icon already shows (its docstring: the
                 # "whole span must be noise" rule keeps "SERIES MANIA" intact), keeping
@@ -628,6 +626,7 @@ class ChannelIngestionMixin:
                 or new_added != channel.detected_added
                 or new_restricted != bool(channel.detected_restricted)
                 or new_collection != channel.detected_collection
+                or collection_group_key(new_collection) != channel.detected_collection_group
                 or new_collection_language != channel.detected_collection_language
                 or new_collection_subdub != channel.detected_collection_subdub
                 or new_collection_quality != channel.detected_collection_quality
@@ -649,6 +648,7 @@ class ChannelIngestionMixin:
                 channel.detected_added  = new_added
                 channel.detected_restricted = new_restricted
                 channel.detected_collection = new_collection
+                channel.detected_collection_group = collection_group_key(new_collection)
                 channel.detected_collection_language = new_collection_language
                 channel.detected_collection_subdub = new_collection_subdub
                 channel.detected_collection_quality = new_collection_quality
