@@ -302,10 +302,11 @@ _BRACKET_SUFFIX_RE = re.compile(r'\s*\[([^\]]+)\]\s*$')
 # Explicit lang/region qualifier in parens at end: (EN), (JP) — 2-3 uppercase letters only
 _LANG_QUALIFIER_RE = re.compile(r'\s*\(([A-Z]{2,3})\)\s*$', re.IGNORECASE)
 
-# Year at end: (2020), (1993-2002), (1993–2002), or provider suffix " - 2025"
+# Year at end: (2020), (1993-2002), (1993–2002), [2020], or provider suffix " - 2025"
 _YEAR_RE = re.compile(
     r'(?:\s*\((\d{4}(?:[-–]\d{4})?)\)'   # group 1: (2025) or (1993-2002)
-    r'|\s+-\s+(\d{4}))'                   # group 2: - 2025
+    r'|\s+-\s+(\d{4})'                    # group 2: - 2025
+    r'|\s*\[((?:19|20)\d{2}(?:[-–](?:19|20)\d{2})?)\])'  # group 3: [1980], never "[1080]"
     r'\s*$'
 )
 
@@ -1400,11 +1401,10 @@ def parse_channel_name(name: str) -> ParsedChannel:
     if not name:
         return ParsedChannel("", "", [], "", "", "")
 
-    # Strip control-character mojibake (stray C1 bytes like U+0081 from a latin-1/
-    # UTF-8 mishandling of accented letters) at the single name-parsing chokepoint so
-    # every derived detected_* field — and the content_key built from detected_title —
-    # is computed from clean text and never carries the non-printing artifact.
-    bare = clean_control_chars(name)
+    # Strip control-character mojibake (stray C1 bytes like U+0081) and NFC-compose
+    # (an "ö" sent as "o" + combining mark missed the Bölüm marker, 181 rows) at the
+    # one name-parsing chokepoint, so every detected_* field is computed from clean text.
+    bare = unicodedata.normalize("NFC", clean_control_chars(name))
     # Decoration first, as its OWN class: folded to 'RAW' it is indistinguishable
     # from the title word in 'EN - WWE Raw (2023)' (test_raw_live_cam_fix.py, B0).
     # A SUPERSCRIPT token cannot be part of a title, so it is safe to read here.
@@ -1674,7 +1674,7 @@ def parse_channel_name(name: str) -> ParsedChannel:
     year = ""
     ym = _YEAR_RE.search(bare)
     if ym:
-        year = ym.group(1) or ym.group(2)  # group 1 = paren form, group 2 = dash form
+        year = ym.group(1) or ym.group(2) or ym.group(3)  # paren / dash / bracket form
         # Anything still after the year here (step 1b usually took it already).
         trailing = trailing or bare[ym.end():].strip()
         bare = bare[: ym.start()].strip()

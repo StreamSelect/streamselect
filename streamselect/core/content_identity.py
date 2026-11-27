@@ -93,6 +93,7 @@ access, no config dependency.
 from __future__ import annotations
 
 import re
+import unicodedata
 from abc import ABC, abstractmethod
 
 
@@ -190,7 +191,9 @@ def normalize_title_for_key(title: str) -> str:
         Normalised string suitable for use as a key component.  May be empty
         when the entire title is punctuation/whitespace.
     """
-    lowered = title.lower()
+    # NFC first: a combining accent is a non-word character to _NONWORD_RE, so an
+    # "é" sent as "e" + U+0301 keyed as "ve ritable" — apart from "véritable".
+    lowered = unicodedata.normalize("NFC", title).lower()
     no_apos = _APOSTROPHE_RE.sub("", lowered)
     no_punct = _NONWORD_RE.sub(" ", no_apos)
     collapsed = _WHITESPACE_RE.sub(" ", no_punct).strip()

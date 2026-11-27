@@ -179,7 +179,10 @@ from streamselect.core.migrations.detected_fields_reparse import DetectedFieldsR
 #       its title and "|8ᴋ| SKY SPORTS 2" (small-capital K) lost its 8K (85 rows).
 #   24  A trailing pipe marker is the parenthetical it stands for: "BENFICA TV |PT|"
 #       → "BENFICA TV" + PT, "… |PERSIAN|" → Persian audio (204 rows).
-CURRENT_VERSION: int = 24
+#   25  Names are NFC-normalized before parsing, so a decomposed "Bölüm" lifts as the
+#       episode marker (181 rows) and a decomposed accent no longer splits a title's
+#       key; a trailing "[1980]" is the year (27 rows, "MOTO GP Assen 500cc [1980]").
+CURRENT_VERSION: int = 25
 
 
 class DetectedTitleReparseTask(DetectedFieldsReparseBase):
