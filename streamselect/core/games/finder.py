@@ -109,6 +109,7 @@ class ListingIn:
     channel_id: Optional[str] = None
     guide_utc: Optional[datetime] = None   # a guide programme's start, UTC
     seeded: bool = False        # names the league itself (set by find_games)
+    guide_stop_utc: Optional[datetime] = None   # a guide programme's stop, UTC
 
 
 @dataclass
@@ -188,6 +189,25 @@ class GameFeed:
     time_from: str
     start_utc: Optional[datetime]
     counts: bool                # counted toward the level (a teamless guide feed is not)
+
+
+@dataclass(frozen=True)
+class Broadcast:
+    """A timed listing naming the league but no teams, joined to no game: a slot or a
+    guide programme showing a game it does not name, or a show about the league
+    (design "Other Broadcasts On Now"). A guide programme counts only when its title
+    says Live (owner, OB pick)."""
+
+    source: str
+    collection: str
+    name: str
+    channel_id: str
+    from_guide: bool
+    start_utc: datetime
+    stop_utc: Optional[datetime]   # the guide's stop; None for a channel name
+    #: Length of the longest league word it matched: the more specific league claims
+    #: a listing two leagues match ("NBA G League" is G League, OB-Q12).
+    word_len: int
 
 
 @dataclass(frozen=True)
@@ -439,6 +459,27 @@ def _mark_stale(work: list[_L], memory: Memory, now: datetime, stale_after: time
     return first_seen
 
 
+_LIVE_WORD = re.compile(r"(?<![A-Z])LIVE(?![A-Z])")
+
+
+def _broadcasts(work: list[_L], groups: list[dict], league: re.Pattern[str]) -> list[Broadcast]:
+    """The timed team-less listings no game took (see :class:`Broadcast`)."""
+    taken = {id(L) for g in groups for L in (*g["timed"], *g["extra"])}
+    out = []
+    for L in work:
+        if (L.kind != "nomatchup" or L.utc is None or not L.src.channel_id or L.stale
+                or id(L) in taken):
+            continue
+        guide = L.src.source == GUIDE
+        if guide and not _LIVE_WORD.search(L.u):
+            continue
+        words = [m.group() for text in (L.u, "" if guide else norm(L.src.collection))
+                 for m in league.finditer(text)]
+        out.append(Broadcast(L.src.source, L.src.collection, L.src.name, L.src.channel_id, guide, L.utc,
+                             L.src.guide_stop_utc if guide else None, max(map(len, words), default=0)))
+    return out
+
+
 def _split(listings: list[ListingIn], league: re.Pattern[str],
            acronyms: frozenset[str] = frozenset()) -> tuple[list[ListingIn], list[ListingIn]]:
     """(listings naming the league in their name or collection: the seed, the rest)."""
@@ -465,7 +506,8 @@ def learn_teams(listings: list[ListingIn], settings: SportSettings) -> TeamBook:
 def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime,
                memory: Optional[Memory] = None,
                known: tuple[Clock, ...] = (), plays=(),
-               book: Optional[TeamBook] = None) -> tuple[list[Game], Memory, list[Clock]]:
+               book: Optional[TeamBook] = None,
+               broadcasts: Optional[list] = None) -> tuple[list[Game], Memory, list[Clock]]:
     """Find one sport's games among *listings*.
 
     Args:
@@ -481,6 +523,7 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
             ``settings.most_watched_days``.
         book: the team book :func:`learn_teams` built from these same
             listings; learned here when not given.
+        broadcasts: when given, filled with this run's :class:`Broadcast` listings.
 
     Returns:
         (games in the window and outside it, the memory for the next run, learned clocks)
@@ -619,6 +662,9 @@ def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime
         near = [g for g in G if g["level"] in (1, 2) and abs(g["utc"] - L.utc) <= settings.teamless_guide_within]
         if len(near) == 1:
             near[0]["extra"].append(L)
+
+    if broadcasts is not None:
+        broadcasts.extend(_broadcasts(work, G, league))
 
     games = []
     for g in G:

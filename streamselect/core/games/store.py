@@ -25,9 +25,9 @@ from streamselect.core.games.finder import (
     GUIDE, ListingIn, Memory, PlayIn, SportSettings, _learn_clocks, find_games, learn_teams,
 )
 from streamselect.core.games.listing_text import (
-    MATCHUP_LIKE_PATTERNS, NOT_PLAIN_GLOB, clean_side, league_matcher, norm,
+    MATCHUP_LIKE_PATTERNS, NOT_PLAIN_GLOB, acronyms_of, broadcast_title, clean_side, league_matcher, norm,
 )
-from streamselect.core.games.models import GameDB, GameFeedDB, GameFinderMemoryDB, SportTeamDB
+from streamselect.core.games.models import GameBroadcastDB, GameDB, GameFeedDB, GameFinderMemoryDB, SportTeamDB
 from streamselect.core.games.teams import team_display
 from streamselect.core.playback_models import PlaybackEventDB
 from streamselect.core.repositories.provider import ProviderRepository
@@ -205,13 +205,29 @@ def _read_listings(session, settings: SportSettings, now: datetime, hidden: set[
     # SQL narrows by substring; the finder applies the whole-word rule itself.
     guide = session.execute(
         select(EpgProgramDB.provider_id, EpgProgramDB.channel_db_id, EpgProgramDB.channel_epg_id,
-               EpgProgramDB.channel_name, EpgProgramDB.title, EpgProgramDB.start_time)
+               EpgProgramDB.channel_name, EpgProgramDB.title, EpgProgramDB.start_time,
+               EpgProgramDB.stop_time)
         # Back as far as the replay rule looks (as much as the guide keeps): the
         # original of a rerun is then found even on a league's first run (finder).
         .where(*_guide_in_window(settings, now))).all()
-    listings += [ListingIn(GUIDE, cname or epg_id or "", title or "", cdb, start)
-                 for pid, cdb, epg_id, cname, title, start in guide if pid not in hidden]
+    listings += [ListingIn(GUIDE, cname or epg_id or "", title or "", cdb, start, guide_stop_utc=stop)
+                 for pid, cdb, epg_id, cname, title, start, stop in guide if pid not in hidden]
     return listings
+
+
+def _keep_broadcasts(session, settings: SportSettings, broadcasts: list, now: datetime) -> None:
+    """Replace the league's stored broadcasts with this run's (design "Other
+    Broadcasts On Now"): a guide programme keeps its own title, a channel name its
+    league part (``listing_text.broadcast_title``)."""
+    session.execute(delete(GameBroadcastDB).where(GameBroadcastDB.sport == settings.sport,
+                                                 GameBroadcastDB.league == settings.league))
+    league = league_matcher(settings.words)
+    caps = acronyms_of(settings.words) if settings.capitals else frozenset()
+    for b in broadcasts:
+        title = b.name.strip() if b.from_guide else broadcast_title(b.name, league, caps)
+        session.add(GameBroadcastDB(sport=settings.sport, league=settings.league, channel_id=b.channel_id,
+                                    title=title or b.name, start_utc=b.start_utc, stop_utc=b.stop_utc,
+                                    from_guide=b.from_guide, word_len=b.word_len, found_at=now))
 
 
 def _keep_teams(session, key: str, names: list[str], games, now: datetime,
@@ -276,7 +292,8 @@ def refresh_games(db: Database, now: datetime | None = None,
             row = session.get(GameFinderMemoryDB, key)
             memory = _memory_from_json(row.memory if row else None)
         book = learn_teams(listings, settings)
-        games, memory, clocks = find_games(listings, settings, now, memory, known, plays, book)
+        broadcasts: list = []
+        games, memory, clocks = find_games(listings, settings, now, memory, known, plays, book, broadcasts)
         with db.session_scope(background=True) as session:
             old = select(GameDB.id).where(GameDB.sport == settings.sport, GameDB.league == settings.league)
             session.execute(delete(GameFeedDB).where(GameFeedDB.game_id.in_(old)))
@@ -290,6 +307,7 @@ def refresh_games(db: Database, now: datetime | None = None,
                                         name=f.name, from_guide=f.from_guide, time_from=f.time_from,
                                         start_utc=f.start_utc, counts=f.counts) for f in g.feeds]
                 session.add(row)
+            _keep_broadcasts(session, settings, broadcasts, now)
             session.merge(GameFinderMemoryDB(finder=key, memory=_memory_to_json(memory), updated_at=now))
             _keep_teams(session, key, [team_display(t) for t in book.teams], games, now,
                         frozenset(team_display(tuple(norm(old).split())) for old, _ in settings.renamed),

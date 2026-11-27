@@ -103,3 +103,27 @@ class SportTeamDB(Base):
     runs_seen    = Column(Integer, nullable=False, default=1)
     #: UTC: the latest run in which it was a side of a stored game; None if never.
     last_in_game = Column(DateTime)
+
+
+class GameBroadcastDB(Base):
+    """A timed listing naming a league but no teams, that joined no game (design
+    "Other Broadcasts On Now"): a slot showing a game it does not name, or a show
+    about the league. Replaced per league on every finder run, like ``games``;
+    the Sports view shows the ones on air under the league's On now.
+    """
+    __tablename__ = "game_broadcasts"
+
+    id         = Column(Integer, primary_key=True, autoincrement=True)
+    sport      = Column(String, nullable=False)
+    league     = Column(String, nullable=False)
+    channel_id = Column(String, nullable=False)
+    #: The card's title: a guide programme's own, or the league part of a channel name.
+    title      = Column(String, nullable=False)
+    start_utc  = Column(DateTime, nullable=False)
+    stop_utc   = Column(DateTime)                     # the guide's stop; NULL for a channel name
+    from_guide = Column(Boolean, nullable=False, default=False)
+    #: Length of the longest league word matched: the more specific league claims it.
+    word_len   = Column(Integer, nullable=False, default=0)
+    found_at   = Column(DateTime, nullable=False)
+
+    __table_args__ = (Index("ix_game_broadcasts_league", "sport", "league"),)

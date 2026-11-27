@@ -196,6 +196,21 @@ def names_league(text: Optional[str], league: re.Pattern[str], acronyms: frozens
     return False
 
 
+#: Where a channel name's schedule tail starts: " @ Nov 27 8:00 PM :Package 19", a
+#: dotted, slashed or ISO date, or a clock time.
+_TAIL_RE = re.compile(r"\s+@\s|\s\d{1,2}[./]\d{1,2}[./]\d{4}|\s\d{4}-\d{2}-\d{2}|\s\d{1,2}:\d{2}")
+
+
+def broadcast_title(name: str, league: re.Pattern[str], acronyms: frozenset[str] = frozenset()) -> str:
+    """How a team-less channel listing reads on its card: the part of the name that
+    names the league, without its schedule tail ("LIVE | NHL-MATCHDAY 27.11.2026 -
+    MIT SKY SPORT | Fri 27 Nov 17:55 CET" -> "NHL-MATCHDAY"; "NHL-studion med
+    målextra @ Nov 27 8:00 PM :Viaplay SE 19" -> "NHL-studion med målextra")."""
+    parts = [p.strip() for p in re.split(r"[|•]", name or "") if p.strip()]
+    part = next((p for p in parts if names_league(p, league, acronyms)), parts[0] if parts else "")
+    return _TAIL_RE.split(" " + part, maxsplit=1)[0].strip(" -:")
+
+
 def acronyms_of(words) -> frozenset[str]:
     """The league words written all in capitals, without spaces ("AHL", "NHL")."""
     return frozenset(w for w in words if w.isupper() and " " not in w)

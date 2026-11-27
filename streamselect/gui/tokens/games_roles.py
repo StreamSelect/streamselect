@@ -32,6 +32,14 @@ def build(t: Mapping[str, object]) -> dict[str, str]:
             f"QFrame#gameCard[playing=\"true\"] {{ border: 2px solid {_('COLOR_OK')}; }}"
             f"QFrame#gameCard[playing=\"true\"][selected=\"true\"] {{ border: 3px solid {_('COLOR_OK')}; }}"
         ),
+        # A broadcast that names the league but not the teams (design "Other Broadcasts
+        # On Now", OB-Q5): the deepest background, so it sits apart from the game cards
+        # above; its section heading and its GUIDE / NAME label say why in words.
+        "BROADCAST_CARD": (
+            f"QFrame#broadcastCard {{ background: {_('COLOR_BG_DEEP')};"
+            f" border: 1px solid {_('COLOR_BORDER')}; border-radius: {_('RADIUS_MD')}; }}"
+            f"QFrame#broadcastCard:hover {{ border-color: {_('COLOR_ACCENT')}; }}"
+        ),
         # The card's "▶ [US] STATION" line: one click plays, so it lights on hover.
         "GAME_PLAY_LINE": (
             f"QFrame#gamePlayLine {{ border-radius: {_('RADIUS_SM')}; }}"

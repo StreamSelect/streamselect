@@ -32,6 +32,7 @@ from loguru import logger
 
 from streamselect.core import sports_catalog
 from streamselect.core.epg_utils import browse_day_separator_label, fmt_time, now_utc, past_day_label, to_local
+from streamselect.core.games.broadcasts import load_broadcasts
 from streamselect.core.games.read import (
     CHANNEL_REPORTS, ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, arrange_feeds, best_feed, game_key, game_state,
     can_mark_not_finished, load_games, load_watch_history, mark_finished,
@@ -55,6 +56,7 @@ from streamselect.gui.game_card import (
 from streamselect.gui.sidebar.base import GroupHeading, _ClickableHeader
 from streamselect.gui.similar_lightbox_card import _ClickableFrame
 from streamselect.gui.sports_view_headers import SportsHeadersMixin, alert_count_chip
+from streamselect.gui.sports_view_broadcasts import SportsBroadcastsMixin
 
 #: Sports are not named here: every sport with a finder league in the one sports list
 #: gets its own section (owner, 2026-11-13: hockey is one segment, not the view).
@@ -95,7 +97,7 @@ def _games_list_name(label: str) -> str:
     name = label.split(" · ")[0]
     return f"{name}'s games list" if name in _RELATIVE_DAYS else f"the games list for {name}"
 
-class SportsView(SportsHeadersMixin, ContentView):
+class SportsView(SportsBroadcastsMixin, SportsHeadersMixin, ContentView):
     """Games on now as cards, later and finished games as rows; see the module docstring."""
 
     playRequested = pyqtSignal(str)           # channel id
@@ -117,6 +119,7 @@ class SportsView(SportsHeadersMixin, ContentView):
         self._run_query = run_query
         self._token: list[int] = [0]
         self._raw: list[GameDTO] = []
+        self._broadcasts: list = []         # other broadcasts on now (sports_view_broadcasts)
         self._history: dict = {}
         self._alerts: list = []
         #: league key -> (local days watched, seconds), for the "Most watched" order.
@@ -260,7 +263,7 @@ class SportsView(SportsHeadersMixin, ContentView):
             hidden = set(ProviderRepository(repos.session).get_hidden_provider_ids())
             games = [g for sp in self.sports for g in load_games(repos.session, sp, hidden, 1, top)]
             return (games, load_watch_history(repos.session, self.sports), load_alerts(repos.session),
-                    load_league_watch(repos.session))
+                    load_league_watch(repos.session), load_broadcasts(repos.session, self.sports, hidden, self._clock()))
         self._run_query(query, self._on_games, token_ref=self._token, on_error=self._on_error)
 
     def set_finding(self, on: bool) -> None:
@@ -314,7 +317,8 @@ class SportsView(SportsHeadersMixin, ContentView):
             self.reload()
 
     def _on_games(self, result) -> None:
-        games, history, alerts, watch = (tuple(result) + ({},))[:4] if result else ([], {}, [], {})
+        games, history, alerts, watch, broadcasts = (tuple(result) + ({}, []))[:5] if result else ([], {}, [], {}, [])
+        self._broadcasts = list(broadcasts or [])
         self._raw, self._history, self._alerts = list(games or []), dict(history or {}), list(alerts or [])
         self._watch = dict(watch or {})
         self._loaded = True
@@ -470,7 +474,8 @@ class SportsView(SportsHeadersMixin, ContentView):
         """On now, the days to come and Finished for *games*; ``sub`` = how many
         levels in their headings sit (1 under a league's band)."""
         on_now, later, finished = self._split(games, now)
-        self._on_now_section(f"{prefix}:on_now", on_now, now, meta=lambda g: "", sub=sub)
+        self._on_now_and_broadcasts(f"{prefix}:on_now", on_now, now, self._broadcasts_of(prefix.replace(":", "/", 1)),
+                                    meta=lambda g: "", sub=sub)
         self._day_sections(prefix, later, now, folded, sub=sub)
         self._finished_section(prefix, finished, now, folded, sub=sub)
 
@@ -479,19 +484,20 @@ class SportsView(SportsHeadersMixin, ContentView):
         on_now, later, finished = self._split(games, now)
         def label(g: GameDTO) -> str:
             return f"{sports_catalog.sport_label(g.sport)} · {g.league}"
-        self._on_now_section(f"{ALL}:on_now", on_now, now, meta=label)
+        self._on_now_and_broadcasts(f"{ALL}:on_now", on_now, now, self._broadcasts_of(), meta=label,
+                                    card_meta=self._broadcast_label)
         self._day_sections(ALL, later, now, folded, label_of=label)
         self._finished_section(ALL, finished, now, folded, label_of=label)
 
     def _on_now_section(self, key: str, on_now: list, now: datetime, meta: Callable,
-                        sub: int = 0) -> None:
+                        sub: int = 0, controls: Optional[QWidget] = None) -> None:
         """Absent when nothing is on (owner, 2026-11-17): an "On now 0" band and a
         "Next:" line only repeated the first day's games listed right below."""
         if not on_now:
             return
         # No count: the league's chip right above says how many are on (owner, 2026-11-18).
         self._layout.addWidget(self._header(key, "On now", None, foldable=True,
-                                            what="the list of games on now", sub=sub))
+                                            what="the list of games on now", sub=sub, controls=controls))
         if key in self._folded():
             return                           # folded like any other section (owner, 2026-11-13)
         opened = [gs for gs in on_now if _game_key(gs[0]) == self._open]
