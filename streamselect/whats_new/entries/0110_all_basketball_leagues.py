@@ -2,7 +2,7 @@ from streamselect.whats_new import WhatsNewEntry
 
 ENTRY = WhatsNewEntry(
     id=110,
-    version="1.2.1",
+    version="1.3.0",
     date="2026-11-23",
     title="Sports: every major basketball league, not just the NBA",
     items=(
