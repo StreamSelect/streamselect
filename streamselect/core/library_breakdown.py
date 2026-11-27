@@ -68,10 +68,18 @@ class SportsBreakdown:
 
 
 @dataclass(frozen=True)
+class Listing:
+    """One unidentified listing: clicking it shows the channel in the details pane."""
+
+    channel_id: str
+    name: str
+
+
+@dataclass(frozen=True)
 class CollectionRow:
     collection: str
     games: int
-    examples: tuple[str, ...]
+    examples: tuple[Listing, ...]
 
 
 @dataclass(frozen=True)
@@ -79,11 +87,11 @@ class CatchAll:
     total: int
     #: Games two confirmed teams of one league name, not yet tagged (the next finder run tags them).
     named_by_teams: int
-    #: (listing name, (league names, ...)): two or more leagues fit.
-    either: tuple[tuple[str, tuple[str, ...]], ...]
+    #: (listing, (league names, ...)): two or more leagues fit.
+    either: tuple[tuple[Listing, tuple[str, ...]], ...]
     strangers: tuple[CollectionRow, ...]
     strangers_total: int
-    not_games: tuple[str, ...]
+    not_games: tuple[Listing, ...]
 
 
 def _visible(session, query):
@@ -139,27 +147,28 @@ def sports_breakdown(session) -> SportsBreakdown:
 
 def catch_all(session) -> CatchAll:
     """The Nothing identified tab: the unknown sports rows, grouped by what would fix them."""
-    rows = session.execute(_visible(session, select(ChannelDB.name, ChannelDB.category)
+    rows = session.execute(_visible(session, select(ChannelDB.id, ChannelDB.name, ChannelDB.category)
                                     .where(ChannelDB.sport_type == sports_catalog.UNKNOWN))).all()
     leagues = load_leagues(session)
     named = 0
-    either: list[tuple[str, tuple[str, ...]]] = []
-    strangers: dict[str, list[str]] = defaultdict(list)
-    not_games: list[str] = []
-    for name, collection in rows:
+    either: list[tuple[Listing, tuple[str, ...]]] = []
+    strangers: dict[str, list[Listing]] = defaultdict(list)
+    not_games: list[Listing] = []
+    for cid, name, collection in rows:
+        listing = Listing(cid, name or "")
         fits = fitting_leagues(name, leagues)
         if fits is None:
-            not_games.append(name or "")
+            not_games.append(listing)
         elif len(fits) == 1:
             named += 1
         elif fits:
-            either.append((name or "", tuple(lg.name for lg in fits)))
+            either.append((listing, tuple(lg.name for lg in fits)))
         else:
-            strangers[collection or ""].append(name or "")
+            strangers[collection or ""].append(listing)
     groups = tuple(CollectionRow(c, len(names), tuple(names[:EXAMPLES]))
                    for c, names in sorted(strangers.items(), key=lambda kv: (-len(kv[1]), kv[0])))
     return CatchAll(len(rows), named, tuple(either), groups,
-                    sum(g.games for g in groups), tuple(sorted(not_games)))
+                    sum(g.games for g in groups), tuple(sorted(not_games, key=lambda li: li.name)))
 
 
 def channel_ids(session, *, sport: Optional[str] = None, league: Optional[str] = None,

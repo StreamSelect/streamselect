@@ -11,7 +11,8 @@ Analytics tab's parts (``gui/analytics_parts.py``, BV-Q3):
   view opens on the first sport in the Sports view's order (BV-Q6).
 * **Nothing identified** — the catch-all (One Sports List slice 6): games two
   leagues fit, games between teams no list knows by collection (BV-Q12), and
-  listings that aren't games (BV-Q9).
+  listings that aren't games (BV-Q9). Every listing shown is a link that puts
+  its channel in the details pane, to help identify it (owner, 2026-11-27).
 
 A name selects; a count (or a tile) opens those channels in Search through the
 host's strict context filter (BV-Q4). Both reads run off the UI thread through
@@ -27,7 +28,6 @@ from streamselect.core import library_breakdown as lb
 from streamselect.core import sports_catalog as sc
 from streamselect.gui import cursor_affordance
 from streamselect.gui.analytics_parts import AnalyticsCard, FigureTile, LinkLabel, short_bar, text_label
-from streamselect.gui.chip_row import MiddleElideLabel
 from streamselect.gui.tool_view import ToolView, clear_layout, show_loading, show_panel_error
 
 #: What the game finder does with a league (BV-Q8).
@@ -68,6 +68,9 @@ class LibraryBreakdownView(ToolView):
 
     #: (label, channel ids): the host opens them in Search as a strict filter.
     browse_requested = pyqtSignal(str, object)
+    #: channel id: the host shows that channel in the details pane (a clicked
+    #: unidentified listing, owner 2026-11-27: "to help identify things").
+    channel_chosen = pyqtSignal(str)
 
     def __init__(self, main_window) -> None:
         super().__init__(main_window)
@@ -121,6 +124,12 @@ class LibraryBreakdownView(ToolView):
         tile.set(f"{figure:,}", caption, warn=warn)
         tile.clicked.connect(lambda: self._browse(label, **where))
         row.addWidget(tile, 1)
+
+    def _listing(self, listing: lb.Listing) -> LinkLabel:
+        """An unidentified listing: a click shows the channel in the details pane."""
+        link = LinkLabel(listing.name, f"Show this channel's details: {listing.name}")
+        link.clicked.connect(lambda cid=listing.channel_id: self.channel_chosen.emit(cid))
+        return link
 
     def _count(self, n: int, label: str, **where) -> LinkLabel:
         link = LinkLabel(f"{n:,}", f"Show these {n:,} channels in Search")
@@ -298,8 +307,8 @@ class LibraryBreakdownView(ToolView):
             return card
         grid = card.grid()
         grid.setColumnStretch(0, 1)
-        for row, (name, leagues) in enumerate(data.either):
-            grid.addWidget(MiddleElideLabel(name, color_token="COLOR_TEXT"), row, 0)
+        for row, (listing, leagues) in enumerate(data.either):
+            grid.addWidget(self._listing(listing), row, 0)
             grid.addWidget(text_label(" or ".join(leagues), "META_HINT"), row, 1)
         return card
 
@@ -311,9 +320,8 @@ class LibraryBreakdownView(ToolView):
             return card
         grid = card.grid()
         hidden = []
-        for row, name in enumerate(data.not_games):
-            label = MiddleElideLabel(name, color_token="COLOR_TEXT")
-            label.setToolTip(name)
+        for row, listing in enumerate(data.not_games):
+            label = self._listing(listing)
             grid.addWidget(label, row, 0)
             if row >= NOT_GAME_ROWS:
                 hidden.append(label)
@@ -333,8 +341,12 @@ class LibraryBreakdownView(ToolView):
         hidden = []
         for row, g in enumerate(data.strangers, start=1):
             title = g.collection or "no collection"
-            example = MiddleElideLabel(" · ".join(g.examples), color_token="COLOR_TEXT")
-            example.setToolTip("\n".join(g.examples))
+            example = QWidget()
+            box = QHBoxLayout(example)
+            box.setContentsMargins(0, 0, 0, 0)
+            box.setSpacing(12)
+            for listing in g.examples:
+                box.addWidget(self._listing(listing), 1)
             cells = (text_label(title, "FIELD_LABEL"),
                      self._count(g.games, f"Unidentified in {title}", collection=g.collection), example)
             for col, widget in enumerate(cells):

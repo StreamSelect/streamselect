@@ -82,9 +82,11 @@ def test_the_sports_read_counts_visible_sources_and_says_how_each_sport_was_deci
 def test_the_catch_all_groups_what_nothing_identified_by_what_would_fix_it(library):
     data = _read(library, lb.catch_all)
     assert data.total == 4
-    assert [(n, set(ls)) for n, ls in data.either] == [("NEXT | TORONTO VS BOSTON | Fri", {"NHL", "NBA"})]
+    assert [(li.channel_id, set(ls)) for li, ls in data.either] == [("u1", {"NHL", "NBA"})]
     assert [(g.collection, g.games) for g in data.strangers] == [("SE PPV", 2)]
-    assert data.not_games == ("US (Peacock 004) | Free Dance (2026-11-27 22:00:00)",)
+    assert {li.channel_id for li in data.strangers[0].examples} == {"u2", "u3"}
+    assert [(li.channel_id, li.name) for li in data.not_games] == [
+        ("u4", "US (Peacock 004) | Free Dance (2026-11-27 22:00:00)")]
 
 
 def test_a_clicked_count_finds_exactly_its_visible_channels(library):
@@ -151,3 +153,18 @@ def test_clicking_a_sport_shows_its_leagues_and_a_count_opens_its_channels(view,
     view.browse_requested.connect(lambda label, ids: got.append((label, sorted(ids))))
     _click(_labels(view, "3")[0])               # soccer's channel count
     assert got == [("Soccer", ["s1", "s2", "s3"])]
+
+
+def test_an_unidentified_listing_is_a_link_that_shows_its_channel_in_the_details_pane(view, qapp):
+    from streamselect.gui.analytics_parts import LinkLabel
+
+    view.tabs.setCurrentIndex(1)
+    qapp.processEvents()
+    chosen = []
+    view.channel_chosen.connect(chosen.append)
+    for text, cid in (("US (Peacock 004) | Free Dance (2026-11-27 22:00:00)", "u4"),   # not a game
+                      ("NEXT | TORONTO VS BOSTON | Fri", "u1"),                          # could be either
+                      ("NEXT | BORAS HC - KALIX HC | Fri", "u3")):                        # a collection's example
+        link = next(w for w in view.findChildren(LinkLabel) if w.text() == text and w.isVisible())
+        _click(link)
+        assert chosen[-1] == cid

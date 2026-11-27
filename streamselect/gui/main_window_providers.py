@@ -233,6 +233,7 @@ class _ProviderMixin:
             # same chokepoint the Analytics tab's "Browse them" uses.
             view.browse_requested.connect(
                 lambda label, ids: self._activate_context_filter(label, _details_id_filter=set(ids)))
+            view.channel_chosen.connect(self.show_channel_details_by_id)
             view.setVisible(False)
             self._list_layout.addWidget(view)
         self._hide_all_content_views()
