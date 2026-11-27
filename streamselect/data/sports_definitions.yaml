@@ -377,6 +377,16 @@ sports:
       # Not the bare "athletics": the Oakland Athletics play baseball.
       World Athletics:
         words: [World Athletics, Athletics Championships, Diamond League]
+  # Library Breakdown BV-Q11 (2026-11-27): 7 event rows nothing identified, and 3
+  # PPV "Short Program" rows that only a SOCCER PPV slot name had called soccer.
+  figure_skating:
+    name: Figure skating
+    words: [figure skating, free skate, free dance, short program, ice dance, pairs skating]
+  # BV-Q11: 6 event rows. Not the bare "GS" ("Women's GS: Killington"): a sport word
+  # also decides what counts as Sports, and two letters are too loose for that.
+  skiing:
+    name: Skiing
+    words: [alpine skiing, slalom, downhill, super-g, super_g, ski jumping]
 
 # Words naming a sports channel that carries many sports. Matched on the channel's
 # NAME, after any slot label is removed. "moto*" catches MOTOR, MOTORVISION and

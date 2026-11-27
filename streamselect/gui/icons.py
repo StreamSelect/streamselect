@@ -675,6 +675,9 @@ VECTOR_KEYS: dict[str, str] = {
     "sport_volleyball": "mdi6.volleyball",
     "sport_swimming": "mdi6.swim",
     "sport_track": "mdi6.run-fast",
+    # Library Breakdown BV-Q11. Both checked present with a QApplication running.
+    "sport_figure_skating": "mdi6.skate",
+    "sport_skiing": "mdi6.ski",
     # The many multi-sport networks — Fox Sports 1, Sky Sports News, beIN.
     # Keyed by the stored kind "network" (sports_catalog.NETWORK; it was keyed
     # "general", a value nothing ever stored). Not "Unclassified": a rack

@@ -158,3 +158,10 @@ def test_a_live_event_outside_the_platform_grammar_is_tagged_when_it_says_sports
     other = ChannelDB(id="e2", name="IT| PRIM 1 HD [LIVE-EVENT]", category="IT EVENTS", media_type="live")
     update_channel_special_content(other)
     assert other.special_view == "live_event" and other.sport_type is None
+
+
+def test_figure_skating_and_skiing_are_sports_and_a_slot_name_no_longer_decides_them():
+    assert sc.classify("US (Peacock 007) | Women`s Free Skate (2026-11-28 02:30:00)").sport_type == "figure_skating"
+    assert sc.classify("US (Peacock 013) | Men`s Super_G: Copper (2026-11-28 13:45:00)").sport_type == "skiing"
+    assert sc.classify("End | Pairs Short Program | all | 27-11-2026 | US: SOCCER PPV 4").sport_type == "figure_skating"
+    assert not sc.is_sports("W GS: Tremblant Run 1"), "two letters never make a channel Sports"
