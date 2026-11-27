@@ -26,6 +26,7 @@ care which class in the MRO defines the name.
 from __future__ import annotations
 
 from dataclasses import replace
+from functools import partial
 
 from loguru import logger
 from PyQt6.QtCore import Qt
@@ -97,102 +98,44 @@ class _MenuActionsMixin:
         # This sat under a SECOND entry called "Diagnostics" whose handler
         # logged one line and returned — two diagnostics items, one dead. The
         # dead one is gone; the real one carries the name, matching its dialog.
-        diagnose_action = QAction(_icon_utils.role_icon("diagnose"), "Stream &diagnostics", self)
-        diagnose_action.setToolTip(
+        add = partial(self._tool_action, tools_menu)
+        add("diagnose", "Stream &diagnostics",
             "Measure the selected channel's stream: reachability, time to first "
-            "byte, throughput, and whether a bigger buffer would help"
-        )
-        diagnose_action.triggered.connect(self.on_diagnose_clicked)
-        tools_menu.addAction(diagnose_action)
+            "byte, throughput, and whether a bigger buffer would help", self.on_diagnose_clicked)
         # "Global Exclusions", never "Filters" — the app's one name for this.
         # Its handler was a stub too, and had a LIVE trigger beyond the menu:
         # the details pane emits manage_filters_requested straight into it.
-        exclusions_action = QAction(
-            _icon_utils.role_icon("global_exclusion"), "Global &Exclusions", self
-        )
-        exclusions_action.setToolTip(
-            "Choose which prefixes, categories and keywords are hidden across "
-            "the whole app"
-        )
-        exclusions_action.triggered.connect(self.manage_filters)
-        tools_menu.addAction(exclusions_action)
-        missing_tmdb_action = QAction(
-            _icon_utils.role_icon("missing_data"), "Missing TMDb Data", self
-        )
-        missing_tmdb_action.setToolTip(
-            "Diagnose TMDb-id coverage and drive on-demand enrichment"
-        )
-        missing_tmdb_action.triggered.connect(self.enter_missing_tmdb_mode)
-        tools_menu.addAction(missing_tmdb_action)
-        breakdown_action = QAction(
-            _icon_utils.role_icon("library_breakdown"), "Library &Breakdown", self
-        )
-        breakdown_action.setToolTip(
-            "See how your channels were sorted into sports, leagues and teams, "
-            "and what couldn't be sorted"
-        )
-        breakdown_action.triggered.connect(self.enter_library_breakdown_mode)
-        tools_menu.addAction(breakdown_action)
-        reconnect_action = QAction(
-            _icon_utils.role_icon("reconnect"), "Reconnect Engaged Content", self
-        )
-        reconnect_action.setToolTip(
-            "Recover favorites/history/queue rows stranded by a removed source "
-            "onto a live copy"
-        )
-        reconnect_action.triggered.connect(self.enter_reconnect_engaged_mode)
-        tools_menu.addAction(reconnect_action)
-        metadata_enrich_action = QAction(
-            _icon_utils.role_icon("metadata_enrich"), "Background Metadata Enrichment", self
-        )
-        metadata_enrich_action.setToolTip(
-            "View progress and start/pause/cancel the background metadata fill"
-        )
-        metadata_enrich_action.triggered.connect(self.enter_metadata_enrichment_mode)
-        tools_menu.addAction(metadata_enrich_action)
-        open_config_action = QAction(
-            _icon_utils.role_icon("folder_open"), "Open config folder", self
-        )
-        open_config_action.setToolTip(
-            "Reveal the folder holding config.yaml and the logs, for support "
-            "and manual edits"
-        )
-        open_config_action.triggered.connect(self.open_config_folder)
-        tools_menu.addAction(open_config_action)
-        log_viewer_action = QAction(
-            _icon_utils.role_icon("log_viewer"), "Log viewer", self
-        )
-        log_viewer_action.setToolTip(
+        add("global_exclusion", "Global &Exclusions",
+            "Choose which prefixes, categories and keywords are hidden across the whole app",
+            self.manage_filters)
+        add("missing_data", "Missing TMDb Data",
+            "Diagnose TMDb-id coverage and drive on-demand enrichment", self.enter_missing_tmdb_mode)
+        add("library_breakdown", "Library &Breakdown",
+            "See how your channels were sorted into sports, leagues and teams, and what "
+            "couldn't be sorted", self.enter_library_breakdown_mode)
+        add("reconnect", "Reconnect Engaged Content",
+            "Recover favorites/history/queue rows stranded by a removed source onto a live copy",
+            self.enter_reconnect_engaged_mode)
+        add("metadata_enrich", "Background Metadata Enrichment",
+            "View progress and start/pause/cancel the background metadata fill",
+            self.enter_metadata_enrichment_mode)
+        add("folder_open", "Open config folder",
+            "Reveal the folder holding config.yaml and the logs, for support and manual edits",
+            self.open_config_folder)
+        add("log_viewer", "Log viewer",
             "Watch the log as it happens, in a window you can move aside — "
-            "with save, filter and diagnostics for a bug report"
-        )
-        log_viewer_action.triggered.connect(self.show_log_viewer)
-        tools_menu.addAction(log_viewer_action)
-        clear_log_action = QAction(
-            _icon_utils.role_icon("clear_log"), "Clear log files", self
-        )
-        clear_log_action.setToolTip(
-            "Delete every log file, rotated copies included, to reclaim disk"
-        )
-        clear_log_action.triggered.connect(self.clear_log_files)
-        tools_menu.addAction(clear_log_action)
+            "with save, filter and diagnostics for a bug report", self.show_log_viewer)
+        add("clear_log", "Clear log files",
+            "Delete every log file, rotated copies included, to reclaim disk", self.clear_log_files)
         tools_menu.addSeparator()
         # The guided tour: menu-only until a user approves offering it
         # during a first scan (ROADMAP onboarding 6; guided_tour.py).
-        tour_action = QAction(_icon_utils.role_icon("info"), "Take the &tour", self)
-        tour_action.setToolTip(
-            "A one-minute walk through the main controls. You can take it "
-            "again any time from here."
-        )
-        tour_action.triggered.connect(self.start_tour)
-        tools_menu.addAction(tour_action)
-        tips_action = QAction(_icon_utils.role_icon("tips"), "Show tips again", self)
-        tips_action.setToolTip(
-            "Show each one-time tip again the next time its moment comes, such "
-            "as opening a view for the first time."
-        )
-        tips_action.triggered.connect(self.reset_tips)
-        tools_menu.addAction(tips_action)
+        add("info", "Take the &tour",
+            "A one-minute walk through the main controls. You can take it again any time from here.",
+            self.start_tour)
+        add("tips", "Show tips again",
+            "Show each one-time tip again the next time its moment comes, such as opening a view "
+            "for the first time.", self.reset_tips)
         self._add_update_menu_items(tools_menu)
         tools_menu.addSeparator()
         for keep, text, tip in (
@@ -264,6 +207,14 @@ class _MenuActionsMixin:
     # The handlers ``gui/shortcuts.py`` names. They live here because this is
     # the file that owns the menu bar, and every one of them is reachable from
     # a menu entry as well as from its key.
+
+    def _tool_action(self, menu, role: str, text: str, tip: str, slot) -> QAction:
+        """One Tools-menu item: its icon role, text, tooltip and handler."""
+        action = QAction(_icon_utils.role_icon(role), text, self)
+        action.setToolTip(tip)
+        action.triggered.connect(slot)
+        menu.addAction(action)
+        return action
 
     def show_keyboard_shortcuts(self) -> None:
         """Open the cheat-sheet — every shortcut, read off the one table."""

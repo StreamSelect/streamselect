@@ -267,5 +267,6 @@ def test_the_tools_menu_reaches_both_handlers(handler):
         p.read_text() for p in
         sorted(pathlib.Path("streamselect/gui").glob("main_window*.py"))
     )
-    assert f"connect(self.{handler})" in src, f"no Tools entry calls {handler}"
+    # A Tools entry hands its handler to _tool_action as the last argument.
+    assert f"self.{handler})" in src, f"no Tools entry calls {handler}"
     assert f"def {handler}" in src, f"{handler} is not defined"
