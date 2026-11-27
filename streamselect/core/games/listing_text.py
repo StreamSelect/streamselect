@@ -56,7 +56,14 @@ MATCHUP_LIKE_PATTERNS = tuple(f"% {sep} %" for sep in _SEPARATORS) + ("% VS. %",
 #: A GLOB that matches any text holding a character outside printable ASCII.
 NOT_PLAIN_GLOB = "*[^ -~]*"
 _CLOCK_IN_SIDE_RE = re.compile(r"\d{1,2}(:\d{2}){1,2}\s*(AM|PM)?|\d{1,2}\s*(AM|PM)(?![A-Z])")
-_STRIP_WORDS = set(MONTH_WORD) | set(WEEKDAY_WORD) | {"AM", "PM"} | set(ZONE_LABELS)
+#: Words that are never part of a team's name, measured in the kept team book
+#: (2026-11-27): "NBA herrar New York Knicks" (Swedish "men's") stored "Herrar New
+#: York Knicks"; "NHL-MATCHDAY 27.11.2026 - MIT SKY SPORT" stored two teams, a show
+#: and its broadcaster; "UK Basketball: Countdown to Tip_Off" stored "Uk Basketball".
+#: HOCKEY is not here: it is a word of "Utah Hockey Club".
+NOT_TEAM_WORDS = frozenset({"HERRAR", "DAMER", "HERREN", "DAMEN", "MATCHDAY", "PREGAME",
+                            "POSTGAME", "COUNTDOWN", "PRESS", "CONFERENCE", "BASKETBALL"})
+_STRIP_WORDS = set(MONTH_WORD) | set(WEEKDAY_WORD) | {"AM", "PM"} | set(ZONE_LABELS) | NOT_TEAM_WORDS
 #: A number that is part of a team's name: digits then 3+ letters ("76ERS", "49ERS"),
 #: never an ordinal ("18TH"), a quality mark ("4K", "1080P") or a frame rate ("60FPS").
 _NAME_NUMBER_RE = re.compile(r"\d+(?!FPS$)[A-Z]{3,}")

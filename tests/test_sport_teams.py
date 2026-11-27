@@ -130,3 +130,34 @@ def test_a_game_listed_under_a_former_name_is_named_by_its_teams(db):
         _unknown(s, "u5", "NEXT | UTAH HOCKEY CLUB VS. NASHVILLE PREDATORS | Fri 27 Nov")
     with db.session_scope() as s:
         assert identify_by_teams(s) == 1
+
+
+# ── words that are never a team's (the kept book, measured 2026-11-27) ──
+
+
+def test_words_that_are_never_a_teams_name_do_not_reach_the_book():
+    from streamselect.core.games.listing_text import league_matcher, matchups, norm
+    from streamselect.core.games.teams import TeamBook, team_display
+
+    nba = league_matcher(["NBA"])
+    assert matchups(norm("NBA: Basket: NBA herrar New York Knicks - Miami Heat"), nba) == [
+        (("NEW", "YORK", "KNICKS"), ("MIAMI", "HEAT"))], "Swedish 'herrar' (men's) is not the team"
+    nhl = league_matcher(["NHL"])
+    assert matchups(norm("LIVE | NHL-MATCHDAY 27.11.2026 - MIT SKY SPORT | Fri 27 Nov 17:55 CET"),
+                    nhl) == [], "a show and its broadcaster are not a game"
+    ncaa = league_matcher(["NCAA"])
+    book = TeamBook([norm("US (ESPN+ 208) | NCAA Men`s Basketball: UK Basketball: Countdown to Tip_Off")],
+                    [], ncaa)
+    assert "Uk Basketball" not in {team_display(t) for t in book.teams}
+
+
+def test_a_stored_misreading_goes_and_a_real_team_stays(db):
+    _seed_db(db)
+    with db.session_scope() as s:
+        for name in ("Matchday", "Herrar Buffalo Sabres"):
+            s.add(SportTeamDB(league_key="hockey/NHL", name=name, first_seen=NOW, last_seen=NOW,
+                              last_in_game=NOW))
+    refresh_games(db, NOW)
+    teams = _teams(db)
+    assert "Matchday" not in teams and "Herrar Buffalo Sabres" not in teams
+    assert teams["Buffalo Sabres"].last_in_game == NOW

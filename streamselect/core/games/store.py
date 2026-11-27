@@ -24,7 +24,7 @@ from streamselect.core.games.finder import (
     GUIDE, ListingIn, Memory, PlayIn, SportSettings, _learn_clocks, find_games, learn_teams,
 )
 from streamselect.core.games.listing_text import (
-    MATCHUP_LIKE_PATTERNS, NOT_PLAIN_GLOB, league_matcher, norm,
+    MATCHUP_LIKE_PATTERNS, NOT_PLAIN_GLOB, NOT_TEAM_WORDS, league_matcher, norm,
 )
 from streamselect.core.games.models import GameDB, GameFeedDB, GameFinderMemoryDB, SportTeamDB
 from streamselect.core.games.teams import team_display
@@ -222,7 +222,9 @@ def _keep_teams(session, key: str, names: list[str], games, now: datetime,
     in_game = {t for g in games if g.level <= 2 for t in (g.team_a, g.team_b)}
     stored = {r.name: r for r in session.execute(
         select(SportTeamDB).where(SportTeamDB.league_key == key)).scalars()}
-    for name in former & set(stored):
+    # A former name, and a misreading kept before its word was listed as never a
+    # team's ("Herrar New York Knicks"), are not teams of their own.
+    for name in [n for n in stored if n in former or NOT_TEAM_WORDS & set(norm(n).split())]:
         session.delete(stored.pop(name))
     for name in sorted(set(names) | in_game):
         row = stored.get(name)
