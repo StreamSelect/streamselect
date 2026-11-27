@@ -345,8 +345,13 @@ sports:
         words: [Ryder Cup]
   cycling:
     name: Cycling
-    words: [cycling]
+    # cyclocross: the UCI Cyclocross World Cup event rows (owner, 2026-11-27);
+    # flobikes: FloSports' cycling feed, like flohoops.
+    words: [cycling, cyclocross, cyclo-cross, flobikes]
     leagues:
+      # Cycling's governing body: its World Cups (cyclocross, track, MTB) are all cycling.
+      UCI:
+        words: [UCI]
       Tour de France:
         words: [Tour de France]
       Vuelta:

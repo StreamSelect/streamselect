@@ -165,3 +165,9 @@ def test_figure_skating_and_skiing_are_sports_and_a_slot_name_no_longer_decides_
     assert sc.classify("US (Peacock 013) | Men`s Super_G: Copper (2026-11-28 13:45:00)").sport_type == "skiing"
     assert sc.classify("End | Pairs Short Program | all | 27-11-2026 | US: SOCCER PPV 4").sport_type == "figure_skating"
     assert not sc.is_sports("W GS: Tremblant Run 1"), "two letters never make a channel Sports"
+
+
+def test_cyclocross_and_the_uci_are_cycling():
+    tag = sc.classify("AU (STAN 02) | Women`s Elite: Ostrava  UCI Cyclocross World Cup 2026/27 (2026-11-28 04:05:50)")
+    assert (tag.sport_type, tag.league_name) == ("cycling", "UCI")
+    assert sc.classify("flobikes: 2026 USA BMX Race of Champions (Main)").sport_type == "cycling"

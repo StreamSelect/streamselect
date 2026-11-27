@@ -222,7 +222,8 @@ if TYPE_CHECKING:                                    # pragma: no cover
 #: v16: a live event outside the platform grammar is tagged when its name says
 #: Sports ("SKY SPORTS UHD [EVENT]": 59 rows had no sport or kind).
 #: v17: figure skating and skiing are sports (Library Breakdown BV-Q11).
-CURRENT_VERSION = 17
+#: v18: cyclocross, flobikes and the UCI are cycling (owner, 2026-11-27).
+CURRENT_VERSION = 18
 
 #: Fields the classifier owns end-to-end. Cleared before each recompute so a row
 #: that stops matching loses its stale label instead of keeping it.
