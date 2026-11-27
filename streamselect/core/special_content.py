@@ -300,7 +300,10 @@ def update_channel_special_content(channel: ChannelDB) -> bool:
                 metadata['start_time'] = pe.start_time.isoformat()
             channel.event_metadata = metadata
 
-            # These are sports events — enrich sport/league/team for the sports facets.
+        # A platform event is a sports event; any other live event ("SKY SPORTS UHD
+        # [EVENT]", 59 rows had no sport at all) is tagged when its name or
+        # collection says Sports, and left alone otherwise (a concert stays untagged).
+        if pe is not None or sports_catalog.is_sports(channel.name or "", channel.category or ""):
             sports_data = parse_sports_channel(channel)
             channel.sport_type = sports_data['sport_type']
             channel.league_name = sports_data['league_name']

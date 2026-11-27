@@ -146,3 +146,15 @@ def test_the_row_chip_names_a_kind_in_words():
     assert _sport_cell(sc.NETWORK).text == "Many sports"
     assert _sport_cell(sc.SLOT).text == "Event slot"
     assert _sport_cell("american_football").text == "American football"
+
+
+def test_a_live_event_outside_the_platform_grammar_is_tagged_when_it_says_sports():
+    from streamselect.core.database import ChannelDB
+    from streamselect.core.special_content import update_channel_special_content
+
+    sky = ChannelDB(id="e1", name="4K| SKY SPORTS UHD [EVENT]", category="4K EVENTS", media_type="live")
+    update_channel_special_content(sky)
+    assert (sky.special_view, sky.sport_type) == ("live_event", sc.NETWORK)
+    other = ChannelDB(id="e2", name="IT| PRIM 1 HD [LIVE-EVENT]", category="IT EVENTS", media_type="live")
+    update_channel_special_content(other)
+    assert other.special_view == "live_event" and other.sport_type is None

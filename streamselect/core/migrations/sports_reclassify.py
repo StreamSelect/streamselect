@@ -219,7 +219,9 @@ if TYPE_CHECKING:                                    # pragma: no cover
 #: v15: one sports list (core/sports_catalog.py): a league names its sport, the
 #: longest word wins, a slot's own name is not its content, networks and slots
 #: are stored kinds, and every row records sport_from.
-CURRENT_VERSION = 15
+#: v16: a live event outside the platform grammar is tagged when its name says
+#: Sports ("SKY SPORTS UHD [EVENT]": 59 rows had no sport or kind).
+CURRENT_VERSION = 16
 
 #: Fields the classifier owns end-to-end. Cleared before each recompute so a row
 #: that stops matching loses its stale label instead of keeping it.
