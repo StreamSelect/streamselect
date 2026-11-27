@@ -13,7 +13,7 @@ import collections
 import re
 from typing import Iterable, Literal, Optional
 
-from streamselect.core.games.listing_text import Side, clean_side, matchups, segments
+from streamselect.core.games.listing_text import Side, clean_side, matchups, norm, segments
 
 Match = Literal["exact", "abbrev"]
 Resolution = Literal["exact", "abbrev", "ambiguous", "unknown"]
@@ -72,12 +72,19 @@ def _gapped(side: Side, team: Side) -> bool:
     return pos == sorted(pos) and pos[-1] - pos[0] > len(pos) - 1
 
 
+def renamed_sides(pairs: Iterable[tuple[str, str]]) -> dict[Side, Side]:
+    """The one list's ``renamed:`` pairs as sides: former team -> the team now."""
+    return {tuple(norm(old).split()): tuple(norm(new).split()) for old, new in pairs}
+
+
 class TeamBook:
     """The teams of one sport, learned from its seed names and guide titles."""
 
     def __init__(self, seed_names: Iterable[str], guide_titles: Iterable[str],
-                 league: re.Pattern[str]):
-        """Learn from normalised names (see :func:`listing_text.norm`)."""
+                 league: re.Pattern[str], renamed: Iterable[tuple[str, str]] = ()):
+        """Learn from normalised names (see :func:`listing_text.norm`). A team's
+        former name (*renamed*, the one list's ``renamed:``) is read as the team now."""
+        self._renamed = renamed_sides(renamed)
         seed_names = list(seed_names)
         side_count: collections.Counter[Side] = collections.Counter()
         seed_sides: set[Side] = set()
@@ -107,7 +114,8 @@ class TeamBook:
         self._labels = {pre for pre, tails in rest.items() if len(tails) >= 3 and pre not in side_count}
         merged: collections.Counter[Side] = collections.Counter()
         for sd, n in side_count.items():
-            merged[self._unlabel(sd)] += n
+            side = self._unlabel(sd)
+            merged[self._renamed.get(side, side)] += n
         ordered = sorted(merged, key=lambda s: (-len(s), -sum(map(len, s)), -merged[s]))
         self.teams: list[Side] = []
         #: A guide's short form with a word dropped from the middle ("VEGAS
@@ -129,6 +137,7 @@ class TeamBook:
     def resolve(self, side: Side, allow_abbrev: bool = True) -> tuple[list[Side], Resolution]:
         """The team(s) a side can mean, and how sure that is."""
         side = self._unlabel(side)
+        side = self._renamed.get(side, side)
         if side in self._short:
             return [self._short[side]], "exact"
         hits = [(t, k) for t in self.teams if (k := match(side, t, allow_abbrev))]

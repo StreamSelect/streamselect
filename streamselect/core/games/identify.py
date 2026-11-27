@@ -28,7 +28,7 @@ from streamselect.core.database import ChannelDB
 from streamselect.core.fixture_titles import parse_fixture_opponents
 from streamselect.core.games.listing_text import Side, clean_side, league_matcher, norm
 from streamselect.core.games.models import SportTeamDB
-from streamselect.core.games.teams import match
+from streamselect.core.games.teams import match, renamed_sides
 
 #: The special views whose rows carry a sport (special_content).
 _VIEWS = ("sports", "ppv", "live_event")
@@ -37,8 +37,10 @@ _VIEWS = ("sports", "ppv", "live_event")
 class LeagueTeams:
     """One league's confirmed teams, indexed by word for a quick candidate list."""
 
-    def __init__(self, key: str, names: list[str], words: tuple[str, ...]):
+    def __init__(self, key: str, names: list[str], words: tuple[str, ...],
+                 renamed: tuple[tuple[str, str], ...] = ()):
         self.sport, self.name = key.split("/", 1)
+        self._renamed = renamed_sides(renamed)
         self.pattern: re.Pattern[str] = league_matcher(words) if words else re.compile(r"(?!x)x")
         self.teams: list[Side] = [tuple(norm(n).split()) for n in names]
         self._by_word: dict[str, list[Side]] = defaultdict(list)
@@ -51,6 +53,7 @@ class LeagueTeams:
         side = clean_side(norm(side_text), self.pattern)
         if not side:
             return None
+        side = self._renamed.get(side, side)
         candidates = {t for w in side for t in self._by_word.get(w, ())}
         exact = [t for t in candidates if match(side, t, allow_abbrev=False) == "exact"]
         return exact[0] if len(exact) == 1 else None
@@ -62,8 +65,10 @@ def load_leagues(session) -> list[LeagueTeams]:
     for key, name in session.execute(select(SportTeamDB.league_key, SportTeamDB.name)
                                      .where(SportTeamDB.last_in_game.is_not(None))):
         confirmed[key].append(name)
-    words = {f"{lg.sport}/{lg.name}": lg.words for s in sports_catalog.sports() for lg in s.leagues}
-    return [LeagueTeams(key, names, words.get(key, ())) for key, names in confirmed.items()]
+    listed = {f"{lg.sport}/{lg.name}": lg for s in sports_catalog.sports() for lg in s.leagues}
+    return [LeagueTeams(key, names, listed[key].words if key in listed else (),
+                        listed[key].renamed if key in listed else ())
+            for key, names in confirmed.items()]
 
 
 def fitting_leagues(name: str, leagues: list[LeagueTeams]) -> Optional[list[LeagueTeams]]:

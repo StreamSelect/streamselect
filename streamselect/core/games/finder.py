@@ -93,6 +93,8 @@ class SportSettings:
     clock_agree_min: int = _D["clock_agree_min"]
     #: Clock evidence older than this is forgotten.
     clock_keep: timedelta = _D["clock_keep"]
+    #: (a team's former name, its name now): the league's ``renamed:`` in the one list.
+    renamed: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -450,7 +452,7 @@ def learn_teams(listings: list[ListingIn], settings: SportSettings) -> TeamBook:
     league = league_matcher(settings.words)
     seeded, _ = _split(listings, league)
     return TeamBook((norm(li.name) for li in seeded if li.source != GUIDE),
-                    (norm(li.name) for li in seeded if li.source == GUIDE), league)
+                    (norm(li.name) for li in seeded if li.source == GUIDE), league, settings.renamed)
 
 
 def find_games(listings: list[ListingIn], settings: SportSettings, now: datetime,

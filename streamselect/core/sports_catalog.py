@@ -71,6 +71,8 @@ class League:
     gates: bool = False
     shared: bool = False
     finder: str = FINDER_OFF
+    #: (a team's former name, its name now), from the list's ``renamed:``.
+    renamed: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -173,8 +175,11 @@ def _parse(data: dict) -> Catalog:
             finder = str(lb.get("finder") or FINDER_OFF)
             if finder not in (FINDER_LISTED, FINDER_TRIAL, FINDER_OFF):
                 raise ValueError(f"sports.{key}.leagues.{name}: finder must be listed, trial or off")
+            renamed = tuple((str(old), str(new)) for old, new in (lb.get("renamed") or {}).items())
+            if any(not old.strip() or not new.strip() for old, new in renamed):
+                raise ValueError(f"sports.{key}.leagues.{name}: renamed needs a former and a current name")
             leagues.append(League(key, str(name), _strs(lb.get("words")), bool(lb.get("gates")),
-                                  bool(lb.get("shared")), finder))
+                                  bool(lb.get("shared")), finder, renamed))
         sports.append(Sport(str(key), str(body.get("name") or key), words, tuple(leagues)))
         for w in words:
             by_word.setdefault(w, []).append(_Entry(order, key, None))

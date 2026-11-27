@@ -33,10 +33,10 @@ from streamselect.core.repositories.provider import ProviderRepository
 from streamselect.core import sports_catalog
 
 
-def _league_words() -> tuple[tuple[str, str, tuple[str, ...]], ...]:
-    """(sport, league, words) for every league the finder runs (the one sports
-    list, ``finder: listed`` or ``trial``)."""
-    return tuple((lg.sport, lg.name, lg.words) for lg in sports_catalog.finder_leagues() if lg.words)
+def _league_words() -> tuple[sports_catalog.League, ...]:
+    """Every league the finder runs (the one sports list, ``finder: listed`` or
+    ``trial``) that has words."""
+    return tuple(lg for lg in sports_catalog.finder_leagues() if lg.words)
 
 
 def enabled_leagues(overrides: Optional[Mapping] = None) -> tuple[SportSettings, ...]:
@@ -44,10 +44,10 @@ def enabled_leagues(overrides: Optional[Mapping] = None) -> tuple[SportSettings,
     sports list, core/sports_catalog.py), each with its sport's numbers: the sport's defaults, then the
     user's own choices (*overrides*, ``Config.sport_settings_overrides``; the core
     never reads Config itself)."""
-    per_sport = {sport: tuning.settings_kwargs(tuning.values(sport, overrides))
-                 for sport, _league, _words in _league_words()}
-    return tuple(SportSettings(sport, league, words, **per_sport[sport])
-                 for sport, league, words in _league_words())
+    per_sport = {lg.sport: tuning.settings_kwargs(tuning.values(lg.sport, overrides))
+                 for lg in _league_words()}
+    return tuple(SportSettings(lg.sport, lg.name, lg.words, **per_sport[lg.sport], renamed=lg.renamed)
+                 for lg in _league_words())
 
 
 def sport_settings(overrides: Optional[Mapping] = None) -> dict[str, SportSettings]:
@@ -212,14 +212,18 @@ def _read_listings(session, settings: SportSettings, now: datetime, hidden: set[
     return listings
 
 
-def _keep_teams(session, key: str, names: list[str], games, now: datetime) -> None:
+def _keep_teams(session, key: str, names: list[str], games, now: datetime,
+                former: frozenset[str] = frozenset()) -> None:
     """Add this run's team book to ``sport_teams``; a team the run did not see is
     kept with its last-seen time (owner, 2026-11-27). A game's two sides are in
     the book by construction; they are added anyway, so a confirmed team is
-    never missing from the table."""
+    never missing from the table. A *former* name (the list's ``renamed:``) is
+    removed: it is the current team now, not a team of its own."""
     in_game = {t for g in games if g.level <= 2 for t in (g.team_a, g.team_b)}
     stored = {r.name: r for r in session.execute(
         select(SportTeamDB).where(SportTeamDB.league_key == key)).scalars()}
+    for name in former & set(stored):
+        session.delete(stored.pop(name))
     for name in sorted(set(names) | in_game):
         row = stored.get(name)
         if row is None:
@@ -280,7 +284,8 @@ def refresh_games(db: Database, now: datetime | None = None,
                                         start_utc=f.start_utc, counts=f.counts) for f in g.feeds]
                 session.add(row)
             session.merge(GameFinderMemoryDB(finder=key, memory=_memory_to_json(memory), updated_at=now))
-            _keep_teams(session, key, [team_display(t) for t in book.teams], games, now)
+            _keep_teams(session, key, [team_display(t) for t in book.teams], games, now,
+                        frozenset(team_display(tuple(norm(old).split())) for old, _ in settings.renamed))
         counts[key] = sum(g.level == 1 for g in games)
         logger.info("Games {}: {} found ({} at level 1) from {:,} listings, {} clocks learned, {:.1f}s",
                     key, len(games), counts[key], len(listings),

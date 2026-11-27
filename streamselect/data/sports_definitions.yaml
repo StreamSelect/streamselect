@@ -52,6 +52,10 @@ sports:
         words: [NHL, Stanley Cup]
         gates: true
         finder: listed
+        # A team's former name -> its name now. Listings keep an old name for a
+        # while (a 24/7 team channel still says UTAH HOCKEY CLUB); the team book
+        # reads it as the current team (owner, 2026-11-27).
+        renamed: {Utah Hockey Club: Utah Mammoth}
       # TRIAL (owner, 2026-11-17): not yet through the test above. One source
       # lists AHL games with clock times and no zone; their collections borrow a
       # clock their sibling collections learned from NHL games (finder

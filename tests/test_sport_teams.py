@@ -92,3 +92,41 @@ def test_each_finder_run_names_the_games_its_teams_now_explain(db):
     with db.session_scope(commit=False) as s:
         row = s.get(ChannelDB, "u9")
         assert (row.sport_type, row.league_name, row.sport_from) == ("hockey", "NHL", "teams")
+
+
+def test_a_former_team_name_is_read_as_the_team_now():
+    from streamselect.core.games.listing_text import league_matcher, norm
+    from streamselect.core.games.teams import TeamBook, team_display
+
+    league = league_matcher(["NHL"])
+    seeds = [norm(n) for n in ("NHL: Utah Mammoth vs Nashville Predators | Fri 27 Nov 8:00 PM ET",
+                               "NHL: Utah Hockey Club vs Nashville Predators | Fri 27 Nov 8:00 PM ET",
+                               "NHL TEAM| UTAH HOCKEY CLUB")]
+    book = TeamBook(seeds, [], league, [("Utah Hockey Club", "Utah Mammoth")])
+    names = {team_display(t) for t in book.teams}
+    assert "Utah Mammoth" in names and "Utah Hockey Club" not in names
+    assert book.resolve(("UTAH", "HOCKEY", "CLUB")) == ([("UTAH", "MAMMOTH")], "exact")
+
+
+def test_the_list_renames_utah_and_a_stored_former_name_goes(db):
+    from streamselect.core import sports_catalog as sc
+
+    nhl = next(lg for s in sc.sports() for lg in s.leagues if lg.name == "NHL")
+    assert ("Utah Hockey Club", "Utah Mammoth") in nhl.renamed
+    _seed_db(db)
+    with db.session_scope() as s:
+        s.add(SportTeamDB(league_key="hockey/NHL", name="Utah Hockey Club", first_seen=NOW, last_seen=NOW))
+    refresh_games(db, NOW)
+    assert "Utah Hockey Club" not in _teams(db)
+
+
+def test_a_game_listed_under_a_former_name_is_named_by_its_teams(db):
+    from streamselect.core.games.identify import identify_by_teams
+
+    with db.session_scope() as s:
+        for name in ("Utah Mammoth", "Nashville Predators"):
+            s.add(SportTeamDB(league_key="hockey/NHL", name=name, first_seen=NOW, last_seen=NOW,
+                              last_in_game=NOW))
+        _unknown(s, "u5", "NEXT | UTAH HOCKEY CLUB VS. NASHVILLE PREDATORS | Fri 27 Nov")
+    with db.session_scope() as s:
+        assert identify_by_teams(s) == 1
