@@ -115,5 +115,7 @@ def test_the_action_uses_the_shared_icon_registry():
     import inspect
     src = pathlib.Path(inspect.getsourcefile(MainWindow.open_config_folder))
     text = src.read_text(encoding="utf-8")
-    assert 'role_icon("folder_open")' in text
+    # Each Tools item is built by _tool_action, which takes its icon from the role.
+    assert 'add("folder_open",' in text
+    assert "QAction(_icon_utils.role_icon(role)" in text
     assert "📂" not in text, "the glyph belongs in icons.py, not the menu code"

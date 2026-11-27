@@ -116,7 +116,9 @@ class LibraryBreakdownView(ToolView):
     def _browse(self, label: str, **where) -> None:
         self.main_window._run_query(lambda repos: lb.channel_ids(repos.session, **where),
                                     lambda ids: self.browse_requested.emit(label, ids),
-                                    token_ref=self._tokens["browse"])
+                                    token_ref=self._tokens["browse"],
+                                    on_error=lambda e: self.main_window.status(
+                                        f"Couldn't list those channels: {e}", level="error"))
 
     def _tile(self, row: QHBoxLayout, figure: int, caption: str, label: str, *, warn: bool = False,
               **where) -> None:

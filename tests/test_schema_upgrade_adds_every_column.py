@@ -216,6 +216,10 @@ ORIGINAL_COLUMNS: dict[str, frozenset[str]] = {
     }),
     "game_finder_memory": frozenset({"finder", "memory", "updated_at"}),
     "game_ends": frozenset({"league_key", "team_a", "team_b", "start_utc", "ended_at"}),
+    # Created whole by create_all() (Library Breakdown BV-Q10, the kept team book) — no ALTERs.
+    "sport_teams": frozenset({
+        "league_key", "name", "first_seen", "last_seen", "runs_seen", "last_in_game",
+    }),
     "tags": frozenset({
         "id", "type", "value",
     }),
