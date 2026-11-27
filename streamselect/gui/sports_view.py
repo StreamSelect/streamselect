@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
 
 from loguru import logger
 
+from streamselect.core import sports_catalog
 from streamselect.core.epg_utils import browse_day_separator_label, fmt_time, now_utc, past_day_label, to_local
 from streamselect.core.games.read import (
     CHANNEL_REPORTS, ENDING, ON_NOW, UPCOMING, WRONG_CONTENT, GameDTO, arrange_feeds, best_feed, game_key, game_state,
@@ -55,7 +56,7 @@ from streamselect.gui.sidebar.base import GroupHeading, _ClickableHeader
 from streamselect.gui.similar_lightbox_card import _ClickableFrame
 from streamselect.gui.sports_view_headers import SportsHeadersMixin, alert_count_chip
 
-#: Sports are not named here: every sport with a league in ``game_finder_leagues``
+#: Sports are not named here: every sport with a finder league in the one sports list
 #: gets its own section (owner, 2026-11-13: hockey is one segment, not the view).
 #: Re-render this often while open: progress bars and on-now/finished move with the clock.
 TICK_MS = 60_000
@@ -477,7 +478,7 @@ class SportsView(SportsHeadersMixin, ContentView):
         """By time (SV-Q50): every sport in one list; rows and cards name sport · league."""
         on_now, later, finished = self._split(games, now)
         def label(g: GameDTO) -> str:
-            return f"{g.sport.title()} · {g.league}"
+            return f"{sports_catalog.sport_label(g.sport)} · {g.league}"
         self._on_now_section(f"{ALL}:on_now", on_now, now, meta=label)
         self._day_sections(ALL, later, now, folded, label_of=label)
         self._finished_section(ALL, finished, now, folded, label_of=label)

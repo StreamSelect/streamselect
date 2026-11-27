@@ -65,7 +65,7 @@ def _channel(name: str) -> ChannelDB:
 def test_a_day_name_ppv_listing_is_categorised_and_stores_its_time():
     from streamselect.core.special_content import update_channel_special_content
     ch = _channel("ENDED | PITCH 10B | DAY 3: MORNING SESSION | Mon 26 Oct 01:00 EDT (US) "
-                  "| 8K EXCLUSIVE | US: FIFA+ PPV 1")
+                  "| 8K EXCLUSIVE | US: EVENTS PPV 1")
     assert update_channel_special_content(ch) is True
     assert ch.special_view == "ppv"
     assert ch.event_start_time is not None

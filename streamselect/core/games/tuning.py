@@ -34,9 +34,7 @@ from datetime import timedelta
 from functools import lru_cache
 from typing import Mapping, Optional
 
-import yaml
-
-from streamselect.core.special_content import _BUNDLED_DEFINITIONS
+from streamselect.core import sports_catalog
 
 GAME, LISTED, ALERTS, WATCHING, ADVANCED = (
     "How long a game runs", "Which games are listed", "Alerts", "What counts as watching",
@@ -154,8 +152,7 @@ BY_KEY: dict[str, Spec] = {s.key: s for s in SPECS}
 
 @lru_cache(maxsize=1)
 def _bundled() -> dict:
-    with open(_BUNDLED_DEFINITIONS) as f:
-        return (yaml.safe_load(f) or {}).get("sport_defaults") or {}
+    return sports_catalog.raw().get("sport_defaults") or {}
 
 
 def defaults(sport: Optional[str] = None) -> dict[str, int]:

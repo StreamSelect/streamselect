@@ -6,9 +6,9 @@ Neither is name-parsing vocabulary, so they live beside the EPG code that asks.
 """
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Optional
 
+from streamselect.core import sports_catalog
 from streamselect.core.content_labels import CONTENT_DESCRIPTOR_GROUPS
 
 
@@ -21,9 +21,9 @@ from streamselect.core.content_labels import CONTENT_DESCRIPTOR_GROUPS
 EPG_CONTENT_TYPES: tuple[str, ...] = ("Sports", "News", "Kids", "Movies", "Music")
 
 # Keyword tables for the keyword-scan fallback (case-insensitive substring match against
-# the channel name).  "Sports" is deliberately absent — its keywords are loaded from
-# special_content.py's load_sports_definitions() (bundled sports_definitions.yaml + any
-# user override) via _sports_keywords_flat() below, so the sport/league keyword list has
+# the channel name).  "Sports" is deliberately absent — it is the one sports list's own
+# predicate (core/sports_catalog.is_sports, the same test that puts a channel in the
+# Sports view), so the sport/league keyword list has
 # exactly one home instead of a second, drifting copy here.
 EPG_CONTENT_TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
     "News": (
@@ -43,30 +43,6 @@ EPG_CONTENT_TYPE_KEYWORDS: dict[str, tuple[str, ...]] = {
 }
 
 
-@lru_cache(maxsize=1)
-def _sports_keywords_flat() -> tuple[str, ...]:
-    """Flattened sport + league keywords from special_content.py (single source of truth).
-
-    Deferred import: ``special_content.py`` imports ``parse_platform_event`` from this
-    module at module scope, so importing it back here at module level would be a
-    circular import — this local import breaks the cycle by deferring it to call time.
-
-    Cached for the process lifetime: ``load_sports_definitions()`` reads a YAML file
-    from disk, and this classifier runs once per On-Now row per render — re-reading the
-    file per channel would be wasteful for a table that is effectively static per
-    session (a settings-UI edit to the user override file takes effect next launch).
-    """
-    from streamselect.core.special_content import load_sports_definitions
-
-    sport_kw, league_kw = load_sports_definitions()
-    flat: list[str] = []
-    for keywords in sport_kw.values():
-        flat.extend(k.lower() for k in keywords)
-    for keywords in league_kw.values():
-        flat.extend(k.lower() for k in keywords)
-    return tuple(flat)
-
-
 def classify_channel_content_type(name: str, detected_prefix: Optional[str]) -> Optional[str]:
     """Classify a channel's EPG viewing content type for the On Now "All Types" filter.
 
@@ -74,8 +50,8 @@ def classify_channel_content_type(name: str, detected_prefix: Optional[str]) -> 
       1. ``detected_prefix`` already denotes a content-descriptor group that is also
          in :data:`EPG_CONTENT_TYPES` (e.g. a channel whose stored prefix IS "Sports" /
          "Kids" / "Music" / "News") — no keyword scan needed, no ambiguity.
-      2. Keyword scan over the lowercased channel *name* — Sports keywords come from
-         special_content.py's sport/league loader (:func:`_sports_keywords_flat`);
+      2. Keyword scan over the lowercased channel *name* — Sports is
+         :func:`sports_catalog.is_sports`;
          News/Kids/Movies/Music from :data:`EPG_CONTENT_TYPE_KEYWORDS`.
       3. ``None`` — the caller displays this as "Other".
 
@@ -99,7 +75,7 @@ def classify_channel_content_type(name: str, detected_prefix: Optional[str]) -> 
     if not name_lower:
         return None
 
-    if any(kw in name_lower for kw in _sports_keywords_flat()):
+    if sports_catalog.is_sports(name_lower):
         return "Sports"
 
     for content_type, keywords in EPG_CONTENT_TYPE_KEYWORDS.items():

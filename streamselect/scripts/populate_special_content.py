@@ -112,9 +112,10 @@ def populate_special_content(
             if sports_only:
                 # Only re-parse sport/league/team fields; don't change special_view
                 from streamselect.core.special_content import parse_sports_channel
-                sports_data = parse_sports_channel(channel, config)
+                sports_data = parse_sports_channel(channel)
                 channel.sport_type = sports_data['sport_type']
                 channel.league_name = sports_data['league_name']
+                channel.sport_from = sports_data['sport_from']
                 channel.team_name = sports_data['team_name']
                 updated += 1
                 stats['sports'] = stats.get('sports', 0) + 1
@@ -126,7 +127,7 @@ def populate_special_content(
                         f"{sports_data['team_name']}"
                     )
             else:
-                was_updated = update_channel_special_content(channel, config)
+                was_updated = update_channel_special_content(channel)
                 if was_updated:
                     updated += 1
                     category = channel.special_view

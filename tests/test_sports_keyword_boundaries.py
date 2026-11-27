@@ -133,8 +133,8 @@ def test_flosports_vertical_titles_classify_to_their_sport(name, sport):
 def test_flo_network_wrestling_passes_the_gate_and_classifies():
     """16 "| wrestling: …" rows failed ``detect_sports_channel`` even though
     "wrestling" was already a keyword in ``parse_sports_channel`` — the gate
-    and the keyword map are separate sets (see ``special_content.py``'s
-    ``SPORTS_GATE_TOKENS``)."""
+    and the keyword map were separate sets. Since the one sports list
+    (core/sports_catalog.py) every sport word is also a gate word."""
     from streamselect.core.special_content import detect_sports_channel
 
     channel = _Channel(

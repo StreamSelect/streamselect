@@ -108,6 +108,7 @@ def _read_channel(db: Database, ch_id: str) -> dict:
             "special_view": row.special_view,
             "sport_type": row.sport_type,
             "league_name": row.league_name,
+            "sport_from": row.sport_from,
             "team_name": row.team_name,
             "event_start_time": row.event_start_time,
             "event_stop_time": row.event_stop_time,
@@ -379,6 +380,7 @@ def test_renamed_row_drops_sports_classification(store_thread, tmp_db):
         "special_view": "sports",
         "sport_type": "tennis",
         "league_name": "ATP",
+        "sport_from": "league",
         "team_name": "A vs B",
         "event_start_time": datetime(2026, 9, 12, 8, 0),
         "event_stop_time": datetime(2026, 9, 12, 10, 0),
@@ -438,7 +440,7 @@ def test_renamed_slot_reclassified_from_new_name(store_thread, tmp_db):
       1. Insert slot2 named "ATP Tennis Tournament".
       2. In a session, run update_channel_special_content(row) and commit.
       3. Assert sport_type == "tennis".
-      4. Store the same id renamed to "UFC Boxing Match".
+      4. Store the same id renamed to "Boxing: Title Fight Night".
       5. Read the row: assert special_view IS NULL (handoff point for reclassify).
       6. Run update_channel_special_content again on the live row and commit.
       7. Assert sport_type == "boxing" (reclassified from new name).
@@ -459,7 +461,7 @@ def test_renamed_slot_reclassified_from_new_name(store_thread, tmp_db):
 
     # --- Step 4: rename to UFC event ---
     _store(store_thread, tmp_db, [
-        _make_channel("slot2", name="UFC Boxing Match")
+        _make_channel("slot2", name="Boxing: Title Fight Night")
     ])
 
     # --- Step 5: assert special_view IS NULL (handoff point) ---

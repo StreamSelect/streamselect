@@ -42,11 +42,8 @@ def db(tmp_path):
 class _Cfg:
     """Config double.
 
-    ``config_dir`` is not decoration: the task threads config through to the
-    classifier so a user's ``sports_definitions.yaml`` override is honoured,
-    and ``get_user_definitions_path`` reads ``config.config_dir`` off it. A
-    double without it raises AttributeError on the path production always
-    takes — which is how ``test_runs_with_a_real_config_object`` came to exist.
+    ``config_dir`` lets a test put a stray ``sports_definitions.yaml`` where the
+    retired user override used to be read, to prove it no longer is.
     """
 
     def __init__(self, config_dir="/nonexistent-for-tests"):
@@ -164,37 +161,32 @@ def test_an_acronym_inside_a_word_is_not_a_sports_channel(name, category):
     assert detect_sports_channel(_row(name, category)) is False
 
 
-def test_every_gate_keyword_is_in_exactly_one_set():
-    """Each keyword's treatment is DECLARED, not inferred from its length.
+def test_every_gate_word_declares_whether_it_is_a_stem():
+    """Each word's treatment is DECLARED in the one sports list, not inferred
+    from its length: ``word*`` matches at the start of a word, any other word
+    matches whole.
 
     A rule like "five letters or more gets prefix matching" would put `moto`
     (which must reach MOTOGP) and `bein` (which must not reach "being") on the
-    same side of the line — and a rule of "brands are whole tokens" drops ESPN2
-    and TSN1, which is how the first draft of this lost them. Every membership
-    was measured against a user's many distinct names before it was
-    written down.
-    """
-    from streamselect.core.special_content import (
-        SPORTS_GATE_STEMS, SPORTS_GATE_TOKENS,
-    )
-    overlap = set(SPORTS_GATE_STEMS) & set(SPORTS_GATE_TOKENS)
-    assert not overlap, f"keyword in both sets: {overlap}"
-    # Each membership below is a measured decision, not a convention:
-    #   sport  prefix adds SPORTS(2300) SPORTSNET(113) SPORT1 — all real
-    #   espn   prefix adds ESPN2 ESPNU ESPN3 ESPN8 ESPNEWS
-    #   f1     prefix adds F1TV(35); TF1 is still blocked by the LEFT guard
-    #   bein   prefix would add "BEING MARY JANE" and "Being Flynn" (137 rows)
-    #
-    # "fight" left SPORTS_GATE_TOKENS entirely by ruling —
-    # see test_sports_keyword_boundaries.py's fight/VOD section — so it is
-    # asserted absent below, not present.
-    for kw in ("sport", "moto", "formula", "f1", "rugby", "espn", "tsn"):
-        assert kw in SPORTS_GATE_STEMS, kw
-    for kw in ("nba", "nfl", "bein", "hockey", "baseball"):
-        assert kw in SPORTS_GATE_TOKENS, kw
-    assert "fight" not in SPORTS_GATE_TOKENS
-    assert "fight" not in SPORTS_GATE_STEMS
+    same side of the line, and a rule of "brands are whole tokens" drops ESPN2
+    and TSN1. Each membership below was measured against a user's names:
 
+      sport  prefix adds SPORTS(2300) SPORTSNET(113) SPORT1, all real
+      espn   prefix adds ESPN2 ESPNU ESPN3 ESPN8 ESPNEWS
+      f1     prefix adds F1TV(35); TF1 is still blocked by the LEFT guard
+      bein   prefix would add "BEING MARY JANE" and "Being Flynn" (137 rows)
+
+    "fight" left the gate by ruling (see test_sports_keyword_boundaries.py's
+    fight/VOD section), so it is asserted absent.
+    """
+    from streamselect.core import sports_catalog
+
+    forms = sports_catalog.catalog().gate.forms
+    for kw in ("sport", "moto", "formula", "f1", "rugby", "espn", "tsn"):
+        assert f"{kw}*" in forms.get(kw, []), kw
+    for kw in ("nba", "nfl", "bein", "hockey", "baseball"):
+        assert kw in forms and not any(w.endswith("*") for w in forms[kw]), kw
+    assert "fight" not in forms
 
 
 @pytest.mark.parametrize("name, category", [
@@ -252,7 +244,7 @@ def test_every_derived_field_is_reset(db):
     therefore a visible edit to this line.
     """
     assert set(DERIVED_FIELDS) == {
-        "special_view", "sport_type", "league_name", "team_name",
+        "special_view", "sport_type", "league_name", "sport_from", "team_name",
         "event_start_time", "event_stop_time", "event_metadata",
         "event_team_a", "event_team_b",
     }
@@ -516,107 +508,49 @@ def test_runs_with_a_real_config_object(db, tmp_path):
     assert cfg.sports_reclassify_version == CURRENT_VERSION
 
 
-def test_a_user_definitions_override_reaches_the_backfill(db, tmp_path):
-    """A custom league keyword must apply when re-classifying, not only at
-    ingestion — otherwise the user's own definitions silently do not reach
-    the 785k rows they already have."""
+def test_a_file_in_the_config_folder_is_not_read(db, tmp_path):
+    """The user override file is retired (One Sports List, OL-Q3): nothing
+    wrote it, and a user's own leagues will live in the profile database. A
+    stray file must not change what the backfill stores."""
     import yaml
 
-    # Both maps are FLAT — sport name -> keywords, league DISPLAY name ->
-    # keywords. league_keywords is not nested under a sport.
     (tmp_path / "sports_definitions.yaml").write_text(yaml.safe_dump({
         "sport_keywords": {"hockey": ["hockey"]},
         "league_keywords": {"Fictional League": ["zzqx"]},
     }))
     _seed(db, [("US| ZZQX HOCKEY NIGHT", "US Sports", None, None, None, None)])
     _run(db, _Cfg(config_dir=str(tmp_path)))
-    assert _labels(db)["US| ZZQX HOCKEY NIGHT"][1] == "Fictional League"
+    _sv, league, sport = _labels(db)["US| ZZQX HOCKEY NIGHT"]
+    assert (sport, league) == ("hockey", None)
 
 
 # --------------------------------------------------------------------------
 # The YAML parse that ran once per channel
 # --------------------------------------------------------------------------
 
-def test_definitions_are_not_re_read_per_channel(tmp_path):
-    """4.34 ms per call, called once per channel.
+def test_definitions_are_not_re_read_per_channel():
+    """Reading and parsing the YAML took 4.34 ms, and the classifier runs once
+    per channel: that was the whole cost of classifying a row (736 rows/s, 18
+    minutes for a library). The list is parsed once per process.
 
-    ``parse_sports_channel`` calls ``load_sports_definitions``, which read and
-    parsed the bundled YAML every time — measured, that was **the entire cost**
-    of the function (4.34 ms of 4.34 ms). It made the classification pass 736
-    rows/s, so many rows took 18 minutes, and ProviderLoader's categorize
-    step paid the same toll on every refresh.
-
-    Someone already knew: ``epg_channel_classify._sports_keywords_flat`` carries
-    an lru_cache and a comment saying this function reads a YAML file. The cache
-    went on the call site that was noticed, not on the function, so the hot
-    caller kept paying.
-
-    Asserting object IDENTITY, not equality — equal dicts would also be
-    returned by a re-read, which is precisely the thing being forbidden.
+    Asserting object IDENTITY, not equality: equal objects would also come
+    back from a re-read, which is precisely the thing being forbidden.
     """
-    from streamselect.core.special_content import load_sports_definitions
+    from streamselect.core import sports_catalog
 
-    cfg = _Cfg(config_dir=str(tmp_path))
-    first = load_sports_definitions(cfg)
-    second = load_sports_definitions(cfg)
-    assert first[0] is second[0] and first[1] is second[1]
+    assert sports_catalog.catalog() is sports_catalog.catalog()
 
 
-def test_a_settings_edit_still_takes_effect(tmp_path, monkeypatch):
-    """The cache keys on the override file's mtime, so it is not a freeze.
+def test_classifying_does_not_change_the_list():
+    """One shared catalog is only safe while callers read it."""
+    from streamselect.core import sports_catalog
+    from streamselect.core.special_content import parse_sports_channel
 
-    The Settings UI writes ``sports_definitions.yaml``; a process-lifetime cache
-    would mean the user's edit did nothing until they restarted. With the stat()
-    TTL, a file edit is picked up after the TTL expires, which is within a second.
-    """
-    import os
-    import yaml
-    import streamselect.core.special_content as mod
-    from streamselect.core.special_content import load_sports_definitions
-
-    # Reset TTL tracking and cache so test ordering doesn't leak.
-    mod._last_stamp_check.clear()
-    mod._last_stamp_check.update(path=None, at=0.0, key=None)
-    mod._DEFINITIONS_CACHE.clear()
-
-    # Mock time.monotonic to control the TTL boundary.
-    fake_time = {"now": 0.0}
-
-    def mock_monotonic():
-        return fake_time["now"]
-
-    monkeypatch.setattr("time.monotonic", mock_monotonic)
-
-    cfg = _Cfg(config_dir=str(tmp_path))
-    path = tmp_path / "sports_definitions.yaml"
-    path.write_text(yaml.safe_dump({"league_keywords": {"League A": ["zzqx"]}}))
-    before = load_sports_definitions(cfg)[1]
-    assert "League A" in before
-
-    path.write_text(yaml.safe_dump({"league_keywords": {"League B": ["zzqx"]}}))
-    os.utime(path, (0, 0))          # force a distinct mtime, not a same-second write
-
-    # Advance fake clock past TTL boundary so the file change is picked up.
-    fake_time["now"] = 1.5
-    after = load_sports_definitions(cfg)[1]
-    assert "League B" in after, "a Settings edit did not reach the classifier after TTL expiry"
-
-
-def test_the_cached_maps_are_not_mutated_by_a_caller(tmp_path):
-    """One shared object per key is only safe while callers read it.
-
-    ``parse_sports_channel`` iterates the maps and writes nothing. If that ever
-    changes, the mutation would leak into every subsequent caller — so pin it.
-    """
-    from streamselect.core.special_content import load_sports_definitions, parse_sports_channel
-
-    cfg = _Cfg(config_dir=str(tmp_path))
-    sport_kw, league_kw = load_sports_definitions(cfg)
-    snapshot = ({k: list(v) for k, v in sport_kw.items()},
-                {k: list(v) for k, v in league_kw.items()})
+    by_word = sports_catalog.catalog().by_word
+    snapshot = {w: tuple(e) for w, e in by_word.items()}
     for name in ("US| NFL NETWORK HD", "4K - Conflict (2024)", "GO| ESPN2"):
-        parse_sports_channel(_row(name, "Sports"), cfg)
-    assert (sport_kw, league_kw) == snapshot
+        parse_sports_channel(_row(name, "Sports"))
+    assert by_word == snapshot
 
 
 # --------------------------------------------------------------------------
@@ -976,152 +910,3 @@ def test_the_bulk_write_round_trips_json_and_datetime_columns(db):
             f"event_metadata came back as {type(row.event_metadata).__name__}")
         assert isinstance(row.event_start_time, datetime)
         assert row.updated_at is not None
-
-
-# --------------------------------------------------------------------------
-# PERF-18: Stat() TTL to avoid 785k syscalls per backfill pass
-# --------------------------------------------------------------------------
-
-def test_stat_ttl_reuses_cache_key_within_window(tmp_path, monkeypatch):
-    """Within the 1s TTL, the cache key is reused without stat()ing again.
-
-    A hot backfill calls load_sports_definitions once per row; statting the
-    override file per call is 785k syscalls per pass. The TTL lets a hot
-    loop stat once per second instead of once per row.
-    """
-    import streamselect.core.special_content as mod
-    from streamselect.core.special_content import load_sports_definitions
-
-    cfg = _Cfg(config_dir=str(tmp_path))
-
-    # Mock time.monotonic and Path.stat to count stat calls.
-    stat_count = {"n": 0}
-    fake_time = {"now": 0.0}
-
-    def mock_stat(self, *args, **kwargs):
-        stat_count["n"] += 1
-        import os
-        return os.stat_result((0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-
-    def mock_monotonic():
-        return fake_time["now"]
-
-    monkeypatch.setattr("pathlib.Path.stat", mock_stat)
-    monkeypatch.setattr("time.monotonic", mock_monotonic)
-
-    # Reset the TTL tracking so test ordering doesn't leak.
-    mod._last_stamp_check.clear()
-    mod._last_stamp_check.update(path=None, at=0.0, key=None)
-    mod._DEFINITIONS_CACHE.clear()
-
-    # Call 50 times at the same fake time — should stat only once.
-    for _ in range(50):
-        load_sports_definitions(cfg)
-    assert stat_count["n"] == 1, "multiple stat() calls within the TTL window"
-
-    # Advance fake clock past the 1.0s TTL boundary.
-    fake_time["now"] = 1.5
-    load_sports_definitions(cfg)
-    assert stat_count["n"] == 2, "stat() was not called after TTL expired"
-
-    # At same fake time again — reuse without stat.
-    load_sports_definitions(cfg)
-    assert stat_count["n"] == 2, "stat() called again within the same second"
-
-
-def test_stat_ttl_freshness_after_file_change(tmp_path, monkeypatch):
-    """After the TTL expires, a file edit is picked up.
-
-    This is the behavior that would break if the TTL logic went stale-forever:
-    modifying the override file with a new mtime and advancing past the TTL
-    must pick up the new definitions.
-    """
-    import os
-    import yaml
-    import streamselect.core.special_content as mod
-    from streamselect.core.special_content import load_sports_definitions
-
-    cfg = _Cfg(config_dir=str(tmp_path))
-    fake_time = {"now": 0.0}
-
-    def mock_monotonic():
-        return fake_time["now"]
-
-    monkeypatch.setattr("time.monotonic", mock_monotonic)
-
-    # Reset TTL tracking and cache.
-    mod._last_stamp_check.clear()
-    mod._last_stamp_check.update(path=None, at=0.0, key=None)
-    mod._DEFINITIONS_CACHE.clear()
-
-    # Write initial override file with one custom league.
-    path = tmp_path / "sports_definitions.yaml"
-    path.write_text(yaml.safe_dump({"league_keywords": {"League A": ["zzqx"]}}))
-
-    first = load_sports_definitions(cfg)[1]
-    assert "League A" in first
-
-    # Modify the file with new mtime.
-    path.write_text(yaml.safe_dump({"league_keywords": {"League B": ["zzqx"]}}))
-    os.utime(path, (0, 0))  # force distinct mtime
-
-    # Advance clock past TTL boundary.
-    fake_time["now"] = 1.5
-
-    second = load_sports_definitions(cfg)[1]
-    assert "League B" in second, "file edit after TTL expiry was not picked up"
-    assert "League A" not in second, "old definition persisted after file change"
-
-
-def test_stat_ttl_mutation_check(tmp_path, monkeypatch):
-    """Mutation test: make the TTL always hit and confirm test_freshness breaks.
-
-    This proves the freshness test would actually fail if the TTL logic
-    went stale-forever (i.e., if we never expired the cached key).
-    """
-    import os
-    import yaml
-    import streamselect.core.special_content as mod
-    from streamselect.core.special_content import load_sports_definitions
-
-    cfg = _Cfg(config_dir=str(tmp_path))
-    fake_time = {"now": 0.0}
-
-    def mock_monotonic():
-        return fake_time["now"]
-
-    monkeypatch.setattr("time.monotonic", mock_monotonic)
-
-    # Reset TTL tracking and cache.
-    mod._last_stamp_check.clear()
-    mod._last_stamp_check.update(path=None, at=0.0, key=None)
-    mod._DEFINITIONS_CACHE.clear()
-
-    # Temporarily patch _STAMP_TTL_S to an impossibly large value so the
-    # TTL never expires, simulating a stale-forever bug.
-    original_ttl = mod._STAMP_TTL_S
-    mod._STAMP_TTL_S = float('inf')
-
-    try:
-        # Write initial override with one league.
-        path = tmp_path / "sports_definitions.yaml"
-        path.write_text(yaml.safe_dump({"league_keywords": {"League A": ["zzqx"]}}))
-
-        first = load_sports_definitions(cfg)[1]
-        assert "League A" in first
-
-        # Modify the file.
-        path.write_text(yaml.safe_dump({"league_keywords": {"League B": ["zzqx"]}}))
-        os.utime(path, (0, 0))
-
-        # Advance time far past what would be the TTL.
-        fake_time["now"] = 100.0
-
-        second = load_sports_definitions(cfg)[1]
-        # With the mutation (TTL forever), the old definition persists.
-        assert "League A" in second, "mutation was not applied — TTL is working as intended"
-        assert "League B" not in second, "mutation check passed: TTL went stale"
-
-    finally:
-        # Restore the real TTL constant.
-        mod._STAMP_TTL_S = original_ttl

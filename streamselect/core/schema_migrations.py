@@ -140,6 +140,7 @@ COLUMN_MIGRATIONS: list[tuple[str, str, str]] = [
     ("channels",     "sport_type",                    "TEXT"),
     ("channels",     "league_name",                   "TEXT"),
     ("channels",     "team_name",                     "TEXT"),
+    ("channels",     "sport_from",                    "TEXT"),  # One Sports List, 2026-11-27
     ("channels",     "event_metadata",                "TEXT"),  # JSONEncoded -> Text
     ("metadata",     "cast",                          "TEXT"),  # JSONEncoded -> Text
     ("metadata",     "crew",                          "TEXT"),  # JSONEncoded -> Text

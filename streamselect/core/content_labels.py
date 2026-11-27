@@ -39,7 +39,7 @@ CURATED_LIST_PREFIXES: frozenset[str] = frozenset({"TOP", "TEAM"})
 #: LEAGUE BASEBALL DIAMONDBACKS - PHILLIES" names DIAMONDBACKS/PHILLIES, not
 #: "MAJOR LEAGUE BASEBALL DIAMONDBACKS" (SPORT-4, core/fixture_titles.py). Only
 #: MLB is corpus-measured; the rest mirror abbreviations already
-#: known above/in special_content.py's league_keywords, for parity — ambiguous
+#: known above/in the one sports list (data/sports_definitions.yaml), for parity — ambiguous
 #: prefixes are left alone rather than guessed (bias to recall).
 FIXTURE_LEAGUE_NAME_PREFIXES: tuple[str, ...] = (
     "MAJOR LEAGUE BASEBALL", "NATIONAL BASKETBALL ASSOCIATION",

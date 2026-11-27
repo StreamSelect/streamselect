@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import NamedTuple, Optional
 
+from streamselect.core import sports_catalog
 from streamselect.core.channel_name_utils import collection_display
 from streamselect.core.quality_vocab import quality_display
 from streamselect.core.region_codes import PLATFORM_CODES, platform_display
@@ -325,12 +326,12 @@ def _sport_cell(sport: str) -> Optional[_Cell]:
     ``tag_decomposer`` emits, so it gets the neutral meta colour and a tooltip,
     exactly like the year.
 
-    The stored value is a slug (``american_football``); the underscores are a
-    storage detail and were being painted raw.
+    The stored value is a key (``american_football``, or a kind such as
+    ``network``); the one sports list names it (``sports_catalog.sport_label``).
     """
     if not sport:
         return None
-    label = str(sport).replace("_", " ").strip().title()
+    label = sports_catalog.sport_label(str(sport))
     if not label:
         return None
     return _Cell(label, False, _theme.COLOR_ROW_META, tip=f"Sport: {label}")

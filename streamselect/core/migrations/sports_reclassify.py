@@ -45,12 +45,13 @@ than the bug**: ``sport`` under a whole-token rule matches "SPORT TV" and misses
 sports channels out of the view**, against the ~many false ones the change was
 meant to remove.
 
-The rule is per-KEYWORD, not per-call-site, and it is now written down as two
-named sets. ``SPORTS_GATE_STEMS`` match at the start of a word, because their
-whole value is that they compound (``sport`` → SPORTSNET, ``moto`` → MOTOGP,
-``fight`` → FIGHTING, and never "firefighter", which is what the left-edge guard
-is for). ``SPORTS_GATE_TOKENS`` match whole, because they hide inside unrelated
-words (``nba`` in GREENBAY, ``f1`` in TF1, ``bein`` in "being").
+The rule is per-WORD, not per-call-site, and it is written down in the one
+sports list (``data/sports_definitions.yaml``, read by core/sports_catalog.py):
+a word written ``word*`` matches at the start of a word, because its whole value
+is that it compounds (``sport`` → SPORTSNET, ``moto`` → MOTOGP, and never
+"firefighter", which is what the left-edge guard is for); every other word
+matches whole, because it hides inside unrelated words (``nba`` in GREENBAY,
+``bein`` in "being").
 
 Reset, then recompute
 ---------------------
@@ -215,12 +216,15 @@ if TYPE_CHECKING:                                    # pragma: no cover
 #: "all these MLS PPV channels … are just black screens".
 #: v14: an EMPTY slot ("(Victory+ 002) |  (2098-12-31 …)") stores
 #: its sentinel start, so "Hide events that haven't started yet" hides it.
-CURRENT_VERSION = 14
+#: v15: one sports list (core/sports_catalog.py): a league names its sport, the
+#: longest word wins, a slot's own name is not its content, networks and slots
+#: are stored kinds, and every row records sport_from.
+CURRENT_VERSION = 15
 
 #: Fields the classifier owns end-to-end. Cleared before each recompute so a row
 #: that stops matching loses its stale label instead of keeping it.
 DERIVED_FIELDS = (
-    "special_view", "sport_type", "league_name", "team_name",
+    "special_view", "sport_type", "league_name", "sport_from", "team_name",
     "event_start_time", "event_stop_time", "event_metadata",
     "event_team_a", "event_team_b",
 )
@@ -329,7 +333,7 @@ class SportsReclassifyTask:
         Args:
             progress_cb: ``(done, total)`` after each page.
             is_cancelled: True when the manager has been asked to stop.
-            config: Passed through to the classifier for user keyword maps.
+            config: Unused; the classifier reads only the bundled sports list.
         """
         from streamselect.core.database import ChannelDB
 
@@ -369,7 +373,7 @@ class SportsReclassifyTask:
                 break
             last_id = page[-1][0]
             done += len(page)
-            changed += self._write_changes(self._reclassify(page, config))
+            changed += self._write_changes(self._reclassify(page))
             progress_cb(min(done, total), total)
 
         progress_cb(total, total)
@@ -378,9 +382,7 @@ class SportsReclassifyTask:
             done, changed,
         )
 
-    def _reclassify(
-        self, page: list, config: "Config | None"
-    ) -> list[dict[str, Any]]:
+    def _reclassify(self, page: list) -> list[dict[str, Any]]:
         """Classify one page off-session; return an update mapping per CHANGED row.
 
         The row is rebuilt as a **transient** ``ChannelDB`` — constructed, never
@@ -400,7 +402,6 @@ class SportsReclassifyTask:
         Args:
             page: Rows from the page query, ``(id, *CLASSIFIER_INPUTS,
                 *DERIVED_FIELDS, TITLE_FIELD, *TITLE_KEY_FIELDS)``.
-            config: Passed to the classifier for user keyword maps.
 
         Returns:
             One ``{"id": …, **DERIVED_FIELDS, TITLE_FIELD: …}`` mapping per
@@ -425,7 +426,7 @@ class SportsReclassifyTask:
             before_title = row[deriv_end]
             scratch.detected_title = before_title
 
-            update_channel_special_content(scratch, config)
+            update_channel_special_content(scratch)
 
             after_derived = tuple(getattr(scratch, field) for field in DERIVED_FIELDS)
             title_changed = scratch.detected_title != before_title

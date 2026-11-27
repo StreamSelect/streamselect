@@ -88,7 +88,7 @@ class ChannelDB(Base):
     #: only shape that sends one; NULL elsewhere, where "still on" falls back to
     #: event_datetime.DEFAULT_EVENT_DURATION. Read by the Sports lane CASE.
     event_stop_time = Column(DateTime)  # partial index, see __table_args__
-    sport_type = Column(String)  # 'soccer', 'basketball', 'football', etc. — partial index, see __table_args__
+    sport_type = Column(String)  # a key from core/sports_catalog.py, or network/slot/unknown — partial index, see __table_args__
 
     # ── Signal check (core/stream_probe.py) ──────────────────────────────────
     # What a probe last saw on this stream. a user abandoned the events work
@@ -108,8 +108,8 @@ class ChannelDB(Base):
     signal_checked_at = Column(DateTime)  # partial index, see __table_args__
     league_name = Column(String)  # 'Premier League', 'NBA', 'NFL', etc. — partial index, see __table_args__
     team_name = Column(String)  # 'Manchester United', 'Lakers', etc. — partial index, see __table_args__
-    #: Fixture opponents (SPORT-4, core/fixture_titles.py); @ fixtures: a=away, b=home.
-    event_team_a = Column(String)
+    sport_from = Column(String)  # where sport_type came from (sports_catalog FROM_*), NULL for a non-sport kind
+    event_team_a = Column(String)  # fixture opponents (SPORT-4, core/fixture_titles.py); @ fixtures: a=away, b=home
     event_team_b = Column(String)  # NULL for racks/races/racing-venue events
     event_metadata = Column(JSONEncoded)  # Additional parsed data (event name, quality, etc.)
 

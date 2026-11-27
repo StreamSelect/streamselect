@@ -15,6 +15,7 @@ from datetime import datetime
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import QFrame, QHBoxLayout, QLabel, QWidget
 
+from streamselect.core import sports_catalog
 from streamselect.core.epg_utils import fmt_time
 from streamselect.core.games.alerts import alerts_for
 from streamselect.core.games.read import event_is_live as event_live
@@ -169,7 +170,7 @@ class SportsHeadersMixin:
         # The whole band folds, not just the name (owner report: only the word worked).
         band = _ClickableFrame()
         cursor_affordance.set_clickable(band)
-        band.setToolTip(f"{'Expand' if key in self._folded() else 'Collapse'} every {sport.title()} list")
+        band.setToolTip(f"{'Expand' if key in self._folded() else 'Collapse'} every {sports_catalog.sport_label(sport)} list")
         band.clicked.connect(lambda k=key: self._toggle_fold(k))
         h = QHBoxLayout(band)
         h.setContentsMargins(2, 10, 6, 2)
@@ -181,7 +182,7 @@ class SportsHeadersMixin:
         _theme.style(glyph, "PANEL_HEADLINE")
         _icon_utils.set_label_icon(glyph, f"sport_{sport}", 18)
         h.addWidget(glyph)
-        name = QLabel(sport.title())
+        name = QLabel(sports_catalog.sport_label(sport))
         _theme.style(name, "PANEL_HEADLINE")
         h.addWidget(name)
         # Every game on now or still to come, all leagues (owner, 2026-11-18): the

@@ -10,10 +10,8 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timedelta
-from functools import lru_cache
 from typing import Mapping, Optional
 
-import yaml
 from loguru import logger
 from sqlalchemy import delete, or_, select
 
@@ -30,22 +28,18 @@ from streamselect.core.games.listing_text import (
 from streamselect.core.games.models import GameDB, GameFeedDB, GameFinderMemoryDB
 from streamselect.core.playback_models import PlaybackEventDB
 from streamselect.core.repositories.provider import ProviderRepository
-from streamselect.core.special_content import _BUNDLED_DEFINITIONS
+from streamselect.core import sports_catalog
 
 
-@lru_cache(maxsize=1)
 def _league_words() -> tuple[tuple[str, str, tuple[str, ...]], ...]:
-    with open(_BUNDLED_DEFINITIONS) as f:
-        data = yaml.safe_load(f) or {}
-    return tuple(
-        (sport, league, tuple(str(w) for w in words))
-        for sport, leagues in (data.get("game_finder_leagues") or {}).items()
-        for league, words in (leagues or {}).items() if words)
+    """(sport, league, words) for every league the finder runs (the one sports
+    list, ``finder: listed`` or ``trial``)."""
+    return tuple((lg.sport, lg.name, lg.words) for lg in sports_catalog.finder_leagues() if lg.words)
 
 
 def enabled_leagues(overrides: Optional[Mapping] = None) -> tuple[SportSettings, ...]:
-    """The leagues the finder runs for (``game_finder_leagues`` in the bundled
-    definitions), each with its sport's numbers: the sport's defaults, then the
+    """The leagues the finder runs for (``finder: listed | trial`` in the one
+    sports list, core/sports_catalog.py), each with its sport's numbers: the sport's defaults, then the
     user's own choices (*overrides*, ``Config.sport_settings_overrides``; the core
     never reads Config itself)."""
     per_sport = {sport: tuning.settings_kwargs(tuning.values(sport, overrides))
