@@ -409,9 +409,10 @@ def test_the_version_is_ahead_of_the_field_count():
     land together — ``detected_rating``/``detected_added`` are both new in
     version 3 — so the invariant is "every column has some version that covers
     it", not one version number per field."""
-    assert CURRENT_VERSION == 4
+    assert CURRENT_VERSION == 5
     assert set(FIELDS) == {
         "runtime", "trailer_url", "detected_rating", "detected_added", "tmdb_id",
+        "detected_release_year",
     }
 
 

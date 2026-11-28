@@ -76,6 +76,7 @@ class Channel:
     # json_extract()'ing raw_data per row.
     detected_rating: Optional[float] = None
     detected_added: Optional[int] = None
+    detected_release_year: Optional[int] = None   # release_year_from_raw (year/decade shelves)
 
     # Timestamps
     added_at: datetime = field(default_factory=datetime.now)

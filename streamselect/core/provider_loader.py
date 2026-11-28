@@ -44,13 +44,9 @@ _CATALOG_COLS: tuple[str, ...] = (
     "category",
     "category_id",
     "logo_url",
-    # The provider has parsed this since forever (xtream.py:357) and this list
-    # dropped it, so it was NULL on all many rows in a large library
-    # while many live channels carried a real one in raw_data. EPG tier-1
-    # matching — the "highest confidence" path — could therefore never fire.
-    # See test_catalog_columns_cover_the_channel.py: the list is now checked
-    # against what the Channel model actually provides, so the next field
-    # someone adds cannot be silently discarded here.
+    # Parsed since forever (xtream.py) but dropped here, so NULL on every row and EPG
+    # tier-1 matching never fired. test_catalog_columns_cover_the_channel.py now checks
+    # this list against the Channel model, so a new field can't be silently discarded.
     "epg_channel_id",
     "media_type",
     "quality",
@@ -59,6 +55,7 @@ _CATALOG_COLS: tuple[str, ...] = (
     "detected_tmdb_id",
     "detected_rating",
     "detected_added",
+    "detected_release_year",
     "source_num",
     "source_category",
     "source_quality_flags",
@@ -413,6 +410,7 @@ class ProviderLoadThread(QThread):
                     "detected_tmdb_id": channel.detected_tmdb_id,
                     "detected_rating": channel.detected_rating,
                     "detected_added": channel.detected_added,
+                    "detected_release_year": channel.detected_release_year,
                     # Provenance marker for the enrichment funnel: 'list' means the id
                     # came straight from the provider's list row (Phase-1 harvest).  Set
                     # on INSERT only — it is NOT in _CATALOG_UPDATE_COLS, so a later

@@ -20,8 +20,7 @@ from sqlalchemy import func, literal_column, text
 from loguru import logger
 
 from streamselect.core import channel_visibility
-from streamselect.core.content_identity import title_key
-from streamselect.core.content_dedup import _YEAR_EXTRACT_RE
+from streamselect.core.content_identity import release_year_from_raw, title_key
 from streamselect.core.filter_utils import genres_from_raw, normalize_genre
 
 
@@ -54,16 +53,8 @@ class ContentCard:
 # ---------------------------------------------------------------------------
 
 def _raw_year(channel) -> int | None:
-    """Best-effort year: raw_data releaseDate → title regex."""
-    rd = channel.raw_data or {}
-    for key in ("releaseDate", "release_date"):
-        val = rd.get(key)
-        if val:
-            m = re.match(r"(\d{4})", str(val))
-            if m:
-                return int(m.group(1))
-    m = _YEAR_EXTRACT_RE.search(channel.name)
-    return int(m.group(1)) if m else None
+    """Best-effort year: raw_data releaseDate → title regex (the ingestion resolver)."""
+    return release_year_from_raw(channel.raw_data, channel.name)
 
 
 def poster_url_from_raw(raw_data) -> str | None:
@@ -504,16 +495,16 @@ def get_by_decade(session, decade: int, limit: int = 30, fav_ids=None, years: in
                   excluded_provider_ids: list[str] | None = None, dead_signal_streak_floor: int | None = None,
                   ) -> list[ContentCard]:
     """Movies and series from a decade (e.g. decade=1990 → 1990–1999); a year
-    shelf passes ``years=1`` (``decade=2026`` → 2026 only)."""
+    shelf passes ``years=1`` (``decade=2026`` → 2026 only). Reads the stored,
+    indexed ``detected_release_year`` (it read every row's payload: 30 s a shelf)."""
     from streamselect.core.database import ChannelDB, MetadataDB
-    start, end = decade, decade + years - 1
     q = (
         session.query(ChannelDB, MetadataDB)
         .outerjoin(MetadataDB, ChannelDB.metadata_id == MetadataDB.id)
         .filter(
             ChannelDB.media_type.in_(["movie", "series"]),
             ChannelDB.is_hidden == False,  # noqa: E712
-            ChannelDB.raw_data.isnot(None),
+            ChannelDB.detected_release_year.between(decade, decade + years - 1),
             ChannelDB.detected_rating >= 5,
             ChannelDB.detected_rating < 10,
         )
@@ -521,14 +512,9 @@ def get_by_decade(session, decade: int, limit: int = 30, fav_ids=None, years: in
     q = _apply_prefix_filter(q, excluded_prefixes, include_uncategorized, excluded_content_types, excluded_keywords, excluded_categories)
     q = _apply_adult_filter(q, adult_mode, force_adult_provider_ids)
     q = _apply_provider_exclusion(q, excluded_provider_ids, dead_signal_streak_floor)
-    results: list[ContentCard] = []
-    for ch, meta in q.all():
-        yr = _raw_year(ch)
-        if yr and start <= yr <= end:
-            results.append(_to_card(ch, meta, fav_ids, queue_ids, watched_ids, liked_ids, progress_map))
-    results.sort(key=lambda c: c.rating or 0, reverse=True)
-    results = _dedup_cards(results)
-    return results[:limit]
+    rows = q.order_by(ChannelDB.detected_rating.desc()).limit(limit * 5).all()
+    cards = [_to_card(ch, meta, fav_ids, queue_ids, watched_ids, liked_ids, progress_map) for ch, meta in rows]
+    return _dedup_cards(cards)[:limit]
 
 
 def get_featured_actor(session, weights=None, fav_ids=None, queue_ids=None,
@@ -672,44 +658,21 @@ def get_year_counts(session,
                     adult_mode: str = "all", force_adult_provider_ids: list[str] | None = None,
                     excluded_provider_ids: list[str] | None = None, dead_signal_streak_floor: int | None = None,
                     ) -> Counter:
-    """Count movies and series by year (1950–2030), for the decade and year shelves.
-
-    Perf: selects only releaseDate/release_date (JSON) + name in SQL, avoiding
-    full ORM object materialisation.  Year derivation runs in Python on those
-    three small strings rather than on the whole raw_data blob.
-    """
+    """Count movies and series by year (1950–2030), for the decade and year shelves:
+    one GROUP BY on the stored, indexed ``detected_release_year``."""
     from streamselect.core.database import ChannelDB
-    _rd_col   = literal_column("json_extract(channels.raw_data, '$.releaseDate')").label("release_date")
-    _rd2_col  = literal_column("json_extract(channels.raw_data, '$.release_date')").label("release_date2")
-    _name_col = ChannelDB.name.label("name")
     q = (
-        session.query(_rd_col, _rd2_col, _name_col)
-        .select_from(ChannelDB)
+        session.query(ChannelDB.detected_release_year, func.count(ChannelDB.id))
         .filter(
             ChannelDB.media_type.in_(["movie", "series"]),
             ChannelDB.is_hidden == False,  # noqa: E712
-            ChannelDB.raw_data.isnot(None),
+            ChannelDB.detected_release_year.between(1950, 2030),
         )
     )
     q = _apply_prefix_filter(q, excluded_prefixes, include_uncategorized, excluded_content_types, excluded_keywords, excluded_categories)
     q = _apply_adult_filter(q, adult_mode, force_adult_provider_ids)
     q = _apply_provider_exclusion(q, excluded_provider_ids, dead_signal_streak_floor)
-    year_counts: Counter = Counter()
-    for (rd, rd2, name) in q.yield_per(5000):
-        yr: int | None = None
-        for val in (rd, rd2):
-            if val:
-                m = re.match(r"(\d{4})", str(val))
-                if m:
-                    yr = int(m.group(1))
-                    break
-        if yr is None and name:
-            m = _YEAR_EXTRACT_RE.search(name)
-            if m:
-                yr = int(m.group(1))
-        if yr and 1950 <= yr <= 2030:
-            year_counts[yr] += 1
-    return year_counts
+    return Counter(dict(q.group_by(ChannelDB.detected_release_year).all()))
 
 
 def time_shelf_keys(year_counts: Counter, this_year: int, floor: int = 5) -> list[str]:

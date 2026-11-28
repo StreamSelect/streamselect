@@ -22,6 +22,7 @@ CHANNEL_FIELDS: tuple[str, ...] = (
     "detected_tmdb_id",
     "detected_rating",
     "detected_added",
+    "detected_release_year",
     "detected_year",
     "content_key",
     "detected_genre",

@@ -60,7 +60,7 @@ from typing import TYPE_CHECKING, Callable
 
 from loguru import logger
 
-from streamselect.core.content_identity import added_from_raw, rating_from_raw
+from streamselect.core.content_identity import added_from_raw, rating_from_raw, release_year_from_raw
 from streamselect.metadata_providers.provider_metadata import (
     runtime_from_raw, tmdb_id_from_raw, trailer_from_raw,
 )
@@ -78,7 +78,8 @@ if TYPE_CHECKING:                                    # pragma: no cover
 #:   2 — trailer_url
 #:   3 — detected_rating, detected_added
 #:   4 — tmdb_id (W-2a)
-CURRENT_VERSION = 4
+#:   5 — detected_release_year (Discover's year and decade shelves)
+CURRENT_VERSION = 5
 
 #: Rows per commit. Matches the other backfills — large enough that the commit
 #: overhead disappears, small enough that a cancel loses little work.
@@ -109,6 +110,7 @@ FIELDS: "dict[str, tuple[str, object]]" = {
     "detected_rating": ("ChannelDB", _detected_rating_from_raw),
     "detected_added": ("ChannelDB", _detected_added_from_raw),
     "tmdb_id": ("MetadataDB", tmdb_id_from_raw),
+    "detected_release_year": ("ChannelDB", release_year_from_raw),   # payload "name" is the fallback
 }
 
 

@@ -64,9 +64,8 @@ class ChannelDB(Base):
     #: edited keeps an ancient timestamp and is indistinguishable from one that
     #: has vanished.
     #:
-    #: NULL means "never observed under this scheme" and is NEVER pruned: after the one
-    #: backfill a NULL is a row that bypassed the catalog upsert, and deleting on an
-    #: absence of evidence is the first-launch-from-empty-lists mistake.
+    #: NULL ("never observed under this scheme") is NEVER pruned: after the one backfill it
+    #: is a row that bypassed the upsert; deleting on absent evidence is the empty-lists mistake.
     last_seen_at = Column(DateTime, index=True)
     is_adult = Column(Boolean, default=False)  # partial index, see __table_args__
     is_rec_suppressed = Column(Boolean, default=False)  # hidden from recommendations only — partial index, see __table_args__
@@ -146,6 +145,7 @@ class ChannelDB(Base):
 
     detected_rating = Column(Float, nullable=True, index=True)    # DB-4: rating_from_raw()
     detected_added  = Column(Integer, nullable=True, index=True)  # DB-4: added_from_raw()
+    detected_release_year = Column(Integer, nullable=True, index=True)  # release_year_from_raw(): year/decade shelves
     # tmdb enrichment provenance marker (Phase 2 — see tmdb_enrichment_manager.py).
     # Encodes HOW/whether a row's tmdb id was resolved, driving the fetch-once guard and
     # the "Missing TMDb data" analytics funnel:

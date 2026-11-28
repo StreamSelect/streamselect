@@ -10,7 +10,7 @@ from loguru import logger
 from streamselect.core.provider_probe import auth_granted
 from streamselect.core.models import Channel, Provider, MediaType, StreamQuality, ProviderURL
 from streamselect.core.connection_tracker import ConnectionTracker
-from streamselect.core.content_identity import added_from_raw, rating_from_raw, valid_tmdb_id
+from streamselect.core.content_identity import added_from_raw, rating_from_raw, release_year_from_raw, valid_tmdb_id
 from streamselect.core.discovery_engine import poster_url_from_raw
 from streamselect.core.url_cycle import UrlCycler
 from streamselect.core.time_display import date_text
@@ -401,6 +401,7 @@ class XtreamAPI:
             # back to it here (rather than a media_type branch) is exact: the
             # two keys never co-occur on the same row in a large library.
             detected_added=added_from_raw(raw_data.get("added") or raw_data.get("last_modified")),
+            detected_release_year=release_year_from_raw(raw_data, name),
         )
 
 

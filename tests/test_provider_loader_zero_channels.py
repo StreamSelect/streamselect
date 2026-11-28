@@ -107,6 +107,7 @@ def test_happy_path_unchanged(tmp_db, fake_provider):
     stub_channel_1.detected_tmdb_id = None
     stub_channel_1.detected_rating = None   # DB-4: the upsert carries both
     stub_channel_1.detected_added = None
+    stub_channel_1.detected_release_year = None
 
     stub_channel_2 = MagicMock(spec=Channel)
     stub_channel_2.id = "ch2"
@@ -124,6 +125,7 @@ def test_happy_path_unchanged(tmp_db, fake_provider):
     stub_channel_2.detected_tmdb_id = None
     stub_channel_2.detected_rating = None   # DB-4: the upsert carries both
     stub_channel_2.detected_added = None
+    stub_channel_2.detected_release_year = None
 
     stub_plugin = MagicMock()
     stub_plugin.fetch_channels = AsyncMock(return_value=[stub_channel_1, stub_channel_2])

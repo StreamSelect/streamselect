@@ -3,6 +3,7 @@
   "combos": {
     "ChannelDB.detected_tmdb_id|live": "live payload carries no 'tmdb' key (Xtream live streams aren't TMDb titles) - not applicable to this media_type.",
     "ChannelDB.detected_rating|live": "live payload carries no 'rating' key (Xtream live streams carry no viewer rating) - not applicable to this media_type.",
+    "ChannelDB.detected_release_year|live": "live payload carries no release date and live channel names no release year - not applicable to this media_type.",
     "ChannelDB.detected_year|live": "live channel names carry no release year - not applicable to this media_type (see module docstring: not a payload-key bug).",
     "ChannelDB.detected_year|series": "worklog W-1 item 2: many series titles omit an embedded year (measured 30.8% populated vs movies' 58.6%). W-1 added the MetadataDB.year fallback (channel_lens.metadata_years_for_chunk), so on a large library this now fills many series - but THIS fixture seeds no metadata row carrying a year, so the fallback has nothing to read here. Listed because the fixture cannot exercise it, not because the gap is unfixed; strengthen the fixture to remove this entry.",
     "ChannelDB.detected_genre|live": "deliberate: GENRE_MEDIA_TYPES excludes live by design (live channels are grouped by bouquet/category, not genre) - a policy, not a bug.",

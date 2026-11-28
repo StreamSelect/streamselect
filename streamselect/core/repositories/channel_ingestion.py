@@ -59,7 +59,7 @@ from streamselect.core.region_codes import (
     exclusion_code,
     normalize_region_code,
 )
-from streamselect.core.content_identity import added_from_raw, content_key_for, valid_tmdb_id
+from streamselect.core.content_identity import added_from_raw, content_key_for, release_year_from_raw, valid_tmdb_id
 from streamselect.core.fixture_titles import fixture_ingest_title
 from streamselect.core.repositories.channel_lens import GENRE_MEDIA_TYPES, metadata_years_for_chunk
 from streamselect.core.repositories.sweep_guard import single_flight
@@ -556,10 +556,9 @@ class ChannelIngestionMixin:
             new_detected_genre  = _genre_list[0] if _genre_list else None
             new_detected_genres = _genre_list or None
 
-            # W-1: re-derive from the ALREADY-STORED raw_data (same source
-            # convert_to_channel reads at ingestion) — the series payload
-            # carries no "added" key at all, only "last_modified".
+            # W-1: from the stored raw_data, as convert_to_channel reads it (series send "last_modified").
             new_added = added_from_raw(_raw.get("added") or _raw.get("last_modified"))
+            new_release_year = release_year_from_raw(_raw, channel.name)
 
             # Restricted-content detection (user-reported gap): the provider's
             # is_adult flag is unreliable, so this catches XXX/ADULT/X-prefix naming
@@ -623,7 +622,7 @@ class ChannelIngestionMixin:
                 or new_detected_audio != channel.detected_audio
                 or new_detected_genre != channel.detected_genre
                 or new_detected_genres != channel.detected_genres
-                or new_added != channel.detected_added
+                or new_added != channel.detected_added or new_release_year != channel.detected_release_year
                 or new_restricted != bool(channel.detected_restricted)
                 or new_collection != channel.detected_collection
                 or collection_group_key(new_collection) != channel.detected_collection_group
@@ -645,7 +644,7 @@ class ChannelIngestionMixin:
                 channel.detected_audio  = new_detected_audio
                 channel.detected_genre  = new_detected_genre
                 channel.detected_genres = new_detected_genres
-                channel.detected_added  = new_added
+                channel.detected_added, channel.detected_release_year = new_added, new_release_year
                 channel.detected_restricted = new_restricted
                 channel.detected_collection = new_collection
                 channel.detected_collection_group = collection_group_key(new_collection)

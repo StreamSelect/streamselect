@@ -317,6 +317,32 @@ def added_from_raw(value) -> int | None:
         return None
 
 
+def release_year_from_raw(raw_data, name: str | None = None) -> int | None:
+    """A title's release year: the provider's ``releaseDate`` / ``release_date``,
+    else a plausible year in its name (*name*, or the payload's own ``name``).
+
+    Sibling of :func:`added_from_raw`; stored at ingestion as
+    ``ChannelDB.detected_release_year`` so the Discover year and decade shelves
+    query an indexed column instead of reading every row's payload (30 s a shelf).
+
+    Args:
+        raw_data: The provider's stream record (``dict``; anything else reads as empty).
+        name: The channel name, when the caller has it.
+
+    Returns:
+        The year, or ``None`` when neither source names one.
+    """
+    from streamselect.core.content_dedup import _YEAR_EXTRACT_RE
+
+    rd = raw_data if isinstance(raw_data, dict) else {}
+    for key in ("releaseDate", "release_date"):
+        m = re.match(r"(\d{4})", str(rd.get(key) or ""))
+        if m:
+            return int(m.group(1))
+    m = _YEAR_EXTRACT_RE.search(name or str(rd.get("name") or ""))
+    return int(m.group(1)) if m else None
+
+
 # ---------------------------------------------------------------------------
 # Strategy interface
 # ---------------------------------------------------------------------------

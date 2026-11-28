@@ -45,6 +45,7 @@ def test_a_year_shelf_holds_only_its_year(tmp_path):
         for year in (2024, 2025, 2025):
             s.add(ChannelDB(id=str(uuid.uuid4()), source_id=str(uuid.uuid4()), provider_id="p1",
                             name=f"Film {uuid.uuid4().hex[:6]}", media_type="movie", detected_rating=7.0,
+                            detected_release_year=year,     # as ingestion stores it
                             raw_data={"releaseDate": f"{year}-05-01", "rating": "7"}))
     with db.session_scope(commit=False) as s:
         cards = fetch_cards_for_key(s, MagicMock(), "year:2025", 30, sk={}, fk={}, af={},
@@ -97,6 +98,7 @@ def test_the_loader_sends_the_groups_in_page_order_with_region_chips(tmp_path):
                             media_type="movie", detected_rating=7.0, detected_genres=["Drama"],
                             detected_collection="KOMEDIE", detected_collection_group="KOMEDIE",
                             detected_region="PL", user_category="Watch Later" if i < 2 else None,
+                            detected_release_year=1994,
                             raw_data={"releaseDate": "1994-01-01", "rating": "7"}))
     got = []
     worker = _LoaderWorker(db, Config(config_dir=tmp_path), _ZoneSnapshot(first_launch=True))
@@ -394,3 +396,15 @@ def test_kept_recommendations_show_without_working_them_out_again(tmp_path, monk
         assert [c.channel_id for c in rs.stale_cards(s, cfg)] == ["c2", "c0"], "still shown at once"
         rs.get_recommended(s, cfg)
     assert len(runs) == 2, "worked out again only because something changed"
+
+
+@pytest.mark.parametrize("raw, name, year", [
+    ({"releaseDate": "1994-09-23"}, "The Shawshank Redemption", 1994),
+    ({"release_date": "2025"}, "", 2025),
+    ({"name": "Heat (1995)"}, None, 1995),           # the payload's own name is the fallback
+    ({}, "News 24/7", None),
+    ("not a dict", "Alien (1979)", 1979),
+])
+def test_the_release_year_comes_from_the_payload_then_the_name(raw, name, year):
+    from streamselect.core.content_identity import release_year_from_raw
+    assert release_year_from_raw(raw, name) == year
