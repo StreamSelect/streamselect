@@ -1600,6 +1600,7 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
         self.discover_view.tmdbEnrichRequested.connect(self._enqueue_tmdb_enrichment)
         self.discover_view.recipeEditRequested.connect(self._on_discover_recipe_edit_requested)
         self.discover_view.userListDeleteRequested.connect(lambda name: delete_user_list(self, name))
+        self.discover_view.queueToggleRequested.connect(self._on_details_queue_toggle)   # a card's bookmark
         self.discover_view.setVisible(False)
         self._list_layout.addWidget(self.discover_view)
 
@@ -1615,8 +1616,7 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
         # channel menu (same seam as DiscoverView and Recommendations).
         self.recipe_view.channelContextMenuRequested.connect(self._on_rec_channel_context_menu)
         self.recipe_view.tmdbEnrichRequested.connect(self._enqueue_tmdb_enrichment)
-        # A save/rename/delete/toggle re-feeds Discover's recipe shelves (a closed Discover only marks itself stale).
-        self.recipe_view.savedRecipesChanged.connect(self.discover_view.reload)
+        self.recipe_view.savedRecipesChanged.connect(self.discover_view.reload)   # (a closed Discover marks itself stale)
         self.discover_view.recipeDeleteRequested.connect(self.recipe_view.delete_saved_recipe_by_name)
         self.recipe_view.savedSearchOpenRequested.connect(self._open_saved_search)
         self.recipe_view.setVisible(False)

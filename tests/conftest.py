@@ -3663,3 +3663,15 @@ def collect_loader_shelves(worker, out: list) -> list:
     worker.shelfReady.connect(shelf)
     worker.cardsReady.connect(cards)
     return out
+
+
+def content_card(channel_id: str, title: str, media_type: str = "movie", **fields):
+    """A real ``ContentCard`` with test defaults (no poster, no ratings).
+
+    Replaces three hand-copied ``_FakeCard`` dataclasses in the Recipe tests: a
+    copy of the card's fields went stale the day the card grew ``user_rating``
+    (Discover judgments) and every Recipe strip test errored building a card.
+    """
+    from streamselect.core.discovery_engine import ContentCard
+    base = {"thumbnail_url": None, "rating": None, "year": None, "genre": None}
+    return ContentCard(channel_id=channel_id, title=title, media_type=media_type, **{**base, **fields})

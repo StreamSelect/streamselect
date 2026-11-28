@@ -46,6 +46,8 @@ class ContentCard:
     progress_fraction: float = 0.0      # 0.0 = none or completed; 0–1 = partial resume
     variant_count: int = 1              # number of same-production variants collapsed into this card (≥ 1)
     content_key: str | None = None      # stored identity key (computed at ingestion); None on pre-migration rows
+    user_rating: int = 0                # your like (+1) / dislike (-1) of the TITLE (card_judgments)
+    is_rec_suppressed: bool = False     # you marked the title Not Interested (card_judgments)
 
 
 # ---------------------------------------------------------------------------

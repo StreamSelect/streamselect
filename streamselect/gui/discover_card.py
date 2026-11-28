@@ -286,6 +286,7 @@ class _ContentCard(QWidget):
     doubleClicked        = pyqtSignal(str)
     middleClicked        = pyqtSignal(str)          # channel_id — configured middle-click play
     contextMenuRequested = pyqtSignal(str, int, int)
+    queueToggleRequested = pyqtSignal(str)          # channel_id — the bookmark button (Watch Later)
 
     def __init__(self, card: ContentCard, image_cache: "ImageCache",
                  config: Config, parent=None) -> None:
@@ -383,8 +384,21 @@ class _ContentCard(QWidget):
             cat_lbl.move(cw - cat_lbl.width() - round(4 * z), ph - round(22 * z))
 
         # Status overlay (top-right corner) — badges scale with zoom.
-        badges = [role for on, role in ((card.is_liked, "like"), (card.is_favorite, "favorite"),
-                                         (card.in_queue, "watch_later"), (card.already_watched, "watched"))
+        # Watch Later is its own button in the corner (owner): shown while the title is
+        # queued, and on hover otherwise, so one click adds or removes it.
+        self._queue_btn = _icon_utils.icon_button(
+            "watch_later", "Remove from Watch Later" if card.in_queue else "Add to Watch Later",
+            style="DISCOVER_SHELF_PAGE_BTN", px=max(10, round(12 * z)), parent=self._poster_frame)
+        qs = max(20, round(22 * z))
+        self._queue_btn.setFixedSize(qs, qs)
+        self._queue_btn.move(cw - qs - round(4 * z), round(4 * z))
+        self._queue_btn.setVisible(card.in_queue)
+        self._queue_btn.clicked.connect(self._on_queue_clicked)     # bound: no strong ref to the card
+        # Your judgment of the title, so you can see what you've already decided on (owner).
+        judged = ("dislike" if card.user_rating == -1 else "not_interested" if card.is_rec_suppressed
+                  else "like" if card.is_liked or card.user_rating == 1 else None)
+        badges = [role for on, role in ((judged is not None, judged), (card.is_favorite, "favorite"),
+                                         (card.already_watched, "watched"))
                   if on]
         if badges:
             status_lbl = QLabel(" ".join(_icon_utils.role_html(r) for r in badges), self._poster_frame)
@@ -392,8 +406,9 @@ class _ContentCard(QWidget):
             _theme.style_fn(status_lbl, lambda: f"background: {_theme.OVERLAY_BLACK_60}; border-radius: 3px;"
                 f" padding: 1px 3px; color: {_theme.COLOR_ON_FILL_LIGHT};")
             status_lbl.adjustSize()
-            status_lbl.move(cw - status_lbl.width() - round(4 * z), round(4 * z))
+            status_lbl.move(cw - qs - status_lbl.width() - round(8 * z), round(4 * z))
             status_lbl.raise_()
+        self._queue_btn.raise_()
 
         # Resume-progress bar — thin strip at the very bottom of the poster frame.
         # Shown only when the movie has been partially watched (not completed).
@@ -512,6 +527,19 @@ class _ContentCard(QWidget):
         """
         logger.debug(f"Poster load failed for {url!r}: {error}")
         self._stop_shimmer()
+
+    def _on_queue_clicked(self) -> None:
+        self.queueToggleRequested.emit(self._card.channel_id)
+
+    def enterEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        # Only where something acts on the click (a Discover shelf or its See-all grid).
+        if self.receivers(self.queueToggleRequested) > 0:
+            self._queue_btn.setVisible(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self._queue_btn.setVisible(self._card.in_queue)
+        super().leaveEvent(event)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:

@@ -35,7 +35,7 @@ def test_row_changes_speaks_each_rows_field_names():
     card = ContentCard(channel_id="a", title="A", media_type="movie", thumbnail_url=None,
                        rating=None, year=None, genre=None, progress_fraction=0.4)
     assert row_changes({"rating": 1, "watch_completed": True}, card) == {
-        "is_liked": True, "already_watched": True, "progress_fraction": 0.0}
+        "user_rating": 1, "is_liked": True, "already_watched": True, "progress_fraction": 0.0}
     assert row_changes({"watch_completed": True, "in_queue": True}, {"id": "a", "watched": False,
                                                                      "in_queue": False}) == {
         "watched": True, "in_queue": True}

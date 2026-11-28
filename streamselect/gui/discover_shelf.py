@@ -90,7 +90,7 @@ class _Shelf(QWidget):
         self._scroll_area: QScrollArea | None = None
         self._inner_layout = None   # set by _build_ui
         self._inner_widget = None   # set by _build_ui
-        # List of (on_clicked, on_double_clicked, on_context_menu, on_middle_click)
+        # (on_clicked, on_double_clicked, on_context_menu, on_middle_click, on_queue_toggle)
         # tuples so set_cards() can wire late-added card widgets to the same slots.
         self._pending_wires: list[tuple] = []
         # Loading/error placeholder shown in the card row during a lazy-expand
@@ -280,11 +280,8 @@ class _Shelf(QWidget):
         w = _ContentCard(card, image_cache, config, self._inner_widget)
         self._inner_layout.addWidget(w)
         self._cards_widgets.append(w)
-        for on_clicked, on_double_clicked, on_context_menu, on_middle_click in self._pending_wires:
-            w.clicked.connect(on_clicked)
-            w.doubleClicked.connect(on_double_clicked)
-            w.contextMenuRequested.connect(on_context_menu)
-            w.middleClicked.connect(on_middle_click)
+        for wires in self._pending_wires:
+            self._wire_card(w, *wires)
         self._size_card_row()
 
     def _on_cards_built(self) -> None:
@@ -645,15 +642,23 @@ class _Shelf(QWidget):
         if not self._collapsed:
             self._load_visible()
 
-    def wire(self, on_clicked, on_double_clicked, on_context_menu, on_middle_click) -> None:
-        self._pending_wires.append(
-            (on_clicked, on_double_clicked, on_context_menu, on_middle_click)
-        )
+    def wire(self, on_clicked, on_double_clicked, on_context_menu, on_middle_click,
+             on_queue_toggle=None) -> None:
+        """Connect every card (built now or later) to the host's handlers."""
+        wires = (on_clicked, on_double_clicked, on_context_menu, on_middle_click, on_queue_toggle)
+        self._pending_wires.append(wires)
         for w in self._cards_widgets:
-            w.clicked.connect(on_clicked)
-            w.doubleClicked.connect(on_double_clicked)
-            w.contextMenuRequested.connect(on_context_menu)
-            w.middleClicked.connect(on_middle_click)
+            self._wire_card(w, *wires)
+
+    @staticmethod
+    def _wire_card(w, on_clicked, on_double_clicked, on_context_menu, on_middle_click,
+                   on_queue_toggle=None) -> None:
+        w.clicked.connect(on_clicked)
+        w.doubleClicked.connect(on_double_clicked)
+        w.contextMenuRequested.connect(on_context_menu)
+        w.middleClicked.connect(on_middle_click)
+        if on_queue_toggle is not None:
+            w.queueToggleRequested.connect(on_queue_toggle)
 
 
 # ── "More Categories" row (design "Tidying Discover's Categories", Plan 1) ──

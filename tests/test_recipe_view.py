@@ -24,6 +24,8 @@ Coverage:
 from __future__ import annotations
 
 import pytest
+
+from tests.conftest import content_card
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -118,27 +120,7 @@ class _TagCountDTO:
 # Helpers
 # ---------------------------------------------------------------------------
 
-@dataclass
-class _FakeCard:
-    """ContentCard-shaped value object for the Now-Plating strip tests.
-
-    Carries the fields _ContentCard reads at construction; thumbnail_url is None
-    so no async poster load is attempted.
-    """
-    channel_id: str
-    title: str
-    media_type: str = "movie"
-    thumbnail_url: str | None = None
-    rating: float | None = None
-    year: int | None = None
-    genre: str | None = None
-    is_favorite: bool = False
-    in_queue: bool = False
-    already_watched: bool = False
-    is_liked: bool = False
-    detected_prefix: str | None = None
-    progress_fraction: float = 0.0
-    variant_count: int = 1
+_FakeCard = content_card     # the real ContentCard (tests/conftest.py)
 
 
 def _make_view(qapp):

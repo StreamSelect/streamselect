@@ -49,6 +49,7 @@ class _BrowseView(QWidget):
     cardClicked       = pyqtSignal(str)
     cardDoubleClicked = pyqtSignal(str)
     cardMiddleClicked = pyqtSignal(str)   # channel_id — configured middle-click play
+    cardQueueToggled  = pyqtSignal(str)   # channel_id — a card's Watch Later button
     cardContextMenu   = pyqtSignal(str, int, int)
     # Emitted when the user scrolls near the bottom AND every known card has been
     # rendered AND the caller has flagged that more pages remain (set_has_more).
@@ -314,6 +315,7 @@ class _BrowseView(QWidget):
         w.doubleClicked.connect(self.cardDoubleClicked)
         w.middleClicked.connect(self.cardMiddleClicked)
         w.contextMenuRequested.connect(self.cardContextMenu)
+        w.queueToggleRequested.connect(self.cardQueueToggled)
         return w
 
     def _relayout_grid(self) -> None:

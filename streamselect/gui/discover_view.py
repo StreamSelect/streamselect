@@ -78,6 +78,7 @@ class DiscoverView(DiscoverGroupsMixin, DiscoverTilesMixin, QWidget):
     recipeEditRequested         = pyqtSignal(str)   # recipe name — a shelf's ✎ click
     recipeDeleteRequested       = pyqtSignal(str)   # recipe name — confirmed in the shelf menu
     userListDeleteRequested     = pyqtSignal(str)   # list (user category) name — confirmed in the shelf menu
+    queueToggleRequested        = pyqtSignal(str)   # channel_id — a card's Watch Later button
 
     def __init__(self, db: Database, config: Config,
                  image_cache: "ImageCache", parent=None) -> None:
@@ -198,6 +199,7 @@ class DiscoverView(DiscoverGroupsMixin, DiscoverTilesMixin, QWidget):
         self._browse_view.cardDoubleClicked.connect(self.playRequested)
         self._browse_view.cardContextMenu.connect(self.channelContextMenuRequested)
         self._browse_view.cardMiddleClicked.connect(self.channelMiddleClicked)
+        self._browse_view.cardQueueToggled.connect(self.queueToggleRequested)
         self._stack.addWidget(self._browse_view)
 
         vl.addWidget(self._stack)
@@ -747,7 +749,8 @@ class DiscoverView(DiscoverGroupsMixin, DiscoverTilesMixin, QWidget):
         shelf.editRequested.connect(self._on_shelf_edit_requested)
         shelf.menuRequested.connect(self._on_shelf_menu_requested)
         shelf.wire(self.channelSelected, self.playRequested,
-                   self.channelContextMenuRequested, self.channelMiddleClicked)
+                   self.channelContextMenuRequested, self.channelMiddleClicked,
+                   self.queueToggleRequested)
         shelf.tile = ShelfTile(shelf, self._image_cache)          # how it shows while collapsed
         shelf.destroyed.connect(shelf.tile.deleteLater)
         if data.loading:

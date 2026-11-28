@@ -115,6 +115,12 @@ def fetch_cards_for_key(
 
     Returns an empty list for unknown keys.
     """
+    from streamselect.core.card_judgments import with_judgments
+    return with_judgments(session, _cards_for_key(session, config, shelf_key, limit, sk, fk, af, ek))
+
+
+def _cards_for_key(session, config, shelf_key, limit, sk, fk, af, ek) -> list[ContentCard]:
+    """The shelf's cards (``fetch_cards_for_key`` adds your judgments)."""
     from streamselect.core.discovery_engine import (
         get_recently_added, get_top_rated, get_by_genre,
         get_by_decade, get_by_actor, get_by_user_category, get_by_collection,
@@ -818,6 +824,8 @@ class _LoaderWorker(QObject):
                 weights = None
             actor, cards = get_featured_actor(session, weights, **sk, **fk, **af, **ek)
             if actor:
+                from streamselect.core.card_judgments import with_judgments
+                cards = with_judgments(session, cards)
                 emit(_ShelfData(f"Featured: {actor}", f"{_ACTOR_PREFIX}{actor}", cards,
                                 is_featured_actor=True, rank=actor_rank))
 

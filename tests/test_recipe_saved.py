@@ -9,10 +9,11 @@ proven end-to-end (write + reload from disk).
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import Any, Callable
 
 import pytest
+
+from tests.conftest import content_card
 import yaml
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication
@@ -46,22 +47,7 @@ class _FakeSeam:
         self.calls[-1]["on_result"](data)
 
 
-@dataclass
-class _FakeCard:
-    channel_id: str
-    title: str
-    media_type: str = "movie"
-    thumbnail_url: str | None = None
-    rating: float | None = None
-    year: int | None = None
-    genre: str | None = None
-    is_favorite: bool = False
-    in_queue: bool = False
-    already_watched: bool = False
-    is_liked: bool = False
-    detected_prefix: str | None = None
-    progress_fraction: float = 0.0
-    variant_count: int = 1
+_FakeCard = content_card     # the real ContentCard (tests/conftest.py)
 
 
 class _FakeImageCache(QObject):
