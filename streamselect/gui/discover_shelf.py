@@ -198,7 +198,8 @@ class _Shelf(QWidget):
         _m = card_metrics(config.discover_zoom)
         scroll = QScrollArea()
         scroll.setWidgetResizable(False)
-        scroll.setFixedHeight(_m.card_h + 16)
+        scroll.setFixedHeight(_m.card_h + 12)       # the cards + the slim bar (6 px + 4 px gap)
+        scroll.viewport().setAutoFillBackground(False)   # the card shows through: no box in a box
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setFrameShape(QScrollArea.Shape.NoFrame)
@@ -239,6 +240,7 @@ class _Shelf(QWidget):
 
         self._size_card_row()  # zero cards yet — chrome must be usable immediately
         scroll.setWidget(inner)
+        inner.setAutoFillBackground(False)     # setWidget turns it on: keep the card showing through
         vl.addWidget(scroll)
 
         scroll.horizontalScrollBar().valueChanged.connect(self._load_visible)
