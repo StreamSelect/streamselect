@@ -2,7 +2,7 @@ from streamselect.whats_new import WhatsNewEntry
 
 ENTRY = WhatsNewEntry(
     id=127,
-    version="1.3.2",
+    version="1.4.0",
     date="2026-11-27",
     title="Discover's categories, tidied",
     items=(
