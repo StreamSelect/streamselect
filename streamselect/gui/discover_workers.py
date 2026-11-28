@@ -479,13 +479,18 @@ def normalize_shelf_config(config: Config) -> None:
 
 class _ShelfData:
     __slots__ = ("title", "shelf_key", "cards", "is_featured_actor",
-                 "is_user_category", "header_only", "chips")
+                 "is_user_category", "header_only", "chips", "loading", "rank")
 
     def __init__(self, title: str, shelf_key: str, cards: list[ContentCard],
                  is_featured_actor: bool = False,
                  is_user_category: bool = False,
-                 header_only: bool = False, chips: tuple[str, ...] = ()) -> None:
+                 header_only: bool = False, chips: tuple[str, ...] = (),
+                 loading: bool = False, rank: int | None = None) -> None:
         self.title = title
+        #: An open shelf sent ahead of its cards, which follow on ``cardsReady``.
+        self.loading = loading
+        #: Its place in the page order, which the arrival order no longer is.
+        self.rank = rank
         #: Region codes shown after the title (a collection shelf's regions, Plan 1).
         self.chips = chips
         self.shelf_key = shelf_key
@@ -657,6 +662,7 @@ class _ShelfCardsWorker(QObject):
 
 class _LoaderWorker(QObject):
     shelfReady = pyqtSignal(object)   # _ShelfData
+    cardsReady = pyqtSignal(str, list)  # (shelf_key, cards) for a shelf sent loading
     finished   = pyqtSignal()
 
     def __init__(self, db: Database, config: Config,
@@ -746,18 +752,40 @@ class _LoaderWorker(QObject):
             def emit(data: _ShelfData) -> None:
                 # header_only shelves always emit (they carry no cards — that's the point).
                 # Card-bearing shelves skip if empty.
-                if data.shelf_key not in hidden and (data.header_only or data.cards):
+                if data.shelf_key not in hidden and (data.header_only or data.loading or data.cards):
                     self.shelfReady.emit(data)
 
+            # The page first, its posters after: every shelf goes out as soon as
+            # its NAME is known, in page order, and an open one follows with its
+            # cards (``fill``). Recommended, the slowest query by far (~5 s on a
+            # large library), fills last, so nothing waits behind it.
+            ranks = iter(range(1_000_000))
+            to_fill: list[str] = []
+
             def shelf(key: str, title: str, **kw) -> None:
-                """One shelf: its cards when it opens (pinned or expanded), else its header."""
+                """One shelf, in page order: open (cards to follow) or just its header."""
+                rank = next(ranks)
                 if key in hidden:
                     return
-                if _zone(key) in (_ZONE_PINNED, _ZONE_EXPANDED):
-                    emit(_ShelfData(title, key, fetch_cards_for_key(
-                        session, self._config, key, 30, sk=sk, fk=fk, af=af, ek=ek), **kw))
+                zone = _zone(key)
+                if zone in (_ZONE_PINNED, _ZONE_EXPANDED):
+                    emit(_ShelfData(title, key, [], loading=True, rank=rank, **kw))
+                    if zone == _ZONE_PINNED and key != "recommended":
+                        fill([key])               # the top of the page: at once
+                    else:
+                        to_fill.append(key)
                 else:
-                    emit(_ShelfData(title, key, [], header_only=True, **kw))
+                    emit(_ShelfData(title, key, [], header_only=True, rank=rank, **kw))
+
+            def fill(keys: list[str]) -> bool:
+                """Send the cards of the open shelves in *keys*; False once cancelled."""
+                while keys:
+                    if self._cancelled:
+                        return False
+                    key = keys.pop(0)
+                    self.cardsReady.emit(key, fetch_cards_for_key(
+                        session, self._config, key, 30, sk=sk, fk=fk, af=af, ek=ek))
+                return True
 
             # The order is the page's (design "Discover as Your Dashboard"): the
             # user's lists, Discover's own one-of-a-kind shelves, every genre,
@@ -790,19 +818,11 @@ class _LoaderWorker(QObject):
                 shelf(key, browse_title_for_key(key))
 
             # Featured actor: the title IS the actor's name, which only the
-            # fetch finds, so this shelf is always fetched.
-            try:
-                from streamselect.core.preference_engine import RecScoringSettings, compute_weights
-                weights = compute_weights(
-                    session, settings=RecScoringSettings.from_config(self._config)
-                )
-            except Exception:
-                logger.warning("Featured-actor shelf falling back to unweighted", exc_info=True)
-                weights = None
-            actor, cards = get_featured_actor(session, weights, **sk, **fk, **af, **ek)
-            if actor:
-                emit(_ShelfData(f"Featured: {actor}", f"{_ACTOR_PREFIX}{actor}", cards,
-                                is_featured_actor=True))
+            # fetch finds, so it keeps its place and comes after the first fill.
+            actor_rank = next(ranks)
+            rec_waits = "recommended" in to_fill
+            first = [k for k in to_fill if k != "recommended"]
+            to_fill[:] = []
 
             # Platform shelves (PLAT-1): a platform earns a shelf once enough
             # DISTINCT TITLES carry its tag — the floor is a setting. ONE
@@ -818,6 +838,20 @@ class _LoaderWorker(QObject):
                 if self._cancelled:
                     return
                 shelf(f"{_PLATFORM_PREFIX}{_value}", _value)
+            if not fill(first + to_fill):
+                return
+            try:
+                from streamselect.core.preference_engine import RecScoringSettings, compute_weights
+                weights = compute_weights(
+                    session, settings=RecScoringSettings.from_config(self._config)
+                )
+            except Exception:
+                logger.warning("Featured-actor shelf falling back to unweighted", exc_info=True)
+                weights = None
+            actor, cards = get_featured_actor(session, weights, **sk, **fk, **af, **ek)
+            if actor:
+                emit(_ShelfData(f"Featured: {actor}", f"{_ACTOR_PREFIX}{actor}", cards,
+                                is_featured_actor=True, rank=actor_rank))
 
             genres = get_all_genres(session, min_count=10, **fk, **af, **ek)
             for genre in _rank_genres_by_preference(genres, ss.liked_ids, session, **fk):
@@ -839,6 +873,8 @@ class _LoaderWorker(QObject):
                 if self._cancelled:
                     return
                 shelf(f"{_COLLECTION_PREFIX}{coll.key}", coll.title, chips=coll.regions)
+            if not fill(to_fill + (["recommended"] if rec_waits else [])):
+                return
 
         except Exception:
             logger.exception("DiscoverView loader error")

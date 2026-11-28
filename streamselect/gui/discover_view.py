@@ -470,11 +470,26 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
                 QTimer.singleShot(0, lambda k=key: self._start_expand_fetch(k))
                 return
 
+    def _on_loader_cards(self, shelf_key: str, cards: list) -> None:
+        """The loader's cards for a shelf it sent open; an open shelf with none
+        isn't shown (as before), though its open state is kept for next time."""
+        shelf = self._shelf_widgets.get(shelf_key)
+        if shelf is not None and not cards:
+            self._shelf_widgets.pop(shelf_key)
+            self._remove_from_zone(shelf, self._shelf_zones[shelf_key])
+            shelf.cancel_pending_build()
+            shelf.deleteLater()
+            return
+        self._fill_shelf(shelf_key, cards)
+
     def _on_expand_cards_ready(self, shelf_key: str, cards: list) -> None:
         """Called on the main thread when the lazy-expand fetch finishes."""
         self._inflight_expand = None
         self._next_expand()
+        self._fill_shelf(shelf_key, cards)
 
+    def _fill_shelf(self, shelf_key: str, cards: list) -> None:
+        """Put fetched *cards* into a built shelf: the one path for both fetches."""
         shelf = self._shelf_widgets.get(shelf_key)
         if shelf is None:
             return  # shelf was hidden/removed while we were fetching
@@ -651,6 +666,7 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.shelfReady.connect(self._on_shelf_ready)
+        self._worker.cardsReady.connect(self._on_loader_cards)
         self._worker.finished.connect(self._on_load_finished)
         self._worker.finished.connect(self._thread.quit)
         self._thread.start()
@@ -672,7 +688,7 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
 
         Callers are responsible for calling ``_add_to_zone`` afterwards.
         """
-        if not data.header_only:
+        if not data.header_only and not data.loading:
             self._shelf_data_cache[data.shelf_key] = data.cards
             self._loaded_shelf_keys.add(data.shelf_key)
             # Feed the just-rendered cards to lazy TMDb enrichment (host chokepoint).
@@ -694,6 +710,8 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         shelf.editRequested.connect(self._on_shelf_edit_requested)
         shelf.wire(self.channelSelected, self.playRequested,
                    self.channelContextMenuRequested, self.channelMiddleClicked)
+        if data.loading:
+            shelf.set_loading()             # its cards follow on the loader's cardsReady
 
         self._shelf_widgets[data.shelf_key] = shelf
         self._shelf_zones[data.shelf_key] = zone
@@ -704,7 +722,8 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
             self._loading_lbl.setVisible(False)
 
         zone = self._determine_zone(data.shelf_key)
-        self._arrival.setdefault(data.shelf_key, len(self._arrival))   # its place in its group
+        self._arrival.setdefault(       # its place in its group: the loader's page order
+            data.shelf_key, len(self._arrival) if data.rank is None else data.rank)
 
         if data.header_only:
             # D2 — buffer collapsed strips; build them in one batch after the

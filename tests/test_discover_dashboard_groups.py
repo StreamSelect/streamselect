@@ -264,3 +264,63 @@ def test_a_refresh_asked_for_during_a_load_runs_after_it(page):
     page._on_load_finished()
     QApplication.processEvents()
     assert calls == [1]
+
+
+def test_the_page_comes_first_and_recommended_fills_last(tmp_path):
+    """Open shelves go out empty in page order; their cards follow, Recommended's last."""
+    from streamselect.core.config import Config
+    from streamselect.core.database import ChannelDB, Database, ProviderDB
+    from streamselect.gui.discover_workers import _LoaderWorker, _ZoneSnapshot
+
+    db = Database(f"sqlite:///{tmp_path / 'f.db'}")
+    db.create_tables()
+    with db.session_scope() as s:
+        s.add(ProviderDB(id="p1", name="P", type="xtream", url="http://x.example.com", is_active=True))
+        for i in range(12):
+            s.add(ChannelDB(id=f"c{i}", source_id=f"c{i}", provider_id="p1", name=f"Film {i}",
+                            media_type="movie", detected_rating=7.0, detected_genres=["Drama"],
+                            raw_data={"releaseDate": "1994-01-01", "rating": "7"}))
+    events = []
+    worker = _LoaderWorker(db, Config(config_dir=tmp_path), _ZoneSnapshot(
+        expanded=frozenset({"recommended", "recently_added", "genre:Drama"})))
+    worker.shelfReady.connect(lambda d: events.append(("shelf", d.shelf_key, d.loading)))
+    worker.cardsReady.connect(lambda k, c: events.append(("cards", k, len(c))))
+    worker.run()
+    shelves = [e for e in events if e[0] == "shelf"]
+    cards = [e for e in events if e[0] == "cards"]
+    assert ("shelf", "recently_added", True) in shelves and ("shelf", "genre:Drama", True) in shelves
+    assert ("cards", "recently_added", 12) in cards
+    assert cards[-1][1] == "recommended", "the slow one never holds up the rest"
+    assert events.index(("shelf", "genre:Drama", True)) < events.index(cards[-1])
+
+
+def test_a_loading_shelf_fills_and_an_empty_one_goes(page):
+    from streamselect.core.discovery_engine import ContentCard
+    from streamselect.gui.discover_workers import _ShelfData
+
+    page._config.discover_expanded_shelves = ["top_series", "platform:Netflix"]
+    page._on_shelf_ready(_ShelfData("Top Rated Series", "top_series", [], loading=True, rank=4))
+    page._on_shelf_ready(_ShelfData("Netflix", "platform:Netflix", [], loading=True, rank=5))
+    assert _keys(page, APP) == ["top_movies", "top_series", "platform:Netflix"], "placed by rank"
+    card = ContentCard(channel_id="c1", title="T", media_type="movie", thumbnail_url=None,
+                       rating=7.0, year=2000, genre="x")
+    page._on_loader_cards("top_series", [card])
+    page._on_loader_cards("platform:Netflix", [])
+    QApplication.processEvents()
+    assert "top_series" in page._loaded_shelf_keys
+    assert _keys(page, APP) == ["top_movies", "top_series"], "an open shelf with nothing in it isn't shown"
+    assert page._shelf_zones["platform:Netflix"] == "expanded", "its open state is kept"
+
+
+def test_clicking_a_title_collapses_an_open_shelf_too(page):
+    from PyQt6.QtCore import QPointF, Qt
+    from PyQt6.QtGui import QMouseEvent
+
+    shelf = page._shelf_widgets["recently_added"]          # pinned, so open
+    page._start_expand_fetch = lambda key: None
+    shelf._title_lbl.mousePressEvent(QMouseEvent(
+        QMouseEvent.Type.MouseButtonPress, QPointF(2, 2), QPointF(2, 2),
+        Qt.MouseButton.LeftButton, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier))
+    QApplication.processEvents()
+    assert shelf._collapsed and not shelf._scroll_area.isVisible()
+    assert shelf._title_lbl.toolTip().startswith("Expand")

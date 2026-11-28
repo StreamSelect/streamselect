@@ -19,6 +19,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tests.conftest import collect_loader_shelves
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -129,7 +131,7 @@ class TestLoaderWorkerZoneAwareness:
         w = _LoaderWorker(seeded_db, cfg, zone_snapshot=snapshot)
 
         shelves: list = []
-        w.shelfReady.connect(lambda d: shelves.append(d))
+        collect_loader_shelves(w, shelves)
         finished: list = []
         w.finished.connect(lambda: finished.append(True))
         w.run()
@@ -156,7 +158,7 @@ class TestLoaderWorkerZoneAwareness:
         w = _LoaderWorker(seeded_db, cfg, zone_snapshot=snapshot)
 
         shelves: list = []
-        w.shelfReady.connect(lambda d: shelves.append(d))
+        collect_loader_shelves(w, shelves)
         w.run()
 
         action_shelves = [s for s in shelves if s.shelf_key == "genre:Action"]
@@ -176,7 +178,7 @@ class TestLoaderWorkerZoneAwareness:
         w = _LoaderWorker(seeded_db, cfg, zone_snapshot=snapshot)
 
         shelves: list = []
-        w.shelfReady.connect(lambda d: shelves.append(d))
+        collect_loader_shelves(w, shelves)
         w.run()
 
         by_key = {s.shelf_key: s for s in shelves}
@@ -202,7 +204,7 @@ class TestLoaderWorkerZoneAwareness:
         w = _LoaderWorker(seeded_db, cfg, zone_snapshot=snapshot)
 
         shelves: list = []
-        w.shelfReady.connect(lambda d: shelves.append(d))
+        collect_loader_shelves(w, shelves)
         w.run()
 
         keys = [s.shelf_key for s in shelves]

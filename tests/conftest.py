@@ -3634,3 +3634,32 @@ class ConfigDefaultsFallback:
         if field is None:
             raise AttributeError(name)
         return field.default_factory() if field.default_factory is not None else field.default
+
+
+def collect_loader_shelves(worker, out: list) -> list:
+    """Gather a Discover ``_LoaderWorker``'s shelves into *out* as the view sees them.
+
+    The loader sends an open shelf first (``loading``) and its cards after, on
+    ``cardsReady``; this joins the two, and drops a shelf whose cards came back
+    empty, as ``DiscoverView._on_loader_cards`` does. Every loader test reads
+    shelves through here rather than wiring the two signals itself.
+    """
+    out_by_key: dict = {}
+
+    def shelf(d):
+        out.append(d)
+        out_by_key[d.shelf_key] = d
+
+    def cards(key, cs):
+        d = out_by_key.get(key)
+        if d is None:
+            return
+        if cs:
+            d.cards = list(cs)
+            d.loading = False
+        else:
+            out.remove(d)
+
+    worker.shelfReady.connect(shelf)
+    worker.cardsReady.connect(cards)
+    return out

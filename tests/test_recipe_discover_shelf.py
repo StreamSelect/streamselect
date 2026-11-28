@@ -31,6 +31,8 @@ import uuid
 
 import pytest
 
+from tests.conftest import collect_loader_shelves
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -126,7 +128,7 @@ class TestRecipeShelfEmission:
         )
         w = _LoaderWorker(tagged_db, cfg, zone_snapshot=snapshot)
         shelves: list = []
-        w.shelfReady.connect(lambda d: shelves.append(d))
+        collect_loader_shelves(w, shelves)
         w.run()
 
         recipe_shelves = [s for s in shelves if s.shelf_key == "recipe:Cold Drama"]
@@ -154,7 +156,7 @@ class TestRecipeShelfEmission:
         )
         w = _LoaderWorker(tagged_db, cfg, zone_snapshot=snapshot)
         shelves: list = []
-        w.shelfReady.connect(lambda d: shelves.append(d))
+        collect_loader_shelves(w, shelves)
         w.run()
 
         keys = [s.shelf_key for s in shelves]
@@ -174,7 +176,7 @@ class TestRecipeShelfEmission:
         )
         w = _LoaderWorker(tagged_db, cfg, zone_snapshot=snapshot)
         shelves: list = []
-        w.shelfReady.connect(lambda d: shelves.append(d))
+        collect_loader_shelves(w, shelves)
         w.run()
 
         keys = [s.shelf_key for s in shelves]

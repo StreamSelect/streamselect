@@ -28,6 +28,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.conftest import collect_loader_shelves
+
 from streamselect.core.content_labels import PLATFORM_SHELF_EXCLUDED_VALUES
 from streamselect.core.platform_shelves import (
     PLATFORM_SHELF_MEDIA_TYPES, platform_shelf_values, representative_version,
@@ -295,7 +297,7 @@ def _shelves(db, cfg, *, pinned=frozenset()):
                              "top_movies", "top_series"}),
     ))
     out: list = []
-    worker.shelfReady.connect(out.append)
+    collect_loader_shelves(worker, out)
     worker.run()
     return out
 
@@ -332,7 +334,7 @@ def test_a_hidden_platform_shelf_is_not_emitted(platform_db, tmp_path, qapp):
         hidden=frozenset({"platform:Netflix"}),
     ))
     out: list = []
-    worker.shelfReady.connect(out.append)
+    collect_loader_shelves(worker, out)
     worker.run()
     assert "platform:Netflix" not in [s.shelf_key for s in out]
 

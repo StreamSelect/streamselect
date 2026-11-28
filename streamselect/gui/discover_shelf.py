@@ -374,18 +374,20 @@ class _Shelf(QWidget):
             self._collapse_btn.setToolTip("Expand " + self._title_lbl.text())
             self._pin_btn.setVisible(False)
             self._hide_btn.setVisible(False)
-            cursor_affordance.set_clickable(self._title_lbl, True)
             self.setStyleSheet("")
         else:
             _icon_utils.set_button_icon(self._collapse_btn, "collapse", color=_theme.COLOR_DISABLED)
             self._collapse_btn.setToolTip("Collapse " + self._title_lbl.text())
             self._pin_btn.setVisible(True)
             self._hide_btn.setVisible(True)
-            cursor_affordance.set_clickable(self._title_lbl, False)
             # Clear any collapsed-row hover background left over from expanding
             # while hovered — leaveEvent's clear is guarded by _collapsed, which
             # is already False by the time the mouse leaves, so it would stick.
             self.setStyleSheet("")
+
+        # The title toggles too (an open shelf's title used to do nothing).
+        cursor_affordance.set_clickable(self._title_lbl, True)
+        self._title_lbl.setToolTip(self._collapse_btn.toolTip())
 
         if self._pinned:
             _icon_utils.set_button_icon(self._pin_btn, "pin", color=_theme.COLOR_GOLD)
@@ -434,8 +436,8 @@ class _Shelf(QWidget):
             self.collapseRequested.emit(self._shelf_key)
 
     def _on_title_click(self, event) -> None:
-        if self._collapsed:
-            self.expandRequested.emit(self._shelf_key)
+        """A title click toggles the shelf, like its arrow — on every shelf."""
+        self._on_collapse_clicked()
 
     def _load_visible(self) -> None:
         """Request images for cards currently visible in the scroll viewport."""
