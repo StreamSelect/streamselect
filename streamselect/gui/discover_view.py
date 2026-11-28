@@ -76,6 +76,8 @@ class DiscoverView(DiscoverGroupsMixin, DiscoverTilesMixin, QWidget):
     tmdbEnrichRequested         = pyqtSignal(list)  # channel_ids just rendered → lazy TMDb enrichment
     zoomChanged                 = pyqtSignal()      # after config.discover_zoom moved
     recipeEditRequested         = pyqtSignal(str)   # recipe name — a shelf's ✎ click
+    recipeDeleteRequested       = pyqtSignal(str)   # recipe name — confirmed in the shelf menu
+    userListDeleteRequested     = pyqtSignal(str)   # list (user category) name — confirmed in the shelf menu
 
     def __init__(self, db: Database, config: Config,
                  image_cache: "ImageCache", parent=None) -> None:
@@ -743,6 +745,7 @@ class DiscoverView(DiscoverGroupsMixin, DiscoverTilesMixin, QWidget):
         shelf.expandRequested.connect(self._on_expand_requested)
         shelf.hideRequested.connect(self._on_hide_requested)
         shelf.editRequested.connect(self._on_shelf_edit_requested)
+        shelf.menuRequested.connect(self._on_shelf_menu_requested)
         shelf.wire(self.channelSelected, self.playRequested,
                    self.channelContextMenuRequested, self.channelMiddleClicked)
         shelf.tile = ShelfTile(shelf, self._image_cache)          # how it shows while collapsed
@@ -825,6 +828,10 @@ class DiscoverView(DiscoverGroupsMixin, DiscoverTilesMixin, QWidget):
             QTimer.singleShot(0, self.refresh)
             return
         QTimer.singleShot(300, self._trigger_image_load_all)
+
+    def _on_shelf_menu_requested(self, shelf_key: str, global_pos) -> None:
+        from streamselect.gui.discover_shelf_menu import show_shelf_menu
+        show_shelf_menu(self, shelf_key, global_pos)
 
     def _return_to_scroll_position(self, *_range) -> None:
         """After a reload, back to where the page was, as soon as the page is tall enough

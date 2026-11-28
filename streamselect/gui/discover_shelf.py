@@ -60,6 +60,7 @@ class _Shelf(QWidget):
     hideRequested     = pyqtSignal(str)
     editRequested     = pyqtSignal(str)  # shelf_key — ✎ click on a recipe shelf
     collapsedChanged  = pyqtSignal()     # open <-> collapsed: its group lays it out again (row or tile)
+    menuRequested     = pyqtSignal(str, object)   # (shelf_key, global QPoint): right-click on header or tile
 
     def __init__(self, title: str, shelf_key: str,
                  cards: list[ContentCard], image_cache: "ImageCache",
@@ -477,6 +478,11 @@ class _Shelf(QWidget):
             self.expandRequested.emit(self._shelf_key)
         else:
             self.collapseRequested.emit(self._shelf_key)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        """Right-click on the header or the row's blank space (a card has its own menu)."""
+        self.menuRequested.emit(self._shelf_key, event.globalPos())
+        event.accept()
 
     def _on_title_click(self, event) -> None:
         """A title click toggles the shelf, like its arrow — on every shelf."""

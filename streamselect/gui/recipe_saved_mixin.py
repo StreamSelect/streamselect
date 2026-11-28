@@ -248,6 +248,13 @@ class _RecipeSavedMixin:
         self.savedRecipesChanged.emit()
         self._load_saved_recipes()
 
+    def delete_saved_recipe_by_name(self, name: str) -> None:
+        """Delete the saved recipe called *name* (Discover's shelf menu), as the Saved tab does."""
+        for i, recipe in enumerate(self._saved_recipes()):
+            if isinstance(recipe, dict) and recipe.get("name") == name:
+                self._on_saved_delete(i)
+                return
+
     def _on_saved_rename(self, index: int, name: str) -> None:
         """Rename the saved recipe at *index* (persist; no re-render churn)."""
         recipes = list(self._saved_recipes())

@@ -329,6 +329,19 @@ class ChannelUserStateMixin:
         self.session.commit()
         return updated
 
+    def delete_user_category(self, category: str) -> int:
+        """Delete a list: clear *category* (and its mood) from every title in it.
+
+        The titles stay in the library; only the list goes. Returns how many rows
+        carried it. The caller commits (``_run_query(..., commit=True)``).
+        """
+        return (
+            self.session.query(ChannelDB)
+            .filter(ChannelDB.user_category == category)
+            .update({"user_category": None, "category_mood": None, "updated_at": datetime.now()},
+                    synchronize_session=False)
+        )
+
     def get_by_user_category(self, category: str) -> list[ChannelDB]:
         """Return all channels assigned to a user category, sorted by name."""
         return (

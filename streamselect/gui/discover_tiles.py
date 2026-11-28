@@ -148,6 +148,11 @@ class ShelfTile(QFrame):
             s.expandRequested.emit(self.shelf_key)
         super().mousePressEvent(event)
 
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        if (s := self._shelf()) is not None:
+            s.menuRequested.emit(self.shelf_key, event.globalPos())
+        event.accept()
+
     def enterEvent(self, event) -> None:  # noqa: N802 - Qt naming
         for b in (self.pin_btn, self.hide_btn):
             b.show()

@@ -73,6 +73,7 @@ from streamselect.gui.collapsible_splitter import CollapsibleSplitter
 from streamselect.gui.channel_state_bus import ChannelStateBus
 from streamselect.gui.details_pane import DetailsPaneWidget
 from streamselect.gui.discover_view import DiscoverView
+from streamselect.gui.discover_shelf_menu import delete_user_list
 from streamselect.gui.epg_view import EpgView
 from streamselect.gui.preferences_view import PreferencesView
 from streamselect.gui.recipe_view import RecipeView
@@ -1598,6 +1599,7 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
         self.discover_view.channelContextMenuRequested.connect(self._on_rec_channel_context_menu)
         self.discover_view.tmdbEnrichRequested.connect(self._enqueue_tmdb_enrichment)
         self.discover_view.recipeEditRequested.connect(self._on_discover_recipe_edit_requested)
+        self.discover_view.userListDeleteRequested.connect(lambda name: delete_user_list(self, name))
         self.discover_view.setVisible(False)
         self._list_layout.addWidget(self.discover_view)
 
@@ -1605,8 +1607,7 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
         self.recipe_view = RecipeView(
             self.db, self.config, self._run_query, self.image_cache, self
         )
-        # Result cards delegate selection/playback to the host (same seam as
-        # DiscoverView) so provider_id threading + the canonical play path are reused.
+        # Result cards delegate selection/playback to the host (same seam as DiscoverView).
         self.recipe_view.channelSelected.connect(self.show_channel_details_by_id)
         self.recipe_view.playRequested.connect(self.play_channel_by_id)
         self.recipe_view.channelMiddleClicked.connect(self._dispatch_middle_click)
@@ -1614,10 +1615,9 @@ class MainWindow(_HistoryMixin, _ProviderMixin, _SourceAddMixin, _EmptyStateMixi
         # channel menu (same seam as DiscoverView and Recommendations).
         self.recipe_view.channelContextMenuRequested.connect(self._on_rec_channel_context_menu)
         self.recipe_view.tmdbEnrichRequested.connect(self._enqueue_tmdb_enrichment)
-        # an earlier change: a save/rename/delete/toggle re-feeds Discover's recipe shelves;
-        # reload() carries an earlier change's dirty-while-inactive guard, so a closed
-        # Discover only marks itself stale.
+        # A save/rename/delete/toggle re-feeds Discover's recipe shelves (a closed Discover only marks itself stale).
         self.recipe_view.savedRecipesChanged.connect(self.discover_view.reload)
+        self.discover_view.recipeDeleteRequested.connect(self.recipe_view.delete_saved_recipe_by_name)
         self.recipe_view.savedSearchOpenRequested.connect(self._open_saved_search)
         self.recipe_view.setVisible(False)
         self._list_layout.addWidget(self.recipe_view)
