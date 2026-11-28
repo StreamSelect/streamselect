@@ -324,3 +324,21 @@ def test_clicking_a_title_collapses_an_open_shelf_too(page):
     QApplication.processEvents()
     assert shelf._collapsed and not shelf._scroll_area.isVisible()
     assert shelf._title_lbl.toolTip().startswith("Expand")
+
+
+@pytest.mark.parametrize("show", ["set_loading", "show_load_error"])
+def test_an_empty_shelfs_loading_and_error_text_is_actually_visible(qapp, owned_widgets, tmp_path, show):
+    """The row is sized from its cards, so an empty one clipped its label to 0 px:
+    "Loading…" was never seen, only a blank band (owner report)."""
+    from streamselect.core.config import Config
+    from streamselect.gui.discover_shelf import _Shelf
+
+    shelf = owned_widgets.own(_Shelf("Recommended", "recommended", [], MagicMock(), Config(config_dir=tmp_path)))
+    shelf.resize(900, 300)
+    shelf.show()
+    getattr(shelf, show)()
+    for _ in range(3):
+        QApplication.processEvents()
+    label = shelf._placeholder_lbl
+    assert label.isVisible() and label.width() >= label.sizeHint().width() > 20, (
+        f"label {label.width()} px wide for text needing {label.sizeHint().width()} px")

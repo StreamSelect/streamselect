@@ -460,6 +460,19 @@ class _Shelf(QWidget):
             self._placeholder_lbl.deleteLater()
             self._placeholder_lbl = None
 
+    def _show_placeholder(self) -> None:
+        """Put the placeholder in the card row, widening the row to fit it.
+
+        The row is sized from its cards (``_size_card_row``), so with none it is
+        a few pixels wide and clipped the label to nothing: the "Loading…" was
+        never visible, only a blank band (owner report). ``set_cards`` re-sizes it.
+        """
+        self._inner_layout.insertWidget(0, self._placeholder_lbl)
+        m = self._inner_layout.contentsMargins()
+        self._inner_widget.resize(max(self._inner_widget.width(),
+                                      self._placeholder_lbl.sizeHint().width() + m.left() + m.right()),
+                                  self._inner_widget.height())
+
     def set_loading(self) -> None:
         """Show a muted "Loading…" placeholder while a lazy-expand fetch is in flight.
 
@@ -475,7 +488,7 @@ class _Shelf(QWidget):
         self._clear_placeholder()
         self._placeholder_lbl = QLabel(f"{_icon_utils.role_html('loading')}&nbsp;Loading…")
         _theme.style(self._placeholder_lbl, "DISCOVER_SHELF_LOADING")
-        self._inner_layout.insertWidget(0, self._placeholder_lbl)
+        self._show_placeholder()
 
     def show_load_error(self, message: str = "Couldn't load this shelf") -> None:
         """Render a visible, non-selectable error row after a failed lazy-expand fetch.
@@ -486,7 +499,7 @@ class _Shelf(QWidget):
         self._clear_placeholder()
         self._placeholder_lbl = QLabel(f"{_icon_utils.role_html('warning')}&nbsp;{_html.escape(message, quote=False)}")
         _theme.style(self._placeholder_lbl, "DISCOVER_SHELF_ERROR")
-        self._inner_layout.insertWidget(0, self._placeholder_lbl)
+        self._show_placeholder()
 
     def set_cards(self, cards: list, image_cache=None, config=None,
                   replace: bool = False) -> None:
