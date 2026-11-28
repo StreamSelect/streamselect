@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import requests
+from PyQt6 import sip
 from PyQt6.QtGui import QPixmap
 from PyQt6.QtCore import QObject, pyqtSignal
 
@@ -225,7 +226,11 @@ class ImageCache(QObject):
             if ref is None:
                 continue
             callback = ref()          # None once the widget has been destroyed
-            if callback is not None:
+            # A widget whose Qt half was deleted (its shelf rebuilt or reloaded)
+            # can outlive it in Python, so the weak reference still resolves;
+            # calling into it raises, and an exception in a slot aborts the app.
+            owner = getattr(callback, "__self__", None)
+            if callback is not None and not (isinstance(owner, sip.simplewrapper) and sip.isdeleted(owner)):
                 callback(*args)
 
     def _store_resident(self, url: str, pixmap: QPixmap) -> None:

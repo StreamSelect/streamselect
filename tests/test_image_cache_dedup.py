@@ -340,3 +340,34 @@ def test_a_cooldown_only_pass_is_a_debug_line_not_a_warning(cache, monkeypatch) 
     levels = [r["level"].name for r in records if "download" in r["message"].lower() or "cooldown" in r["message"].lower()]
     assert "WARNING" not in levels, levels
     assert any(r["message"].startswith("cooldown: no candidate tried") for r in records)
+
+
+def test_a_poster_for_a_widget_whose_qt_half_is_gone_is_dropped(qapp, tmp_path, owned_widgets):
+    """A shelf rebuilt while its posters download deletes the cards' Qt objects, but a
+    Python reference can keep the wrapper alive, so the weak callback still resolves.
+    Calling it raised "wrapped C/C++ object ... has been deleted" inside a slot, which
+    aborted the app (owner crash, 2026-11-27). A live widget still gets its poster."""
+    from PyQt6 import sip
+    from PyQt6.QtCore import QPropertyAnimation
+    from PyQt6.QtGui import QPixmap
+    from PyQt6.QtWidgets import QWidget
+
+    from streamselect.core.image_cache import ImageCache
+
+    class Card(QWidget):
+        def __init__(self):
+            super().__init__()
+            self.anim = QPropertyAnimation(self)
+            self.got = 0
+
+        def loaded(self, url, pixmap):
+            self.anim.stop()                  # touches a child, as the real card does
+            self.got += 1
+
+    cache = ImageCache(cache_dir=tmp_path)
+    dead, live = Card(), owned_widgets.own(Card())
+    cache.subscribe("u", dead.loaded)
+    cache.subscribe("u", live.loaded)
+    sip.delete(dead)                          # Qt half gone, Python wrapper still referenced
+    cache._dispatch("u", 0, "u", QPixmap())   # must not raise
+    assert live.got == 1
