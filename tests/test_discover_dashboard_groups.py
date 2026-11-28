@@ -208,3 +208,59 @@ def test_a_heading_folds_its_group_states_its_count_and_remembers(page):
     assert _y(page, page._groups[DECADES]) < decades_before, "the page closes up under the heading"
     genres.heading.click()
     assert genres.body.isVisible() and page._config.discover_folded_groups == []
+
+
+def test_every_group_but_pinned_folds_from_its_heading(page):
+    from PyQt6.QtWidgets import QPushButton
+
+    assert not isinstance(page._groups[PINNED].heading, QPushButton), "Pinned never folds"
+    lists = page._groups[LISTS]
+    assert lists.heading.text() == "Your Shelves  (3)"
+    lists.heading.click()
+    QApplication.processEvents()
+    assert not lists.body.isVisible() and page._config.discover_folded_groups == [LISTS]
+    assert page._groups[APP].heading.text().startswith("Discover's Shelves")
+
+
+def test_manage_changes_apply_shelf_by_shelf_without_a_rebuild(page):
+    page._start_expand_fetch = lambda key: None
+    before = dict(page._shelf_widgets)
+    cfg = page._config
+    cfg.discover_expanded_shelves = ["genre:Horror"]            # Manage: Watch Later collapsed, Horror opened
+    cfg.discover_pinned_shelves = ["recently_added", "year:2026"]   # Manage: Up / Down
+    page._apply_zone_config(set(cfg.discover_hidden_shelves))
+    QApplication.processEvents()
+    assert page._shelf_widgets["user_cat:Watch Later"] is before["user_cat:Watch Later"], "not rebuilt"
+    assert page._shelf_widgets["user_cat:Watch Later"]._collapsed
+    assert not page._shelf_widgets["genre:Horror"]._collapsed
+    assert _keys(page, PINNED) == ["recently_added", "year:2026"]
+    assert cfg.discover_expanded_shelves == ["genre:Horror"], "saved from what is on screen"
+
+
+def test_opening_several_shelves_loads_each_in_turn(page):
+    started = []
+    page._inflight_expand = "genre:Comedy"            # one fetch already running
+    real = type(page)._start_expand_fetch
+    page._stop_loader = lambda *a: None
+    for key in ("genre:Drama", "genre:Horror"):
+        real(page, key)
+    assert page._expand_queue == ["genre:Drama", "genre:Horror"], "queued, not cancelled"
+    page._start_expand_fetch = started.append
+    page._on_expand_cards_ready("genre:Comedy", [])
+    QApplication.processEvents()
+    assert started == ["genre:Drama"] and page._expand_queue == ["genre:Horror"]
+
+
+def test_a_refresh_asked_for_during_a_load_runs_after_it(page):
+    class _Running:
+        def isRunning(self):
+            return True
+    page._thread = _Running()
+    page.refresh()
+    assert page._refresh_pending, "remembered, not dropped"
+    page._thread = None
+    calls = []
+    page.refresh = lambda: calls.append(1)
+    page._on_load_finished()
+    QApplication.processEvents()
+    assert calls == [1]

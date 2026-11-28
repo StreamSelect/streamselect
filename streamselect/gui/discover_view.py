@@ -10,7 +10,7 @@ load on-demand through the existing ImageCache.
 Zones and groups
 ----------------
 A shelf's zone (pinned / expanded / collapsed) is its state; its group (Pinned,
-Your lists, Discover's shelves, Genres, Decades, Provider Categories) is its place
+Your Shelves, Discover's Shelves, Genres, Decades, Provider Categories) is its place
 on the page — ``discover_groups``.
 
 Hidden shelves are not added to the layout at all; only restorable via
@@ -89,6 +89,8 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         self._expand_thread: QThread | None = None
         self._expand_worker: "_ShelfCardsWorker | None" = None
         self._inflight_expand: str | None = None  # shelf_key being fetched right now
+        self._expand_queue: list[str] = []         # keys waiting their turn (Manage opens several)
+        self._refresh_pending = False              # a refresh asked for while a load ran
         self._loaded = False
         self._active = False  # True between on_activate() and on_deactivate()
         self._shelf_data_cache: dict[str, list[ContentCard]] = {}
@@ -431,8 +433,15 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         (user-reported perf bug — worse before #genre-perf's genre-shelf fix,
         but any shelf fetch deserves visible feedback).
         """
-        # Cancel any previous expand fetch (user expanded a second shelf before
-        # the first one finished — keep the most recent request).
+        shelf = self._shelf_widgets.get(shelf_key)
+        if self._inflight_expand not in (None, shelf_key):
+            # One fetch at a time; the rest wait their turn (opening several from
+            # Manage used to cancel all but the last, leaving the others empty).
+            if shelf_key not in self._expand_queue:
+                self._expand_queue.append(shelf_key)
+            if shelf is not None:
+                shelf.set_loading()
+            return
         self._stop_loader(
             getattr(self, "_expand_worker", None), self._expand_thread
         )
@@ -440,7 +449,6 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         self._expand_worker = None
 
         self._inflight_expand = shelf_key
-        shelf = self._shelf_widgets.get(shelf_key)
         if shelf is not None:
             shelf.set_loading()
 
@@ -454,9 +462,18 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         self._expand_worker.error.connect(lambda *_: self._expand_thread.quit())
         self._expand_thread.start()
 
+    def _next_expand(self) -> None:
+        """Start the next waiting shelf fetch, skipping any hidden or loaded since."""
+        while self._expand_queue:
+            key = self._expand_queue.pop(0)
+            if key in self._shelf_widgets and key not in self._loaded_shelf_keys:
+                QTimer.singleShot(0, lambda k=key: self._start_expand_fetch(k))
+                return
+
     def _on_expand_cards_ready(self, shelf_key: str, cards: list) -> None:
         """Called on the main thread when the lazy-expand fetch finishes."""
         self._inflight_expand = None
+        self._next_expand()
 
         shelf = self._shelf_widgets.get(shelf_key)
         if shelf is None:
@@ -482,6 +499,7 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         out of ``_loaded_shelf_keys`` so the next expand/pin retries the fetch.
         """
         self._inflight_expand = None
+        self._next_expand()
         logger.warning(f"DiscoverView: shelf '{shelf_key}' failed to load: {message}")
 
         shelf = self._shelf_widgets.get(shelf_key)
@@ -569,6 +587,7 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         # Clear inflight marker so a re-expand of the same key isn't blocked.
         if hasattr(self, "_inflight_expand"):
             self._inflight_expand = None
+        self.__dict__.get("_expand_queue", []).clear()   # same before-init safety as above
         for shelf in self.__dict__.get("_shelf_widgets", {}).values():
             shelf.cancel_pending_build()
 
@@ -604,7 +623,10 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
 
     def refresh(self) -> None:
         if self._thread and self._thread.isRunning():
+            self._refresh_pending = True       # run once this load ends, never dropped
             return
+        self._refresh_pending = False
+        self._expand_queue.clear()
         self._loaded = False
         self._shelf_data_cache.clear()
         self._loaded_shelf_keys.clear()
@@ -741,6 +763,9 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
                 self._batch_timer.stop()
             self._flush_pending_collapsed()
         self._update_group_heads()
+        if self._refresh_pending:
+            QTimer.singleShot(0, self.refresh)
+            return
         QTimer.singleShot(300, self._trigger_image_load_all)
 
     def _trigger_image_load_all(self) -> None:
@@ -871,6 +896,9 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
 
     def _open_manage_dialog(self) -> None:
         from streamselect.gui.discover_filter_dialog import DiscoverManageDialog
+        if self._pending_collapsed:
+            self._flush_pending_collapsed()      # every shelf has its widget first
+        hidden_before = set(self._config.discover_hidden_shelves)
         dlg = DiscoverManageDialog(
             self._db, self._config,
             self._shelf_widgets, self._shelf_zones,
@@ -878,4 +906,4 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         )
         dlg.exec()
         if dlg._changed:
-            self.refresh()
+            self._apply_zone_config(hidden_before)

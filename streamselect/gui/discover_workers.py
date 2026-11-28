@@ -170,7 +170,7 @@ _GENRE_PREFIX = "genre:"
 _DECADE_PREFIX = "decade:"
 _YEAR_PREFIX = "year:"           # one year of the current decade (``time_shelf_keys``)
 
-#: The list "Your lists" leads with (the category picker's preset of that name).
+#: The shelf "Your Shelves" leads with (the category picker's preset of that name).
 WATCH_LATER = "Watch Later"
 _ACTOR_PREFIX = "actor:"
 _USER_CAT_PREFIX = "user_cat:"

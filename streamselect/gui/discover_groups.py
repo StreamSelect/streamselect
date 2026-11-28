@@ -1,6 +1,6 @@
 """Discover's groups (design "Discover as Your Dashboard", rev 2).
 
-The page reads top to bottom as six groups: what you pinned, your lists, Discover's
+The page reads top to bottom as six groups: what you pinned, your shelves, Discover's
 own shelves, every genre, the years and decades, the provider's categories. A
 shelf's zone (pinned / expanded / collapsed, ``discover_workers.determine_zone``)
 is its STATE; the group is its PLACE. Opening or collapsing a shelf leaves it where
@@ -8,8 +8,8 @@ it is; pinning lifts it into Pinned, unpinning puts it back in its group.
 
 Inside a group the shelves keep the order the loader sent them in; Pinned follows
 the order of ``discover_pinned_shelves``, so the Manage dialog's Up / Down orders it.
-Genres, Decades and the provider categories collapse as a whole from their heading,
-which states the count; the choice is remembered.
+Every group but Pinned collapses as a whole from its heading, which states the
+count; the choice is remembered. Shelves behave the same in every group.
 """
 
 from __future__ import annotations
@@ -31,14 +31,14 @@ from streamselect.gui.discover_workers import (
 PINNED, LISTS, APP, GENRES, DECADES, CATEGORIES = (
     "pinned", "lists", "app", "genres", "decades", "categories")
 
-#: (group, heading), top to bottom. The last three fold from a button heading.
+#: (group, heading), top to bottom. All but Pinned fold from a button heading.
 GROUPS: tuple[tuple[str, str], ...] = (
-    (PINNED, "Pinned"), (LISTS, "Your lists"), (APP, "Discover's shelves"),
+    (PINNED, "Pinned"), (LISTS, "Your Shelves"), (APP, "Discover's Shelves"),
     (GENRES, "Genres"), (DECADES, "Decades"), (CATEGORIES, "Provider Categories"),
 )
-FOLDABLE = (GENRES, DECADES, CATEGORIES)
+FOLDABLE = (LISTS, APP, GENRES, DECADES, CATEGORIES)
 
-#: Open on a profile's first visit (the loader's first-launch defaults): your lists
+#: Open on a profile's first visit (the loader's first-launch defaults): your shelves
 #: and Recently Added, the one shelf of Discover's own that changes daily.
 DEFAULT_EXPANDED = frozenset({f"{_USER_CAT_PREFIX}{WATCH_LATER}", "recommended", "queue", "recently_added"})
 
@@ -57,7 +57,7 @@ def group_of(shelf_key: str) -> str:
 
 
 def seed_dashboard_defaults(config) -> None:
-    """Open your lists once on a profile that already had a Discover layout.
+    """Open your shelves once on a profile that already had a Discover layout.
 
     A new profile gets :data:`DEFAULT_EXPANDED` from the first-launch rule; a
     returning one has its zones recorded, and an unrecorded key reads as collapsed,
@@ -218,6 +218,34 @@ class DiscoverGroupsMixin:
             _icon_utils.set_button_icon(btn, "collapse" if is_open else "expand")
             btn.setToolTip(f"{'Collapse' if is_open else 'Expand'} {group.label} ({n} shelves)")
             group.body.setVisible(is_open)
+
+    def _apply_zone_config(self, hidden_before: set[str]) -> None:
+        """Bring the page in line with the zone lists, shelf by shelf (after Manage).
+
+        Each shelf moves, opens, collapses or goes, in place; nothing is rebuilt.
+        Only a shelf restored from hidden has no widget to move, so that one case
+        reloads. Ends by saving the lists from what is on screen.
+        """
+        cfg = self._config
+        if set(hidden_before) - set(cfg.discover_hidden_shelves):
+            self.refresh()
+            return
+        pinned, expanded = list(cfg.discover_pinned_shelves), set(cfg.discover_expanded_shelves)
+        hidden = set(cfg.discover_hidden_shelves)
+        for key in list(self._shelf_widgets):
+            if key in hidden:
+                self._on_hide_requested(key)
+                continue
+            zone = "pinned" if key in pinned else "expanded" if key in expanded else "collapsed"
+            shelf = self._shelf_widgets[key]
+            if zone == self._shelf_zones.get(key) == "pinned":       # re-rank: Up / Down
+                self._remove_from_zone(shelf, zone)
+                self._add_to_zone(shelf, zone)
+            else:
+                self._move_shelf(key, zone)
+            if zone != "collapsed" and key not in self._loaded_shelf_keys:
+                self._start_expand_fetch(key)
+        self._save_zone_config()
 
     def _show_filter_matches(self, wanted: dict) -> None:
         """While the shelf filter has text: only groups with a match show, opened."""
