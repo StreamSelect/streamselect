@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import NamedTuple, Optional
 
 from streamselect.core.quality_vocab import _Attributes, _AUDIO_NORM, _BRACKET_LANG_NORM, _BRACKET_QUALITY_ALIASES, _collapse_same_rank, _FPS_RE, _SOURCE_QUALITY_NORM, _SUB_DUB_TOKENS, _UNAMBIGUOUS_SUBDUB_MARKERS, AUDIO_CODEC_NORM, ENCODING_NORM, MEDIA_TYPE_TOKENS, QUALITY_TIER_RANK, QUALITY_TOKENS, RESOLUTION_TO_QUALITY, TIER_TOKENS
+from streamselect.core.name_title_words import is_dash_title_word, strip_provider_tags
 from streamselect.core.region_codes import _ALIAS_MAP, _FULL_NAME_TO_CODE, AUDIO_LANG_WORD_MAP, normalize_region_code, PLATFORM_CODES, platform_display, REGION_FULL_NAMES
 from streamselect.core.content_labels import AGE_RATING_PREFIXES
 from streamselect.core.collection_quality import peel_trailing_noise, quality_words
@@ -1401,16 +1402,15 @@ def parse_channel_name(name: str) -> ParsedChannel:
     if not name:
         return ParsedChannel("", "", [], "", "", "")
 
-    # Strip control-character mojibake (stray C1 bytes like U+0081) and NFC-compose
-    # (an "ö" sent as "o" + combining mark missed the Bölüm marker, 181 rows) at the
-    # one name-parsing chokepoint, so every detected_* field is computed from clean text.
+    # Strip control-char mojibake (stray C1 bytes) and NFC-compose ("o"+combining mark missed
+    # the Bölüm marker, 181 rows) here, so every detected_* field is computed from clean text.
     bare = unicodedata.normalize("NFC", clean_control_chars(name))
+    bare = strip_provider_tags(bare)          # "[ID37849]", "[m2160p]" (name_title_words)
     # Decoration first, as its OWN class: folded to 'RAW' it is indistinguishable
     # from the title word in 'EN - WWE Raw (2023)' (test_raw_live_cam_fix.py, B0).
     # A SUPERSCRIPT token cannot be part of a title, so it is safe to read here.
     bare, _sup_attrs = _extract_superscript_attributes(bare)
-    # Same argument for a slash-joined pair: "HD/RAW" is unambiguously two
-    # attributes, so RAW is readable there even though a bare trailing RAW is not.
+    # Same for a slash-joined pair: "HD/RAW" is two attributes, so RAW is readable there.
     bare, _slash_attrs = _extract_slash_pair_attributes(bare)
     if not bare:
         return ParsedChannel("", "", [], "", "", "")
@@ -1470,7 +1470,7 @@ def parse_channel_name(name: str) -> ParsedChannel:
             bare = cm.group("title").strip()
     else:
         m = _SEPARATOR_RE.match(bare)
-        if m:
+        if m and not is_dash_title_word(m, bare):
             region = normalize_region_code(m.group(1))
             bare = m.group(2).strip()
         else:

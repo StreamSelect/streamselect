@@ -187,7 +187,11 @@ from streamselect.core.migrations.detected_fields_reparse import DetectedFieldsR
 #       1,034 of 1,868 labels carried one; detected_collection_group (new column) is
 #       the Discover shelf key near-identical spellings share (design "Tidying
 #       Discover's Categories", Plans 1-2).
-CURRENT_VERSION: int = 26
+#   27  A word before " - " that is no known code and is in lower case, or is followed
+#       only by a year, is the title ("Avatar - Fuoco e cenere", "KAPI - 2019"; 56
+#       films had lost it as a fake language), and a trailing "[ID37849]" is cut and
+#       "[m2160p]" read as quality (name_title_words).
+CURRENT_VERSION: int = 27
 
 
 class DetectedTitleReparseTask(DetectedFieldsReparseBase):
