@@ -59,6 +59,7 @@ class _Shelf(QWidget):
     expandRequested   = pyqtSignal(str)
     hideRequested     = pyqtSignal(str)
     editRequested     = pyqtSignal(str)  # shelf_key — ✎ click on a recipe shelf
+    collapsedChanged  = pyqtSignal()     # open <-> collapsed: its group lays it out again (row or tile)
 
     def __init__(self, title: str, shelf_key: str,
                  cards: list[ContentCard], image_cache: "ImageCache",
@@ -71,6 +72,8 @@ class _Shelf(QWidget):
         # Kept so DiscoverView's shelf filter can match on what the user SEES,
         # not on the internal key ("collection:Apple+ Kids" vs "Apple+ Kids").
         self._title = title
+        #: False while Discover's shelf filter hides it (its row or its tile).
+        self.matches_filter = True
         self._config = config
         self._image_cache = image_cache
         # Derived from the key's namespace (never a separate flag threaded
@@ -426,8 +429,11 @@ class _Shelf(QWidget):
             self._pin_btn.setToolTip("Pin to top")
 
     def set_collapsed(self, collapsed: bool) -> None:
+        changed = collapsed != self._collapsed
         self._collapsed = collapsed
         self._apply_state()
+        if changed:
+            self.collapsedChanged.emit()
         if not collapsed:
             QTimer.singleShot(120, self._load_visible)
 

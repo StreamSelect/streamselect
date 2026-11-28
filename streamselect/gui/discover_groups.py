@@ -17,12 +17,14 @@ from __future__ import annotations
 import weakref
 from bisect import bisect_right
 
-from PyQt6.QtWidgets import QLabel, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtCore import QTimer, pyqtSignal
+from PyQt6.QtWidgets import QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui import icon_utils as _icon_utils
 from streamselect.gui import theme as _theme
 from streamselect.gui.discover_shelf import more_categories_row
+from streamselect.gui.discover_tiles import TileGrid
 from streamselect.gui.discover_workers import (
     _COLLECTION_PREFIX, _DECADE_PREFIX, _GENRE_PREFIX, _RECIPE_PREFIX, _USER_CAT_PREFIX, _YEAR_PREFIX,
     WATCH_LATER,
@@ -86,12 +88,19 @@ def style_group_button(btn: QPushButton) -> None:
 
 
 class ShelfGroup(QWidget):
-    """One group: a heading over its shelves, kept in rank order."""
+    """One group: a heading over its shelves, kept in rank order.
 
-    def __init__(self, key: str, heading: QWidget) -> None:
+    An open shelf is a row; each run of collapsed shelves is one grid of tiles
+    (``discover_tiles``), so a tile opened in place splits its grid around the row.
+    """
+
+    relaid = pyqtSignal()           # after a layout pass: new tiles may be on screen
+
+    def __init__(self, key: str, heading: QWidget, zoom: float = 1.0) -> None:
         super().__init__()
         self.key = key
         self.heading = heading
+        self._zoom = zoom
         v = QVBoxLayout(self)
         v.setContentsMargins(0, 6, 0, 0)
         v.setSpacing(4)
@@ -101,32 +110,84 @@ class ShelfGroup(QWidget):
         self.shelves.setContentsMargins(0, 0, 0, 0)
         self.shelves.setSpacing(6)
         v.addWidget(self.body)
-        self._ranks: list[float] = []
+        self._entries: list[tuple[float, QWidget]] = []
+        self._grids: list[TileGrid] = []
+        self._soon = QTimer(self)
+        self._soon.setSingleShot(True)
+        self._soon.timeout.connect(self.relayout)
+        # Never taller than its content: a window taller than the page leaves the
+        # spare height below the last section, not spread between its rows.
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
         self.setVisible(False)
 
     def count(self) -> int:
-        return len(self._ranks)
+        return len(self._entries)
 
     def insert(self, shelf: QWidget, rank: float) -> None:
-        i = bisect_right(self._ranks, rank)
-        self._ranks.insert(i, rank)
-        self.shelves.insertWidget(i, shelf)
+        i = bisect_right([r for r, _ in self._entries], rank)
+        self._entries.insert(i, (rank, shelf))
+        shelf.setParent(self.body)
+        shelf.collapsedChanged.connect(self.relayout_soon)
+        self.relayout_soon()
 
     def remove(self, shelf: QWidget) -> None:
-        i = self.shelves.indexOf(shelf)
-        if i >= 0:
-            self.shelves.removeWidget(shelf)
-            del self._ranks[i]
+        for i, (_, s) in enumerate(self._entries):
+            if s is shelf:
+                del self._entries[i]
+                shelf.collapsedChanged.disconnect(self.relayout_soon)
+                self.shelves.removeWidget(shelf)
+                tile = getattr(shelf, "tile", None)
+                if tile is not None and tile.parent() in self._grids:
+                    self._park(tile)                # before its grid goes; the next group adopts it
+                self.relayout_soon()
+                return
 
     def members(self) -> list[QWidget]:
-        return [self.shelves.itemAt(i).widget() for i in range(self.shelves.count())]
+        return [s for _, s in self._entries]
 
     def clear(self) -> None:
-        for w in self.members():
-            self.shelves.removeWidget(w)
+        for _, w in self._entries:
             w.cancel_pending_build()      # PERF-17: stop any in-flight chunked card build
             w.deleteLater()
-        self._ranks.clear()
+        self._entries.clear()
+        self.relayout()
+
+    def _park(self, tile: QWidget) -> None:
+        """Keep a tile that is not in a grid (its shelf is open, or moving) alive and hidden."""
+        tile.hide()
+        tile.setParent(self.body)
+
+    def relayout_soon(self) -> None:
+        self._soon.start(0)
+
+    def relayout(self) -> None:
+        """Rows for open shelves, a tile grid for each run of collapsed ones."""
+        while self.shelves.count():
+            self.shelves.takeAt(0)
+        old, self._grids, grid = self._grids, [], None
+        for _, shelf in self._entries:
+            tile = getattr(shelf, "tile", None)
+            shown = getattr(shelf, "matches_filter", True)
+            if shelf._collapsed and tile is not None:
+                if grid is None:
+                    grid = TileGrid(self._zoom)
+                    self.shelves.addWidget(grid)
+                    self._grids.append(grid)
+                grid.add(tile)
+                tile.setVisible(shown)
+                shelf.hide()
+            else:
+                grid = None
+                self.shelves.addWidget(shelf)
+                shelf.setVisible(shown)
+        for g in old:
+            for t in g.tiles():
+                if t.parent() is g:       # an opened shelf's tile: kept, out of sight
+                    self._park(t)
+            g.deleteLater()
+        for g in self._grids:
+            g.arrange()
+        self.relaid.emit()
 
 
 def _toggler(view, key: str):
@@ -159,7 +220,8 @@ class DiscoverGroupsMixin:
             if key in FOLDABLE:
                 style_group_button(btn)
                 btn.clicked.connect(_toggler(self, key))
-            self._groups[key] = ShelfGroup(key, head)
+            self._groups[key] = ShelfGroup(key, head, self._config.discover_zoom)
+            self._groups[key].relaid.connect(self._previews_soon)
             self._groups[key].label = text
             into.addWidget(self._groups[key])
 
@@ -178,6 +240,7 @@ class DiscoverGroupsMixin:
             cfg.discover_folded_groups = [*cfg.discover_folded_groups, key]
         _cfgsave.save_soon(self)
         self._update_group_heads()
+        self._previews_soon()                    # an opened group's tiles may now be on screen
 
     def _place_of(self, shelf_key: str, zone: str) -> tuple[ShelfGroup, float]:
         """The group *shelf_key* goes in for *zone*, and its rank there."""
@@ -185,7 +248,9 @@ class DiscoverGroupsMixin:
         if zone == "pinned":
             pins = self._config.discover_pinned_shelves
             return self._groups[PINNED], (pins.index(shelf_key) if shelf_key in pins else 10_000 + arrival)
-        return self._groups[group_of(shelf_key)], arrival
+        # Open shelves lead their group when it is laid out (a load, or a move into
+        # it); one opened from its tile stays in place until then (_move_shelf).
+        return self._groups[group_of(shelf_key)], arrival + (1_000_000 if zone == "collapsed" else 0)
 
     def _add_to_zone(self, shelf, zone: str) -> None:
         group, rank = self._place_of(shelf._shelf_key, zone)

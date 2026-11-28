@@ -60,8 +60,11 @@ def view(qapp, owned_widgets, tmp_path):
 
 
 def _visible(view) -> set[str]:
+    """Titles on screen: an open shelf's row, or a collapsed shelf's tile."""
+    QApplication.processEvents()
     return {
-        s._title for s in view._shelf_widgets.values() if s.isVisible()
+        s._title for s in view._shelf_widgets.values()
+        if s.isVisible() or (s._collapsed and s.tile.isVisible())
     }
 
 

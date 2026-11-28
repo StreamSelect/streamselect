@@ -196,7 +196,8 @@ def test_pinning_lifts_a_shelf_and_unpinning_puts_it_back(page):
     assert _keys(page, PINNED)[-1] == "genre:Drama" and "genre:Drama" not in _keys(page, GENRES)
     assert _y(page, page._shelf_widgets["genre:Drama"]) < _y(page, page._groups[LISTS]), "pinned is on top"
     page._on_unpin_requested("genre:Drama")
-    assert _keys(page, GENRES) == ["genre:Comedy", "genre:Drama", "genre:Horror"], "back at its place"
+    assert _keys(page, GENRES) == ["genre:Drama", "genre:Comedy", "genre:Horror"], (
+        "back in Genres as an open row, which leads the section as after a reload")
 
 
 def test_a_heading_folds_its_group_states_its_count_and_remembers(page):
@@ -303,14 +304,15 @@ def test_a_loading_shelf_fills_and_an_empty_one_goes(page):
     page._config.discover_expanded_shelves = ["top_series", "platform:Netflix"]
     page._on_shelf_ready(_ShelfData("Top Rated Series", "top_series", [], loading=True, rank=4))
     page._on_shelf_ready(_ShelfData("Netflix", "platform:Netflix", [], loading=True, rank=5))
-    assert _keys(page, APP) == ["top_movies", "top_series", "platform:Netflix"], "placed by rank"
+    assert _keys(page, APP) == ["top_series", "platform:Netflix", "top_movies"], (
+        "placed by rank, open rows ahead of the collapsed tiles")
     card = ContentCard(channel_id="c1", title="T", media_type="movie", thumbnail_url=None,
                        rating=7.0, year=2000, genre="x")
     page._on_loader_cards("top_series", [card])
     page._on_loader_cards("platform:Netflix", [])
     QApplication.processEvents()
     assert "top_series" in page._loaded_shelf_keys
-    assert _keys(page, APP) == ["top_movies", "top_series"], "an open shelf with nothing in it isn't shown"
+    assert _keys(page, APP) == ["top_series", "top_movies"], "an open shelf with nothing in it isn't shown"
     assert page._shelf_zones["platform:Netflix"] == "expanded", "its open state is kept"
 
 
@@ -354,7 +356,7 @@ def test_a_pinned_shelf_collapses_in_place_and_stays_pinned(page):
     assert shelf._collapsed and _keys(page, PINNED) == ["year:2026", "recently_added"], "still pinned, same place"
     assert page._shelf_zones["recently_added"] == "pinned"
     assert page._config.discover_collapsed_pins == ["recently_added"]
-    assert _y(page, shelf) < _y(page, page._groups[LISTS])
+    assert _y(page, shelf.tile) < _y(page, page._groups[LISTS]), "its tile is on top, in Pinned"
     snap = page._build_zone_snapshot()
     assert "recently_added" in snap.collapsed_pins, "the next load sends it collapsed"
     shelf._collapse_btn.click()

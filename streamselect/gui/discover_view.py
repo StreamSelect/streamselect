@@ -45,6 +45,7 @@ from streamselect.gui.discover_browse import _BrowseView
 from streamselect.gui.discover_card import card_zoom_slider
 from streamselect.gui.discover_groups import DEFAULT_EXPANDED, DiscoverGroupsMixin, seed_dashboard_defaults
 from streamselect.gui.discover_shelf import _Shelf
+from streamselect.gui.discover_tiles import DiscoverTilesMixin, ShelfTile
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui.discover_workers import (
     _LoaderWorker, _RECIPE_PREFIX, _SeeAllWorker, _ShelfCardsWorker,
@@ -65,7 +66,7 @@ _ZONE_PINNED    = "pinned"
 _ZONE_EXPANDED  = "expanded"
 _ZONE_COLLAPSED = "collapsed"
 
-class DiscoverView(DiscoverGroupsMixin, QWidget):
+class DiscoverView(DiscoverGroupsMixin, DiscoverTilesMixin, QWidget):
     """🧭 Discover — horizontal shelf browse view with two-zone layout."""
 
     playRequested               = pyqtSignal(str)
@@ -182,6 +183,7 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         self._shelves_layout.addStretch()
 
         shelves_outer.setWidget(self._shelves_inner)
+        self._init_tiles(shelves_outer)
         self._stack.addWidget(shelves_outer)
 
         # --- Browse page ---
@@ -303,13 +305,14 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
             for shelf in self._shelf_widgets.values()
         }
 
+        for shelf, visible in wanted.items():
+            shelf.matches_filter = visible          # its row or its tile (ShelfGroup.relayout)
+        for group in self._groups.values():
+            group.relayout()
         if needle:
             self._show_filter_matches(wanted)
         else:
             self._update_group_heads()
-
-        for shelf, visible in wanted.items():
-            shelf.setVisible(visible)
 
         if needle and not any(wanted.values()):
             logger.debug("Discover shelf filter {!r} matched nothing", text)
@@ -327,7 +330,11 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         old_zone = self._shelf_zones.get(shelf_key)
         if old_zone == new_zone:
             return
-        if old_zone:
+        # Opening or collapsing within a group keeps the shelf where it is (a tile
+        # opens as a row in its place); a move to another group re-places it.
+        same = bool(old_zone) and (self._place_of(shelf_key, old_zone)[0]
+                                   is self._place_of(shelf_key, new_zone)[0])
+        if old_zone and not same:
             self._remove_from_zone(shelf, old_zone)
         self._shelf_zones[shelf_key] = new_zone
         if shelf_key in self._config.discover_collapsed_pins:     # pinning / unpinning opens it
@@ -339,7 +346,8 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
             # Unconditionally un-collapse — a pinned shelf is always expanded.
             shelf.set_collapsed(False)
         shelf.set_pinned(is_pinned)
-        self._add_to_zone(shelf, new_zone)
+        if not same:
+            self._add_to_zone(shelf, new_zone)
 
     def _save_zone_config(self) -> None:
         """Persist the current widget zone map to config.
@@ -619,6 +627,7 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         self._stop_loader(getattr(self, "_worker", None), getattr(self, "_thread", None))
         self._stop_loader(getattr(self, "_see_all_worker", None), getattr(self, "_see_all_thread", None))
         self._stop_loader(getattr(self, "_expand_worker", None), getattr(self, "_expand_thread", None))
+        self._stop_previews()
         # Clear inflight marker so a re-expand of the same key isn't blocked.
         if hasattr(self, "_inflight_expand"):
             self._inflight_expand = None
@@ -730,6 +739,8 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         shelf.editRequested.connect(self._on_shelf_edit_requested)
         shelf.wire(self.channelSelected, self.playRequested,
                    self.channelContextMenuRequested, self.channelMiddleClicked)
+        shelf.tile = ShelfTile(shelf, self._image_cache)          # how it shows while collapsed
+        shelf.destroyed.connect(shelf.tile.deleteLater)
         if data.loading:
             shelf.set_loading()             # its cards follow on the loader's cardsReady
 
@@ -802,6 +813,7 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
                 self._batch_timer.stop()
             self._flush_pending_collapsed()
         self._update_group_heads()
+        self._previews_soon()
         if self._refresh_pending:
             QTimer.singleShot(0, self.refresh)
             return

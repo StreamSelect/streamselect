@@ -2,7 +2,7 @@ from streamselect.whats_new import WhatsNewEntry
 
 ENTRY = WhatsNewEntry(
     id=136,
-    version="1.4.1",
+    version="1.5.0",
     date="2026-11-28",
     title="Scrolling Discover no longer gets caught on a row",
     items=(

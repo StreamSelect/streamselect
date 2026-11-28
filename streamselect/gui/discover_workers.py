@@ -516,6 +516,35 @@ class _ZoneSnapshot:
     first_launch: bool = False
 
 
+def scope_kwargs(session, config) -> tuple[dict, dict, dict]:
+    """The scoping kwargs every Discover shelf query takes: ``(fk, af, ek)``.
+
+    fk: prefix / user-category / content-type / keyword exclusions (paused-aware);
+    af: the adult filter; ek: hidden (inactive + expired) sources and the
+    dead-signal floor. The one builder for the loader, See-all, lazy-expand and
+    the tile previews (it was three hand-copied blocks).
+    """
+    from streamselect.core.discovery_engine import build_adult_filter
+    from streamselect.core.filter_utils import (
+        get_active_category_filter, get_excluded_prefixes, keyword_exclusion_list, global_exclusion_sets,
+    )
+    from streamselect.core.repositories import RepositoryFactory
+    from streamselect.core.tag_exclusions import excluded_tag_content_types
+    cat_excluded, include_uncategorized = get_active_category_filter(config)
+    all_excl = list(set(cat_excluded or []) | get_excluded_prefixes(config))
+    _, excluded_user_categories, _, _ = global_exclusion_sets(config)
+    fk = {"excluded_prefixes": all_excl or None,
+          "excluded_categories": excluded_user_categories or None,
+          "include_uncategorized": include_uncategorized,
+          "excluded_content_types": excluded_tag_content_types(config) or None,
+          "excluded_keywords": keyword_exclusion_list(config) or None}
+    adult_mode, force_adult_ids = build_adult_filter(session, config)
+    af = {"adult_mode": adult_mode, "force_adult_provider_ids": force_adult_ids or None}
+    ek = {"excluded_provider_ids": RepositoryFactory(session).providers.get_hidden_provider_ids() or None,
+          "dead_signal_streak_floor": _dead_signal_streak_floor(config)}
+    return fk, af, ek
+
+
 # ---------------------------------------------------------------------------
 # Workers
 # ---------------------------------------------------------------------------
@@ -537,38 +566,14 @@ class _SeeAllWorker(QObject):
         self._cancelled = True
 
     def run(self) -> None:
-        from streamselect.core.discovery_engine import build_status_sets, build_adult_filter
-        from streamselect.core.filter_utils import (
-            get_active_category_filter, get_excluded_prefixes, keyword_exclusion_list,
-            global_exclusion_sets,
-        )
-        from streamselect.core.tag_exclusions import excluded_tag_content_types
-        from streamselect.core.repositories import RepositoryFactory
+        from streamselect.core.discovery_engine import build_status_sets
         session = self._db.get_session()
         try:
             ss = build_status_sets(session)
-            cat_excluded, include_uncategorized = get_active_category_filter(self._config)
-            per_prefix = get_excluded_prefixes(self._config)
-            all_excl = list(set(cat_excluded or []) | per_prefix)
-            # excluded_categories: the user_category axis (distinct from the
-            # detected_prefix axis all_excl carries above) — its own field on
-            # global_exclusion_sets, paused-aware like the other three.
-            _, excluded_user_categories, _, _ = global_exclusion_sets(self._config)
-            fk = {"excluded_prefixes": all_excl or None,
-                      "excluded_categories": excluded_user_categories or None,
-                      "include_uncategorized": include_uncategorized,
-                      # Content-provenance layer (paused-aware): hide AI content everywhere.
-                      "excluded_content_types": excluded_tag_content_types(self._config) or None,
-                      "excluded_keywords": keyword_exclusion_list(self._config) or None}
             sk = {"fav_ids": ss.fav_ids, "queue_ids": ss.queue_ids,
-                      "watched_ids": ss.watched_ids, "liked_ids": ss.liked_ids,
-                      "progress_map": ss.progress_map}
-            adult_mode, force_adult_ids = build_adult_filter(session, self._config)
-            af = {"adult_mode": adult_mode, "force_adult_provider_ids": force_adult_ids or None}
-            # Canonical provider scoping: hide inactive + expired sources.
-            _excl_ids = RepositoryFactory(session).providers.get_hidden_provider_ids()
-            ek = {"excluded_provider_ids": _excl_ids or None,
-                  "dead_signal_streak_floor": _dead_signal_streak_floor(self._config)}
+                  "watched_ids": ss.watched_ids, "liked_ids": ss.liked_ids,
+                  "progress_map": ss.progress_map}
+            fk, af, ek = scope_kwargs(session, self._config)
 
             cards = fetch_cards_for_key(
                 session, self._config, self._shelf_key, _SEE_ALL_LIMIT,
@@ -610,39 +615,16 @@ class _ShelfCardsWorker(QObject):
         self._cancelled = True
 
     def run(self) -> None:
-        from streamselect.core.discovery_engine import build_status_sets, build_adult_filter
-        from streamselect.core.filter_utils import (
-            get_active_category_filter, get_excluded_prefixes, keyword_exclusion_list,
-            global_exclusion_sets,
-        )
-        from streamselect.core.tag_exclusions import excluded_tag_content_types
-        from streamselect.core.repositories import RepositoryFactory
+        from streamselect.core.discovery_engine import build_status_sets
         session = self._db.get_session()
         cards: list | None = None
         error_message: str | None = None
         try:
             ss = build_status_sets(session)
-            cat_excluded, include_uncategorized = get_active_category_filter(self._config)
-            per_prefix = get_excluded_prefixes(self._config)
-            all_excl = list(set(cat_excluded or []) | per_prefix)
-            # excluded_categories: the user_category axis (distinct from the
-            # detected_prefix axis all_excl carries above) — its own field on
-            # global_exclusion_sets, paused-aware like the other three.
-            _, excluded_user_categories, _, _ = global_exclusion_sets(self._config)
-            fk = {"excluded_prefixes": all_excl or None,
-                      "excluded_categories": excluded_user_categories or None,
-                      "include_uncategorized": include_uncategorized,
-                      # Content-provenance layer (paused-aware): hide AI content everywhere.
-                      "excluded_content_types": excluded_tag_content_types(self._config) or None,
-                      "excluded_keywords": keyword_exclusion_list(self._config) or None}
             sk = {"fav_ids": ss.fav_ids, "queue_ids": ss.queue_ids,
-                      "watched_ids": ss.watched_ids, "liked_ids": ss.liked_ids,
-                      "progress_map": ss.progress_map}
-            adult_mode, force_adult_ids = build_adult_filter(session, self._config)
-            af = {"adult_mode": adult_mode, "force_adult_provider_ids": force_adult_ids or None}
-            _excl_ids = RepositoryFactory(session).providers.get_hidden_provider_ids()
-            ek = {"excluded_provider_ids": _excl_ids or None,
-                  "dead_signal_streak_floor": _dead_signal_streak_floor(self._config)}
+                  "watched_ids": ss.watched_ids, "liked_ids": ss.liked_ids,
+                  "progress_map": ss.progress_map}
+            fk, af, ek = scope_kwargs(session, self._config)
 
             cards = fetch_cards_for_key(
                 session, self._config, self._shelf_key, self._limit,
@@ -689,16 +671,10 @@ class _LoaderWorker(QObject):
             get_featured_actor, get_all_genres, get_year_counts, time_shelf_keys,
             get_all_user_categories, get_all_collections,
             MIN_COLLECTION_SHELF_MEMBERS,
-            _rank_genres_by_preference, build_status_sets, build_adult_filter,
+            _rank_genres_by_preference, build_status_sets,
         )
         from streamselect.core.content_labels import PLATFORM_SHELF_EXCLUDED_VALUES
-        from streamselect.core.filter_utils import (
-            get_active_category_filter, get_excluded_prefixes, keyword_exclusion_list,
-            global_exclusion_sets,
-        )
-        from streamselect.core.tag_exclusions import excluded_tag_content_types
         from streamselect.core.platform_shelves import platform_shelf_values
-        from streamselect.core.repositories import RepositoryFactory
         from streamselect.core.visibility_resolver import resolve_scope as _resolve_scope
         session = self._db.get_session()
         try:
@@ -707,26 +683,8 @@ class _LoaderWorker(QObject):
                       "watched_ids": ss.watched_ids, "liked_ids": ss.liked_ids,
                       "progress_map": ss.progress_map}
 
-            cat_excluded, include_uncategorized = get_active_category_filter(self._config)
-            per_prefix = get_excluded_prefixes(self._config)
-            all_excl = list(set(cat_excluded or []) | per_prefix)
-            # excluded_categories: the user_category axis (distinct from the
-            # detected_prefix axis all_excl carries above) — its own field on
-            # global_exclusion_sets, paused-aware like the other three.
-            _, excluded_user_categories, _, _ = global_exclusion_sets(self._config)
-            fk = {"excluded_prefixes": all_excl or None,
-                      "excluded_categories": excluded_user_categories or None,
-                      "include_uncategorized": include_uncategorized,
-                      # Content-provenance layer (paused-aware): hide AI content everywhere.
-                      "excluded_content_types": excluded_tag_content_types(self._config) or None,
-                      "excluded_keywords": keyword_exclusion_list(self._config) or None}
-
-            adult_mode, force_adult_ids = build_adult_filter(session, self._config)
-            af = {"adult_mode": adult_mode, "force_adult_provider_ids": force_adult_ids or None}
-            # Canonical provider scoping: hide inactive + expired sources.
-            _excl_ids = RepositoryFactory(session).providers.get_hidden_provider_ids()
-            ek = {"excluded_provider_ids": _excl_ids or None,
-                  "dead_signal_streak_floor": _dead_signal_streak_floor(self._config)}
+            fk, af, ek = scope_kwargs(session, self._config)
+            _excl_ids = ek["excluded_provider_ids"]
 
             excluded_user_cats = list(getattr(
                 self._config, "global_filter_excluded_user_categories", []

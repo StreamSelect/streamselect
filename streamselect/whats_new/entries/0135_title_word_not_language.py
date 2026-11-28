@@ -2,7 +2,7 @@ from streamselect.whats_new import WhatsNewEntry
 
 ENTRY = WhatsNewEntry(
     id=135,
-    version="1.4.1",
+    version="1.5.0",
     date="2026-11-28",
     title="Film titles no longer lose their first word to a fake language",
     items=(
