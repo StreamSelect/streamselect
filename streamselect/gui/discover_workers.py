@@ -118,8 +118,8 @@ def fetch_cards_for_key(
     from streamselect.core.discovery_engine import (
         get_recently_added, get_top_rated, get_by_genre,
         get_by_decade, get_by_actor, get_by_user_category, get_by_collection,
-        get_recommended,
     )
+    from streamselect.core.recommended_shelf import get_recommended
 
     if shelf_key == "recommended":
         # Takes no sk/fk/af/ek: every exclusion axis comes from
@@ -511,6 +511,7 @@ class _ZoneSnapshot:
     expanded: frozenset[str] = field(default_factory=frozenset)
     collapsed: frozenset[str] = field(default_factory=frozenset)
     hidden: frozenset[str] = field(default_factory=frozenset)
+    collapsed_pins: frozenset[str] = field(default_factory=frozenset)   # pinned, shown collapsed
     default_expanded: frozenset[str] = field(default_factory=frozenset)
     first_launch: bool = False
 
@@ -768,7 +769,7 @@ class _LoaderWorker(QObject):
                 if key in hidden:
                     return
                 zone = _zone(key)
-                if zone in (_ZONE_PINNED, _ZONE_EXPANDED):
+                if zone in (_ZONE_PINNED, _ZONE_EXPANDED) and key not in zs.collapsed_pins:
                     emit(_ShelfData(title, key, [], loading=True, rank=rank, **kw))
                     if zone == _ZONE_PINNED and key != "recommended":
                         fill([key])               # the top of the page: at once
@@ -823,6 +824,15 @@ class _LoaderWorker(QObject):
             rec_waits = "recommended" in to_fill
             first = [k for k in to_fill if k != "recommended"]
             to_fill[:] = []
+            if rec_waits:
+                # Recommendations kept from last time: still current, they fill
+                # with the rest (instant); otherwise they show now and the fresh
+                # ones replace them at the end (recommended_shelf).
+                from streamselect.core.recommended_shelf import is_current, stale_cards
+                current = is_current(session, self._config)
+                if kept := stale_cards(session, self._config):
+                    self.cardsReady.emit("recommended", kept)
+                rec_waits = rec_waits and not (current and kept)
 
             # Platform shelves (PLAT-1): a platform earns a shelf once enough
             # DISTINCT TITLES carry its tag — the floor is a setting. ONE

@@ -263,6 +263,7 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
             expanded=frozenset(cfg.discover_expanded_shelves),
             collapsed=frozenset(cfg.discover_collapsed_shelves),
             hidden=frozenset(cfg.discover_hidden_shelves),
+            collapsed_pins=frozenset(cfg.discover_collapsed_pins),
             default_expanded=frozenset(_DEFAULT_EXPANDED),
             first_launch=self._is_first_launch(),
         )
@@ -316,9 +317,9 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
     def _move_shelf(self, shelf_key: str, new_zone: str) -> None:
         """Move a shelf widget to a new zone.
 
-        Invariant: ``pin ⟹ expand``.  A pinned shelf is ALWAYS rendered
-        expanded with its cards visible.  Opening or collapsing keeps the shelf
-        in its group, at its place; pinning lifts it into Pinned.
+        Pinning opens a shelf and lifts it into Pinned; it can then be collapsed
+        in place and stay pinned (``discover_collapsed_pins``). Opening or
+        collapsing any other shelf keeps it in its group, at its place.
         """
         shelf = self._shelf_widgets.get(shelf_key)
         if shelf is None:
@@ -329,7 +330,9 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         if old_zone:
             self._remove_from_zone(shelf, old_zone)
         self._shelf_zones[shelf_key] = new_zone
-        # pin ⟹ expand: pinned shelves are never collapsed.
+        if shelf_key in self._config.discover_collapsed_pins:     # pinning / unpinning opens it
+            self._set_pin_collapsed(shelf_key, False)
+        # Pinning opens the shelf.
         is_pinned = (new_zone == _ZONE_PINNED)
         shelf.set_collapsed(new_zone == _ZONE_COLLAPSED)
         if is_pinned:
@@ -397,8 +400,18 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         self._save_zone_config()
 
     def _on_collapse_requested(self, shelf_key: str) -> None:
+        if self._shelf_zones.get(shelf_key) == _ZONE_PINNED:
+            # A pinned shelf collapses in place and stays pinned, like any shelf.
+            self._shelf_widgets[shelf_key].set_collapsed(True)
+            self._set_pin_collapsed(shelf_key, True)
+            return
         self._move_shelf(shelf_key, _ZONE_COLLAPSED)
         self._save_zone_config()
+
+    def _set_pin_collapsed(self, shelf_key: str, collapsed: bool) -> None:
+        pins = [k for k in self._config.discover_collapsed_pins if k != shelf_key]
+        self._config.discover_collapsed_pins = pins + ([shelf_key] if collapsed else [])
+        _cfgsave.save_soon(self)
 
     def _on_expand_requested(self, shelf_key: str) -> None:
         """Expand a shelf — fetching its cards first if not yet loaded.
@@ -407,11 +420,14 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
         widget), flush the batch immediately so ``_move_shelf`` finds the widget.
         """
         self._flush_if_pending(shelf_key)
-        # Always move the widget to the expanded zone immediately so the UI
-        # responds instantly.  The card row will fill in asynchronously if
-        # the shelf was header-only.
-        self._move_shelf(shelf_key, _ZONE_EXPANDED)
-        self._save_zone_config()
+        if self._shelf_zones.get(shelf_key) == _ZONE_PINNED:     # a collapsed pin opens in place
+            self._shelf_widgets[shelf_key].set_collapsed(False)
+            self._set_pin_collapsed(shelf_key, False)
+        else:
+            # Move the widget to the expanded zone at once so the UI responds
+            # instantly; the card row fills in asynchronously if header-only.
+            self._move_shelf(shelf_key, _ZONE_EXPANDED)
+            self._save_zone_config()
 
         if shelf_key in self._loaded_shelf_keys:
             # Cards already present — nothing more to do.
@@ -495,8 +511,12 @@ class DiscoverView(DiscoverGroupsMixin, QWidget):
             return  # shelf was hidden/removed while we were fetching
 
         # Populate the shelf with its newly fetched cards (replaces any
-        # loading placeholder — see _Shelf.set_cards()).
-        shelf.set_cards(cards, image_cache=self._image_cache, config=self._config)
+        # loading placeholder — see _Shelf.set_cards()); a second delivery (fresh
+        # recommendations after the kept ones) replaces the first.
+        shelf.set_cards(cards, image_cache=self._image_cache, config=self._config,
+                        replace=shelf_key in self._loaded_shelf_keys)
+        if shelf_key == "recommended":
+            _cfgsave.save_soon(self)        # keeps the answer for next time (recommended_shelf)
         self._shelf_data_cache[shelf_key] = cards
         self._loaded_shelf_keys.add(shelf_key)
         if cards:

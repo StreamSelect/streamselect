@@ -607,11 +607,11 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     # Discover zone persistence; shelf keys: "recently_added", "top_movies", "top_series", "genre:Drama", "decade:1990", etc.
     discover_pinned_shelves: list = Field(default_factory=list)
     discover_expanded_shelves: list = Field(default_factory=list)
-    #: Kept as a FIELD but no longer written to: collapsed is the default
-    #: zone, so storing it recorded the answer the code would reach anyway.
-    #: On a user's config that was 818 entries — 17% of the whole file —
-    #: growing by one per shelf ever rendered. See _retire_collapsed_shelves.
+    #: Kept as a FIELD, no longer written: collapsed is the default zone (it grew to 818
+    #: entries, 17% of a config, recording nothing). See _retire_collapsed_shelves.
     discover_collapsed_shelves: list = Field(default_factory=list)
+    discover_collapsed_pins: list = Field(default_factory=list, json_schema_extra=PROFILE)  # pinned AND collapsed: stays on top
+    discover_recommended_cache: dict = Field(default_factory=dict, json_schema_extra=PROFILE)  # recommended_shelf.py
     #: True once the first-launch zone defaults were applied: an explicit marker, since
     #: with collapsed unstored, "no zone data" stopped meaning "first launch".
     discover_zones_seeded: bool = False

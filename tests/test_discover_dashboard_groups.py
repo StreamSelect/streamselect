@@ -342,3 +342,55 @@ def test_an_empty_shelfs_loading_and_error_text_is_actually_visible(qapp, owned_
     label = shelf._placeholder_lbl
     assert label.isVisible() and label.width() >= label.sizeHint().width() > 20, (
         f"label {label.width()} px wide for text needing {label.sizeHint().width()} px")
+
+
+def test_a_pinned_shelf_collapses_in_place_and_stays_pinned(page):
+    page._start_expand_fetch = lambda key: None
+    shelf = page._shelf_widgets["recently_added"]
+    shelf._collapse_btn.click()
+    QApplication.processEvents()
+    assert shelf._collapsed and _keys(page, PINNED) == ["year:2026", "recently_added"], "still pinned, same place"
+    assert page._shelf_zones["recently_added"] == "pinned"
+    assert page._config.discover_collapsed_pins == ["recently_added"]
+    assert _y(page, shelf) < _y(page, page._groups[LISTS])
+    snap = page._build_zone_snapshot()
+    assert "recently_added" in snap.collapsed_pins, "the next load sends it collapsed"
+    shelf._collapse_btn.click()
+    assert not shelf._collapsed and page._config.discover_collapsed_pins == []
+    shelf._collapse_btn.click()
+    page._on_unpin_requested("recently_added")
+    assert page._config.discover_collapsed_pins == [], "unpinning forgets the pinned-collapse"
+
+
+def test_kept_recommendations_show_without_working_them_out_again(tmp_path, monkeypatch):
+    from streamselect.core import recommended_shelf as rs
+    from streamselect.core.config import Config
+    from streamselect.core.database import ChannelDB, Database, ProviderDB, UserRatingDB
+
+    db = Database(f"sqlite:///{tmp_path / 'r.db'}")
+    db.create_tables()
+    with db.session_scope() as s:
+        s.add(ProviderDB(id="p1", name="P", type="xtream", url="http://x.example.com", is_active=True))
+        for i in range(3):
+            s.add(ChannelDB(id=f"c{i}", source_id=f"c{i}", provider_id="p1", name=f"Film {i}",
+                            media_type="movie", raw_data={}))
+    cfg = Config(config_dir=tmp_path)
+    runs = []
+
+    def scorer(*a, **k):
+        runs.append(1)
+        return [type("S", (), {"channel_id": "c2"})(), type("S", (), {"channel_id": "c0"})()]
+    monkeypatch.setattr("streamselect.core.preference_engine.score_candidates", scorer)
+    monkeypatch.setattr("streamselect.core.preference_engine.compute_weights",
+                        lambda *a, **k: type("W", (), {"is_empty": lambda self: False})())
+    with db.session_scope(commit=False) as s:
+        assert [c.channel_id for c in rs.get_recommended(s, cfg)] == ["c2", "c0"]
+        assert rs.is_current(s, cfg)
+        assert [c.channel_id for c in rs.get_recommended(s, cfg)] == ["c2", "c0"] and len(runs) == 1
+    with db.session_scope() as s:
+        s.add(UserRatingDB(channel_id="c1", rating=1))          # a new like: the inputs changed
+    with db.session_scope(commit=False) as s:
+        assert not rs.is_current(s, cfg)
+        assert [c.channel_id for c in rs.stale_cards(s, cfg)] == ["c2", "c0"], "still shown at once"
+        rs.get_recommended(s, cfg)
+    assert len(runs) == 2, "worked out again only because something changed"
