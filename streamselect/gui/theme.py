@@ -978,9 +978,9 @@ def _build_semantic_constants() -> dict[str, object]:
     # Shelf-row placeholder — shown in a Discover shelf's card row while a
     # lazy-expand fetch is in flight (DISCOVER_SHELF_LOADING) or after it fails
     # (DISCOVER_SHELF_ERROR). See discover_shelf.py set_loading()/show_load_error().
-    # Shelf scrollbar: a slim rounded handle inside the row's card, no track or arrows (owner: the bar looked bolted on).
-    DISCOVER_SHELF_SCROLLBAR = ("QScrollBar:horizontal { height: 6px; background: transparent; margin: 4px 2px 0 2px; }"
-        " QScrollBar::handle:horizontal { background: " + OVERLAY_15 + "; border-radius: 3px; min-width: 48px; } QScrollBar::handle:horizontal:hover { background: " + OVERLAY_40 + "; }"
+    # Shelf scrollbar inside the row's card: a 14 px grab area drawing a slim 6 px handle, 10 px on hover (owner).
+    DISCOVER_SHELF_SCROLLBAR = ("QScrollBar:horizontal { height: 14px; background: transparent; margin: 0 2px; }"
+        " QScrollBar::handle:horizontal { background: " + OVERLAY_15 + "; border-radius: 3px; min-width: 48px; margin: 4px 0; } QScrollBar::handle:horizontal:hover { background: " + OVERLAY_40 + "; border-radius: 5px; margin: 2px 0; }"
         " QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; } QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }")
 
     # Shelf paging chevrons. macOS draws scrollbars as OVERLAYS — they appear

@@ -232,7 +232,7 @@ class TestShelfSizeCardRowZoom:
                            collapsed=False)
             card_h = card_metrics(zoom).card_h
             heights[zoom] = shelf._scroll_area.height()
-            assert card_h + 6 <= heights[zoom] <= card_h + 16, (
+            assert card_h + 6 <= heights[zoom] <= card_h + 20, (
                 f"zoom={zoom}: {heights[zoom]} px for {card_h} px cards — room for the bar, little more")
         assert heights[1.5] > heights[1.0]
 

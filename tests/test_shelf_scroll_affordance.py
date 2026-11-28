@@ -158,3 +158,11 @@ def test_the_arrows_show_only_while_the_row_is_hovered(shelf, qapp):
     _hover(shelf)
     qapp.processEvents()
     assert shelf._page_right.isVisible()
+
+
+def test_the_scroll_bar_is_easy_to_grab_and_says_so(shelf):
+    """Owner: a bigger area to grab than the slim line it draws, and a cursor change on it."""
+    from PyQt6.QtCore import Qt
+    bar = shelf._scroll_area.horizontalScrollBar()
+    assert bar.height() >= 12, f"grab area {bar.height()} px"
+    assert bar.cursor().shape() == Qt.CursorShape.OpenHandCursor

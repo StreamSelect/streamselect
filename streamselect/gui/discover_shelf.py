@@ -198,7 +198,8 @@ class _Shelf(QWidget):
         _m = card_metrics(config.discover_zoom)
         scroll = QScrollArea()
         scroll.setWidgetResizable(False)
-        scroll.setFixedHeight(_m.card_h + 12)       # the cards + the slim bar (6 px + 4 px gap)
+        scroll.setFixedHeight(_m.card_h + 18)       # the cards + the bar's 14 px grab area
+        cursor_affordance.set_draggable(scroll.horizontalScrollBar())      # the hand: "you're on it"
         scroll.viewport().setAutoFillBackground(False)   # the card shows through: no box in a box
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)

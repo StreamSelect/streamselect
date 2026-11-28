@@ -166,6 +166,12 @@ def set_clickable(widget: QWidget, clickable: bool = True, *,
         widget.unsetCursor()
 
 
+def set_draggable(widget: QWidget) -> None:
+    """A drag handle (a row's scroll bar): the open hand while the pointer is over it,
+    so the user can tell they are on something to drag."""
+    widget.setCursor(Qt.CursorShape.OpenHandCursor)
+
+
 def set_resizable(widget: QWidget, orientation: Qt.Orientation) -> None:
     """Give a drag-to-resize divider the platform's resize cursor.
 
