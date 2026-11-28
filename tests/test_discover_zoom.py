@@ -217,22 +217,24 @@ class TestShelfSizeCardRowZoom:
         )
 
     def test_scroll_area_height_uses_zoomed_card_height(self, qapp):
-        """Scroll area fixed height must be card_metrics().card_h + 16."""
+        """The row fits the zoomed cards plus the slim scroll bar, and grows with the zoom.
+
+        Asserts the floor and the property, never the exact pixel count: the bar
+        was slimmed (owner: too much space above it) and the old exact-px pin
+        turned that improvement red.
+        """
         from streamselect.gui.discover_shelf import _Shelf
         from streamselect.gui.discover_card import card_metrics
 
-        zoom = 1.5
-        cfg = _make_config(zoom=zoom)
-        ic = _make_image_cache()
-
-        shelf = _Shelf("Test", "genre:Test", [], ic, cfg, collapsed=False)
-        m = card_metrics(zoom)
-        expected_h = m.card_h + 16
-        actual_h = shelf._scroll_area.height()
-        assert actual_h == expected_h, (
-            f"scroll area height at zoom={zoom} should be {expected_h}px "
-            f"(card_h={m.card_h}+16), got {actual_h}px"
-        )
+        heights = {}
+        for zoom in (1.0, 1.5):
+            shelf = _Shelf("Test", "genre:Test", [], _make_image_cache(), _make_config(zoom=zoom),
+                           collapsed=False)
+            card_h = card_metrics(zoom).card_h
+            heights[zoom] = shelf._scroll_area.height()
+            assert card_h + 6 <= heights[zoom] <= card_h + 16, (
+                f"zoom={zoom}: {heights[zoom]} px for {card_h} px cards — room for the bar, little more")
+        assert heights[1.5] > heights[1.0]
 
     def test_card_and_shelf_widths_stay_in_sync(self, qapp):
         """A single card's width must equal the card_w from card_metrics (same source)."""
