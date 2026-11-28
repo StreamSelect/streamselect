@@ -183,6 +183,9 @@ class DiscoverView(DiscoverGroupsMixin, DiscoverTilesMixin, QWidget):
         self._shelves_layout.addStretch()
 
         shelves_outer.setWidget(self._shelves_inner)
+        self._page_scroll = shelves_outer
+        self._restore_scroll: int | None = None   # the page position a reload returns to
+        shelves_outer.verticalScrollBar().rangeChanged.connect(self._return_to_scroll_position)
         self._init_tiles(shelves_outer)
         self._stack.addWidget(shelves_outer)
 
@@ -671,6 +674,9 @@ class DiscoverView(DiscoverGroupsMixin, DiscoverTilesMixin, QWidget):
             return
         self._refresh_pending = False
         self._expand_queue.clear()
+        # A reload (a finished background re-read, a source change) rebuilds the page;
+        # it returns to where the user was, not to the top (owner report).
+        self._restore_scroll = self._page_scroll.verticalScrollBar().value()
         self._loaded = False
         self._shelf_data_cache.clear()
         self._loaded_shelf_keys.clear()
@@ -814,10 +820,21 @@ class DiscoverView(DiscoverGroupsMixin, DiscoverTilesMixin, QWidget):
             self._flush_pending_collapsed()
         self._update_group_heads()
         self._previews_soon()
+        self._return_to_scroll_position()
         if self._refresh_pending:
             QTimer.singleShot(0, self.refresh)
             return
         QTimer.singleShot(300, self._trigger_image_load_all)
+
+    def _return_to_scroll_position(self, *_range) -> None:
+        """After a reload, back to where the page was, as soon as the page is tall enough
+        again (rows and tiles lay out after the load finishes). Done once it is reached."""
+        bar = self._page_scroll.verticalScrollBar()
+        if self._restore_scroll is None or not self._loaded:
+            return
+        bar.setValue(self._restore_scroll)
+        if bar.value() == self._restore_scroll:
+            self._restore_scroll = None
 
     def _trigger_image_load_all(self) -> None:
         """Fire image loading for all pinned/expanded shelves after zones become visible."""

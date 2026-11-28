@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QEvent, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractScrollArea, QApplication, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QAbstractScrollArea, QApplication, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
 from streamselect.core.config import Config
@@ -100,8 +100,16 @@ class _Shelf(QWidget):
 
     def _build_ui(self, title: str, cards: list[ContentCard],
                   image_cache: "ImageCache", config: Config) -> None:
-        vl = QVBoxLayout(self)
-        vl.setContentsMargins(8, 4, 8, 4)
+        # The row sits in a card like the collapsed shelves' tiles (discover_tiles), so an
+        # open row is one contained object with its scrollbar inside it (owner report).
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.card = QFrame()
+        self.card.setObjectName("shelfCard")
+        _theme.style_fn(self.card, lambda: f"#shelfCard {{ background: {_theme.OVERLAY_08}; border-radius: 8px; }}")
+        outer.addWidget(self.card)
+        vl = QVBoxLayout(self.card)
+        vl.setContentsMargins(10, 6, 10, 8)
         vl.setSpacing(4)
 
         # --- Header row ---

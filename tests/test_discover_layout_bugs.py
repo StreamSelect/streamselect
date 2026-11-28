@@ -173,8 +173,8 @@ class TestCollapseButtonIsRightmost:
     """D3: collapse_btn must come after (to the right of) pin_btn and hide_btn."""
 
     def _header_layout(self, shelf):
-        """Extract the QHBoxLayout that is the header row from the shelf's main VLayout."""
-        vl = shelf.layout()
+        """Extract the QHBoxLayout that is the header row from the shelf card's VLayout."""
+        vl = shelf.card.layout()
         # The header row is the first item (index 0) in the outer VBoxLayout.
         return vl.itemAt(0).layout()
 

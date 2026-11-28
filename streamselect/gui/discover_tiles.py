@@ -40,11 +40,16 @@ class _PosterSlot(QLabel):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self._url = ""
+        self._poster: QPixmap | None = None      # the loaded image, kept to re-fit on resize
         _theme.style_fn(self, lambda: f"background: {_theme.COLOR_BG_DEEP}; border-radius: 3px;")
 
     def show_card(self, card, image_cache) -> None:
+        url = (card.thumbnail_url or "") if card else ""
+        if url and url == self._url and self._poster is not None:
+            self._fit()                          # same poster: re-fit, never reload (owner report)
+            return
         self.setToolTip(card.title if card else "")
-        self._url = (card.thumbnail_url or "") if card else ""
+        self._url, self._poster = url, None
         self.clear()
         if self._url and image_cache is not None:
             image_cache.subscribe(self._url, self._on_loaded)       # bound method: held weakly
@@ -53,8 +58,13 @@ class _PosterSlot(QLabel):
     def _on_loaded(self, url: str, pixmap: QPixmap) -> None:
         if url != self._url or pixmap.isNull():
             return
-        scaled = pixmap.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
-                               Qt.TransformationMode.SmoothTransformation)
+        self._poster = pixmap
+        self._fit()
+
+    def _fit(self) -> None:
+        """Crop the kept poster to fill this slot's current size."""
+        scaled = self._poster.scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                     Qt.TransformationMode.SmoothTransformation)
         x, y = (scaled.width() - self.width()) // 2, (scaled.height() - self.height()) // 3
         self.setPixmap(scaled.copy(QRect(max(0, x), max(0, y), self.width(), self.height())))
 
@@ -85,9 +95,12 @@ class ShelfTile(QFrame):
         row.addStretch(1)
         v.addLayout(row)
         text = QHBoxLayout()
-        self.name_lbl = QLabel(f"<b>{shelf._title}</b>")
-        _theme.style_fn(self.name_lbl, lambda: f"font-size: {_theme.FONT_MD};")
-        self.name_lbl.setTextFormat(Qt.TextFormat.RichText)
+        # Semi-bold, a size up, in the bright text colour: a regular-weight name was
+        # lost among four posters (owner report).
+        self.name_lbl = QLabel(shelf._title)
+        self.name_lbl.setTextFormat(Qt.TextFormat.PlainText)
+        _theme.style_fn(self.name_lbl, lambda: f"font-size: {_theme.FONT_LG}; font-weight: 600;"
+                                               f" color: {_theme.COLOR_TEXT_HI};")
         self.count_lbl = QLabel(" ".join(shelf.chips))
         _theme.style(self.count_lbl, "TEXT_SM_MUTED")
         text.addWidget(self.name_lbl, 1)
@@ -105,7 +118,9 @@ class ShelfTile(QFrame):
         self.hide_btn.clicked.connect(lambda: (s := self._shelf()) and s.hideRequested.emit(self.shelf_key))
 
     def set_width(self, w: int) -> None:
-        """Size the tile and its posters for a column *w* px wide."""
+        """Size the tile and its posters for a column *w* px wide (a no-op at its width)."""
+        if w == self.width() and self.minimumWidth() == w:
+            return
         pw = max(30, (w - 20 - (_POSTERS - 1) * 4) // _POSTERS)
         for s in self.slots:
             s.setFixedSize(pw, int(pw * 1.5))
