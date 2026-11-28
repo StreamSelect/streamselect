@@ -7,9 +7,9 @@ import weakref
 
 from typing import TYPE_CHECKING
 
-from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QEvent, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QAbstractScrollArea, QApplication, QHBoxLayout, QLabel, QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
 from streamselect.core.config import Config
@@ -229,6 +229,11 @@ class _Shelf(QWidget):
         vl.addWidget(scroll)
 
         scroll.horizontalScrollBar().valueChanged.connect(self._load_visible)
+        # Up/down wheel turns belong to the page (eventFilter): Qt's default hands
+        # them to the shelf's sideways bar and swallows them, so scrolling down the
+        # page stopped on a shelf and slid it sideways (owner report).
+        for w in (scroll, scroll.viewport(), scroll.horizontalScrollBar()):
+            w.installEventFilter(self)
 
         # Card widgets are the expensive part (DiscoverCard.__init__ — a user-
         # sampled 3-6s stalls building a shelf's cards synchronously). Chrome
@@ -336,6 +341,30 @@ class _Shelf(QWidget):
         )
         self._page_left.raise_()
         self._page_right.raise_()
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt naming
+        """An up/down wheel turn over the row scrolls the page; Shift turns it sideways.
+
+        A sideways swipe or tilt (x larger than y) is left to Qt and moves the row.
+        """
+        if event.type() == QEvent.Type.Wheel and self._scroll_area is not None:
+            d = event.angleDelta()
+            if abs(d.y()) > abs(d.x()):
+                if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+                    bar = self._scroll_area.horizontalScrollBar()
+                    bar.setValue(bar.value() - d.y())
+                    event.accept()
+                elif (page := self._page_scroll_area()) is not None:
+                    QApplication.sendEvent(page.viewport(), event.clone())   # the page scrolls
+                return True
+        return super().eventFilter(obj, event)
+
+    def _page_scroll_area(self) -> "QAbstractScrollArea | None":
+        """The scroll area this shelf sits in (Discover's page), if any."""
+        w = self.parentWidget()
+        while w is not None and not isinstance(w, QAbstractScrollArea):
+            w = w.parentWidget()
+        return w
 
     def resizeEvent(self, event):  # noqa: N802 - Qt naming
         """Re-place the chevrons when the shelf width changes."""
