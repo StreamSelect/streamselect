@@ -71,8 +71,6 @@ _RGBA = re.compile(
 
 # (file, selector, fg token, bg token) -> why it is still below the floor.
 KNOWN_BELOW_FLOOR: dict[tuple[str, str, str, str], str] = {
-    ("discover_view.py", "QPushButton:hover", "@COLOR_TEXT@", "@OVERLAY_15@"):
-        "COLOR_MUTED-family secondary text; see module docstring",
     ("main_window.py", "QPushButton", "@COLOR_DISABLED@", "@COLOR_LINE_DARK@"):
         "COLOR_MUTED-family secondary text; see module docstring",
     ("channel_transparency.py", "QPushButton",

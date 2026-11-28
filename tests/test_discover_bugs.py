@@ -1,6 +1,6 @@
 """Behavioral tests for the Discover-view bug fixes (A, D2, D1, F).
 
-Bug A  — get_all_genres/get_all_decades no longer materialise full ORM objects;
+Bug A  — get_all_genres/get_year_counts no longer materialise full ORM objects;
          streaming scalar-select preserves exact output.
 Bug D2 — get_all_genres filters "null"/"undefined" sentinel genre tokens.
 Bug D1 — set_cards() resizes the inner widget so cards render at full width.
@@ -170,33 +170,29 @@ class TestGetAllGenresExcludesSentinels:
 
 
 # ---------------------------------------------------------------------------
-# Bug A — get_all_decades streaming scalar-select preserves output
+# Bug A — get_year_counts streaming scalar-select preserves output
 # ---------------------------------------------------------------------------
 
 class TestGetAllDecadesScalar:
 
-    def test_returns_correct_decades(self, seeded_db):
-        """get_all_decades returns 2000 and 1990 (each ≥ 5 entries)."""
-        from streamselect.core.discovery_engine import get_all_decades
+    def _keys(self, seeded_db, this_year=2026):
+        from streamselect.core.discovery_engine import get_year_counts, time_shelf_keys
         session = seeded_db.get_session()
         try:
-            decades = get_all_decades(session)
+            return time_shelf_keys(get_year_counts(session), this_year)
         finally:
             session.close()
 
-        assert 2000 in decades, "decade 2000 must appear (12 Action movies)"
-        assert 1990 in decades, "decade 1990 must appear (12 Drama series)"
+    def test_returns_correct_decades(self, seeded_db):
+        """The 2000s and 1990s each hold ≥ 5 titles, so each is a decade shelf."""
+        keys = self._keys(seeded_db)
+        assert "decade:2000" in keys, "decade 2000 must appear (12 Action movies)"
+        assert "decade:1990" in keys, "decade 1990 must appear (12 Drama series)"
 
     def test_sorted_descending(self, seeded_db):
         """Decades are returned newest-first."""
-        from streamselect.core.discovery_engine import get_all_decades
-        session = seeded_db.get_session()
-        try:
-            decades = get_all_decades(session)
-        finally:
-            session.close()
-
-        assert decades == sorted(decades, reverse=True), "decades must be descending"
+        decades = [int(k.split(":")[1]) for k in self._keys(seeded_db) if k.startswith("decade:")]
+        assert decades and decades == sorted(decades, reverse=True), "decades must be descending"
 
 
 # ---------------------------------------------------------------------------

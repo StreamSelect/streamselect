@@ -591,8 +591,8 @@ class _Shelf(QWidget):
 # (Config.discover_show_live_collections; owner, 2026-11-27).
 
 def more_categories_row(view) -> QWidget:
-    """The view's ``_more_btn`` with the switch beside it; the row shows and hides with
-    the button (``DiscoverView._update_more_btn`` toggles the button's visibility)."""
+    """The Provider Categories heading: the view's ``_more_btn`` with the Live categories
+    switch beside it (``discover_groups`` folds the group from the button)."""
     row = QWidget()
     h = QHBoxLayout(row)
     h.setContentsMargins(0, 0, 0, 0)

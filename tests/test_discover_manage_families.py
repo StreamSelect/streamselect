@@ -371,61 +371,31 @@ class TestFamilyTable:
 
 class TestBrowsingStripIsNotGrouped:
 
-    def _view(self, config, owned_widgets):
-        """A DiscoverView with only its three zone containers wired.
-
-        Everything hangs off ONE owned parent, so ``_add_to_zone``'s
-        ``setVisible(True)`` marks a child visible instead of popping a
-        top-level window open mid-suite.
-        """
-        from PyQt6.QtWidgets import QPushButton, QVBoxLayout, QWidget
-        from streamselect.gui.discover_view import DiscoverView
-
-        host = owned_widgets.own(QWidget())
-        view = DiscoverView.__new__(DiscoverView)
-        view._config = config
-        view._pending_collapsed = []
-        view._more_expanded = False
-        for zone in ("pinned", "expanded", "collapsed"):
-            widget = QWidget(host)
-            layout = QVBoxLayout(widget)
-            setattr(view, f"_{zone}_zone", widget)
-            setattr(view, f"_{zone}_layout", layout)
-        view._more_btn = QPushButton(host)
-        return view
-
     def test_zone_layouts_hold_only_shelves(self, qapp, config, owned_widgets):
-        """Four families go into the strip; four plain shelves come out.
+        """Manage's families never reach the page: each group holds plain shelves.
 
-        No heading widget, no extra layout item — a platform shelf browses
+        No family heading widget inside a group — a platform shelf browses
         exactly like a genre shelf, which is the half of PLAT-2 that must NOT
-        change.
+        change — and Discover's shelves keep the order they were given.
         """
         from unittest.mock import MagicMock
 
         from streamselect.gui.discover_filter_dialog import _FamilyGroup
+        from streamselect.gui.discover_groups import APP
         from streamselect.gui.discover_shelf import _Shelf
-        from streamselect.gui.discover_view import _ZONE_EXPANDED
+        from streamselect.gui.discover_view import DiscoverView, _ZONE_EXPANDED
 
-        view = self._view(config, owned_widgets)
-        keys = ["platform:Netflix", "platform:Max",
-                "collection:Marvel", "genre:Action", "recently_added"]
+        view = owned_widgets.own(DiscoverView(MagicMock(), config, MagicMock()))
+        keys = ["recently_added", "platform:Netflix", "platform:Max",
+                "collection:Marvel", "genre:Action"]
         for key in keys:
-            shelf = _Shelf(key, key, [], MagicMock(), config)
-            view._add_to_zone(shelf, _ZONE_EXPANDED)
+            view._add_to_zone(_Shelf(key, key, [], MagicMock(), config), _ZONE_EXPANDED)
 
-        layout = view._expanded_layout
-        assert layout.count() == len(keys), (
-            f"the strip must hold one item per shelf and nothing else, "
-            f"got {layout.count()} for {len(keys)} shelves"
-        )
-        widgets = [layout.itemAt(i).widget() for i in range(layout.count())]
-        assert all(isinstance(w, _Shelf) for w in widgets), (
-            f"every strip item must be a _Shelf, got "
-            f"{[type(w).__name__ for w in widgets]}"
-        )
+        widgets = [w for g in view._groups.values() for w in g.members()]
+        assert len(widgets) == len(keys), "one item per shelf and nothing else"
+        assert all(isinstance(w, _Shelf) for w in widgets)
         assert not any(isinstance(w, _FamilyGroup) for w in widgets)
-        assert [w._shelf_key for w in widgets] == keys, (
-            "the strip must keep the order it was given — grouping would "
-            "reorder a platform shelf away from its neighbours"
+        assert [w._shelf_key for w in view._groups[APP].members()] == keys[:3], (
+            "the strip must keep the order it was given — grouping by family "
+            "would reorder a platform shelf away from its neighbours"
         )

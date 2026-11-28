@@ -550,7 +550,7 @@ def get_by_genre(session, genre: str, limit: int = 30, fav_ids=None,
     return _dedup_cards(cards)[:limit]
 
 
-def get_by_decade(session, decade: int, limit: int = 30, fav_ids=None,
+def get_by_decade(session, decade: int, limit: int = 30, fav_ids=None, years: int = 10,
                   queue_ids=None, watched_ids=None, liked_ids=None, progress_map=None,
                   excluded_prefixes=None, excluded_categories=None, include_uncategorized: bool = True,
                        excluded_content_types=None,
@@ -558,9 +558,10 @@ def get_by_decade(session, decade: int, limit: int = 30, fav_ids=None,
                   adult_mode: str = "all", force_adult_provider_ids: list[str] | None = None,
                   excluded_provider_ids: list[str] | None = None, dead_signal_streak_floor: int | None = None,
                   ) -> list[ContentCard]:
-    """Movies and series from a decade (e.g. decade=1990 → 1990–1999)."""
+    """Movies and series from a decade (e.g. decade=1990 → 1990–1999); a year
+    shelf passes ``years=1`` (``decade=2026`` → 2026 only)."""
     from streamselect.core.database import ChannelDB, MetadataDB
-    start, end = decade, decade + 9
+    start, end = decade, decade + years - 1
     q = (
         session.query(ChannelDB, MetadataDB)
         .outerjoin(MetadataDB, ChannelDB.metadata_id == MetadataDB.id)
@@ -719,14 +720,14 @@ def get_all_genres(session, min_count: int = 10,
     return [g for g, cnt in counter.most_common() if cnt >= min_count]
 
 
-def get_all_decades(session,
+def get_year_counts(session,
                     excluded_prefixes=None, excluded_categories=None, include_uncategorized: bool = True,
                        excluded_content_types=None,
                        excluded_keywords=None,
                     adult_mode: str = "all", force_adult_provider_ids: list[str] | None = None,
                     excluded_provider_ids: list[str] | None = None, dead_signal_streak_floor: int | None = None,
-                    ) -> list[int]:
-    """Return decades (as start year) that have ≥ 5 entries with a known year.
+                    ) -> Counter:
+    """Count movies and series by year (1950–2030), for the decade and year shelves.
 
     Perf: selects only releaseDate/release_date (JSON) + name in SQL, avoiding
     full ORM object materialisation.  Year derivation runs in Python on those
@@ -748,7 +749,7 @@ def get_all_decades(session,
     q = _apply_prefix_filter(q, excluded_prefixes, include_uncategorized, excluded_content_types, excluded_keywords, excluded_categories)
     q = _apply_adult_filter(q, adult_mode, force_adult_provider_ids)
     q = _apply_provider_exclusion(q, excluded_provider_ids, dead_signal_streak_floor)
-    decade_counts: Counter = Counter()
+    year_counts: Counter = Counter()
     for (rd, rd2, name) in q.yield_per(5000):
         yr: int | None = None
         for val in (rd, rd2):
@@ -762,11 +763,22 @@ def get_all_decades(session,
             if m:
                 yr = int(m.group(1))
         if yr and 1950 <= yr <= 2030:
-            decade_counts[(yr // 10) * 10] += 1
-    return sorted(
-        [d for d, cnt in decade_counts.items() if cnt >= 5],
-        reverse=True,
-    )
+            year_counts[yr] += 1
+    return year_counts
+
+
+def time_shelf_keys(year_counts: Counter, this_year: int, floor: int = 5) -> list[str]:
+    """The Decades group's shelf keys: this decade a year at a time, newest first,
+    then each earlier decade, a year or decade holding at least *floor* titles."""
+    this_decade = this_year // 10 * 10
+    years = sorted((y for y, n in year_counts.items() if this_decade <= y <= this_year and n >= floor),
+                   reverse=True)
+    decades: Counter = Counter()
+    for y, n in year_counts.items():
+        if y < this_decade:
+            decades[y // 10 * 10] += n
+    return [f"year:{y}" for y in years] + [f"decade:{d}" for d in sorted(
+        (d for d, n in decades.items() if n >= floor), reverse=True)]
 
 
 def _rank_genres_by_preference(genres: list[str], liked_ids: set,

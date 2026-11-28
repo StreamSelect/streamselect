@@ -7,12 +7,11 @@ Data comes entirely from raw_data (no TMDb API key needed). Poster images
 use the TMDb CDN URLs already embedded in stream_icon / cover fields and
 load on-demand through the existing ImageCache.
 
-Zone model
-----------
-  Pinned zone    — always expanded, always at top; immune to "Collapse all"
-  Expanded zone  — currently browsing; preference-ranked
-  ── More Categories ──  (divider, visible when collapsed zone has items)
-  Collapsed zone — header-only strips; expands on click
+Zones and groups
+----------------
+A shelf's zone (pinned / expanded / collapsed) is its state; its group (Pinned,
+Your lists, Discover's shelves, Genres, Decades, Provider Categories) is its place
+on the page — ``discover_groups``.
 
 Hidden shelves are not added to the layout at all; only restorable via
 the Manage dialog.
@@ -44,7 +43,8 @@ from streamselect.core.database import Database
 from streamselect.core.discovery_engine import ContentCard
 from streamselect.gui.discover_browse import _BrowseView
 from streamselect.gui.discover_card import card_zoom_slider
-from streamselect.gui.discover_shelf import _Shelf, more_categories_row
+from streamselect.gui.discover_groups import DEFAULT_EXPANDED, DiscoverGroupsMixin, seed_dashboard_defaults
+from streamselect.gui.discover_shelf import _Shelf
 from streamselect.gui import deferred_config_save as _cfgsave
 from streamselect.gui.discover_workers import (
     _LoaderWorker, _RECIPE_PREFIX, _SeeAllWorker, _ShelfCardsWorker,
@@ -59,17 +59,13 @@ if TYPE_CHECKING:
     from streamselect.core.image_cache import ImageCache
 
 
-_DEFAULT_EXPANDED = {
-    "recently_added",
-    "top_movies",
-    "top_series",
-}
+_DEFAULT_EXPANDED = DEFAULT_EXPANDED
 
 _ZONE_PINNED    = "pinned"
 _ZONE_EXPANDED  = "expanded"
 _ZONE_COLLAPSED = "collapsed"
 
-class DiscoverView(QWidget):
+class DiscoverView(DiscoverGroupsMixin, QWidget):
     """🧭 Discover — horizontal shelf browse view with two-zone layout."""
 
     playRequested               = pyqtSignal(str)
@@ -180,49 +176,7 @@ class DiscoverView(QWidget):
         _theme.style_fn(self._loading_lbl, lambda: f"color: {_theme.COLOR_MUTED_2}; font-size: {_theme.FONT_XL}; padding: 20px;")
         self._shelves_layout.addWidget(self._loading_lbl)
 
-        # Zone containers
-        self._pinned_zone = QWidget()
-        self._pinned_layout = QVBoxLayout(self._pinned_zone)
-        self._pinned_layout.setContentsMargins(0, 0, 0, 0)
-        self._pinned_layout.setSpacing(8)
-        self._pinned_zone.setVisible(False)
-        self._shelves_layout.addWidget(self._pinned_zone)
-
-        self._expanded_zone = QWidget()
-        self._expanded_layout = QVBoxLayout(self._expanded_zone)
-        self._expanded_layout.setContentsMargins(0, 0, 0, 0)
-        self._expanded_layout.setSpacing(8)
-        self._expanded_zone.setVisible(False)
-        self._shelves_layout.addWidget(self._expanded_zone)
-
-        self._more_btn = QPushButton("More Categories", toolTip="Show the collapsed shelves")
-        _icon_utils.set_button_icon(self._more_btn, "expand")
-        self._more_btn.setFixedHeight(36)
-        _theme.style_fn(self._more_btn, lambda: "QPushButton {"
-            f"  background: {_theme.OVERLAY_08};"
-            "  border: none;"
-            "  border-radius: 4px;"
-            f"  color: {_theme.COLOR_TEXT_HI};"
-            f"  font-size: {_theme.FONT_LG};"
-            "  text-align: left;"
-            "  padding: 0 12px;"
-            "}"
-            "QPushButton:hover {"
-            f"  background: {_theme.OVERLAY_15};"
-            f"  color: {_theme.COLOR_TEXT};"
-            "}")
-        self._more_btn.clicked.connect(self._toggle_more_categories)
-        self._more_btn.setVisible(False)
-        self._more_expanded = self._config.discover_more_expanded
-        self._shelves_layout.addWidget(more_categories_row(self))
-
-        self._collapsed_zone = QWidget()
-        self._collapsed_layout = QVBoxLayout(self._collapsed_zone)
-        self._collapsed_layout.setContentsMargins(4, 0, 0, 0)
-        self._collapsed_layout.setSpacing(2)
-        self._collapsed_zone.setVisible(False)
-        self._shelves_layout.addWidget(self._collapsed_zone)
-
+        self._build_groups(self._shelves_layout)
         self._shelves_layout.addStretch()
 
         shelves_outer.setWidget(self._shelves_inner)
@@ -346,22 +300,10 @@ class DiscoverView(QWidget):
             for shelf in self._shelf_widgets.values()
         }
 
-        for zone_widget, layout in (
-            (self._pinned_zone, self._pinned_layout),
-            (self._expanded_zone, self._expanded_layout),
-            (self._collapsed_zone, self._collapsed_layout),
-        ):
-            members = [
-                layout.itemAt(i).widget()
-                for i in range(layout.count())
-                if layout.itemAt(i).widget() is not None
-            ]
-            if needle:
-                zone_widget.setVisible(any(wanted.get(w, False) for w in members))
-            else:
-                # Cleared — restore the app's own invariant: a zone is on screen
-                # exactly when it holds something.
-                zone_widget.setVisible(bool(members))
+        if needle:
+            self._show_filter_matches(wanted)
+        else:
+            self._update_group_heads()
 
         for shelf, visible in wanted.items():
             shelf.setVisible(visible)
@@ -369,75 +311,12 @@ class DiscoverView(QWidget):
         if needle and not any(wanted.values()):
             logger.debug("Discover shelf filter {!r} matched nothing", text)
 
-    def _zone_layout(self, zone: str):
-        return {
-            _ZONE_PINNED:    self._pinned_layout,
-            _ZONE_EXPANDED:  self._expanded_layout,
-            _ZONE_COLLAPSED: self._collapsed_layout,
-        }[zone]
-
-    def _add_to_zone(self, shelf: _Shelf, zone: str, at_top: bool = False) -> None:
-        layout = self._zone_layout(zone)
-        if zone == _ZONE_COLLAPSED and at_top:
-            layout.insertWidget(0, shelf)
-        else:
-            layout.addWidget(shelf)
-        if zone == _ZONE_PINNED:
-            self._pinned_zone.setVisible(True)
-        elif zone == _ZONE_EXPANDED:
-            self._expanded_zone.setVisible(True)
-        elif zone == _ZONE_COLLAPSED:
-            self._update_more_btn()
-
-    def _remove_from_zone(self, shelf: _Shelf, zone: str) -> None:
-        self._zone_layout(zone).removeWidget(shelf)
-        if zone == _ZONE_PINNED and self._pinned_layout.count() == 0:
-            self._pinned_zone.setVisible(False)
-        elif zone == _ZONE_EXPANDED and self._expanded_layout.count() == 0:
-            self._expanded_zone.setVisible(False)
-        elif zone == _ZONE_COLLAPSED and self._collapsed_layout.count() == 0:
-            self._collapsed_zone.setVisible(False)
-            self._update_more_btn()
-
-    def _update_more_btn(self) -> None:
-        """Sync the More Categories button label and visibility.
-
-        The count includes both built (already in _collapsed_layout) and
-        pending (buffered but not yet built — D2 deferral) collapsed strips so
-        the label shows the correct total immediately during streaming load.
-        """
-        built_count = self._collapsed_layout.count()
-        pending_count = len(self._pending_collapsed)
-        count = built_count + pending_count
-        visible = count > 0
-        self._more_btn.setVisible(visible)
-        if not visible:
-            self._collapsed_zone.setVisible(False)
-            return
-        verb = "Collapse" if self._more_expanded else "Expand"
-        self._more_btn.setText(f"More Categories  ({count})")
-        _icon_utils.set_button_icon(self._more_btn, "collapse" if self._more_expanded else "expand")
-        self._more_btn.setToolTip(f"{verb} More Categories ({count} shelves)")
-        self._collapsed_zone.setVisible(self._more_expanded)
-
-    def _toggle_more_categories(self) -> None:
-        self._more_expanded = not self._more_expanded
-        self._config.discover_more_expanded = self._more_expanded
-        _cfgsave.save_soon(self)
-        self._update_more_btn()
-
     def _move_shelf(self, shelf_key: str, new_zone: str) -> None:
         """Move a shelf widget to a new zone.
 
         Invariant: ``pin ⟹ expand``.  A pinned shelf is ALWAYS rendered
-        expanded with its cards visible.  ``set_collapsed(False)`` is called
-        whenever *new_zone* is ``_ZONE_PINNED`` so the card row is never hidden.
-
-        If *new_zone* is the collapsed zone and ``config.discover_collapse_to_top``
-        is set, the shelf is inserted at position 0 (top) so the user can find
-        their recently collapsed item immediately (D4).  Initial-load placement
-        always uses ``at_top=False`` (only ``_move_shelf`` calls this for a user
-        gesture, and ``_add_collapsed_strip`` handles initial load directly).
+        expanded with its cards visible.  Opening or collapsing keeps the shelf
+        in its group, at its place; pinning lifts it into Pinned.
         """
         shelf = self._shelf_widgets.get(shelf_key)
         if shelf is None:
@@ -455,8 +334,7 @@ class DiscoverView(QWidget):
             # Unconditionally un-collapse — a pinned shelf is always expanded.
             shelf.set_collapsed(False)
         shelf.set_pinned(is_pinned)
-        at_top = (new_zone == _ZONE_COLLAPSED and self._config.discover_collapse_to_top)
-        self._add_to_zone(shelf, new_zone, at_top=at_top)
+        self._add_to_zone(shelf, new_zone)
 
     def _save_zone_config(self) -> None:
         """Persist the current widget zone map to config.
@@ -619,7 +497,7 @@ class DiscoverView(QWidget):
             self._pending_collapsed = [
                 d for d in self._pending_collapsed if d.shelf_key != shelf_key
             ]
-            self._update_more_btn()
+            self._update_group_heads()
             # Persist the hide (in memory at once; write settles via save_soon).
             cfg = self._config
             if shelf_key not in cfg.discover_hidden_shelves:
@@ -665,6 +543,7 @@ class DiscoverView(QWidget):
         self._active = True
         if not self._loaded:
             normalize_shelf_config(self._config)
+            seed_dashboard_defaults(self._config)
             self.refresh()
 
     def on_deactivate(self) -> None:
@@ -735,18 +614,10 @@ class DiscoverView(QWidget):
         if self._batch_timer is not None:
             self._batch_timer.stop()
         self._pending_collapsed.clear()
-
-        for layout in (self._pinned_layout, self._expanded_layout, self._collapsed_layout):
-            while layout.count():
-                item = layout.takeAt(0)
-                w = item.widget()
-                if w is not None:
-                    w.cancel_pending_build()  # PERF-17: stop any in-flight chunked card build
-                    w.deleteLater()
-        self._pinned_zone.setVisible(False)
-        self._expanded_zone.setVisible(False)
-        self._collapsed_zone.setVisible(False)
-        self._update_more_btn()
+        self._arrival.clear()
+        for group in self._groups.values():
+            group.clear()
+        self._update_group_heads()
 
         self._loading_lbl.setVisible(True)
         self._loading_lbl.setText("Loading…")
@@ -811,6 +682,7 @@ class DiscoverView(QWidget):
             self._loading_lbl.setVisible(False)
 
         zone = self._determine_zone(data.shelf_key)
+        self._arrival.setdefault(data.shelf_key, len(self._arrival))   # its place in its group
 
         if data.header_only:
             # D2 — buffer collapsed strips; build them in one batch after the
@@ -818,7 +690,7 @@ class DiscoverView(QWidget):
             # Restart a debounce timer; when it fires (≈120 ms of silence) the
             # batch builder creates all pending strips in a single relayout pass.
             self._pending_collapsed.append(data)
-            self._update_more_btn()  # shows correct count from pending list
+            self._update_group_heads()  # shows correct count from pending list
             if self._batch_timer is None:
                 self._batch_timer = QTimer(self)
                 self._batch_timer.setSingleShot(True)
@@ -840,8 +712,7 @@ class DiscoverView(QWidget):
         the layout in a single ``setUpdatesEnabled(False/True)`` pass so Qt
         does one relayout instead of one per strip.
 
-        D4 note: these strips come from *initial load*, so they always append
-        (``at_top=False``) — only an explicit user collapse uses ``at_top``.
+        Each strip lands in its group at the place its arrival order gives it.
         """
         if not self._pending_collapsed:
             return
@@ -849,19 +720,15 @@ class DiscoverView(QWidget):
         pending = self._pending_collapsed[:]
         self._pending_collapsed.clear()
 
-        self._collapsed_zone.setUpdatesEnabled(False)
+        self._shelves_inner.setUpdatesEnabled(False)
         try:
             for data in pending:
                 zone = self._determine_zone(data.shelf_key)
-                shelf = self._create_and_wire_shelf(data, zone, collapsed=True)
-                self._add_to_zone(shelf, zone, at_top=False)
+                group, rank = self._place_of(data.shelf_key, zone)
+                group.insert(self._create_and_wire_shelf(data, zone, collapsed=True), rank)
         finally:
-            self._collapsed_zone.setUpdatesEnabled(True)
-
-        # Single relayout + button update after all strips are built.
-        self._update_more_btn()
-        if self._more_expanded:
-            self._collapsed_zone.setVisible(True)
+            self._shelves_inner.setUpdatesEnabled(True)
+        self._update_group_heads()      # one heading pass after all strips are built
 
     def _on_load_finished(self) -> None:
         self._loaded = True
@@ -873,7 +740,7 @@ class DiscoverView(QWidget):
             if self._batch_timer is not None:
                 self._batch_timer.stop()
             self._flush_pending_collapsed()
-        self._update_more_btn()
+        self._update_group_heads()
         QTimer.singleShot(300, self._trigger_image_load_all)
 
     def _trigger_image_load_all(self) -> None:

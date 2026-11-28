@@ -15,8 +15,8 @@ Guards the three core invariants:
    removed from the lower-priority list (collapsed), so the view and config
    agree after sanitisation.
 
-4. Default expansion includes ``recently_added``, ``top_movies``, ``top_series``
-   on first launch.
+4. Default expansion is the dashboard's: your lists (Watch Later, Recommended,
+   Watch Queue) and Recently Added on first launch.
 
 5. Manage-dialog ``_transfer`` to pinned removes the key from expanded/collapsed.
 """
@@ -49,18 +49,22 @@ def config(tmp_path):
 # Helper — a minimal DiscoverView with no DB / image-cache wiring
 # ---------------------------------------------------------------------------
 
+_VIEWS: list = []
+
+
+@pytest.fixture(autouse=True)
+def _destroy_views():
+    yield
+    from tests.conftest import destroy_widget
+    destroy_widget(*_VIEWS)
+    _VIEWS.clear()
+
+
 def _build_view(qapp, config):
-    """Build a DiscoverView using __new__ to skip real DB / thread start."""
+    """The real DiscoverView on a stub DB and image cache; nothing loads until activated."""
     from streamselect.gui.discover_view import DiscoverView
-    view = DiscoverView.__new__(DiscoverView)
-    view._config = config
-    view._shelf_widgets = {}
-    view._shelf_zones   = {}
-    view._loaded_shelf_keys = set()
-    view._inflight_expand   = None
-    view._pending_collapsed = []
-    view._batch_timer       = None
-    view._more_expanded     = False  # needed by _update_more_btn
+    view = DiscoverView(MagicMock(), config, MagicMock())
+    _VIEWS.append(view)
     return view
 
 
@@ -84,15 +88,6 @@ class TestPinTriggersCardFetch:
         view._shelf_widgets["recently_added"] = shelf
         view._shelf_zones["recently_added"]   = _ZONE_COLLAPSED
 
-        # Wire minimal zone containers so _move_shelf can call _add/_remove.
-        from PyQt6.QtWidgets import QVBoxLayout, QWidget
-        for attr in ("_pinned_zone", "_expanded_zone", "_collapsed_zone"):
-            w = QWidget()
-            setattr(view, attr, w)
-        for attr in ("_pinned_layout", "_expanded_layout", "_collapsed_layout"):
-            setattr(view, attr, QVBoxLayout())
-        view._more_btn = MagicMock()
-        view._config.discover_collapse_to_top = True
 
         fetched: list[str] = []
 
@@ -126,12 +121,6 @@ class TestPinTriggersCardFetch:
         # Mark as already loaded.
         view._loaded_shelf_keys.add("top_movies")
 
-        from PyQt6.QtWidgets import QVBoxLayout, QWidget
-        for attr in ("_pinned_zone", "_expanded_zone", "_collapsed_zone"):
-            setattr(view, attr, QWidget())
-        for attr in ("_pinned_layout", "_expanded_layout", "_collapsed_layout"):
-            setattr(view, attr, QVBoxLayout())
-        view._more_btn = MagicMock()
 
         fetched: list[str] = []
         view._start_expand_fetch = lambda k: fetched.append(k)
@@ -287,13 +276,6 @@ class TestMoveShelfPinImpliesExpanded:
         view._shelf_widgets["genre:Action"] = shelf
         view._shelf_zones["genre:Action"]   = _ZONE_COLLAPSED
 
-        from PyQt6.QtWidgets import QVBoxLayout, QWidget
-        for attr in ("_pinned_zone", "_expanded_zone", "_collapsed_zone"):
-            w = QWidget()
-            setattr(view, attr, w)
-        for attr in ("_pinned_layout", "_expanded_layout", "_collapsed_layout"):
-            setattr(view, attr, QVBoxLayout())
-        view._more_btn = MagicMock()
 
         # Before: collapsed.
         assert shelf._collapsed is True
@@ -320,12 +302,6 @@ class TestMoveShelfPinImpliesExpanded:
         view._shelf_widgets["genre:Drama"] = shelf
         view._shelf_zones["genre:Drama"]   = _ZONE_EXPANDED
 
-        from PyQt6.QtWidgets import QVBoxLayout, QWidget
-        for attr in ("_pinned_zone", "_expanded_zone", "_collapsed_zone"):
-            setattr(view, attr, QWidget())
-        for attr in ("_pinned_layout", "_expanded_layout", "_collapsed_layout"):
-            setattr(view, attr, QVBoxLayout())
-        view._more_btn = MagicMock()
 
         assert shelf._collapsed is False
         view._move_shelf("genre:Drama", _ZONE_COLLAPSED)
@@ -445,21 +421,21 @@ class TestSanitizeZoneConfig:
 class TestDefaultExpandedSet:
 
     def test_default_expanded_includes_key_shelves(self):
-        """_DEFAULT_EXPANDED must include recently_added, top_movies, top_series."""
+        """_DEFAULT_EXPANDED opens your lists and Recently Added (the dashboard)."""
         from streamselect.gui.discover_view import _DEFAULT_EXPANDED
 
-        for key in ("recently_added", "top_movies", "top_series"):
+        for key in ("user_cat:Watch Later", "recommended", "queue", "recently_added"):
             assert key in _DEFAULT_EXPANDED, (
                 f"'{key}' must be in _DEFAULT_EXPANDED for sensible first-run defaults"
             )
 
-    def test_first_launch_defaults_top_series_expanded(self):
-        """On first launch, top_series maps to the expanded zone."""
+    def test_first_launch_defaults_the_queue_expanded(self):
+        """On first launch, the Watch Queue shelf maps to the expanded zone."""
         from streamselect.gui.discover_workers import determine_zone, _ZONE_EXPANDED
         from streamselect.gui.discover_view import _DEFAULT_EXPANDED
 
         zone = determine_zone(
-            "top_series",
+            "queue",
             pinned=frozenset(),
             expanded=frozenset(),
             collapsed=frozenset(),
@@ -468,7 +444,7 @@ class TestDefaultExpandedSet:
             first_launch=True,
         )
         assert zone == _ZONE_EXPANDED, (
-            f"top_series must map to expanded on first launch, got {zone!r}"
+            f"queue must map to expanded on first launch, got {zone!r}"
         )
 
     def test_first_launch_genre_still_collapsed(self):
@@ -578,12 +554,6 @@ class TestUnpinReturnsToExpanded:
         view._shelf_widgets["recently_added"] = shelf
         view._shelf_zones["recently_added"]   = _ZONE_PINNED
 
-        from PyQt6.QtWidgets import QVBoxLayout, QWidget
-        for attr in ("_pinned_zone", "_expanded_zone", "_collapsed_zone"):
-            setattr(view, attr, QWidget())
-        for attr in ("_pinned_layout", "_expanded_layout", "_collapsed_layout"):
-            setattr(view, attr, QVBoxLayout())
-        view._more_btn = MagicMock()
 
         view._on_unpin_requested("recently_added")
 

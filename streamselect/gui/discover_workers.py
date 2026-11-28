@@ -17,6 +17,7 @@ Module-level shared helpers
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QObject, pyqtSignal
@@ -137,6 +138,12 @@ def fetch_cards_for_key(
         return get_by_genre(session, shelf_key[len(_GENRE_PREFIX):], limit=limit, **sk, **fk, **af, **ek)
     if shelf_key.startswith(_DECADE_PREFIX):
         return get_by_decade(session, int(shelf_key[len(_DECADE_PREFIX):]), limit=limit, **sk, **fk, **af, **ek)
+    if shelf_key.startswith(_YEAR_PREFIX):
+        return get_by_decade(session, int(shelf_key[len(_YEAR_PREFIX):]), limit=limit, years=1,
+                             **sk, **fk, **af, **ek)
+    if shelf_key == "queue":
+        from streamselect.core.discover_queue_shelf import get_queue_cards
+        return get_queue_cards(session, limit, **sk, excluded_provider_ids=ek["excluded_provider_ids"])
     if shelf_key.startswith(_ACTOR_PREFIX):
         return get_by_actor(session, shelf_key[len(_ACTOR_PREFIX):], limit=limit, **sk, **fk, **af, **ek)
     if shelf_key.startswith(_USER_CAT_PREFIX):
@@ -161,6 +168,10 @@ def fetch_cards_for_key(
 #: a grep for one finds every site (ledger F44).
 _GENRE_PREFIX = "genre:"
 _DECADE_PREFIX = "decade:"
+_YEAR_PREFIX = "year:"           # one year of the current decade (``time_shelf_keys``)
+
+#: The list "Your lists" leads with (the category picker's preset of that name).
+WATCH_LATER = "Watch Later"
 _ACTOR_PREFIX = "actor:"
 _USER_CAT_PREFIX = "user_cat:"
 _COLLECTION_PREFIX = "collection:"
@@ -187,6 +198,7 @@ SHELF_FAMILIES: tuple[tuple[str, str], ...] = (
     (_COLLECTION_PREFIX, "Collections"),
     (_GENRE_PREFIX, "Genres"),
     (_DECADE_PREFIX, "Decades"),
+    (_YEAR_PREFIX, "Years"),
     (_ACTOR_PREFIX, "Featuring"),
 )
 
@@ -384,6 +396,8 @@ def browse_title_for_key(shelf_key: str) -> str:
         return shelf_key[len(_GENRE_PREFIX):]
     if shelf_key.startswith(_DECADE_PREFIX):
         return f"{shelf_key[len(_DECADE_PREFIX):]}s"
+    if shelf_key.startswith(_YEAR_PREFIX):
+        return shelf_key[len(_YEAR_PREFIX):]
     if shelf_key.startswith(_ACTOR_PREFIX):
         return f"Featuring {shelf_key[len(_ACTOR_PREFIX):]}"
     if shelf_key.startswith(_COLLECTION_PREFIX):
@@ -398,6 +412,8 @@ def browse_title_for_key(shelf_key: str) -> str:
         "recently_added": "Recently Added",
         "top_movies": "Top Rated Movies",
         "top_series": "Top Rated Series",
+        "recommended": "Recommended for You",
+        "queue": "Watch Queue",
     }.get(shelf_key, shelf_key)
 
 
@@ -663,7 +679,7 @@ class _LoaderWorker(QObject):
 
     def run(self) -> None:
         from streamselect.core.discovery_engine import (
-            get_featured_actor, get_all_genres, get_all_decades,
+            get_featured_actor, get_all_genres, get_year_counts, time_shelf_keys,
             get_all_user_categories, get_all_collections,
             MIN_COLLECTION_SHELF_MEMBERS,
             _rank_genres_by_preference, build_status_sets, build_adult_filter,
@@ -728,142 +744,53 @@ class _LoaderWorker(QObject):
                 )
 
             def emit(data: _ShelfData) -> None:
-                if data.shelf_key in hidden:
-                    return
                 # header_only shelves always emit (they carry no cards — that's the point).
                 # Card-bearing shelves skip if empty.
-                if not data.header_only and not data.cards:
-                    return
-                self.shelfReady.emit(
-                    _ShelfData(
-                        data.title, data.shelf_key, data.cards,
-                        is_featured_actor=data.is_featured_actor,
-                        is_user_category=data.is_user_category,
-                        header_only=data.header_only,
-                    )
-                )
+                if data.shelf_key not in hidden and (data.header_only or data.cards):
+                    self.shelfReady.emit(data)
 
-            # ── User-defined category shelves — shown FIRST (user curated) ──────
-            user_cats = get_all_user_categories(
-                session, excluded_user_categories=excluded_user_cats
-            )
-            for cat in user_cats:
-                if self._cancelled:
-                    return
-                key = f"user_cat:{cat['name']}"
+            def shelf(key: str, title: str, **kw) -> None:
+                """One shelf: its cards when it opens (pinned or expanded), else its header."""
                 if key in hidden:
-                    continue
-                zone = _zone(key)
-                if zone in (_ZONE_PINNED, _ZONE_EXPANDED):
-                    cards = fetch_cards_for_key(
-                        session, self._config, key, 30,
-                        sk=sk, fk=fk, af=af, ek=ek,
-                    )
-                    emit(_ShelfData(browse_title_for_key(key), key, cards,
-                                    is_user_category=True))
-                else:
-                    emit(_ShelfData(browse_title_for_key(key), key, [], is_user_category=True,
-                                    header_only=True))
-
-            # ── Saved-recipe shelves — the user's own facet queries ────────────
-            #
-            # User report: "saved recipes should be available as Discover Shelves".
-            # A recipe already IS a shelf in everything but where it appears —
-            # a named facet query the user built and kept. Placed beside the
-            # user-category shelves because they are the same kind of thing:
-            # curated by the user, so they come before the catalogue's own.
-            #
-            # ``show_in_discover`` (default True — absent on pre-an earlier change saves)
-            # is the per-recipe master switch: OFF skips the shelf entirely,
-            # never even as a header-only strip. The title carries the ✦
-            # marker (icons.recipe_icon) as a non-color cue, which is also
-            # what keeps a recipe and a same-named user category
-            # distinguishable in the shelf manager, where both appear as
-            # reorderable rows.
-            for recipe in (getattr(self._config, "saved_recipes", None) or []):
-                if self._cancelled:
                     return
-                if not isinstance(recipe, dict):
-                    continue
-                if not recipe.get("show_in_discover", True):
-                    continue
-                recipe_name = (recipe.get("name") or "").strip()
-                if not recipe_name:
-                    continue
-                key = f"{_RECIPE_PREFIX}{recipe_name}"
-                if key in hidden:
-                    continue
-                title = browse_title_for_key(key)
                 if _zone(key) in (_ZONE_PINNED, _ZONE_EXPANDED):
                     emit(_ShelfData(title, key, fetch_cards_for_key(
-                        session, self._config, key, 30,
-                        sk=sk, fk=fk, af=af, ek=ek,
-                    )))
+                        session, self._config, key, 30, sk=sk, fk=fk, af=af, ek=ek), **kw))
                 else:
-                    emit(_ShelfData(title, key, [], header_only=True))
+                    emit(_ShelfData(title, key, [], header_only=True, **kw))
 
-            # ── Platform shelves — the catalogue's own rollup (PLAT-1) ────────
-            #
-            # After the user's own shelves (categories, recipes) because these
-            # are the catalogue describing itself: "what did Netflix add".
-            # A platform earns a strip once enough DISTINCT TITLES carry its
-            # tag — the floor is a setting (Settings → Content → Discover
-            # shelves), because the right number depends on the library.
-            # ONE aggregate query decides all of them; never a count per value.
-            for _value, _titles in platform_shelf_values(
-                session,
-                min_titles=int(getattr(
-                    self._config, "discover_platform_shelf_min_titles", 50)),
-                excluded_values=PLATFORM_SHELF_EXCLUDED_VALUES,
-                scope=_resolve_scope(session, self._config,
-                                     excluded_provider_ids=_excl_ids),
-            ):
+            # The order is the page's (design "Discover as Your Dashboard"): the
+            # user's lists, Discover's own one-of-a-kind shelves, every genre,
+            # this decade a year at a time then the decades, the provider's
+            # folders. Pinned shelves come out of each group to the top (the view).
+            user_cats = sorted(get_all_user_categories(
+                session, excluded_user_categories=excluded_user_cats),
+                key=lambda c: c["name"] != WATCH_LATER)    # stable: Watch Later first
+            lists = [(f"{_USER_CAT_PREFIX}{c['name']}", True) for c in user_cats]
+            at = 1 if user_cats and user_cats[0]["name"] == WATCH_LATER else 0
+            lists[at:at] = [("recommended", False), ("queue", False)]
+            for key, is_cat in lists:
                 if self._cancelled:
                     return
-                key = f"{_PLATFORM_PREFIX}{_value}"
-                if key in hidden:
-                    continue
-                # The title IS the value — icons.py has no platform glyphs, and
-                # inventing one here would put a literal in widget code.
-                if _zone(key) in (_ZONE_PINNED, _ZONE_EXPANDED):
-                    emit(_ShelfData(_value, key, fetch_cards_for_key(
-                        session, self._config, key, 30,
-                        sk=sk, fk=fk, af=af, ek=ek,
-                    )))
-                else:
-                    emit(_ShelfData(_value, key, [], header_only=True))
+                shelf(key, browse_title_for_key(key), is_user_category=is_cat)
 
-            # ── Fixed shelves ─────────────────────────────────────────────────
-            for key, title in (
-                # First: it is the one shelf built from YOUR taste rather than
-                # from the catalogue, so it is what the grocery's butcher puts
-                # at the front. Falls back to nothing (header_only) until there
-                # is enough signal, exactly like the sidebar section.
-                ("recommended",    "Recommended for You"),
-                ("recently_added", "Recently Added"),
-                ("top_movies",     "Top Rated Movies"),
-                ("top_series",     "Top Rated Series"),
-            ):
+            # Saved recipes: a recipe's ``show_in_discover`` (default True) is
+            # its master switch — OFF skips the shelf entirely, never even as a
+            # header. The ✦ in the title keeps a recipe and a same-named list apart.
+            for recipe in (getattr(self._config, "saved_recipes", None) or []):
+                name = (recipe.get("name") or "").strip() if isinstance(recipe, dict) else ""
                 if self._cancelled:
                     return
-                if key in hidden:
-                    continue
-                zone = _zone(key)
-                if zone in (_ZONE_PINNED, _ZONE_EXPANDED):
-                    cards = fetch_cards_for_key(
-                        session, self._config, key, 30,
-                        sk=sk, fk=fk, af=af, ek=ek,
-                    )
-                    emit(_ShelfData(title, key, cards))
-                else:
-                    emit(_ShelfData(title, key, [], header_only=True))
+                if name and recipe.get("show_in_discover", True):
+                    shelf(f"{_RECIPE_PREFIX}{name}", browse_title_for_key(f"{_RECIPE_PREFIX}{name}"))
 
-            # ── Featured Actor ────────────────────────────────────────────────
-            # The title IS the actor name, which requires fetching to discover;
-            # so we always fetch eagerly for this shelf (it starts in
-            # _DEFAULT_EXPANDED and has a unique key per actor).
-            if self._cancelled:
-                return
+            for key in ("recently_added", "top_movies", "top_series"):
+                if self._cancelled:
+                    return
+                shelf(key, browse_title_for_key(key))
+
+            # Featured actor: the title IS the actor's name, which only the
+            # fetch finds, so this shelf is always fetched.
             try:
                 from streamselect.core.preference_engine import RecScoringSettings, compute_weights
                 weights = compute_weights(
@@ -874,69 +801,44 @@ class _LoaderWorker(QObject):
                 weights = None
             actor, cards = get_featured_actor(session, weights, **sk, **fk, **af, **ek)
             if actor:
-                key = f"actor:{actor}"
-                if key not in hidden:
-                    emit(_ShelfData(f"Featured: {actor}", key, cards,
-                                    is_featured_actor=True))
+                emit(_ShelfData(f"Featured: {actor}", f"{_ACTOR_PREFIX}{actor}", cards,
+                                is_featured_actor=True))
 
-            # ── Genre shelves — preference-ranked, no hard cap ────────────────
+            # Platform shelves (PLAT-1): a platform earns a shelf once enough
+            # DISTINCT TITLES carry its tag — the floor is a setting. ONE
+            # aggregate query decides all of them; never a count per value.
+            for _value, _titles in platform_shelf_values(
+                session,
+                min_titles=int(getattr(
+                    self._config, "discover_platform_shelf_min_titles", 50)),
+                excluded_values=PLATFORM_SHELF_EXCLUDED_VALUES,
+                scope=_resolve_scope(session, self._config,
+                                     excluded_provider_ids=_excl_ids),
+            ):
+                if self._cancelled:
+                    return
+                shelf(f"{_PLATFORM_PREFIX}{_value}", _value)
+
             genres = get_all_genres(session, min_count=10, **fk, **af, **ek)
-            genres = _rank_genres_by_preference(genres, ss.liked_ids, session, **fk)
-            for genre in genres:
+            for genre in _rank_genres_by_preference(genres, ss.liked_ids, session, **fk):
                 if self._cancelled:
                     return
-                key = f"genre:{genre}"
-                if key in hidden:
-                    continue
-                zone = _zone(key)
-                if zone in (_ZONE_PINNED, _ZONE_EXPANDED):
-                    cards = fetch_cards_for_key(
-                        session, self._config, key, 30,
-                        sk=sk, fk=fk, af=af, ek=ek,
-                    )
-                    emit(_ShelfData(genre, key, cards))
-                else:
-                    emit(_ShelfData(genre, key, [], header_only=True))
+                shelf(f"{_GENRE_PREFIX}{genre}", genre)
 
-            # ── Decade shelves — no hard cap ──────────────────────────────────
-            for decade in get_all_decades(session, **fk, **af, **ek):
+            for key in time_shelf_keys(get_year_counts(session, **fk, **af, **ek), date.today().year):
                 if self._cancelled:
                     return
-                key = f"decade:{decade}"
-                if key in hidden:
-                    continue
-                zone = _zone(key)
-                if zone in (_ZONE_PINNED, _ZONE_EXPANDED):
-                    cards = fetch_cards_for_key(
-                        session, self._config, key, 30,
-                        sk=sk, fk=fk, af=af, ek=ek,
-                    )
-                    emit(_ShelfData(f"{decade}s", key, cards))
-                else:
-                    emit(_ShelfData(f"{decade}s", key, [], header_only=True))
+                shelf(key, browse_title_for_key(key))
 
-            # ── Collection shelves — provider-category "Collections",
-            # e.g. "Apple+ Kids", "Hindu Subs" — no hard cap beyond the
+            # Collection shelves — the provider's own folders, above the
             # min-member floor applied inside get_all_collections().
-            collections = get_all_collections(
+            for coll in get_all_collections(
                 session, min_count=MIN_COLLECTION_SHELF_MEMBERS, **fk, **af, **ek,
                 include_live=bool(self._config.discover_show_live_collections),
-            )
-            for shelf in collections:
+            ):
                 if self._cancelled:
                     return
-                collection, key = shelf.title, f"collection:{shelf.key}"
-                if key in hidden:
-                    continue
-                zone = _zone(key)
-                if zone in (_ZONE_PINNED, _ZONE_EXPANDED):
-                    cards = fetch_cards_for_key(
-                        session, self._config, key, 30,
-                        sk=sk, fk=fk, af=af, ek=ek,
-                    )
-                    emit(_ShelfData(collection, key, cards, chips=shelf.regions))
-                else:
-                    emit(_ShelfData(collection, key, [], header_only=True, chips=shelf.regions))
+                shelf(f"{_COLLECTION_PREFIX}{coll.key}", coll.title, chips=coll.regions)
 
         except Exception:
             logger.exception("DiscoverView loader error")

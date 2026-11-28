@@ -612,17 +612,16 @@ class Config(_WatchStateMixin, _ConfigMigrationsMixin, BaseModel):
     #: On a user's config that was 818 entries — 17% of the whole file —
     #: growing by one per shelf ever rendered. See _retire_collapsed_shelves.
     discover_collapsed_shelves: list = Field(default_factory=list)
-    #: True once the first-launch zone defaults have been applied. Exists
-    #: BECAUSE collapsed stopped being stored: "first launch" used to mean "all
-    #: four zone lists are empty", which a collapse-only user suddenly matched,
-    #: so every start re-expanded the defaults. Inferring a first run from an
-    #: absence of data breaks the moment having no data is legitimate.
+    #: True once the first-launch zone defaults were applied: an explicit marker, since
+    #: with collapsed unstored, "no zone data" stopped meaning "first launch".
     discover_zones_seeded: bool = False
+    #: Rev 2 defaults ("your lists" open) applied once to a returning profile (discover_groups).
+    discover_dashboard_seeded: bool = Field(default=False, json_schema_extra=PROFILE)
+    discover_folded_groups: list = Field(default_factory=list, json_schema_extra=PROFILE)  # Genres/Decades headings the user collapsed
     discover_hidden_shelves: list = Field(default_factory=list)
     discover_shelf_order: list = Field(default_factory=list)  # manual order within expanded zone
     discover_manage_folded_families: list = Field(default_factory=list)  # Manage-shelves dialog ONLY: folded family headings. Never a zone — folding hides rows in that dialog and changes nothing Discover renders.
     discover_more_expanded: bool = False   # "More Categories" accordion — collapsed by default
-    discover_collapse_to_top: bool = True  # re-collapsed shelves jump to top of collapsed zone
     search_view_posters: bool = Field(default=False, json_schema_extra=PROFILE)  # Search as a poster grid
     discover_zoom: float = 1.0             # content card zoom factor (0.6–1.8); persisted
     #: A platform earns its own Discover shelf once this many DISTINCT TITLES carry its tag (PLAT-1, platform_shelves.py).

@@ -21,7 +21,7 @@ leaves every widget on screen is the exact failure the UI-test rule exists for.
 from __future__ import annotations
 
 import pytest
-from PyQt6.QtWidgets import QApplication, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication
 
 from streamselect.gui.discover_view import DiscoverView
 
@@ -31,50 +31,29 @@ def qapp():
     return QApplication.instance() or QApplication([])
 
 
-class _FakeShelf(QWidget):
-    """Stands in for _Shelf — the filter only needs a title and visibility."""
-
-    def __init__(self, title: str):
-        super().__init__()
-        self._title = title
-
-
 @pytest.fixture()
-def view(qapp):
-    """A DiscoverView skeleton wired with the real filter method and 4 shelves.
+def view(qapp, owned_widgets, tmp_path):
+    """The real DiscoverView with 4 real shelves fed through the loader's slot.
 
-    Built with ``__new__`` + the real handler rather than a full construction:
-    the method under test touches only the widget registry and the three zone
-    containers, and booting the whole view would drag in the DB and loader
-    threads for no added coverage.
+    Stub DB and image cache: nothing loads until ``on_activate``, so the shelves
+    arrive exactly as the loader would send them, in their real groups.
     """
-    v = DiscoverView.__new__(DiscoverView)
-    QWidget.__init__(v)
+    from unittest.mock import MagicMock
 
-    v._shelf_widgets = {}
-    outer = QVBoxLayout(v)
-    zones = {}
-    for name in ("pinned", "expanded", "collapsed"):
-        container = QWidget()
-        layout = QVBoxLayout(container)
-        # Parented into the view: an unparented container never becomes
-        # visible, so isVisible() would be False for every shelf and the
-        # filter tests would all "pass" against a blank screen.
-        outer.addWidget(container)
-        setattr(v, f"_{name}_zone", container)
-        setattr(v, f"_{name}_layout", layout)
-        zones[name] = layout
+    from streamselect.core.config import Config
+    from streamselect.gui.discover_workers import _ShelfData
 
-    for key, title, zone in [
-        ("collection:Apple+ Kids", "Apple+ Kids", "expanded"),
-        ("collection:Hindu Subs",  "Hindu Subs",  "collapsed"),
-        ("genre:Comedy",           "Comedy",      "collapsed"),
-        ("decade:1990",            "1990s",       "pinned"),
-    ]:
-        shelf = _FakeShelf(title)
-        v._shelf_widgets[key] = shelf
-        zones[zone].addWidget(shelf)
-
+    cfg = Config(config_dir=tmp_path)
+    cfg.discover_zones_seeded = True
+    cfg.discover_pinned_shelves = ["decade:1990"]
+    cfg.discover_expanded_shelves = ["collection:Apple+ Kids"]
+    cfg.discover_more_expanded = True
+    v = owned_widgets.own(DiscoverView(MagicMock(), cfg, MagicMock()))
+    for key, title in [("collection:Apple+ Kids", "Apple+ Kids"), ("collection:Hindu Subs", "Hindu Subs"),
+                       ("genre:Comedy", "Comedy"), ("decade:1990", "1990s")]:
+        opens = key in ("decade:1990", "collection:Apple+ Kids")
+        v._on_shelf_ready(_ShelfData(title, key, [], header_only=not opens))
+    v._flush_pending_collapsed()
     v.show()
     QApplication.processEvents()
     return v
@@ -152,26 +131,22 @@ class TestItDoesNotDamageState:
         Visibility and zone membership are different things; conflating them
         would silently unpin shelves as a side effect of typing.
         """
-        before = [
-            view._pinned_layout.itemAt(i).widget()
-            for i in range(view._pinned_layout.count())
-        ]
+        from streamselect.gui.discover_groups import PINNED
+        before = view._groups[PINNED].members()
+        assert [w._shelf_key for w in before] == ["decade:1990"]
 
         view._on_shelf_filter_changed("comedy")
         QApplication.processEvents()
         view._on_shelf_filter_changed("")
         QApplication.processEvents()
 
-        after = [
-            view._pinned_layout.itemAt(i).widget()
-            for i in range(view._pinned_layout.count())
-        ]
-        assert before == after
+        assert view._groups[PINNED].members() == before
 
     def test_a_zone_with_a_match_stays_on_screen(self, view):
         view._on_shelf_filter_changed("1990")
         QApplication.processEvents()
-        assert view._pinned_zone.isVisible(), (
+        from streamselect.gui.discover_groups import PINNED
+        assert view._groups[PINNED].isVisible(), (
             "hid the container of the only matching shelf — the match would be "
             "invisible despite matching"
         )
@@ -180,19 +155,8 @@ class TestItDoesNotDamageState:
 class TestTheControlIsUsable:
     """Project UI conventions, which exist because their absence is a papercut."""
 
-    def test_it_has_a_clear_button_and_a_tooltip(self, qapp, tmp_path):
-        from unittest.mock import MagicMock
-
-        v = DiscoverView.__new__(DiscoverView)
-        QWidget.__init__(v)
-        v._config = MagicMock()
-        v._config.discover_zoom = 1.0
-        v._config.discover_hidden_shelves = []
-        v._image_cache = MagicMock()
-        v._db = MagicMock()
-        v._shelf_widgets = {}
-        v._setup_ui()
-
+    def test_it_has_a_clear_button_and_a_tooltip(self, view):
+        v = view
         assert v._shelf_filter.isClearButtonEnabled(), (
             "filter inputs use setClearButtonEnabled(True) — project standard"
         )

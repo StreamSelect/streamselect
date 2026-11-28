@@ -191,7 +191,6 @@ _KNOWN_SLACK: dict[str, int] = {
     "streamselect/core/repositories/channel.py": 53,
     "streamselect/core/repositories/channel_ingestion.py": 3,
     "streamselect/gui/details_sections.py": 4,
-    "streamselect/gui/discover_view.py": 47,
     "streamselect/gui/epg_watchlist_mixin.py": 1,
     "streamselect/gui/global_filter_dialog.py": 3,
     "streamselect/gui/main_window.py": 98,

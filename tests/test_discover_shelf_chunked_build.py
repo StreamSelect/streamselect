@@ -108,7 +108,7 @@ def test_hide_requested_mid_build_stops_further_batches_no_error(qapp, qtbot, tm
     shelf = _Shelf("Drama", "genre:drama", _cards(40), _image_cache(), cfg)
     view._shelf_widgets["genre:drama"] = shelf
     view._shelf_zones["genre:drama"] = _ZONE_EXPANDED
-    view._expanded_layout.addWidget(shelf)
+    view._add_to_zone(shelf, _ZONE_EXPANDED)
 
     assert len(shelf._cards_widgets) == _CARD_BATCH_SIZE, "precondition: build is mid-flight"
 
