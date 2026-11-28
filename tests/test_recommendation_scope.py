@@ -145,15 +145,29 @@ def test_the_scope_carries_the_adult_filter_from_config(tmp_path):
     )
 
 
-def test_the_discover_shelf_is_registered_and_routes_through_the_scope():
-    """The shelf a user asked for exists, and takes no exclusions of its own."""
-    from streamselect.gui import discover_workers
+def test_the_discover_shelf_is_registered_and_routes_through_the_scope(tmp_path, monkeypatch):
+    """The shelf a user asked for exists, and takes no exclusions of its own.
 
-    src = pathlib.Path(discover_workers.__file__).read_text()
-    assert '("recommended",    "Recommended for You")' in src, (
-        "Discover has no Recommended shelf"
-    )
-    assert 'if shelf_key == "recommended"' in src, (
-        "fetch_cards_for_key does not dispatch the recommended shelf, so See-all "
-        "and lazy-expand would return nothing for it"
-    )
+    Behavioural: the loader sends a Recommended shelf, and the one card dispatcher
+    (See-all, lazy-expand) hands it to ``recommended_shelf.get_recommended`` with
+    no shelf kwargs, so ``recommendation_scope`` is its only source of exclusions.
+    """
+    from streamselect.core.config import Config
+    from streamselect.core.database import Database
+    from streamselect.gui.discover_workers import _LoaderWorker, _ZoneSnapshot, fetch_cards_for_key
+
+    db = Database(f"sqlite:///{tmp_path / 'r.db'}")
+    db.create_tables()
+    sent = []
+    worker = _LoaderWorker(db, Config(config_dir=tmp_path), _ZoneSnapshot())
+    worker.shelfReady.connect(lambda d: sent.append((d.shelf_key, d.title)))
+    worker.run()
+    assert ("recommended", "Recommended for You") in sent, "Discover has no Recommended shelf"
+
+    calls = []
+    monkeypatch.setattr("streamselect.core.recommended_shelf.get_recommended",
+                        lambda *a, **k: calls.append((a, k)) or [])
+    fetch_cards_for_key(None, "cfg", "recommended", 30, sk={"x": 1}, fk={"y": 1}, af={}, ek={})
+    assert calls == [((None, "cfg"), {"limit": 30})], (
+        "fetch_cards_for_key must dispatch the recommended shelf with no exclusions of its "
+        "own, so See-all and lazy-expand get it and recommendation_scope stays the one source")

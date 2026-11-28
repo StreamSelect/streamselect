@@ -18,7 +18,7 @@ from typing import Iterable
 
 from sqlalchemy import select
 
-from streamselect.core.epg_utils import is_local_today
+from streamselect.core.epg_utils import local_date
 from streamselect.core.event_datetime import DEFAULT_EVENT_DURATION
 from streamselect.core.games.models import GameDB, GameFeedDB
 
@@ -42,7 +42,8 @@ def pick(starts: list[tuple[datetime, CarriedGame]], now: datetime) -> CarriedGa
     on = [(s, g) for s, g in starts if s <= now < s + DEFAULT_EVENT_DURATION]
     if on:
         return max(on, key=lambda t: t[0])[1]
-    later = [(s, g) for s, g in starts if s > now and is_local_today(s)]
+    today = local_date(now)              # *now*'s day, never the real clock's
+    later = [(s, g) for s, g in starts if s > now and local_date(s) == today]
     return min(later, key=lambda t: t[0])[1] if later else None
 
 
