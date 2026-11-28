@@ -75,6 +75,7 @@ class _Shelf(QWidget):
         self._title = title
         #: False while Discover's shelf filter hides it (its row or its tile).
         self.matches_filter = True
+        self._hovered = False      # the paging arrows show only while the pointer is over the row
         self._config = config
         self._image_cache = image_cache
         # Derived from the key's namespace (never a separate flag threaded
@@ -334,7 +335,7 @@ class _Shelf(QWidget):
         if self._scroll_area is None or "_page_left" not in self.__dict__:
             return
         bar = self._scroll_area.horizontalScrollBar()
-        scrollable = bar.maximum() > bar.minimum()
+        scrollable = self._hovered and bar.maximum() > bar.minimum()      # owner: only on hover
         self._page_left.setVisible(scrollable and bar.value() > bar.minimum())
         self._page_right.setVisible(scrollable and bar.value() < bar.maximum())
         self._place_page_buttons()
@@ -451,7 +452,9 @@ class _Shelf(QWidget):
         self._apply_state()
 
     def enterEvent(self, event) -> None:
-        """Reveal pin + hide buttons when hovering a collapsed row."""
+        """Reveal the paging arrows (and, on a collapsed row, pin + hide) while hovered."""
+        self._hovered = True
+        self._sync_page_buttons()
         if self._collapsed:
             self._pin_btn.setVisible(True)
             self._hide_btn.setVisible(True)
@@ -459,6 +462,8 @@ class _Shelf(QWidget):
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
+        self._hovered = False
+        self._sync_page_buttons()
         if self._collapsed:
             self._pin_btn.setVisible(False)
             self._hide_btn.setVisible(False)

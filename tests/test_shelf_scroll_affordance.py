@@ -33,6 +33,14 @@ def _cards(n: int) -> list[ContentCard]:
     ]
 
 
+def _hover(sh, inside: bool = True) -> None:
+    from PyQt6.QtCore import QEvent, QPointF
+    from PyQt6.QtGui import QEnterEvent
+    from PyQt6.QtWidgets import QApplication
+    ev = QEnterEvent(QPointF(5, 5), QPointF(5, 5), QPointF(5, 5)) if inside else QEvent(QEvent.Type.Leave)
+    QApplication.sendEvent(sh, ev)
+
+
 @pytest.fixture()
 def shelf(qapp, qtbot, tmp_path):
     """A shelf wide enough to overflow, actually shown so geometry is real.
@@ -48,10 +56,11 @@ def shelf(qapp, qtbot, tmp_path):
     sh.resize(800, 300)
     sh.show()
     qapp.processEvents()
-    sh._sync_page_buttons()
+    _hover(sh)                    # the arrows show only while the pointer is over the row
     qapp.processEvents()
     yield sh
-    sh.deleteLater()
+    from tests.conftest import destroy_widget
+    destroy_widget(sh)
 
 
 def test_the_row_actually_overflows(shelf):
@@ -138,3 +147,14 @@ def test_the_chevrons_use_the_shared_icon_and_theme_role(shelf):
     ), "left/right must be distinct glyphs, not the same icon twice"
     assert shelf._page_left.toolTip(), "an icon-only control needs a tooltip"
     assert shelf._page_right.toolTip(), "an icon-only control needs a tooltip"
+
+
+def test_the_arrows_show_only_while_the_row_is_hovered(shelf, qapp):
+    """Owner: the arrows looked out of place at rest; they show on hover only."""
+    assert shelf._page_right.isVisible()
+    _hover(shelf, inside=False)
+    qapp.processEvents()
+    assert not shelf._page_right.isVisible() and not shelf._page_left.isVisible()
+    _hover(shelf)
+    qapp.processEvents()
+    assert shelf._page_right.isVisible()

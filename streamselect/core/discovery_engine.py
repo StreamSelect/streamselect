@@ -588,18 +588,21 @@ def get_by_actor(session, actor: str, limit: int = 30, fav_ids=None,
                  adult_mode: str = "all", force_adult_provider_ids: list[str] | None = None,
                  excluded_provider_ids: list[str] | None = None, dead_signal_streak_floor: int | None = None,
                  ) -> list[ContentCard]:
-    """Series featuring a named actor (partial match on cast string)."""
+    """Films and series featuring *actor*, through the one person predicate.
+
+    It searched series only, by the raw provider cast (which a film's payload
+    doesn't carry), so a featured actor of films showed one title: Clint
+    Eastwood 1 (Rawhide) where the library has 78 (owner report).
+    """
     from streamselect.core.database import ChannelDB, MetadataDB
+    from streamselect.core.repositories.channel_lens import person_predicate
     q = (
         session.query(ChannelDB, MetadataDB)
         .outerjoin(MetadataDB, ChannelDB.metadata_id == MetadataDB.id)
         .filter(
-            ChannelDB.media_type == "series",
+            ChannelDB.media_type.in_(["movie", "series"]),
             ChannelDB.is_hidden == False,  # noqa: E712
-            ChannelDB.raw_data.isnot(None),
-            text("json_extract(channels.raw_data, '$.cast') LIKE :pat").bindparams(
-                pat=f"%{actor}%"
-            ),
+            person_predicate(actor),
         )
     )
     q = _apply_prefix_filter(q, excluded_prefixes, include_uncategorized, excluded_content_types, excluded_keywords, excluded_categories)

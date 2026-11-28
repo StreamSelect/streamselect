@@ -193,3 +193,23 @@ def test_opening_or_collapsing_a_row_never_reloads_the_tiles_posters(view):
     assert cache.get_image_async.call_count == asked, "no poster asked for again"
     others = [t for k, t in zip(GENRE_KEYS, tiles) if k != "genre:G1"]
     assert all(s.pixmap() is not None and not s.pixmap().isNull() for t in others for s in t.slots)
+
+
+def test_a_featured_actor_shelf_finds_their_films_too(tmp_path):
+    """Owner: Featured: Clint Eastwood showed one title. The shelf searched series by
+    the raw cast only; it now uses the one person predicate, films included."""
+    from streamselect.core.database import ChannelDB, Database, ProviderDB
+    from streamselect.core.discovery_engine import get_by_actor
+
+    db = Database(f"sqlite:///{tmp_path / 'a.db'}")
+    db.create_tables()
+    with db.session_scope() as s:
+        s.add(ProviderDB(id="p1", name="P", type="xtream", url="http://x.example.com", is_active=True))
+        s.add(ChannelDB(id="s", source_id="s", provider_id="p1", name="Rawhide", detected_title="Rawhide",
+                        media_type="series", raw_data={"cast": "Clint Eastwood, Eric Fleming"}))
+        s.add(ChannelDB(id="m", source_id="m", provider_id="p1", name="Unforgiven", detected_title="Unforgiven",
+                        media_type="movie", raw_data={"director": "Clint Eastwood"}))
+        s.add(ChannelDB(id="x", source_id="x", provider_id="p1", name="Heat", detected_title="Heat",
+                        media_type="movie", raw_data={"cast": "Al Pacino"}))
+    with db.session_scope(commit=False) as s:
+        assert sorted(c.title for c in get_by_actor(s, "Clint Eastwood")) == ["Rawhide", "Unforgiven"]
